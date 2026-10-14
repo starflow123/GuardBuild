@@ -1,0 +1,2 @@
+# 文本文件统一按 LF 检出：本地 / CI（ubuntu / windows）行为一致
+* text=auto eol=lf

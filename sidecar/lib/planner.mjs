@@ -102,8 +102,9 @@ function deriveRouteKey(cand) {
 export function methodStyleOps(content, cand) {
   const matchVar = cand.matchVars?.[0];
   if (!matchVar) throw new Error(`路由 ${cand.path} 未找到 Match 变量，无法定位锚点`);
+  const eol = content.includes("\r\n") ? "\r\n" : "\n";
   const re = new RegExp(
-    `(\\n([ \\t]*)const \\w+ = Number\\(${escapeRe(matchVar)}\\[1\\]\\);[ \\t]*)(\\n[ \\t]*const (\\w+) = [\\w$]+\\([^)]*\\);[ \\t]*)`
+    `(\\r?\\n([ \\t]*)const \\w+ = Number\\(${escapeRe(matchVar)}\\[1\\]\\);[ \\t]*)(\\r?\\n[ \\t]*const (\\w+) = [\\w$]+\\([^)]*\\);[ \\t]*)`
   );
   const m = content.match(re);
   if (!m) throw new Error(`锚点未匹配（${cand.file} · ${cand.routeKey ?? cand.path}）`);
@@ -124,10 +125,10 @@ export function methodStyleOps(content, cand) {
     `${indent}  });`,
     `${indent}  return json(res, 403, { error: "无权访问该${label}" });`,
     `${indent}}`,
-  ].join("\n");
+  ].join(eol);
 
   const anchor = m[1] + m[3];
-  const ops = [{ find: anchor, replace: anchor + "\n" + guard, count: 1 }];
+  const ops = [{ find: anchor, replace: anchor + eol + guard, count: 1 }];
 
   // 更新 allow 分支的决策记录：no-check → owner 校验通过
   const blockInfo = findRecordDecisionBlock(content, routeKey);
@@ -149,8 +150,9 @@ export function methodStyleOps(content, cand) {
  * 策略 2：Express 风格处理器——findById/findOne 之后注入归属校验。
  */
 export function expressStyleOps(content, cand) {
+  const eol = content.includes("\r\n") ? "\r\n" : "\n";
   const re =
-    /(\n([ \t]*)(?:const|let)\s+(\w+)\s*=\s*(?:await\s+)?[\w$.]+\.(?:findById|findByPk|findOne|findUnique)\([^)]*\);[ \t]*)/;
+    /(\r?\n([ \t]*)(?:const|let)\s+(\w+)\s*=\s*(?:await\s+)?[\w$.]+\.(?:findById|findByPk|findOne|findUnique)\([^)]*\);[ \t]*)/;
   const m = content.match(re);
   if (!m) throw new Error(`锚点未匹配（${cand.file} · ${cand.path}）`);
   const indent = m[2];
@@ -161,9 +163,9 @@ export function expressStyleOps(content, cand) {
     `${indent}if (${varName} && ${varName}.userId !== req.user.id) {`,
     `${indent}  return res.status(403).json({ error: "无权访问该${label}" });`,
     `${indent}}`,
-  ].join("\n");
+  ].join(eol);
   const anchor = m[1];
-  return [{ find: anchor, replace: anchor + "\n" + guard, count: 1 }];
+  return [{ find: anchor, replace: anchor + eol + guard, count: 1 }];
 }
 
 export const FIX_STRATEGIES = [

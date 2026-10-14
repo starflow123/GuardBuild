@@ -8,7 +8,7 @@ import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 import { translatePathRegex } from "../lib/analyzer.mjs";
-import { methodStyleOps, findRecordDecisionBlock } from "../lib/planner.mjs";
+import { methodStyleOps, expressStyleOps, findRecordDecisionBlock } from "../lib/planner.mjs";
 
 const fixturePath = fileURLToPath(new URL("../../fixtures/vibeshop/src/app.js", import.meta.url));
 const fixture = readFileSync(fixturePath, "utf8");
@@ -80,4 +80,39 @@ test("methodStyleOps: 锚点缺失时诚实抛错", () => {
     () => methodStyleOps(fixture, { matchVars: [], resource: "order", path: "/x", file: "x.js" }),
     /未找到 Match 变量/
   );
+});
+
+test("methodStyleOps: CRLF 内容（Windows 检出/目标项目）同样可生成补丁并保留行尾", () => {
+  const crlf = fixture.replace(/\r?\n/g, "\r\n");
+  const candGet = {
+    matchVars: ["orderDetailMatch"],
+    resource: "order",
+    path: "/api/orders/:id",
+    routeKeys: ["orders.get"],
+    file: "fixtures/vibeshop/src/app.js",
+  };
+  const candCancel = {
+    matchVars: ["orderCancelMatch"],
+    resource: "order",
+    path: "/api/orders/:id/cancel",
+    routeKeys: ["orders.cancel"],
+    file: "fixtures/vibeshop/src/app.js",
+  };
+  const patched = applyOps(crlf, [...methodStyleOps(crlf, candGet), ...methodStyleOps(crlf, candCancel)]);
+  assert.ok(!patched.includes('decision: "no-check"'), "补丁后不应残留 no-check 决策");
+  assert.equal((patched.match(/order\.userId !== auth\.user\.id/g) ?? []).length, 2, "两个端点各注入一处归属守卫");
+  assert.ok(!/(?<!\r)\n/.test(patched), "不应混入 LF 行尾");
+});
+
+test("expressStyleOps: CRLF 内容可生成补丁并保留行尾", () => {
+  const src = [
+    'app.get("/orders/:id", async (req, res) => {',
+    "  const order = await Order.findById(req.params.id);",
+    "  res.json(order);",
+    "});",
+    "",
+  ].join("\r\n");
+  const patched = applyOps(src, expressStyleOps(src, { resource: "order", path: "/orders/:id", file: "x.js" }));
+  assert.ok(patched.includes("req.user.id"), "应注入 Express 归属校验");
+  assert.ok(!/(?<!\r)\n/.test(patched), "不应混入 LF 行尾");
 });

@@ -1,0 +1,57 @@
+name: Self-Test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  drill:
+    name: 端到端演练（${{ matrix.os }}）
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: 安装 Rust 工具链
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cargo 构建缓存
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: 构建无头宿主（无 GUI / WebKit 依赖）
+        working-directory: src-tauri
+        run: cargo build --no-default-features --bin guardbuild-headless
+
+      - name: Sidecar 单元测试
+        run: node --test "sidecar/tests/**/*.test.mjs"
+
+      - name: gate 演练（4 轮裁决 + 报告产物）
+        run: node scripts/e2e-gate.mjs
+
+      - name: 主工作流 E2E（31 断言）
+        run: node scripts/e2e-headless.mjs
+
+      - name: 上传报告与证据库
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: guardbuild-artifacts-${{ matrix.os }}
+          if-no-files-found: ignore
+          retention-days: 14
+          path: |
+            .demo-gate/reports
+            .demo-gate/data/guardbuild.db
+            .demo/data/guardbuild.db

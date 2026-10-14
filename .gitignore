@@ -1,0 +1,17 @@
+node_modules/
+dist/
+target/
+src-tauri/target/
+.guardbuild/
+guardbuild-data/
+.DS_Store
+*.log
+
+# 演示与运行时产物（由 scripts/ 生成，不入库）
+.demo/
+.demo-gate/
+guardbuild.db*
+*.tsbuildinfo
+
+# Tauri 构建期生成的 capability schema
+src-tauri/gen/schemas/

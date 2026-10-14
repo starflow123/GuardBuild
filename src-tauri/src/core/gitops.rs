@@ -1,0 +1,375 @@
+use std::path::{Path, PathBuf};
+use std::process::Command;
+
+use serde::{Deserialize, Serialize};
+
+use super::error::{HostError, HostResult};
+use super::fsops;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileChange {
+    pub path: String,
+    pub insertions: usize,
+    pub deletions: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiffCapture {
+    pub diff: String,
+    pub files: Vec<FileChange>,
+    pub patch_hash: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupEntry {
+    pub path: String,
+    pub backup_path: String,
+    pub sha_before: String,
+    pub sha_after: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupManifest {
+    pub backup_id: String,
+    pub session_id: String,
+    pub root: String,
+    pub created_at: i64,
+    pub patch_hash: String,
+    pub files: Vec<BackupEntry>,
+}
+
+#[cfg(windows)]
+fn apply_no_window(cmd: &mut Command) {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    cmd.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+fn apply_no_window(_cmd: &mut Command) {}
+
+fn run_git(dir: &Path, args: &[&str]) -> HostResult<(bool, String, String)> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C").arg(dir).args(args);
+    apply_no_window(&mut cmd);
+    let out = cmd
+        .output()
+        .map_err(|e| HostError::Git(format!("无法执行 git: {e}")))?;
+    Ok((
+        out.status.success(),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    ))
+}
+
+pub fn is_git_repo(dir: &Path) -> bool {
+    match run_git(dir, &["rev-parse", "--is-inside-work-tree"]) {
+        Ok((ok, stdout, _)) => ok && stdout.trim() == "true",
+        Err(_) => false,
+    }
+}
+
+pub fn head_exists(dir: &Path) -> bool {
+    matches!(run_git(dir, &["rev-parse", "--verify", "HEAD"]), Ok((true, _, _)))
+}
+
+pub fn status_porcelain(dir: &Path) -> HostResult<Vec<(String, String)>> {
+    let (ok, stdout, stderr) = run_git(dir, &["status", "--porcelain=v1"])?;
+    if !ok {
+        return Err(HostError::Git(format!("git status 失败: {stderr}")));
+    }
+    Ok(stdout
+        .lines()
+        .filter(|l| l.len() > 3)
+        .map(|l| (l[..2].trim().to_string(), l[3..].to_string()))
+        .collect())
+}
+
+/// 在隔离目录创建 worktree（从 HEAD 检出，detached），不触碰原工作区与未提交改动。
+pub fn worktree_add(root: &Path, target_dir: &Path) -> HostResult<()> {
+    if !is_git_repo(root) {
+        return Err(HostError::Git(
+            "目标目录不是 Git 仓库；请在目标项目中执行 `git init && git add -A && git commit` 后重试".into(),
+        ));
+    }
+    if !head_exists(root) {
+        return Err(HostError::Git(
+            "Git 仓库尚无提交（HEAD 不存在）；请先提交一次基线后再运行修复".into(),
+        ));
+    }
+    if let Some(parent) = target_dir.parent() {
+        std::fs::create_dir_all(parent).map_err(HostError::from)?;
+    }
+    let dir_str = target_dir.to_string_lossy().to_string();
+    let (ok, _stdout, stderr) = run_git(root, &["worktree", "add", "--detach", &dir_str, "HEAD"])?;
+    if !ok {
+        // 目录可能已存在残留，先 prune 再重试一次
+        let _ = run_git(root, &["worktree", "prune"]);
+        let (ok2, _, stderr2) = run_git(root, &["worktree", "add", "--detach", &dir_str, "HEAD"])?;
+        if !ok2 {
+            return Err(HostError::Git(format!(
+                "git worktree add 失败: {stderr} / {stderr2}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+pub fn worktree_remove(root: &Path, target_dir: &Path) -> HostResult<()> {
+    let dir_str = target_dir.to_string_lossy().to_string();
+    let (ok, _, stderr) = run_git(root, &["worktree", "remove", "--force", &dir_str])?;
+    if !ok {
+        return Err(HostError::Git(format!("git worktree remove 失败: {stderr}")));
+    }
+    Ok(())
+}
+
+/// 捕获目录相对 HEAD 的完整 diff（含未跟踪文件不处理；worktree 内我们只改已跟踪文件）。
+pub fn diff_capture(dir: &Path) -> HostResult<DiffCapture> {
+    let (ok, diff, stderr) = run_git(dir, &["diff", "--no-color", "--no-ext-diff"])?;
+    if !ok {
+        return Err(HostError::Git(format!("git diff 失败: {stderr}")));
+    }
+    let (ok2, numstat, stderr2) = run_git(dir, &["diff", "--numstat"])?;
+    if !ok2 {
+        return Err(HostError::Git(format!("git diff --numstat 失败: {stderr2}")));
+    }
+    let mut files = Vec::new();
+    for line in numstat.lines() {
+        let cols: Vec<&str> = line.split('\t').collect();
+        if cols.len() == 3 {
+            files.push(FileChange {
+                insertions: cols[0].parse().unwrap_or(0),
+                deletions: cols[1].parse().unwrap_or(0),
+                path: cols[2].to_string(),
+            });
+        }
+    }
+    let patch_hash = fsops::sha256_hex(diff.as_bytes());
+    Ok(DiffCapture {
+        diff,
+        files,
+        patch_hash,
+    })
+}
+
+/// 将补丁应用到工作区：先 --check，再备份被修改文件，最后 apply。
+/// 返回 (backup_manifest, 应用的文件列表)。
+pub fn writeback_patch(
+    root: &Path,
+    patch: &str,
+    patch_hash: &str,
+    session_id: &str,
+    backup_root: &Path,
+) -> HostResult<BackupManifest> {
+    if patch.trim().is_empty() {
+        return Err(HostError::Git("补丁为空".into()));
+    }
+    // 1) 预检
+    let tmp_patch = backup_root.join(format!("apply-{}.patch", &patch_hash[..12]));
+    std::fs::create_dir_all(backup_root).map_err(HostError::from)?;
+    std::fs::write(&tmp_patch, patch).map_err(HostError::from)?;
+    let tmp_str = tmp_patch.to_string_lossy().to_string();
+    let (ok, _, stderr) = run_git(root, &["apply", "--check", "--whitespace=nowarn", &tmp_str])?;
+    if !ok {
+        return Err(HostError::Conflict(format!(
+            "补丁无法干净地应用到工作区（可能文件已被修改）: {stderr}"
+        )));
+    }
+
+    // 2) 解析文件列表并备份
+    let files = parse_patch_files(patch);
+    if files.is_empty() {
+        return Err(HostError::Git("补丁不包含任何文件变更".into()));
+    }
+    let backup_id = format!(
+        "bk_{}",
+        &fsops::sha256_hex(format!("{session_id}:{patch_hash}:{}", crate::core::token::now_ms()).as_bytes())[..16]
+    );
+    let backup_dir = backup_root.join(&backup_id).join("files");
+    let mut entries: Vec<BackupEntry> = Vec::new();
+    for rel in &files {
+        let abs = root.join(rel);
+        let sha_before = if abs.exists() {
+            fsops::sha256_file(&abs)?
+        } else {
+            String::from("")
+        };
+        let backup_path = backup_dir.join(rel);
+        if abs.exists() {
+            fsops::copy_file(&abs, &backup_path)?;
+        }
+        entries.push(BackupEntry {
+            path: rel.clone(),
+            backup_path: backup_path.to_string_lossy().to_string(),
+            sha_before,
+            sha_after: String::new(),
+        });
+    }
+
+    // 3) 应用
+    let (ok2, _out, stderr2) = run_git(root, &["apply", "--whitespace=nowarn", &tmp_str])?;
+    if !ok2 {
+        return Err(HostError::Git(format!("git apply 失败: {stderr2}")));
+    }
+    let _ = std::fs::remove_file(&tmp_patch);
+
+    // 4) 记录应用后哈希，写 manifest
+    for e in entries.iter_mut() {
+        let abs = root.join(&e.path);
+        e.sha_after = if abs.exists() {
+            fsops::sha256_file(&abs)?
+        } else {
+            String::new()
+        };
+    }
+    let manifest = BackupManifest {
+        backup_id: backup_id.clone(),
+        session_id: session_id.to_string(),
+        root: root.to_string_lossy().to_string(),
+        created_at: crate::core::token::now_ms(),
+        patch_hash: patch_hash.to_string(),
+        files: entries,
+    };
+    let manifest_path = backup_root.join(&backup_id).join("manifest.json");
+    std::fs::create_dir_all(manifest_path.parent().unwrap()).map_err(HostError::from)?;
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string_pretty(&manifest).map_err(HostError::from)?,
+    )
+    .map_err(HostError::from)?;
+    Ok(manifest)
+}
+
+pub fn load_manifest(backup_root: &Path, backup_id: &str) -> HostResult<BackupManifest> {
+    let p = backup_root.join(backup_id).join("manifest.json");
+    let text = std::fs::read_to_string(&p)
+        .map_err(|e| HostError::NotFound(format!("备份清单不存在: {:?} ({e})", p)))?;
+    serde_json::from_str(&text).map_err(HostError::from)
+}
+
+/// 回滚：恢复备份文件。返回 (已恢复文件, 有冲突的文件)。
+/// 冲突 = 当前文件哈希与「写回后记录」不一致（说明用户在写回后手动改过）。
+pub fn rollback(backup_root: &Path, backup_id: &str) -> HostResult<(Vec<String>, Vec<String>)> {
+    let manifest = load_manifest(backup_root, backup_id)?;
+    let root = PathBuf::from(&manifest.root);
+    let mut restored = Vec::new();
+    let mut conflicts = Vec::new();
+    for e in &manifest.files {
+        let abs = root.join(&e.path);
+        let current_sha = if abs.exists() {
+            fsops::sha256_file(&abs).unwrap_or_default()
+        } else {
+            String::new()
+        };
+        if !e.sha_after.is_empty() && current_sha != e.sha_after && !current_sha.is_empty() {
+            conflicts.push(e.path.clone());
+        }
+        let backup = PathBuf::from(&e.backup_path);
+        if backup.exists() {
+            fsops::copy_file(&backup, &abs)?;
+            restored.push(e.path.clone());
+        } else if e.sha_before.is_empty() {
+            // 原文件本来不存在 → 删除新增文件
+            let _ = std::fs::remove_file(&abs);
+            restored.push(e.path.clone());
+        }
+    }
+    Ok((restored, conflicts))
+}
+
+/// 从 unified diff 中解析涉及的文件相对路径（跳过 /dev/null）。
+fn parse_patch_files(patch: &str) -> Vec<String> {
+    let mut files = Vec::new();
+    for line in patch.lines() {
+        if let Some(rest) = line.strip_prefix("+++ b/") {
+            let p = rest.trim().to_string();
+            if p != "/dev/null" && !p.is_empty() && !files.contains(&p) {
+                files.push(p);
+            }
+        }
+    }
+    files
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn git_init(dir: &Path) {
+        let run = |args: &[&str]| {
+            let mut c = Command::new("git");
+            c.arg("-C").arg(dir).args(args);
+            apply_no_window(&mut c);
+            let out = c.output().unwrap();
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "tester"]);
+        run(&["config", "core.autocrlf", "false"]);
+    }
+
+    #[test]
+    fn worktree_flow_keeps_workspace_untouched() {
+        let base = std::env::temp_dir().join(format!("gb_git_test_{}", std::process::id()));
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        git_init(&repo);
+        let baseline = "const a = 1;\nconst b = 0;\nconst c = 3;\nconst d = 4;\nconst e = 5;\n";
+        std::fs::write(repo.join("src/app.js"), baseline).unwrap();
+        // 提交基线
+        let run = |args: &[&str]| {
+            let mut c = Command::new("git");
+            c.arg("-C").arg(&repo).args(args);
+            apply_no_window(&mut c);
+            let out = c.output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["add", "-A"]);
+        run(&["commit", "-qm", "base"]);
+
+        // 制造未提交改动（与补丁区域不重叠，必须被保留）
+        std::fs::write(repo.join("src/app.js"), format!("{baseline}const local = true;\n")).unwrap();
+
+        // 创建 worktree 并修改第 1 行
+        let wt = base.join("wt");
+        worktree_add(&repo, &wt).unwrap();
+        assert!(wt.join("src/app.js").exists());
+        std::fs::write(wt.join("src/app.js"), "const a = 1; const fixed = true;\nconst b = 0;\nconst c = 3;\nconst d = 4;\nconst e = 5;\n").unwrap();
+        let cap = diff_capture(&wt).unwrap();
+        assert!(cap.diff.contains("const fixed = true"));
+        assert_eq!(cap.files.len(), 1);
+
+        // 写回工作区：补丁生效，且本地未提交改动仍在
+        let backups = base.join("backups");
+        let manifest = writeback_patch(&repo, &cap.diff, &cap.patch_hash, "s_test", &backups).unwrap();
+        assert_eq!(manifest.files.len(), 1);
+        let content = std::fs::read_to_string(repo.join("src/app.js")).unwrap();
+        assert!(content.contains("const fixed = true"), "补丁应已生效: {content}");
+        assert!(content.contains("const local = true"), "本地未提交改动应被保留: {content}");
+
+        // 回滚：恢复写回前状态（本地改动仍在、补丁消失）
+        let (restored, conflicts) = rollback(&backups, &manifest.backup_id).unwrap();
+        assert_eq!(restored.len(), 1);
+        assert!(conflicts.is_empty());
+        let content2 = std::fs::read_to_string(repo.join("src/app.js")).unwrap();
+        assert!(content2.contains("const local = true"), "回滚后本地改动应在: {content2}");
+        assert!(!content2.contains("const fixed = true"), "回滚后补丁应消失: {content2}");
+        assert!(content2.starts_with("const a = 1;\n"), "第 1 行应恢复原样: {content2}");
+
+        // 冲突保护：本地改动与补丁区域重叠时应拒绝写回
+        std::fs::write(repo.join("src/app.js"), "const a = 999; // conflict\nconst b = 0;\nconst c = 3;\nconst d = 4;\nconst e = 5;\n").unwrap();
+        let err = writeback_patch(&repo, &cap.diff, &cap.patch_hash, "s_test", &backups).unwrap_err();
+        assert!(matches!(err, HostError::Conflict(_)), "应返回冲突错误，实际: {err:?}");
+        let content3 = std::fs::read_to_string(repo.join("src/app.js")).unwrap();
+        assert!(content3.contains("const a = 999"), "拒绝写回后本地文件不应被改动: {content3}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+}

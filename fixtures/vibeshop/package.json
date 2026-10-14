@@ -1,0 +1,10 @@
+{
+  "name": "vibeshop",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "description": "VibeShop - 示例订单服务（GuardBuild 诊断靶场：含对象级越权漏洞）",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

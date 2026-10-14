@@ -1,0 +1,36 @@
+{
+  "name": "guardbuild",
+  "private": true,
+  "version": "0.1.0",
+  "description": "GuardBuild - 桌面安全 Agent：本地安全诊断、漏洞复现、可回滚修复与双验收工作流",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "tauri": "tauri",
+    "app:dev": "tauri dev",
+    "app:build": "tauri build --no-bundle",
+    "host:build": "cargo build --manifest-path src-tauri/Cargo.toml",
+    "host:release": "cargo build --release --manifest-path src-tauri/Cargo.toml",
+    "host:headless": "cargo build --manifest-path src-tauri/Cargo.toml --no-default-features --bin guardbuild-headless",
+    "test:rust": "cargo test --manifest-path src-tauri/Cargo.toml",
+    "test:sidecar": "node --test \"sidecar/tests/**/*.test.mjs\"",
+    "seed-demo": "node scripts/seed-demo.mjs",
+    "e2e": "node scripts/e2e-headless.mjs",
+    "e2e:gate": "node scripts/e2e-gate.mjs"
+  },
+  "dependencies": {
+    "@tauri-apps/api": "^2.9.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2.9.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@vitejs/plugin-react": "^4.3.4",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.3"
+  }
+}

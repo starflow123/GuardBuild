@@ -1,0 +1,7 @@
+{
+  "name": "guardbuild-sidecar",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "GuardBuild Node.js Sidecar - 任务编排与决策层（零依赖）"
+}

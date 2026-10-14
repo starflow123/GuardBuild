@@ -1,0 +1,79 @@
+import type { ViewPatch } from "../bridge";
+
+function lineClass(line: string): string {
+  if (line.startsWith("+++") || line.startsWith("---") || line.startsWith("diff --git") || line.startsWith("index "))
+    return "meta";
+  if (line.startsWith("@@")) return "hunk";
+  if (line.startsWith("+")) return "add";
+  if (line.startsWith("-")) return "del";
+  return "";
+}
+
+export function DiffViewer({
+  patch,
+  canApprove,
+  onApprove,
+}: {
+  patch: ViewPatch | null;
+  canApprove: boolean;
+  onApprove: () => void;
+}) {
+  if (!patch) {
+    return <div className="empty">尚未生成补丁。修复阶段会在隔离 Git worktree 中生成最小权限补丁并展示 Diff。</div>;
+  }
+  const lines = patch.diff.split("\n");
+  return (
+    <div className="panel" style={{ minHeight: 0, flex: 1 }}>
+      <div className="patch-meta">
+        <span>
+          补丁哈希 <b className="mono">{patch.hash.slice(0, 16)}…</b>
+        </span>
+        <span>
+          变更 <b>{patch.lineCount}</b> 行 / <b>{patch.files?.length ?? 0}</b> 个文件
+        </span>
+        <span>
+          隔离目录 <b className="mono">{patch.worktree}</b>
+        </span>
+        <span>
+          状态{" "}
+          <b>
+            {patch.status === "pending_review"
+              ? "待审查"
+              : patch.status === "written_back"
+                ? "已写回"
+                : patch.status === "rolled_back"
+                  ? "已回滚"
+                  : patch.status}
+          </b>
+        </span>
+        <span className="grow" />
+        {canApprove && (
+          <button className="btn primary" onClick={onApprove}>
+            批准 Diff · 启动隔离验收
+          </button>
+        )}
+      </div>
+      {patch.fixes && patch.fixes.length > 0 && (
+        <div className="patch-meta" style={{ borderBottom: "1px solid var(--line-soft)" }}>
+          <span className="muted small">
+            修复策略：{patch.fixes.map((f) => `${f.file}（${f.fixes.map((x) => x.strategy).join("/")}，${f.appliedOps} 处替换）`).join("；")}
+          </span>
+        </div>
+      )}
+      {patch.skipped && patch.skipped.length > 0 && (
+        <div className="patch-meta" style={{ borderBottom: "1px solid var(--line-soft)" }}>
+          <span className="small" style={{ color: "#f7dc9b" }}>
+            跳过：{patch.skipped.map((s) => `${s.candidate ?? s.file}（${s.reason}）`).join("；")}
+          </span>
+        </div>
+      )}
+      <div className="diff" style={{ flex: 1 }}>
+        {lines.map((l, i) => (
+          <div key={i} className={`diff-line ${lineClass(l)}`}>
+            {l || " "}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}

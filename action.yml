@@ -1,0 +1,83 @@
+name: 'GuardBuild Gate'
+description: '漏洞发现→复现→隔离修复→双重验收的 CI 门禁。退出码约定：0=无漏洞证据（no_candidates / not_reproducible）；1=漏洞证据成立（附已验证补丁与报告）；2=执行失败。gate 模式结构性禁止写回，不修改被测工作区。'
+author: 'GuardBuild'
+branding:
+  icon: 'shield'
+  color: 'purple'
+
+inputs:
+  project:
+    description: '目标项目路径（相对调用方工作区；可含 guardbuild.json 启动契约）'
+    required: false
+    default: '.'
+  report-dir:
+    description: '报告输出目录（report.json / report.md / gate.json / gate.log）'
+    required: false
+    default: 'guardbuild-report'
+  data-dir:
+    description: '运行时数据目录（worktrees / backups / 证据库 guardbuild.db）'
+    required: false
+    default: 'guardbuild-evidence'
+  node-version:
+    description: 'Node.js 版本（需 ≥ 22.5，node:sqlite 依赖）'
+    required: false
+    default: '24'
+
+outputs:
+  verdict:
+    description: '裁决：vulnerable / no_candidates / not_reproducible / failed / aborted / timeout'
+    value: ${{ steps.gate.outputs.verdict }}
+  exit-code:
+    description: 'gate 退出码（0/1/2）'
+    value: ${{ steps.gate.outputs.exit-code }}
+  patch-hash:
+    description: '已验证修复补丁的 sha256（仅 vulnerable+verified 时非空）'
+    value: ${{ steps.gate.outputs.patch-hash }}
+
+runs:
+  using: 'composite'
+  steps:
+    - name: 安装 Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+
+    - name: 安装 Rust 工具链
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cargo 构建缓存
+      uses: Swatinem/rust-cache@v2
+      with:
+        workspaces: src-tauri -> target
+
+    - name: 构建无头宿主（无 GUI / WebKit 依赖）
+      shell: bash
+      working-directory: ${{ github.action_path }}/src-tauri
+      run: cargo build --release --no-default-features --bin guardbuild-headless
+
+    - name: 运行 gate 裁决
+      id: gate
+      shell: bash
+      working-directory: ${{ github.workspace }}
+      env:
+        GUARDBUILD_SIDECAR: ${{ github.action_path }}/sidecar/main.mjs
+        GUARDBUILD_DATA_DIR: ${{ github.workspace }}/${{ inputs.data-dir }}
+        GB_BIN: ${{ github.action_path }}/src-tauri/target/release/guardbuild-headless
+        GB_PROJECT: ${{ inputs.project }}
+        GB_REPORT: ${{ github.workspace }}/${{ inputs.report-dir }}
+      run: |
+        set +e
+        mkdir -p "$GB_REPORT"
+        BIN="$GB_BIN"
+        [ -f "$BIN" ] || BIN="$GB_BIN.exe"
+        "$BIN" --gate --project "$GB_PROJECT" --report "$GB_REPORT" 2>&1 | tee "$GB_REPORT/gate.log"
+        code=${PIPESTATUS[0]}
+        echo "exit-code=$code" >> "$GITHUB_OUTPUT"
+        grep '^GB_GATE ' "$GB_REPORT/gate.log" | tail -n 1 | sed 's/^GB_GATE //' > "$GB_REPORT/gate.json" || true
+        if [ -s "$GB_REPORT/gate.json" ]; then
+          verdict=$(grep -o '"verdict":"[^"]*"' "$GB_REPORT/gate.json" | head -n 1 | cut -d'"' -f4)
+          patch_hash=$(grep -o '"patchHash":"[^"]*"' "$GB_REPORT/gate.json" | head -n 1 | cut -d'"' -f4)
+          echo "verdict=$verdict" >> "$GITHUB_OUTPUT"
+          echo "patch-hash=$patch_hash" >> "$GITHUB_OUTPUT"
+        fi
+        exit $code

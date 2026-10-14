@@ -1,7 +1,8 @@
 # GuardBuild · 桌面安全 Agent
 
 <p align="center">
-  <img src="src-tauri/icons/128x128@2x.png" width="120" alt="GuardBuild" />
+  <img src="src-tauri/icons/128x128@2x.png" width="120" alt="GuardBuild" /><br/>
+  <a href="https://github.com/starflow123/GuardBuild/actions/workflows/selftest.yml"><img src="https://github.com/starflow123/GuardBuild/actions/workflows/selftest.yml/badge.svg" alt="Self-Test" /></a>
 </p>
 
 面向 Vibe Coding 开发者的本地安全 Agent：对正在开发的项目执行 **发现 → 复现 → 隔离修复 → 双重验收** 的完整取证工作流——把「感觉有漏洞」变成可复现的证据链，把「让 AI 改代码」变成经过验收的补丁。
@@ -95,7 +96,7 @@ npm run test:rust      # Rust Host
 
 ```yaml
 - name: GuardBuild Gate
-  uses: <owner>/<repo>@main   # 替换为实际仓库地址；建议固定到 tag 或 commit
+  uses: starflow123/GuardBuild@master   # 引用前建议固定到 tag 或 commit
   with:
     project: .                # 目标项目路径（可含 guardbuild.json）
     report-dir: guardbuild-report

@@ -8,12 +8,14 @@
  *
  * 通信：stdin/stdout NDJSON JSON-RPC 2.0（双向）。
  */
+import path from "node:path";
 import { RpcPeer } from "./lib/rpc.mjs";
 import { EvidenceStore } from "./lib/db.mjs";
 import { StateMachine } from "./lib/statemachine.mjs";
 import { analyzeProject } from "./lib/analyzer.mjs";
 import { buildProbePlan, loadIdentities } from "./lib/planner.mjs";
 import { loadTargetConfig, DEFAULT_START } from "./lib/targetconfig.mjs";
+import { parsePortFromLine, stripAnsi } from "./lib/readyline.mjs";
 import { runPhase, ProbeError } from "./lib/probe.mjs";
 import { createPatch, writebackPatch, rollbackWorkspace, PatchError } from "./lib/patcher.mjs";
 import { emitReport } from "./lib/report.mjs";
@@ -86,6 +88,7 @@ function createCtx(params) {
     projectName: params.projectRoot.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? "project",
     tokens: { project: params.token },
     identities: loadIdentities(),
+    loginConfig: null,
     analysis: null,
     plan: null,
     view: {
@@ -195,6 +198,8 @@ function compactEvidence(r) {
     expectation: r.expectation,
     actual: r.actual,
     verdict: r.verdict,
+    evidenceGrade: r.evidenceGrade ?? null,
+    crossProof: r.crossProof ?? null,
     impact: r.impact ?? null,
     request: r.request,
     response: {
@@ -260,22 +265,13 @@ async function spawnTarget(ctx, { cwd, label, role = "target" }) {
       details: { cwd, start, output: lines },
     });
   }
-  let port = null;
-  const jsonStart = wait.line.indexOf("{");
-  if (jsonStart >= 0) {
-    try {
-      port = JSON.parse(wait.line.slice(jsonStart)).port ?? null;
-    } catch {
-      /* fallthrough */
-    }
-  }
-  if (!port) {
-    const m = wait.line.match(/127\.0\.0\.1:(\d+)/);
-    if (m) port = Number(m[1]);
-  }
+  const port = parsePortFromLine(wait.line);
   if (!port) {
     await killProc(ctx, res.pid);
-    throw new SessionError(`无法从就绪输出解析端口（${label}）`, { code: "port_parse_failed", details: { line: wait.line } });
+    throw new SessionError(`无法从就绪输出解析端口（${label}）`, {
+      code: "port_parse_failed",
+      details: { line: stripAnsi(wait.line) },
+    });
   }
   const target = { pid: res.pid, port, url: `http://127.0.0.1:${port}` };
   emit(ctx, {
@@ -300,6 +296,61 @@ async function shutdownProcs(ctx) {
   const entries = Object.values(ctx.procs).filter(Boolean);
   for (const p of entries) await killProc(ctx, p.pid);
   ctx.procs = {};
+}
+
+/** 按契约 prepare 步骤顺序执行（依赖安装/构建等），失败即中止会话 */
+async function runPrepare(ctx, { cwd, label }) {
+  const steps = ctx.targetConfig?.prepare ?? [];
+  for (const [i, step] of steps.entries()) {
+    ensureAlive(ctx);
+    const stepCwd = path.isAbsolute(step.cwd) ? step.cwd : path.resolve(cwd, step.cwd);
+    const cmdline = `${step.cmd} ${step.args.join(" ")}`.trim();
+    emit(ctx, {
+      kind: "prepare",
+      severity: SEVERITY.INFO,
+      message: `[${label}] 准备步骤 ${i + 1}/${steps.length}：${cmdline}`,
+      phase: STATE.PROBING,
+      data: { cmd: step.cmd, args: step.args, cwd: stepCwd },
+    });
+    const res = await ctx.rpc.request(
+      RPC_TO_HOST.PROC_SPAWN,
+      { token: ctx.tokens.spawn, cmd: step.cmd, args: step.args, cwd: stepCwd, role: "prepare" },
+      { timeoutMs: 30_000 }
+    );
+    const wait = await ctx.rpc.request(
+      RPC_TO_HOST.PROC_WAIT_EXIT,
+      { token: ctx.tokens.spawn, pid: res.pid, timeoutMs: step.timeoutMs },
+      { timeoutMs: step.timeoutMs + 15_000 }
+    );
+    if (!wait.exited || wait.exitCode !== 0) {
+      let lines = [];
+      try {
+        const logs = await ctx.rpc.request(RPC_TO_HOST.PROC_LOGS, {
+          token: ctx.tokens.spawn,
+          pid: res.pid,
+          tail: 40,
+        });
+        lines = (logs.lines ?? []).map((l) => l.line);
+      } catch {
+        /* ignore */
+      }
+      await killProc(ctx, res.pid);
+      throw new SessionError(`[${label}] 准备步骤失败：${cmdline}`, {
+        code: "prepare_failed",
+        hint: wait.exited
+          ? `该命令来自 guardbuild.json 的 prepare 配置（退出码 ${wait.exitCode}）；可在目标项目本地手动执行以复现错误`
+          : `准备步骤超时（${step.timeoutMs}ms），可在 guardbuild.json 中提高该步骤的 timeoutMs`,
+        details: { step, exitCode: wait.exitCode ?? null, output: lines },
+      });
+    }
+    emit(ctx, {
+      kind: "prepare",
+      severity: SEVERITY.SUCCESS,
+      message: `[${label}] 准备步骤完成：${cmdline}`,
+      phase: STATE.PROBING,
+      data: { exitCode: wait.exitCode },
+    });
+  }
 }
 
 function recordAcceptanceRows(ctx, phase, evidence) {
@@ -370,13 +421,17 @@ async function stageAnalyze(ctx) {
     data: { fileCount: ctx.analysis.fileCount, candidates: ctx.view.findings },
   });
   if (cands.length === 0) {
-    throw new SessionError("未发现对象级越权（IDOR）候选端点，无法演示复现与修复", {
+    const d = ctx.analysis.diagnostics ?? {};
+    const scanned = `已扫描 ${d.scannedFiles ?? 0} 个源文件（项目共 ${d.candidateFiles ?? 0} 个候选源文件${
+      d.outputDirFiles > 0 ? `，其中产物目录 ${d.outputDirFiles} 个` : ""
+    }${d.readFailures > 0 ? `，读取失败 ${d.readFailures} 个` : ""}）`;
+    throw new SessionError(`${scanned}，未发现对象级资源接口线索`, {
       code: "no_candidates",
-      hint: "当前示例聚焦订单对象级越权；请选择包含订单类接口的项目，或等待后续策略包",
+      hint: `${scanned}。请确认项目包含「按对象 ID 取资源」的 HTTP 接口（如 /api/orders/:id），或调整 guardbuild.json 的 scopes 后重试`,
     });
   }
 
-  ctx.plan = buildProbePlan(ctx.analysis);
+  ctx.plan = buildProbePlan(ctx.analysis, { loginPathOverride: ctx.loginConfig?.path ?? null });
   if (!ctx.plan.readCandidate && !ctx.plan.cancelCandidate) {
     throw new SessionError("无法构建探测计划：候选端点缺少可解析的路径", { code: "plan_incomplete" });
   }
@@ -394,6 +449,7 @@ async function stageAnalyze(ctx) {
 async function stageReproduce(ctx) {
   ensureAlive(ctx);
   setState(ctx, STATE.PROBING);
+  await runPrepare(ctx, { cwd: ctx.projectRoot, label: "原始工作区" });
   const target = await spawnTarget(ctx, { cwd: ctx.projectRoot, label: "原始工作区（修复前）", role: "target-pre" });
   ctx.procs.original = target;
   ctx.view.targets.original = { ...target, role: "原始工作区（修复前）" };
@@ -433,6 +489,7 @@ async function stagePatch(ctx) {
   };
   pushView(ctx);
 
+  await runPrepare(ctx, { cwd: result.worktree, label: "隔离工作区" });
   const wt = await spawnTarget(ctx, { cwd: result.worktree, label: "隔离工作区（修复候选）", role: "target-post" });
   ctx.procs.worktree = wt;
   ctx.view.targets.worktree = { ...wt, role: "隔离工作区（修复候选）" };
@@ -554,16 +611,23 @@ async function runFlow(ctx) {
 
     const targetConfig = await loadTargetConfig(ctx);
     ctx.targetConfig = targetConfig;
+    ctx.loginConfig = targetConfig.login ?? null;
     if (targetConfig.identities) {
       ctx.identities = targetConfig.identities;
     }
     if (targetConfig.source === "guardbuild.json") {
+      const extras = [
+        targetConfig.login ? `登录端点 ${targetConfig.login.path}` : null,
+        targetConfig.prepare?.length ? `准备步骤 ${targetConfig.prepare.length} 个` : null,
+      ].filter(Boolean);
       emit(ctx, {
         kind: "session",
         severity: SEVERITY.INFO,
-        message: `已加载启动契约 guardbuild.json：${targetConfig.start.cmd} ${targetConfig.start.args.join(" ")}（就绪模式 ${targetConfig.start.readyPattern}）`,
+        message: `已加载启动契约 guardbuild.json：${targetConfig.start.cmd} ${targetConfig.start.args.join(" ")}（就绪模式 ${targetConfig.start.readyPattern}${extras.length ? `；${extras.join("，")}` : ""}）`,
         data: {
           start: targetConfig.start,
+          login: targetConfig.login,
+          prepare: targetConfig.prepare,
           identities: targetConfig.identities ? targetConfig.identities.map((i) => i.name) : null,
           scopes: targetConfig.scopes,
         },

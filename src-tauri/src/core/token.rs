@@ -243,10 +243,10 @@ impl Token {
             .file_stem()
             .map(|s| s.to_string_lossy().to_lowercase())
             .unwrap_or_default();
-        let allowed_cmd = base == "node" || base == "npm" || cmd == node_bin;
+        let allowed_cmd = base == "node" || base == "npm" || base == "npx" || cmd == node_bin;
         if !allowed_cmd {
             return Err(HostError::ScopeDenied(format!(
-                "命令 `{cmd}` 不在允许列表（node/npm）内"
+                "命令 `{cmd}` 不在允许列表（node/npm/npx）内"
             )));
         }
         if any_scope(self, |s| match s {

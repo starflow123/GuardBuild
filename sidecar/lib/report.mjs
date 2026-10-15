@@ -12,6 +12,8 @@ import { PROTOCOL_VERSION, RPC_TO_HOST, SEVERITY, STATE_LABELS } from "../../sha
 
 const MD_EVIDENCE_CAP = 20;
 
+const GRADE_LABELS = { strong: "决策轨迹", "cross-proven": "内容归属", "http-only": "仅HTTP" };
+
 function fmtTime(ms) {
   try {
     return new Date(ms).toISOString();
@@ -68,13 +70,16 @@ function suggestions(r) {
 function evidenceTable(rows) {
   if (!rows.length) return "_无_\n";
   const shown = rows.slice(0, MD_EVIDENCE_CAP);
-  const head = "| 用例 | 类别 | 身份 | 判定 | 实际 | 服务端决策 |\n| --- | --- | --- | --- | --- | --- |";
+  const head =
+    "| 用例 | 类别 | 身份 | 判定 | 级别 | 实际 | 服务端决策 |\n| --- | --- | --- | --- | --- | --- | --- |";
   const body = shown
     .map((e) => {
       const decision = e.decision
         ? `${e.decision.routeKey ?? "?"}: ${e.decision.decision}${Array.isArray(e.decision.checks) ? ` [${e.decision.checks.join(",")}]` : ""}`
         : "—";
-      return `| ${esc(e.name)} | ${esc(e.category)} | ${esc(e.identity)} | ${esc(e.verdict)} | ${esc(e.actual)} | ${esc(decision)} |`;
+      const grade = e.evidenceGrade ? GRADE_LABELS[e.evidenceGrade] ?? e.evidenceGrade : "—";
+      const actual = e.crossProof ? `${e.actual}（归属证明：${e.crossProof}）` : e.actual;
+      return `| ${esc(e.name)} | ${esc(e.category)} | ${esc(e.identity)} | ${esc(e.verdict)} | ${esc(grade)} | ${esc(actual)} | ${esc(decision)} |`;
     })
     .join("\n");
   const rest = rows.length > shown.length ? `\n\n_其余 ${rows.length - shown.length} 条见 report.json。_\n` : "\n";
@@ -108,6 +113,12 @@ function renderMarkdown(r) {
   parts.push(`## 摘要\n`);
   const summaryLines = [`- 静态发现：${r.summary.findingCount} 个对象级越权候选`];
   summaryLines.push(`- 修复前证据（pre）：${pre.length} 条，其中 vulnerable ${preVuln} 条`);
+  const preGrades = r.summary.phases?.pre?.grades;
+  if (preGrades) {
+    summaryLines.push(
+      `- 证据级别（pre）：决策轨迹 ${preGrades.strong ?? 0} 条 / 内容归属 ${preGrades["cross-proven"] ?? 0} 条 / 仅 HTTP ${preGrades["http-only"] ?? 0} 条`
+    );
+  }
   if (acc) {
     summaryLines.push(
       `- 双重验收：攻击阻断 ${acc.attackBlocked}/${acc.attackTotal}，业务保持 ${acc.businessPassed}/${acc.businessTotal} → ${acc.pass ? "通过" : "未通过"}`

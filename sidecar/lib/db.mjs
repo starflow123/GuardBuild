@@ -48,6 +48,14 @@ export class EvidenceStore {
       CREATE INDEX IF NOT EXISTS idx_evidence_session ON evidence(session_id, phase);
       CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, ts);
     `);
+    // 存量库补列（CREATE IF NOT EXISTS 不会更新既有表结构）
+    const cols = this.db.prepare(`PRAGMA table_info(evidence)`).all().map((c) => c.name);
+    if (!cols.includes("evidence_grade")) {
+      this.db.exec(`ALTER TABLE evidence ADD COLUMN evidence_grade TEXT`);
+    }
+    if (!cols.includes("cross_proof")) {
+      this.db.exec(`ALTER TABLE evidence ADD COLUMN cross_proof TEXT`);
+    }
   }
 
   ensureProject(id, root, name) {
@@ -81,8 +89,9 @@ export class EvidenceStore {
   insertEvidence(rec) {
     this.db
       .prepare(`INSERT INTO evidence (id, session_id, phase, identity, method, endpoint,
-                request_json, response_json, decision_json, expectation, verdict, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+                request_json, response_json, decision_json, expectation, verdict, created_at,
+                evidence_grade, cross_proof)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(
         rec.id,
         rec.sessionId,
@@ -95,7 +104,9 @@ export class EvidenceStore {
         JSON.stringify(rec.decision ?? null),
         rec.expectation,
         rec.verdict,
-        rec.createdAt
+        rec.createdAt,
+        rec.evidenceGrade ?? null,
+        rec.crossProof ?? null
       );
   }
 
@@ -143,6 +154,8 @@ export class EvidenceStore {
       decision: r.decision_json ? JSON.parse(r.decision_json) : null,
       expectation: r.expectation,
       verdict: r.verdict,
+      evidenceGrade: r.evidence_grade ?? null,
+      crossProof: r.cross_proof ?? null,
       createdAt: r.created_at,
     }));
   }

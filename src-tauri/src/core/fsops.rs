@@ -131,3 +131,40 @@ pub fn copy_file(src: &Path, dst: &Path) -> HostResult<()> {
     fs::copy(src, dst).map_err(|e| HostError::Io(format!("{:?} -> {:?}: {e}", src, dst)))?;
     Ok(())
 }
+
+/// 创建目录链接：Windows 用 junction（mklink /J，无需管理员），Unix 用 symlink。
+/// 用于把 node_modules 等重目录链接进 worktree，避免全量拷贝。
+pub fn link_dir(src: &Path, dst: &Path) -> HostResult<()> {
+    if dst.exists() {
+        return Err(HostError::Conflict(format!("链接目标已存在: {:?}", dst)));
+    }
+    if !src.is_dir() {
+        return Err(HostError::NotFound(format!("链接源目录不存在: {:?}", src)));
+    }
+    if let Some(parent) = dst.parent() {
+        fs::create_dir_all(parent).map_err(|e| HostError::Io(format!("{:?}: {e}", parent)))?;
+    }
+    #[cfg(windows)]
+    {
+        let out = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(dst)
+            .arg(src)
+            .output()
+            .map_err(|e| HostError::Io(format!("mklink 调用失败: {e}")))?;
+        if !out.status.success() {
+            return Err(HostError::Io(format!(
+                "mklink /J {:?} -> {:?} 失败: {}",
+                dst,
+                src,
+                String::from_utf8_lossy(&out.stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        std::os::unix::fs::symlink(src, dst)
+            .map_err(|e| HostError::Io(format!("{:?} -> {:?}: {e}", src, dst)))
+    }
+}

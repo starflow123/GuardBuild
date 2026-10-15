@@ -382,6 +382,7 @@ impl Host {
         cap!("fs.list", cap_fs_list);
         cap!("fs.read", cap_fs_read);
         cap!("fs.stat", cap_fs_stat);
+        cap!("fs.linkDir", cap_fs_link_dir);
         cap!("fs.write", cap_fs_write);
         cap!("git.status", cap_git_status);
         cap!("git.worktreeAdd", cap_git_worktree_add);
@@ -391,6 +392,7 @@ impl Host {
         cap!("git.rollback", cap_git_rollback);
         cap!("proc.spawn", cap_proc_spawn);
         cap!("proc.waitForOutput", cap_proc_wait_output);
+        cap!("proc.waitExit", cap_proc_wait_exit);
         cap!("proc.logs", cap_proc_logs);
         cap!("proc.kill", cap_proc_kill);
         cap!("proc.list", cap_proc_list);
@@ -706,6 +708,47 @@ impl Host {
         token.require_read_path(&abs)?;
         drop(tokens);
         Ok(json!(fsops::stat(&abs)?))
+    }
+
+    /// 创建目录链接（node_modules → worktree）。
+    /// dst 必须落在 worktree.write 作用域内；src 可读（可用独立 readToken，如 project.read）。
+    fn cap_fs_link_dir(&self, params: Value) -> HostResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            token: String,
+            #[serde(default, rename = "readToken")]
+            read_token: Option<String>,
+            src: String,
+            dst: String,
+        }
+        let p: P = jget(&params)?;
+        let tokens = self.tokens.read().unwrap();
+        let token = tokens.require(&p.token)?;
+        let dst = self.resolve_for_token(token, &p.dst)?;
+        token.require_worktree_write_path(&dst)?;
+        let src = match self.resolve_for_token(token, &p.src) {
+            Ok(s) => {
+                token.require_read_path(&s)?;
+                s
+            }
+            Err(e) => {
+                let rt = p.read_token.as_deref().ok_or(e)?;
+                let rtoken = tokens.require(rt)?;
+                let s = self.resolve_for_token(rtoken, &p.src)?;
+                rtoken.require_read_path(&s)?;
+                s
+            }
+        };
+        drop(tokens);
+        fsops::link_dir(&src, &dst)?;
+        self.push_event(
+            "file",
+            "patching",
+            "info",
+            "已建立目录链接（避免重复安装依赖）",
+            json!({ "src": src.to_string_lossy(), "dst": dst.to_string_lossy() }),
+        );
+        Ok(json!({ "src": src.to_string_lossy(), "dst": dst.to_string_lossy() }))
     }
 
     fn cap_fs_write(&self, params: Value) -> HostResult<Value> {
@@ -1087,6 +1130,29 @@ impl Host {
         let timeout = p.timeout_ms.unwrap_or(15_000).min(60_000);
         let matched = procops::wait_for_output(&self.procs.lock().unwrap(), p.pid, &p.pattern, timeout)?;
         Ok(json!({ "matched": matched.is_some(), "line": matched }))
+    }
+
+    fn cap_proc_wait_exit(&self, params: Value) -> HostResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            token: String,
+            pid: u32,
+            #[serde(default, rename = "timeoutMs")]
+            timeout_ms: Option<u64>,
+        }
+        let p: P = jget(&params)?;
+        let session_id = self.session_of_token(&p.token)?;
+        let rec = {
+            let table = self.procs.lock().unwrap();
+            let rec = table.get(p.pid).ok_or(HostError::NotFound(format!("进程 {}", p.pid)))?;
+            if rec.session_id != session_id {
+                return Err(HostError::ScopeDenied("进程不属于当前会话".into()));
+            }
+            rec
+        };
+        let timeout = p.timeout_ms.unwrap_or(120_000).min(600_000);
+        let code = procops::wait_exit(&rec, timeout);
+        Ok(json!({ "exited": code.is_some(), "exitCode": code }))
     }
 
     fn cap_proc_logs(&self, params: Value) -> HostResult<Value> {

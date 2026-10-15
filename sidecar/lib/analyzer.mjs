@@ -6,24 +6,48 @@
  */
 
 const SOURCE_EXT = [".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py"];
-const MAX_FILES = 26;
+const MAX_FILES = 64;
 const MAX_FILE_BYTES = 128 * 1024;
+
+// 编译/生成产物目录：同分时让位于真实源码
+const OUTPUT_DIR = /(^|\/)(build|dist|out|coverage|\.next|\.nuxt)(\/|$)/;
+
+export function normalizePath(p) {
+  return String(p).replace(/\\/g, "/");
+}
 
 function extOf(p) {
   const i = p.lastIndexOf(".");
   return i >= 0 ? p.slice(i).toLowerCase() : "";
 }
 
-function scoreFile(path) {
-  const lower = path.toLowerCase();
+export function scoreFile(rawPath) {
+  const p = normalizePath(rawPath); // Windows 路径须先归一，否则 /src/ 加分与深度惩罚失效
+  const lower = p.toLowerCase();
   let s = 0;
   if (/(route|router|app|server|api|controller|handler)/.test(lower)) s += 10;
   if (lower.includes("/src/")) s += 5;
   if (lower.includes("index")) s -= 3;
   if (lower.includes("test") || lower.includes("spec")) s -= 20;
   if (lower.includes("node_modules") || lower.includes(".git")) s -= 100;
-  s -= path.split("/").length; // 越浅越优先
+  if (OUTPUT_DIR.test(lower)) s -= 15;
+  s -= p.split("/").length; // 越浅越优先
   return s;
+}
+
+/** 从 fs.list 结果中筛出候选源文件（扩展名 + 大小过滤） */
+export function filterSourceFiles(listing) {
+  return listing.filter(
+    (e) => e.kind === "file" && SOURCE_EXT.includes(extOf(e.path)) && e.size > 0 && e.size < MAX_FILE_BYTES
+  );
+}
+
+/** 从 fs.list 结果中选出待分析文件：源码扩展名 + 大小过滤，按评分取前 N */
+export function selectSourceFiles(listing, { maxFiles = MAX_FILES } = {}) {
+  return filterSourceFiles(listing)
+    .map((e) => ({ ...e, score: scoreFile(e.path) }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, maxFiles);
 }
 
 // —— 路由锚点：express 风格 or 手写 if (method === "X") 风格 ——
@@ -139,11 +163,8 @@ export async function analyzeProject(ctx) {
   const { rpc, projectRoot } = ctx;
   const token = ctx.tokens.project;
   const listing = await rpc.request("fs.list", { token, path: projectRoot, depth: 4 });
-  const files = listing.entries
-    .filter((e) => e.kind === "file" && SOURCE_EXT.includes(extOf(e.path)) && e.size > 0 && e.size < MAX_FILE_BYTES)
-    .map((e) => ({ ...e, score: scoreFile(e.path) }))
-    .sort((a, b) => b.score - a.score)
-    .slice(0, MAX_FILES);
+  const allCandidates = filterSourceFiles(listing.entries);
+  const files = selectSourceFiles(listing.entries);
 
   const sections = [];
   const readFiles = [];
@@ -196,7 +217,17 @@ export async function analyzeProject(ctx) {
     }
   }
 
-  return { fileCount: files.length, readFiles, sections, endpoints, candidates };
+  const diagnostics = {
+    totalEntries: listing.entries.length,
+    candidateFiles: allCandidates.length,
+    scannedFiles: readFiles.length,
+    outputDirFiles: allCandidates.filter((e) => OUTPUT_DIR.test(normalizePath(e.path).toLowerCase()))
+      .length,
+    readFailures: files.length - readFiles.length,
+    sections: sections.length,
+  };
+
+  return { fileCount: files.length, readFiles, sections, endpoints, candidates, diagnostics };
 }
 
 function guessResource(pathHint, text) {

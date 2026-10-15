@@ -20,11 +20,6 @@ export class PatchError extends Error {
   }
 }
 
-function toWorktreePath(worktree, projectRoot, absFile) {
-  const rel = relative(projectRoot, absFile).split(sep).join("/");
-  return `${worktree.replace(/[\\/]+$/, "")}/${rel}`;
-}
-
 /**
  * 为静态分析得到的候选端点生成修复补丁。
  * 返回 { worktree, patch: {id, hash, diff, files, strategies}, filePatches, skipped }
@@ -46,6 +41,31 @@ export async function createPatch(ctx) {
     { timeoutMs: 90_000 }
   );
   const worktree = wtRes.path;
+  const wtRoot = worktree.replace(/[\\/]+$/, "");
+
+  // 1.5 链接依赖目录（避免在 worktree 中重复安装；失败不致命，交由契约 prepare 兜底）
+  try {
+    const srcNm = `${ctx.projectRoot.replace(/[\\/]+$/, "")}/node_modules`;
+    await ctx.rpc.request(RPC_TO_HOST.FS_STAT, { token: ctx.tokens.project, path: srcNm }, { timeoutMs: 15_000 });
+    await ctx.rpc.request(
+      RPC_TO_HOST.FS_LINK_DIR,
+      { token: ctx.tokens.worktree, readToken: ctx.tokens.project, src: srcNm, dst: `${wtRoot}/node_modules` },
+      { timeoutMs: 60_000 }
+    );
+    ctx.emit({
+      kind: "patch",
+      severity: SEVERITY.INFO,
+      message: "已将 node_modules 链接到隔离工作区（复用依赖安装）",
+      data: { src: srcNm, dst: `${wtRoot}/node_modules` },
+    });
+  } catch (e) {
+    ctx.emit({
+      kind: "patch",
+      severity: SEVERITY.WARN,
+      message: `未能链接 node_modules（${e.message}），依赖将由 prepare 步骤处理`,
+      data: {},
+    });
+  }
 
   // 2. 按文件分组候选，逐一生成定向替换
   const byFile = new Map();
@@ -58,11 +78,34 @@ export async function createPatch(ctx) {
   const filePatches = [];
   const skipped = [];
   for (const [file, cands] of byFile) {
+    const rel = relative(ctx.projectRoot, file).split(sep).join("/");
+    const wtPath = `${wtRoot}/${rel}`;
+
+    // 未跟踪文件诊断：worktree 从 HEAD 检出，未提交的文件不在其中
+    try {
+      await ctx.rpc.request(RPC_TO_HOST.FS_STAT, { token: ctx.tokens.worktree, path: wtPath }, { timeoutMs: 15_000 });
+    } catch {
+      skipped.push({
+        file,
+        reason: `worktree 中不存在 ${rel}（文件未纳入 git 提交）`,
+        hint: "在目标项目执行 git add && git commit 后重新运行",
+      });
+      ctx.emit({
+        kind: "patch",
+        severity: SEVERITY.WARN,
+        message: `跳过补丁目标 ${rel}：该文件未提交到 git，隔离 worktree（基于 HEAD 检出）中不存在`,
+        data: { file: rel },
+      });
+      continue;
+    }
+
     let read;
     try {
+      // redact:false —— 锚点必须取自真实字节（Host 在真实文件上执行替换）；
+      // 脱敏会使含敏感字样的锚点失配（anchor_conflict）或把掩码写进补丁
       read = await ctx.rpc.request(
         RPC_TO_HOST.FS_READ,
-        { token: ctx.tokens.project, path: file, redact: true },
+        { token: ctx.tokens.project, path: file, redact: false },
         { timeoutMs: 30_000 }
       );
     } catch (e) {
@@ -93,7 +136,6 @@ export async function createPatch(ctx) {
     }
     if (ops.length === 0) continue;
 
-    const wtPath = toWorktreePath(worktree, ctx.projectRoot, file);
     let write;
     try {
       write = await ctx.rpc.request(
@@ -114,7 +156,7 @@ export async function createPatch(ctx) {
       });
     }
     filePatches.push({
-      file: relative(ctx.projectRoot, file).split(sep).join("/"),
+      file: rel,
       appliedOps: write.appliedOps,
       beforeSha256: write.beforeSha256,
       sha256: write.sha256,
@@ -123,9 +165,13 @@ export async function createPatch(ctx) {
   }
 
   if (filePatches.length === 0) {
+    const untracked = skipped.filter((s) => s.reason?.includes("未纳入 git 提交"));
     throw new PatchError("未能为任何候选生成补丁锚点", {
       code: "no_patch_applied",
-      hint: "锚点定位失败，可查看跳过原因",
+      hint:
+        untracked.length > 0
+          ? `${untracked.length} 个候选文件未提交到 git（worktree 基于 HEAD 检出）；请先 git add/commit 后重试`
+          : "锚点定位失败，可查看跳过原因",
       details: { skipped },
     });
   }

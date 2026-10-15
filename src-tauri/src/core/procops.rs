@@ -160,6 +160,133 @@ fn apply_no_window(cmd: &mut Command) {
 #[cfg(not(windows))]
 fn apply_no_window(_cmd: &mut Command) {}
 
+fn env_value(env: &[(String, String)], key: &str) -> Option<String> {
+    env.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(key))
+        .map(|(_, v)| v.clone())
+        .or_else(|| std::env::var(key).ok())
+}
+
+/// Windows 下沿 PATH + PATHEXT 解析可执行文件（npm → npm.cmd）。
+/// 返回 (真实路径, 是否需要经 cmd.exe 包装)。非 Windows 原样返回。
+#[cfg(windows)]
+pub fn resolve_program(program: &str, env: &[(String, String)]) -> (PathBuf, bool) {
+    let exts: Vec<String> = env_value(env, "PATHEXT")
+        .unwrap_or_else(|| ".COM;.EXE;.BAT;.CMD".to_string())
+        .split(';')
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.trim().to_string())
+        .collect();
+    let lower = program.to_lowercase();
+    let has_sep = program.contains('/') || program.contains('\\');
+    let ends_exec = exts.iter().any(|e| lower.ends_with(&e.to_lowercase()));
+
+    let via_cmd = |p: &Path| {
+        p.extension()
+            .map(|e| {
+                let e = e.to_string_lossy().to_lowercase();
+                e == "cmd" || e == "bat"
+            })
+            .unwrap_or(false)
+    };
+
+    if has_sep || ends_exec {
+        let p = PathBuf::from(program);
+        if p.is_file() {
+            let wrap = via_cmd(&p);
+            return (p, wrap);
+        }
+        if !ends_exec {
+            for e in &exts {
+                let cand = PathBuf::from(format!("{program}{e}"));
+                if cand.is_file() {
+                    let wrap = via_cmd(&cand);
+                    return (cand, wrap);
+                }
+            }
+        }
+        return (PathBuf::from(program), false);
+    }
+
+    let path_var = env_value(env, "PATH").unwrap_or_default();
+    for dir in std::env::split_paths(&path_var) {
+        for e in &exts {
+            let cand = dir.join(format!("{program}{e}"));
+            if cand.is_file() {
+                let wrap = via_cmd(&cand);
+                return (cand, wrap);
+            }
+        }
+    }
+    (PathBuf::from(program), false)
+}
+
+#[cfg(not(windows))]
+pub fn resolve_program(program: &str, _env: &[(String, String)]) -> (PathBuf, bool) {
+    (PathBuf::from(program), false)
+}
+
+/// MSVC 风格参数引用（引号/反斜杠转义），用于拼进 cmd.exe 的命令行。
+#[cfg(windows)]
+fn quote_cmd_arg(s: &str) -> String {
+    let needs = s.is_empty() || s.chars().any(|c| c.is_whitespace() || "\"&|<>^()".contains(c));
+    if !needs {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    let mut backslashes = 0usize;
+    for ch in s.chars() {
+        match ch {
+            '\\' => {
+                backslashes += 1;
+                out.push('\\');
+            }
+            '"' => {
+                for _ in 0..backslashes {
+                    out.push('\\');
+                }
+                out.push('\\');
+                out.push('"');
+                backslashes = 0;
+            }
+            c => {
+                backslashes = 0;
+                out.push(c);
+            }
+        }
+    }
+    for _ in 0..backslashes {
+        out.push('\\');
+    }
+    out.push('"');
+    out
+}
+
+/// 构造命令：.cmd/.bat 需经 `cmd.exe /d /s /c` 执行。
+/// 外层再包一对引号，配合 /s 的「剥首尾引号」规则保证带空格路径正确。
+fn build_command(program: &Path, args: &[String], via_cmd: bool) -> Command {
+    #[cfg(windows)]
+    if via_cmd {
+        use std::os::windows::process::CommandExt;
+        let mut tail = quote_cmd_arg(&program.to_string_lossy());
+        for a in args {
+            tail.push(' ');
+            tail.push_str(&quote_cmd_arg(a));
+        }
+        let mut c = Command::new("cmd.exe");
+        c.raw_arg("/d")
+            .raw_arg("/s")
+            .raw_arg("/c")
+            .raw_arg(format!("\"{tail}\""));
+        return c;
+    }
+    let _ = via_cmd;
+    let mut c = Command::new(program);
+    c.args(args);
+    c
+}
+
 /// 启动进程并挂接日志泵。返回进程记录。
 pub fn spawn(
     table: &mut ProcTable,
@@ -171,9 +298,9 @@ pub fn spawn(
     env: &[(String, String)],
     resolve_log: Arc<dyn Fn(&str) -> Option<ProcLogLine> + Send + Sync>,
 ) -> HostResult<Arc<ProcRecord>> {
-    let mut cmd = Command::new(program);
-    cmd.args(args)
-        .current_dir(cwd)
+    let (exe, via_cmd) = resolve_program(program, env);
+    let mut cmd = build_command(&exe, args, via_cmd);
+    cmd.current_dir(cwd)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -183,9 +310,12 @@ pub fn spawn(
     }
     apply_no_window(&mut cmd);
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| HostError::Proc(format!("启动 `{program}` 失败: {e}")))?;
+    let mut child = cmd.spawn().map_err(|e| {
+        HostError::Proc(format!(
+            "启动 `{program}` 失败（解析为 {}）: {e}",
+            exe.to_string_lossy()
+        ))
+    })?;
     let pid = child.id() as u32;
 
     let out = Arc::new(Mutex::new(RingBuffer::default()));
@@ -252,9 +382,9 @@ pub fn spawn(
                 let mut child = rec.child.lock().unwrap();
                 match child.try_wait() {
                     Ok(Some(status)) => {
-                        rec.exited.store(true, Ordering::SeqCst);
                         rec.exit_code
                             .store(status.code().unwrap_or(-1) as i64, Ordering::SeqCst);
+                        rec.exited.store(true, Ordering::SeqCst);
                         break;
                     }
                     Ok(None) => {}
@@ -301,5 +431,19 @@ pub fn wait_for_output(
             return Ok(None);
         }
         std::thread::sleep(Duration::from_millis(60));
+    }
+}
+
+/// 等待进程退出，返回退出码；超时返回 None。不持有进程表锁。
+pub fn wait_exit(rec: &ProcRecord, timeout_ms: u64) -> Option<i64> {
+    let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+    loop {
+        if rec.is_exited() {
+            return Some(rec.exit_code.load(Ordering::SeqCst));
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(80));
     }
 }

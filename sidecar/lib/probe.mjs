@@ -40,6 +40,7 @@ async function httpJson(ctx, opts) {
     storeAs = null,
     credentialPath = null,
     credentialPrefix = null,
+    credentialHeader = null,
     redact = true,
   } = opts;
   const params = {
@@ -54,6 +55,7 @@ async function httpJson(ctx, opts) {
     params.storeCredentialAs = storeAs;
     params.credentialPath = credentialPath;
     params.credentialPrefix = credentialPrefix;
+    if (credentialHeader) params.credentialHeader = credentialHeader;
   }
   params.redact = redact;
 
@@ -93,34 +95,138 @@ function matchDecision(entries, kase) {
   return null;
 }
 
-/** 所有身份登录（凭证直接存入 Host 保险库，不流经 Sidecar） */
-export async function loginAll(ctx, baseUrl) {
-  const loggedIn = [];
-  for (const ident of ctx.identities) {
-    const res = await httpJson(ctx, {
-      baseUrl,
-      method: "POST",
-      path: ctx.plan.loginPath,
-      body: JSON.stringify({ username: ident.username, password: ident.password }),
-      storeAs: ident.name,
-      credentialPath: "token",
-      credentialPrefix: "Bearer ",
-    });
-    if (res.status !== 200 || res.storedIdentity !== ident.name) {
-      throw new ProbeError(`身份「${ident.name}」登录失败（HTTP ${res.status}）`, {
-        code: "login_failed",
-        hint: `请确认目标服务在 ${baseUrl} 运行，且登录接口 ${ctx.plan.loginPath} 接受提供的账号`,
+/**
+ * 构造登录请求体：identity.fields > 契约 login.bodyTemplate > username/email 默认形状。
+ * 模板值支持 {name} {username} {email} {password} 占位符（递归替换）。
+ */
+export function buildLoginBody(identity, loginCfg) {
+  const fill = (value) => {
+    if (typeof value === "string") {
+      return value.replace(/\{(name|username|email|password)\}/g, (_, k) => {
+        const v = k === "name" ? identity.name : identity[k];
+        return v ?? "";
       });
     }
-    ctx.emit({
-      kind: "identity",
-      severity: SEVERITY.INFO,
-      message: `身份「${ident.name}」登录成功，令牌已存入 Host 保险库（响应中的 token 对 Sidecar 显示为 ***）`,
-      data: { identity: ident.name, user: res.json?.user ?? null, stored: true },
-    });
-    loggedIn.push({ ...ident, user: res.json?.user ?? null });
+    if (Array.isArray(value)) return value.map(fill);
+    if (value && typeof value === "object") {
+      return Object.fromEntries(Object.entries(value).map(([k, v]) => [k, fill(v)]));
+    }
+    return value;
+  };
+  const source = identity.fields ?? loginCfg?.bodyTemplate ?? null;
+  if (source) return fill(source);
+  if (identity.username) return { username: identity.username, password: identity.password };
+  return { email: identity.email ?? "", password: identity.password };
+}
+
+/** 从登录响应中提取用户对象：契约 userPath > 顶层 user > authentication.user */
+function pickUser(json, loginCfg) {
+  if (!json || typeof json !== "object") return null;
+  const userPath = loginCfg?.userPath;
+  if (userPath) {
+    const v = userPath
+      .split(".")
+      .reduce((o, k) => (o && typeof o === "object" ? o[k] : undefined), json);
+    if (v && typeof v === "object") return v;
   }
-  return loggedIn;
+  const direct = json.user ?? json.authentication?.user ?? null;
+  return direct && typeof direct === "object" ? direct : null;
+}
+
+/** 登录失败归因：按尝试记录给出可行动的 hint */
+export function classifyLoginFailure(attempts) {
+  const tried = [...new Set(attempts.map((a) => a.path))];
+  const statuses = attempts.map((a) => a.status).filter((s) => Number.isFinite(s));
+  const anyAuth = statuses.some((s) => s === 401 || s === 403);
+  const allMissing = statuses.length > 0 && statuses.every((s) => s === 404 || s === 405);
+  const allServerErr = statuses.length > 0 && statuses.every((s) => s >= 500);
+  if (allMissing) {
+    return {
+      code: "login_endpoint_missing",
+      hint: `所有候选登录端点均不存在（${tried.join("、")} 返回 404/405）。请在 guardbuild.json 的 login.path 中显式声明正确的登录路径`,
+    };
+  }
+  if (anyAuth) {
+    return {
+      code: "login_rejected",
+      hint: `登录端点已响应但拒绝凭据（HTTP ${statuses.filter((s) => s === 401 || s === 403).join("/")}）。请核对 guardbuild.json 中 identities 的账号/密码，以及 login.bodyTemplate 的字段形状（email 还是 username）`,
+    };
+  }
+  if (allServerErr) {
+    return {
+      code: "login_server_error",
+      hint: `登录请求触发服务端错误（HTTP ${statuses[statuses.length - 1]}）。常见原因：login.bodyTemplate 与端点期望的请求体不匹配，或服务启动不完整；请查看目标进程日志`,
+    };
+  }
+  return {
+    code: "login_failed",
+    hint: `请确认目标服务正常响应，且登录端点 ${tried[tried.length - 1] ?? ""} 接受契约提供的账号`,
+  };
+}
+
+/**
+ * 所有身份登录（凭证直接存入 Host 保险库，不流经 Sidecar）。
+ * 候选端点按序尝试：契约声明 > 静态分析 > /api/login；找到可用端点后固化回 plan。
+ */
+export async function loginAll(ctx, baseUrl) {
+  const cfg = ctx.loginConfig ?? null;
+  const candidates =
+    Array.isArray(ctx.plan.loginCandidates) && ctx.plan.loginCandidates.length
+      ? ctx.plan.loginCandidates
+      : [ctx.plan.loginPath];
+  const attempts = [];
+
+  for (const path of candidates) {
+    const loggedIn = [];
+    let failed = false;
+    for (const ident of ctx.identities) {
+      const res = await httpJson(ctx, {
+        baseUrl,
+        method: "POST",
+        path,
+        body: JSON.stringify(buildLoginBody(ident, cfg)),
+        storeAs: ident.name,
+        credentialPath: cfg?.credentialPath ?? "token",
+        credentialPrefix: cfg?.credentialPrefix ?? "Bearer ",
+        credentialHeader: cfg?.credentialHeader ?? null,
+      });
+      if (okStatus(res.status) && res.storedIdentity === ident.name) {
+        const user = pickUser(res.json, cfg);
+        ctx.emit({
+          kind: "identity",
+          severity: SEVERITY.INFO,
+          message: `身份「${ident.name}」登录成功（${path}），令牌已存入 Host 保险库（响应中的 token 对 Sidecar 显示为 ***）`,
+          data: { identity: ident.name, user, stored: true, endpoint: path },
+        });
+        loggedIn.push({ ...ident, user });
+        continue;
+      }
+      attempts.push({ path, identity: ident.name, status: res.status });
+      if (okStatus(res.status) && res.storedIdentity !== ident.name) {
+        throw new ProbeError(
+          `登录返回 HTTP ${res.status}，但响应中未找到凭据字段「${cfg?.credentialPath ?? "token"}」`,
+          {
+            code: "credential_path_missing",
+            hint: `请检查 guardbuild.json 的 login.credentialPath（当前为 "${cfg?.credentialPath ?? "token"}"）；嵌套令牌应写如 "authentication.token"`,
+          }
+        );
+      }
+      failed = true;
+      break;
+    }
+    if (!failed) {
+      ctx.plan.loginPath = path;
+      ctx.plan.loginCandidates = [path, ...candidates.filter((c) => c !== path)];
+      return loggedIn;
+    }
+  }
+
+  const { code, hint } = classifyLoginFailure(attempts);
+  const last = attempts[attempts.length - 1];
+  throw new ProbeError(`所有候选登录端点均失败（最后尝试 ${last.path}，HTTP ${last.status}）`, {
+    code,
+    hint,
+  });
 }
 
 /** 通过各身份的列表接口发现资源归属（owner → 对象列表） */
@@ -249,6 +355,15 @@ function buildCases(ctx, targets) {
         : "";
       return verifyAttack(res, phase, detail);
     },
+    crossProof: (res) => {
+      const o = res.json?.order;
+      if (!o || o.id !== readTarget.id) return null;
+      const ownerOk = !victim.user?.id || o.userId === victim.user.id;
+      if (!ownerOk) return null;
+      return {
+        note: `响应对象 #${o.id} 与请求目标一致，归属 ${o.userId}${victim.user?.id ? "（与受害人身份一致）" : ""}`,
+      };
+    },
     impact: (res) => (okStatus(res.status) ? `可读取他人订单详情及字段（id/userId/amount/address 等）` : null),
   });
 
@@ -267,6 +382,14 @@ function buildCases(ctx, targets) {
       const changed = o && o.status === "cancelled" && o.userId === victim.user?.id;
       const detail = changed ? `证据：订单 #${o.id}（归属 ${o.userId}）状态已被改为 cancelled` : "";
       return verifyAttack(res, phase, detail);
+    },
+    crossProof: (res) => {
+      const o = res.json?.order;
+      if (!o || o.id !== cancelTarget.id) return null;
+      if (victim.user?.id && o.userId !== victim.user.id) return null;
+      return {
+        note: `被操对象 #${o.id} 归属 ${o.userId}${o.status === "cancelled" ? "，状态已变更为 cancelled" : ""}`,
+      };
     },
     impact: (res) => {
       const o = res.json?.order;
@@ -455,6 +578,9 @@ export async function runPhase(ctx, { phase, baseUrl }) {
     const decision = matchDecision(fresh, kase);
     const { verdict, actual } = kase.verify(res, phase);
     const impact = kase.impact ? kase.impact(res) : null;
+    const cross = kase.crossProof ? kase.crossProof(res) : null;
+    // 证据分级：strong=有服务端决策轨迹；cross-proven=内容归属交叉证明；http-only=仅 HTTP 状态
+    const evidenceGrade = decision ? "strong" : cross ? "cross-proven" : "http-only";
 
     const record = {
       id: shortId("ev"),
@@ -478,6 +604,8 @@ export async function runPhase(ctx, { phase, baseUrl }) {
         durationMs: res.durationMs ?? null,
       },
       decision,
+      crossProof: cross?.note ?? null,
+      evidenceGrade,
       expectation: kase.expect,
       verdict,
       actual,
@@ -507,6 +635,8 @@ export async function runPhase(ctx, { phase, baseUrl }) {
         category: kase.category,
         verdict,
         status: res.status,
+        evidenceGrade,
+        crossProof: cross?.note ?? null,
         decision: decision ? { checks: decision.checks, decision: decision.decision, note: decision.note } : null,
       },
     });
@@ -515,12 +645,16 @@ export async function runPhase(ctx, { phase, baseUrl }) {
   const counts = { vulnerable: 0, blocked: 0, passed: 0, regressed: 0, inconclusive: 0 };
   for (const e of evidence) counts[e.verdict] = (counts[e.verdict] ?? 0) + 1;
 
+  const grades = { strong: 0, "cross-proven": 0, "http-only": 0 };
+  for (const e of evidence) grades[e.evidenceGrade] = (grades[e.evidenceGrade] ?? 0) + 1;
+
   const attackRecords = evidence.filter((e) => e.caseCategory === CASE_CATEGORY.ATTACK);
   const businessRecords = evidence.filter((e) => e.caseCategory === CASE_CATEGORY.BUSINESS);
   const summary = {
     phase,
     baseUrl,
     counts,
+    grades,
     total: evidence.length,
     attackRepro: attackRecords.filter((e) => e.verdict === VERDICT.VULNERABLE).length,
     attackBlocked: attackRecords.filter((e) => e.verdict === VERDICT.BLOCKED).length,

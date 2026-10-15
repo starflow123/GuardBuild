@@ -23,6 +23,7 @@ export const RPC_TO_HOST = {
   FS_READ: "fs.read",
   FS_WRITE: "fs.write",
   FS_STAT: "fs.stat",
+  FS_LINK_DIR: "fs.linkDir",
 
   GIT_STATUS: "git.status",
   GIT_WORKTREE_ADD: "git.worktreeAdd",
@@ -33,6 +34,7 @@ export const RPC_TO_HOST = {
 
   PROC_SPAWN: "proc.spawn",
   PROC_WAIT_OUTPUT: "proc.waitForOutput",
+  PROC_WAIT_EXIT: "proc.waitExit",
   PROC_LOGS: "proc.logs",
   PROC_KILL: "proc.kill",
   PROC_LIST: "proc.list",

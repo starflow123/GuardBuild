@@ -15,7 +15,7 @@
 
 | # | 阶段 | 说明 |
 | --- | --- | --- |
-| 1 | 启动目标 | 按项目根 `guardbuild.json` 契约启动被检服务并就绪握手（缺省 `node server.js` + stdout `GB_LISTEN`） |
+| 1 | 启动目标 | 按项目根 `guardbuild.json` 契约执行 `prepare` 前置步骤（依赖安装 / 构建）并启动被检服务就绪握手（缺省 `node server.js` + stdout `GB_LISTEN`） |
 | 2 | 静态线索 | 分析路由与代码产出候选发现（如 IDOR 线索），只作为待实证的线索 |
 | 3 | 动态实证 | 用「身份（普通用户/管理员/匿名）× 对象」用例矩阵真实请求服务：攻击用例证明越权可打穿，业务用例验证授权边界完好 |
 | 4 | 决策关联 | 目标提供 `/__diag/decisions` 诊断端点时，将每次越权请求归因到具体服务端决策点 |
@@ -59,7 +59,7 @@ npm run app:build      # 构建（--no-bundle）
 # 无头验收（零 npm 依赖：构建宿主后即可运行）
 npm run host:headless  # 构建无头宿主（--no-default-features）
 npm run e2e            # 主工作流 E2E（31 断言，自动生成 .demo 演示目标）
-npm run e2e:gate       # CI gate 演练（27 断言，4 轮裁决 + 报告产物）
+npm run e2e:gate       # CI gate 演练（34 断言，5 轮裁决 + 报告产物）
 npm run seed-demo      # 单独生成演示工作区 .demo/vibeshop（供桌面端手动演练）
 
 # 单元测试
@@ -69,7 +69,7 @@ npm run test:rust      # Rust Host
 
 ## guardbuild.json（目标启动契约）
 
-在被检项目根放置 `guardbuild.json` 声明启动方式、测试身份与预声明作用域；文件缺失或字段非法时逐项回落到缺省值：
+在被检项目根放置 `guardbuild.json` 声明启动方式、准备步骤、登录契约、测试身份与预声明作用域；文件缺失或字段非法时逐项回落到缺省值：
 
 ```json
 {
@@ -80,17 +80,35 @@ npm run test:rust      # Rust Host
     "readyPattern": "GB_LISTEN",
     "readyTimeoutMs": 20000
   },
+  "prepare": [
+    { "cmd": "npx", "args": ["tsc"], "timeoutMs": 240000 }
+  ],
+  "login": {
+    "path": "/rest/user/login",
+    "bodyTemplate": { "email": "{email}", "password": "{password}" },
+    "credentialPath": "authentication.token"
+  },
   "identities": [
-    { "name": "alice", "username": "alice", "password": "alice123", "role": "user" },
-    { "name": "admin", "username": "admin", "password": "admin123", "role": "admin" }
+    { "name": "alice", "email": "alice@example.com", "password": "alice123", "role": "user" },
+    { "name": "admin", "email": "admin@example.com", "password": "admin123", "role": "admin" }
   ],
   "scopes": ["project.read", "worktree.write", "proc.spawn", "net.probe"]
 }
 ```
 
-- `start.env.PORT=0`：让服务自选端口；就绪以 `readyPattern` 在 stdout 出现为准
-- `identities`：至少 2 个，否则回退到内置演示身份；`role: "admin"` 的身份用于管理端用例
+- `start`：`env.PORT=0` 让服务自选端口；就绪以 `readyPattern` 在 stdout 出现为准（解析前先剥 ANSI 色码，依次识别行内 JSON `port` → `host:port` → `listening on port NNNN` 三种形状）
+- `prepare`：目标启动前按序执行的前置命令（安装依赖 / 构建），`cwd` 相对项目根；在「原始工作区」与「隔离 worktree」各执行一次——修复阶段的验收不依赖原工作区的构建产物
+- `login`：登录契约——`path` 指定登录端点（优先级高于静态分析候选）；`bodyTemplate` 适配非 `username` 的请求体形状，值支持 `{name}` / `{username}` / `{email}` / `{password}` 占位符；`credentialPath` 支持点路径（如 `authentication.token`），`credentialHeader` / `credentialPrefix` 缺省为 `Authorization` / `Bearer `
+- `identities`：支持 `username` / `email` / 自定义 `fields` 三种形状；至少 2 个，否则回退到内置演示身份；`role: "admin"` 的身份用于管理端用例
 - `scopes`：仅 CI gate 模式读取，作为「预声明授权」白名单；桌面模式不生效（仍逐次征求用户授权）
+
+**真实项目接入的常见准备**：
+
+- 服务依赖构建产物（`tsc` / 打包）→ 把构建命令放进 `prepare`，gate 与桌面模式都会在启动前执行，无需手工预生成
+- 登录不是 `/api/login`、不是 `{username, password}`、token 不在顶层 → 用 `login` 契约显式声明；引擎先后尝试「契约声明 → 静态分析候选 → `/api/login`」，成功后固化优先级
+- 登录失败会给出归因：凭据错误（401/403）、端点不存在（404/405）、服务端异常（5xx），并提示检查契约对应字段
+- Windows 上 `npm` / `npx` 等 `.cmd` shim 自动解析（沿 `PATH` × `PATHEXT` 查找），契约里直接写 `npm` / `npx` 即可
+- 服务启动时有端口自检（对声明端口做 connect / 占用检查）→ 与 `env.PORT=0` 冲突（gate 的原始 / 修复实例并发运行，固定端口会争用）；可用启动 hook 让端口 0 视为可用，或确保服务在自检失败时不退出
 
 ## CI 门禁接入（GitHub Actions）
 
@@ -144,7 +162,7 @@ npm run test:rust      # Rust Host
 - 动态用例当前聚焦 Node.js HTTP/JSON 服务形态；其它技术栈需要自定义启动契约与用例（尚未泛化）
 - Windows 全链路已实测；Linux / macOS 构建与运行尚未在真实环境验证（CI 矩阵已配置，待首次运行）
 - GitHub Action 已按 runner 脚本逐字本地模拟，尚未在真实 runner 上运行
-- 尚未在第三方真实开源项目上 dogfood
+- 已在 OWASP Juice Shop v20.3.0 上完成全链路 dogfood（Windows，真实依赖与启动链）：静态分析 → email 登录 → 越权复现 → 隔离修复 → 双重验收 `patchStatus=verified`；靶点为注入式 IDOR 样例（非 Juice Shop 自身漏洞），据此修复 10 项真实项目接入失败点
 
 ## 开发备注
 

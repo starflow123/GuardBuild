@@ -1,0 +1,23 @@
+{
+  "start": {
+    "cmd": "node",
+    "args": ["server.js"],
+    "env": { "PORT": "0" },
+    "readyPattern": "listening on port",
+    "readyTimeoutMs": 20000
+  },
+  "prepare": [
+    { "cmd": "npm", "args": ["run", "prepare"], "timeoutMs": 60000 }
+  ],
+  "login": {
+    "path": "/api/login",
+    "bodyTemplate": { "email": "{email}", "password": "{password}" },
+    "credentialPath": "authentication.token"
+  },
+  "identities": [
+    { "name": "alice", "email": "alice@legacy.shop", "password": "alice123", "role": "user" },
+    { "name": "bob", "email": "bob@legacy.shop", "password": "bob123", "role": "user" },
+    { "name": "admin", "email": "admin@legacy.shop", "password": "admin123", "role": "admin" }
+  ],
+  "scopes": ["project.read", "worktree.write", "proc.spawn", "net.probe"]
+}

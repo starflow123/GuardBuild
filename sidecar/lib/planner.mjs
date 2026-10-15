@@ -26,14 +26,21 @@ export function loadIdentities() {
   return DEFAULT_IDENTITIES;
 }
 
-/** 由静态分析结果构建探测计划 */
-export function buildProbePlan(analysis) {
+/** 由静态分析结果构建探测计划；loginPathOverride 来自契约（优先级最高） */
+export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
   const eps = analysis.endpoints;
   const candidates = analysis.candidates;
 
-  const login =
-    eps.find((e) => e.method === "POST" && (e.path ?? "").toLowerCase().includes("login")) ??
-    { path: "/api/login", method: "POST" };
+  const analysisLogin = eps.find(
+    (e) => e.method === "POST" && (e.path ?? "").toLowerCase().includes("login")
+  );
+  const loginCandidates = [];
+  const pushLogin = (p) => {
+    if (typeof p === "string" && p && !loginCandidates.includes(p)) loginCandidates.push(p);
+  };
+  pushLogin(loginPathOverride);
+  if (analysisLogin) pushLogin(analysisLogin.path);
+  pushLogin("/api/login");
 
   const cancelCandidate = candidates.find((c) => c.method === "POST" && (c.path ?? "").endsWith("/cancel"));
   const readCandidate = candidates.find((c) => c.method === "GET" && (c.path ?? "").includes(":id"));
@@ -50,7 +57,8 @@ export function buildProbePlan(analysis) {
   const resource = readCandidate?.resource ?? cancelCandidate?.resource ?? "resource";
 
   return {
-    loginPath: login.path,
+    loginPath: loginCandidates[0],
+    loginCandidates,
     resource,
     readCandidate: readCandidate ?? null,
     cancelCandidate: cancelCandidate ?? null,

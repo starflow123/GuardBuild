@@ -1,0 +1,11 @@
+{
+  "name": "legacy-shop",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "LegacyShop - 真实形状示例（人类可读 ANSI 就绪行 + 编译产物诱饵 + 源码在 src/）",
+  "scripts": {
+    "start": "node server.js",
+    "prepare": "node prepare.mjs"
+  }
+}

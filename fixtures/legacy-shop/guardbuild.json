@@ -14,6 +14,7 @@
     "bodyTemplate": { "email": "{email}", "password": "{password}" },
     "credentialPath": "authentication.token"
   },
+  "responses": { "list": "data.items", "entity": "data" },
   "identities": [
     { "name": "alice", "email": "alice@legacy.shop", "password": "alice123", "role": "user" },
     { "name": "bob", "email": "bob@legacy.shop", "password": "bob123", "role": "user" },

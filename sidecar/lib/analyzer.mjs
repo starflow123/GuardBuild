@@ -62,13 +62,179 @@ const OWNER_GUARD =
   /(?:\.userId|\.ownerId|\.uid|\.authorId)\s*[!=]==?\s*[^,;\n]+|user\s*\.\s*id\s*[!=]==?\s*[^;,\n]*\.(?:userId|ownerId|uid)|(?:req|request|auth|ctx)\s*\.\s*user\s*[!=]==?/;
 
 // 角色校验
-const ROLE_GUARD = /role\s*[!=]==?\s*["'`]admin["'`]|isAdmin|hasRole\s*\(|requireRole/i;
+const ROLE_GUARD = /role\s*[!=]==?\s*["'`]admin["'`]|isAdmin|hasRole\s*\(|requireRole|adminRequired|requireAdmin|ensureAdmin|adminGuard/i;
 
 // 认证
 const AUTH_GUARD = /authenticate\s*\(|requireAuth|requireLogin|ensureAuth|auth\s*\.\s*user|req\s*\.\s*user|getUser\s*\(/;
 
-// 归属过滤（列表接口按归属过滤）
-const OWNER_FILTER = /filter\s*\(\s*\(?[^)]*\)?\s*=>[^)]*\.userId\s*[!=]==|where\s*:?\s*\{[^}]*userId/;
+// 归属过滤（列表接口按归属过滤）：兼容 userId/user_id 与 where 变量赋值形态
+const OWNER_FILTER =
+  /filter\s*\(\s*\(?[^)]*\)?\s*=>[^)]*\.user_?[Ii][Dd]\s*[!=]==|where\s*:?\s*\{[^}]*\buser_?[Ii][Dd]\b|where\s*=[^;\n]*\buser_?[Ii][Dd]\b/;
+
+// —— 挂载级鉴权：app.use("/api/x", authRequired, router) / router.use(authenticate) ——
+// 真实 Express 项目常把鉴权放在挂载点或文件顶部，路由文件正文中看不到守卫，
+// 仅测区块文本会把「有认证」误判为 false，导致候选漏检。
+
+// 认证中间件命名启发式（authRequired / authenticate / requireLogin / verifyToken / jwt…）
+const AUTH_MW_NAME = /auth|token|guard|login|jwt|permission/i;
+
+/** 按顶层逗号切分调用参数（忽略括号/引号内的逗号） */
+function splitArgsTopLevel(s) {
+  const out = [];
+  let depth = 0;
+  let cur = "";
+  let quote = null;
+  for (const ch of s) {
+    if (quote) {
+      cur += ch;
+      if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch;
+      cur += ch;
+      continue;
+    }
+    if (ch === "(" || ch === "[" || ch === "{") depth += 1;
+    else if (ch === ")" || ch === "]" || ch === "}") depth -= 1;
+    else if (ch === "," && depth === 0) {
+      out.push(cur.trim());
+      cur = "";
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur.trim()) out.push(cur.trim());
+  return out;
+}
+
+/** 收集 obj.use(...) 调用，参数按括号配平切分 */
+function collectUseCalls(text) {
+  const calls = [];
+  const re = /\b([A-Za-z_$][\w$]*)\s*\.\s*use\s*\(/g;
+  let m;
+  while ((m = re.exec(text))) {
+    const open = re.lastIndex - 1;
+    let depth = 0;
+    let quote = null;
+    let end = -1;
+    for (let i = open; i < text.length; i += 1) {
+      const ch = text[i];
+      if (quote) {
+        if (ch === quote) quote = null;
+        continue;
+      }
+      if (ch === '"' || ch === "'" || ch === "`") quote = ch;
+      else if (ch === "(") depth += 1;
+      else if (ch === ")") {
+        depth -= 1;
+        if (depth === 0) {
+          end = i;
+          break;
+        }
+      }
+    }
+    if (end > open) calls.push({ obj: m[1], args: splitArgsTopLevel(text.slice(open + 1, end)) });
+  }
+  return calls;
+}
+
+const isStringLit = (a) => /^["'`][^"'`]*["'`]$/.test(a);
+const isBareIdent = (a) => /^[A-Za-z_$][\w$]*$/.test(a);
+
+function joinNormalize(dir, spec) {
+  // 保留前导斜杠：Host 返回的真实路径带 \\?\ 扩展前缀（归一化后为 //?/…），
+  // 若吞掉前缀，挂载级鉴权对任何绝对路径的解析都会失效。
+  const joined = `${dir}/${spec}`;
+  const lead = /^\/+/.exec(joined)?.[0] ?? "";
+  const out = [];
+  for (const p of joined.slice(lead.length).split("/")) {
+    if (!p || p === ".") continue;
+    if (p === "..") out.pop();
+    else out.push(p);
+  }
+  return lead + out.join("/");
+}
+
+/** 拼接请求 URL：挂载前缀 + 路由路径（折叠重复斜杠、去尾部斜杠） */
+function joinUrl(prefix, routePath) {
+  if (!prefix) return routePath ?? null;
+  if (!routePath) return String(prefix).replace(/\/+$/, "") || "/";
+  const joined = `${prefix}/${routePath}`.replace(/\/{2,}/g, "/");
+  return joined.length > 1 ? joined.replace(/\/+$/, "") : joined;
+}
+
+function resolveModuleCandidates(dir, spec) {
+  const base = joinNormalize(dir, spec);
+  const out = [base];
+  for (const ext of [".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx"]) out.push(base + ext);
+  for (const ext of [".js", ".mjs", ".cjs", ".ts"]) out.push(`${base}/index${ext}`);
+  return out;
+}
+
+/**
+ * 跨文件识别路由文件的鉴权守卫：
+ *  - 挂载级：app.use("/api/x", authRequired, router)，router 经 require/import 解析到具体文件
+ *  - 文件级：router.use(authenticate)（无路径的全局中间件）
+ * 返回 { mountGuarded, selfGuarded, mountPrefixes, diag }：
+ *  - mountGuarded / selfGuarded 为归一化路径集合
+ *  - mountPrefixes：目标文件 → 首个挂载点前缀（无论该挂载点是否带鉴权中间件）
+ */
+export function collectFileAuthGuards(files) {
+  const known = new Set(files.map((f) => normalizePath(f.path)));
+  const mountGuarded = new Set();
+  const selfGuarded = new Set();
+  const mountPrefixes = new Map();
+  const diag = { mountsWithAuth: 0, resolvedModules: 0 };
+  for (const f of files) {
+    const filePath = normalizePath(f.path);
+    const content = f.content ?? "";
+    const requires = new Map();
+    for (const m of content.matchAll(
+      /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\(\s*["'](\.[^"']+)["']\s*\)/g
+    )) {
+      requires.set(m[1], m[2]);
+    }
+    for (const m of content.matchAll(/import\s+([A-Za-z_$][\w$]*)\s+from\s+["'](\.[^"']+)["']/g)) {
+      requires.set(m[1], m[2]);
+    }
+    const dir = filePath.slice(0, filePath.lastIndexOf("/"));
+    for (const call of collectUseCalls(content)) {
+      // router.use(authenticate)：无路径的全局认证中间件 → 本文件整体受保护
+      if (call.args.length >= 1 && isBareIdent(call.args[0]) && AUTH_MW_NAME.test(call.args[0])) {
+        selfGuarded.add(filePath);
+        continue;
+      }
+      if (!isStringLit(call.args[0])) continue;
+      const mountPath = call.args[0].slice(1, -1);
+      const middlewares = call.args.slice(1);
+      const hasAuth = middlewares.some((a) => isBareIdent(a) && AUTH_MW_NAME.test(a));
+      if (hasAuth) diag.mountsWithAuth += 1;
+      const target = [...middlewares].reverse().find(isBareIdent);
+      if (!target) continue;
+      const spec = requires.get(target);
+      if (spec) {
+        for (const cand of resolveModuleCandidates(dir, spec)) {
+          if (known.has(cand)) {
+            if (!mountPrefixes.has(cand)) mountPrefixes.set(cand, mountPath);
+            if (hasAuth) {
+              mountGuarded.add(cand);
+              diag.resolvedModules += 1;
+            }
+            break;
+          }
+        }
+        continue;
+      }
+      // 同文件内定义的 router（const router = express.Router()）→ 保守视为整文件受保护
+      if (new RegExp(`(?:const|let|var|function)\\s+${target}\\b`).test(content)) {
+        if (!mountPrefixes.has(filePath)) mountPrefixes.set(filePath, mountPath);
+        if (hasAuth) selfGuarded.add(filePath);
+      }
+    }
+  }
+  return { mountGuarded, selfGuarded, mountPrefixes, diag };
+}
 
 export function translatePathRegex(regexLiteral) {
   // 把 /^\/api\/orders\/(\d+)$/ 这类正则字面量翻译成 /api/orders/:id 形态
@@ -168,6 +334,7 @@ export async function analyzeProject(ctx) {
 
   const sections = [];
   const readFiles = [];
+  const readContents = [];
   for (const f of files) {
     let res;
     try {
@@ -176,8 +343,12 @@ export async function analyzeProject(ctx) {
       continue;
     }
     readFiles.push({ path: f.path, size: res.size, redacted: res.redacted, redactions: res.redactions });
+    readContents.push({ path: f.path, content: res.content });
     for (const s of sectionize(f.path, res.content)) sections.push(s);
   }
+
+  // 跨文件鉴权线索（挂载级 / 文件级中间件），补偿区块文本看不到的守卫
+  const authGuards = collectFileAuthGuards(readContents);
 
   const endpoints = [];
   const candidates = [];
@@ -185,21 +356,30 @@ export async function analyzeProject(ctx) {
     const eps = extractEndpoints(s);
     const sinks = extractSinks(s);
     const routeKeys = extractRouteKeys(s);
-    const hasAuth = AUTH_GUARD.test(s.text);
+    const normFile = normalizePath(s.file);
+    const inlineAuth = AUTH_GUARD.test(s.text);
+    const mountAuth =
+      !inlineAuth && (authGuards.mountGuarded.has(normFile) || authGuards.selfGuarded.has(normFile));
+    const hasAuth = inlineAuth || mountAuth;
     const hasOwnerGuard = OWNER_GUARD.test(s.text);
     const hasRoleGuard = ROLE_GUARD.test(s.text);
     const hasOwnerFilter = OWNER_FILTER.test(s.text);
     const matchVars = extractMatchVars(s);
     const path = eps[0]?.path ?? null;
+    const mountPrefix = authGuards.mountPrefixes.get(normFile) ?? null;
+    const fullPath = path ? joinUrl(mountPrefix, path) : null;
 
     const ep = {
       file: s.file,
       startLine: s.startLine,
       method: s.method,
       path,
+      mountPrefix,
+      fullPath,
       routeKeys,
       matchVars,
       hasAuth,
+      authSource: inlineAuth ? "inline" : mountAuth ? "mount" : null,
       hasOwnerGuard,
       hasRoleGuard,
       hasOwnerFilter,
@@ -212,7 +392,7 @@ export async function analyzeProject(ctx) {
       candidates.push({
         ...ep,
         kind: "idor-suspect",
-        resource: guessResource(path, s.text),
+        resource: guessResource(fullPath, s.text),
       });
     }
   }
@@ -225,6 +405,9 @@ export async function analyzeProject(ctx) {
       .length,
     readFailures: files.length - readFiles.length,
     sections: sections.length,
+    mountAuthFiles: authGuards.mountGuarded.size,
+    selfAuthFiles: authGuards.selfGuarded.size,
+    mountPrefixFiles: authGuards.mountPrefixes.size,
   };
 
   return { fileCount: files.length, readFiles, sections, endpoints, candidates, diagnostics };

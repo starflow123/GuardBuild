@@ -3,18 +3,23 @@
  *
  * 目标仓库根可放置 guardbuild.json 声明如何启动被检服务、测试身份与预声明作用域：
  * {
- *   "start": { "cmd": "node", "args": ["server.js"], "env": { "PORT": "0" },
+ *   "start": { "cmd": "node", "args": ["server.js"], "env": { "PORT": "${GB_PORT}" },
  *              "readyPattern": "GB_LISTEN", "readyTimeoutMs": 20000 },
  *   "prepare": [{ "cmd": "npm", "args": ["run", "build"], "timeoutMs": 120000 }],
  *   "login": { "path": "/api/login", "bodyTemplate": { "email": "{email}", "password": "{password}" },
  *              "credentialHeader": "Authorization", "credentialPath": "authentication.token",
  *              "credentialPrefix": "Bearer " },
+ *   "responses": { "list": "orders", "entity": "order" },
  *   "identities": [{ "name": "alice", "email": "alice@example.com", "password": "alice123", "role": "user" }],
  *   "scopes": ["project.read", "worktree.write", "proc.spawn", "net.probe"]
  * }
  *
  * 身份支持三种形状：username / email / fields（自定义字段映射），至少两项。
  * prepare 步骤在目标进程启动前按序执行（依赖安装、构建等），在 worktree 中同样复跑。
+ * start 的 cmd/args/env 中可使用 `${GB_PORT}` 占位符：宿主每次 spawn 前分配一个空闲端口注入，
+ *   使「原始工作区 / 隔离 worktree」多个实例可并存，也让打印字面量端口的项目无需改写。
+ * responses 声明列表/单体资源在响应 JSON 中的位置（点路径，如 "data.items"）；
+ * 缺省时按「顶层数组 → 首个对象数组」/「首个对象值字段」自适应。
  *
  * 文件缺失或字段不合法时回落到内建缺省（node server.js + GB_LISTEN），
  * 保持对既有目标（含内置演示项目）的向后兼容。
@@ -32,6 +37,30 @@ export const DEFAULT_START = Object.freeze({
   readyPattern: "GB_LISTEN",
   readyTimeoutMs: 20_000,
 });
+
+/**
+ * 端口槽位占位符：start.cmd/args/env 中出现时，由宿主每次 spawn 分配空闲端口后替换。
+ * 用于「双实例并存」与「应用打印字面量端口、PORT=0 无效」的目标项目。
+ */
+export const PORT_SLOT = "${GB_PORT}";
+
+export function startUsesPortSlot(start) {
+  const s = start ?? DEFAULT_START;
+  return [s.cmd, ...(s.args ?? []), ...Object.values(s.env ?? {})].some(
+    (v) => typeof v === "string" && v.includes(PORT_SLOT)
+  );
+}
+
+/** 用分配的端口渲染启动命令；port 为 null 时保持占位符原样（供测试与诊断） */
+export function renderStart(start, port) {
+  const s = start ?? DEFAULT_START;
+  const sub = (v) => (port == null ? String(v) : String(v).split(PORT_SLOT).join(String(port)));
+  return {
+    cmd: sub(s.cmd),
+    args: s.args.map(sub),
+    env: Object.fromEntries(Object.entries(s.env).map(([k, v]) => [k, sub(v)])),
+  };
+}
 
 function normalizeStart(raw) {
   const s = raw && typeof raw === "object" ? raw : {};
@@ -131,6 +160,16 @@ function normalizePrepare(raw) {
   return out.length ? out : null;
 }
 
+/** 响应形状契约：列表/单体资源在 JSON 响应中的点路径（如 "data.items"），缺省为自适应探测。 */
+function normalizeResponses(raw) {
+  const r = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : null;
+  if (!r) return null;
+  const list = typeof r.list === "string" && r.list.trim() ? r.list.trim() : null;
+  const entity = typeof r.entity === "string" && r.entity.trim() ? r.entity.trim() : null;
+  if (!list && !entity) return null;
+  return { list, entity };
+}
+
 function fallback(source, invalid = null) {
   return {
     source,
@@ -139,6 +178,7 @@ function fallback(source, invalid = null) {
     identities: null,
     login: null,
     prepare: null,
+    responses: null,
     scopes: null,
   };
 }
@@ -176,6 +216,7 @@ export async function loadTargetConfig(ctx) {
     identities: normalizeIdentities(parsed.identities),
     login: normalizeLogin(parsed.login),
     prepare: normalizePrepare(parsed.prepare),
+    responses: normalizeResponses(parsed.responses),
     scopes: Array.isArray(parsed.scopes)
       ? parsed.scopes.filter((x) => typeof x === "string" && x)
       : null,

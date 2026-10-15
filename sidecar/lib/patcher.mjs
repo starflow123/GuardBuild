@@ -33,13 +33,52 @@ export async function createPatch(ctx) {
     });
   }
 
+  // 0. 预检：隔离修复依赖 git 仓库与至少一次提交基线
+  let repoState = null;
+  try {
+    repoState = await ctx.rpc.request(
+      RPC_TO_HOST.GIT_STATUS,
+      { token: ctx.tokens.worktree, dir: ctx.projectRoot },
+      { timeoutMs: 15_000 }
+    );
+  } catch {
+    /* 探测失败不阻断（交由 worktree.add 报错兜底） */
+  }
+  if (repoState && repoState.isRepo === false) {
+    throw new PatchError("目标项目不是 Git 仓库，无法创建隔离 worktree", {
+      code: "not_a_git_repo",
+      hint: "隔离修复依赖 git：请在目标项目根执行 `git init && git add -A && git commit -m baseline` 后重试（未提交的文件不会进入隔离副本）",
+      details: { projectRoot: ctx.projectRoot },
+    });
+  }
+
   // 1. 创建隔离 worktree
   const name = `fix-${Date.now().toString(36)}`;
-  const wtRes = await ctx.rpc.request(
-    RPC_TO_HOST.GIT_WORKTREE_ADD,
-    { token: ctx.tokens.worktree, name },
-    { timeoutMs: 90_000 }
-  );
+  let wtRes;
+  try {
+    wtRes = await ctx.rpc.request(
+      RPC_TO_HOST.GIT_WORKTREE_ADD,
+      { token: ctx.tokens.worktree, name },
+      { timeoutMs: 90_000 }
+    );
+  } catch (e) {
+    const msg = String(e?.message ?? e);
+    if (msg.includes("不是 Git 仓库")) {
+      throw new PatchError("目标项目不是 Git 仓库，无法创建隔离 worktree", {
+        code: "not_a_git_repo",
+        hint: "隔离修复依赖 git：请在目标项目根执行 `git init && git add -A && git commit -m baseline` 后重试",
+        details: { projectRoot: ctx.projectRoot, hostError: msg },
+      });
+    }
+    if (msg.includes("尚无提交")) {
+      throw new PatchError("Git 仓库尚无提交基线（HEAD 不存在），无法创建隔离 worktree", {
+        code: "no_baseline_commit",
+        hint: "请在目标项目执行 `git add -A && git commit -m baseline` 建立基线提交后重试",
+        details: { projectRoot: ctx.projectRoot, hostError: msg },
+      });
+    }
+    throw e;
+  }
   const worktree = wtRes.path;
   const wtRoot = worktree.replace(/[\\/]+$/, "");
 

@@ -14,7 +14,7 @@ import { EvidenceStore } from "./lib/db.mjs";
 import { StateMachine } from "./lib/statemachine.mjs";
 import { analyzeProject } from "./lib/analyzer.mjs";
 import { buildProbePlan, loadIdentities } from "./lib/planner.mjs";
-import { loadTargetConfig, DEFAULT_START } from "./lib/targetconfig.mjs";
+import { loadTargetConfig, DEFAULT_START, startUsesPortSlot, renderStart } from "./lib/targetconfig.mjs";
 import { parsePortFromLine, stripAnsi } from "./lib/readyline.mjs";
 import { runPhase, ProbeError } from "./lib/probe.mjs";
 import { createPatch, writebackPatch, rollbackWorkspace, PatchError } from "./lib/patcher.mjs";
@@ -228,14 +228,35 @@ async function requestScope(ctx, kind, reason) {
 
 async function spawnTarget(ctx, { cwd, label, role = "target" }) {
   const start = ctx.targetConfig?.start ?? DEFAULT_START;
+  // 契约声明了 ${GB_PORT} 槽位时，先分配空闲端口再渲染启动命令（支持多实例并存）
+  let allocated = null;
+  if (startUsesPortSlot(start)) {
+    try {
+      const res = await ctx.rpc.request(RPC_TO_HOST.PROC_ALLOC_PORT, { token: ctx.tokens.spawn }, { timeoutMs: 15_000 });
+      allocated = res.port;
+      emit(ctx, {
+        kind: "process",
+        severity: SEVERITY.INFO,
+        message: `已分配空闲端口 ${allocated}（注入 ${label} 的 \${GB_PORT} 槽位）`,
+        data: { port: allocated, label },
+      });
+    } catch (e) {
+      throw new SessionError("无法分配空闲端口（启动契约使用了 ${GB_PORT} 槽位）", {
+        code: "port_alloc_failed",
+        hint: e.message,
+        details: { cwd, label },
+      });
+    }
+  }
+  const { cmd, args, env } = renderStart(start, allocated);
   const res = await ctx.rpc.request(
     RPC_TO_HOST.PROC_SPAWN,
     {
       token: ctx.tokens.spawn,
-      cmd: start.cmd,
-      args: start.args,
+      cmd,
+      args,
       cwd,
-      env: start.env,
+      env,
       role,
     },
     { timeoutMs: 30_000 }
@@ -265,11 +286,14 @@ async function spawnTarget(ctx, { cwd, label, role = "target" }) {
       details: { cwd, start, output: lines },
     });
   }
-  const port = parsePortFromLine(wait.line);
+  // 就绪行解析优先（它是真实绑定端口）；解析不到但契约声明了槽位时回退到分配值
+  let port = parsePortFromLine(wait.line);
+  if (!port && allocated) port = allocated;
   if (!port) {
     await killProc(ctx, res.pid);
     throw new SessionError(`无法从就绪输出解析端口（${label}）`, {
       code: "port_parse_failed",
+      hint: "可在 guardbuild.json 的 start.env 中使用 ${PORT: \"${GB_PORT}\"} 由宿主分配端口，无需依赖输出解析",
       details: { line: stripAnsi(wait.line) },
     });
   }
@@ -403,7 +427,8 @@ async function stageAnalyze(ctx) {
   ctx.view.findings = cands.map((c) => ({
     id: shortId("fi"),
     method: c.method,
-    path: c.path,
+    path: c.fullPath ?? c.path,
+    routePath: c.path,
     file: c.file,
     startLine: c.startLine,
     resource: c.resource,
@@ -433,13 +458,16 @@ async function stageAnalyze(ctx) {
 
   ctx.plan = buildProbePlan(ctx.analysis, { loginPathOverride: ctx.loginConfig?.path ?? null });
   if (!ctx.plan.readCandidate && !ctx.plan.cancelCandidate) {
-    throw new SessionError("无法构建探测计划：候选端点缺少可解析的路径", { code: "plan_incomplete" });
+    throw new SessionError("无法构建探测计划：候选端点中缺少可探测的单体资源接口", {
+      code: "plan_incomplete",
+      hint: `已发现 ${cands.length} 个候选端点，但均不含「按 ID 取单体资源」的路径（如 GET /api/orders/:id）。请确认项目中存在带路径参数的资源接口，或在 guardbuild.json 中补充契约`,
+    });
   }
   ctx.view.plan = {
     loginPath: ctx.plan.loginPath,
     resource: ctx.plan.resource,
-    readPath: ctx.plan.readCandidate?.path ?? null,
-    cancelPath: ctx.plan.cancelCandidate?.path ?? null,
+    readPath: ctx.plan.readCandidate?.fullPath ?? ctx.plan.readCandidate?.path ?? null,
+    cancelPath: ctx.plan.cancelCandidate?.fullPath ?? ctx.plan.cancelCandidate?.path ?? null,
     listPath: ctx.plan.listEndpoint?.path ?? null,
   };
   pushView(ctx);
@@ -475,6 +503,23 @@ async function stageReproduce(ctx) {
 async function stagePatch(ctx) {
   ensureAlive(ctx);
   setState(ctx, STATE.PATCHING);
+
+  // 隔离验收需再启动一个实例：先停止原始实例，避免固定端口互撞
+  // （原始实例在复现阶段已完成使命；写回后复核会重新拉起）
+  if (ctx.procs.original) {
+    await killProc(ctx, ctx.procs.original.pid);
+    ctx.procs.original = null;
+    ctx.view.targets.original = { ...ctx.view.targets.original, stopped: true };
+    emit(ctx, {
+      kind: "process",
+      severity: SEVERITY.INFO,
+      message: "已停止原始工作区实例（为隔离验收实例腾出端口；写回后会重新启动复核）",
+      phase: STATE.PATCHING,
+      data: {},
+    });
+    pushView(ctx);
+  }
+
   const result = await createPatch(ctx);
   const lineCount = result.patch.diff.split("\n").filter((l) => l.startsWith("+") || l.startsWith("-")).length;
   ctx.view.patch = {

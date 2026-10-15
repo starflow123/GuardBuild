@@ -33,6 +33,7 @@ export const RPC_TO_HOST = {
   GIT_ROLLBACK: "git.rollback",
 
   PROC_SPAWN: "proc.spawn",
+  PROC_ALLOC_PORT: "proc.allocPort",
   PROC_WAIT_OUTPUT: "proc.waitForOutput",
   PROC_WAIT_EXIT: "proc.waitExit",
   PROC_LOGS: "proc.logs",

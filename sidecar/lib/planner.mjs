@@ -26,35 +26,56 @@ export function loadIdentities() {
   return DEFAULT_IDENTITIES;
 }
 
+/** 端点请求路径：有挂载前缀时用 fullPath（完整 URL），否则退回声明路径 */
+function epPath(e) {
+  return e.fullPath ?? e.path ?? null;
+}
+
+/** 路径中的 :参数 个数（用于识别「按 ID 取单体资源」的路由，不绑定 :id 命名） */
+function paramCount(p) {
+  return String(p ?? "").match(/:[A-Za-z_]\w*/g)?.length ?? 0;
+}
+
 /** 由静态分析结果构建探测计划；loginPathOverride 来自契约（优先级最高） */
 export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
   const eps = analysis.endpoints;
   const candidates = analysis.candidates;
 
   const analysisLogin = eps.find(
-    (e) => e.method === "POST" && (e.path ?? "").toLowerCase().includes("login")
+    (e) => e.method === "POST" && (epPath(e) ?? "").toLowerCase().includes("login")
   );
   const loginCandidates = [];
   const pushLogin = (p) => {
     if (typeof p === "string" && p && !loginCandidates.includes(p)) loginCandidates.push(p);
   };
   pushLogin(loginPathOverride);
-  if (analysisLogin) pushLogin(analysisLogin.path);
+  if (analysisLogin) pushLogin(epPath(analysisLogin));
   pushLogin("/api/login");
 
-  const cancelCandidate = candidates.find((c) => c.method === "POST" && (c.path ?? "").endsWith("/cancel"));
-  const readCandidate = candidates.find((c) => c.method === "GET" && (c.path ?? "").includes(":id"));
-
-  const list =
-    eps.find(
-      (e) => e.method === "GET" && e.path && !e.path.includes(":id") && e.hasOwnerFilter && !/admin/i.test(e.path)
-    ) ?? null;
-
-  const adminList = eps.find((e) => e.method === "GET" && /admin/i.test(e.path ?? "") && e.hasRoleGuard) ?? null;
-  const adminCancel =
-    eps.find((e) => e.method === "POST" && /admin/i.test(e.path ?? "") && (e.path ?? "").endsWith("/cancel")) ?? null;
+  const cancelCandidate =
+    candidates.find((c) => c.method === "POST" && (epPath(c) ?? "").endsWith("/cancel")) ?? null;
+  const readCandidate = candidates.find((c) => c.method === "GET" && paramCount(epPath(c)) === 1) ?? null;
 
   const resource = readCandidate?.resource ?? cancelCandidate?.resource ?? "resource";
+
+  // 列表/管理端点优先选择与资源名匹配的路径（避免把别的资源列表当作探测目标）
+  const byResource = (list) =>
+    list.find((e) => epPath(e).toLowerCase().includes(resource.toLowerCase())) ?? list[0] ?? null;
+  const listFields = eps.filter(
+    (e) =>
+      e.method === "GET" &&
+      epPath(e) &&
+      paramCount(epPath(e)) === 0 &&
+      e.hasOwnerFilter &&
+      !/admin/i.test(epPath(e))
+  );
+  const list = byResource(listFields);
+  const adminFields = eps.filter((e) => e.method === "GET" && /admin/i.test(epPath(e) ?? "") && e.hasRoleGuard);
+  const adminCancelFields = eps.filter(
+    (e) => e.method === "POST" && /admin/i.test(epPath(e) ?? "") && (epPath(e) ?? "").endsWith("/cancel")
+  );
+  const adminList = byResource(adminFields);
+  const adminCancel = byResource(adminCancelFields);
 
   return {
     loginPath: loginCandidates[0],
@@ -62,9 +83,9 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
     resource,
     readCandidate: readCandidate ?? null,
     cancelCandidate: cancelCandidate ?? null,
-    listEndpoint: list ? { path: list.path, routeKey: list.routeKeys?.[0] ?? null } : null,
-    adminListEndpoint: adminList ? { path: adminList.path, routeKey: adminList.routeKeys?.[0] ?? null } : null,
-    adminCancelEndpoint: adminCancel ? { path: adminCancel.path, routeKey: adminCancel.routeKeys?.[0] ?? null } : null,
+    listEndpoint: list ? { path: epPath(list), routeKey: list.routeKeys?.[0] ?? null } : null,
+    adminListEndpoint: adminList ? { path: epPath(adminList), routeKey: adminList.routeKeys?.[0] ?? null } : null,
+    adminCancelEndpoint: adminCancel ? { path: epPath(adminCancel), routeKey: adminCancel.routeKeys?.[0] ?? null } : null,
     candidates,
   };
 }

@@ -9,7 +9,7 @@ export function stripAnsi(s) {
   return String(s ?? "").replace(ANSI_RE, "");
 }
 
-/** 依次尝试：行内 JSON 的 port 字段 → host:port → "port NNNN" 文本回退 */
+/** 依次尝试：行内 JSON 的 port 字段 → host:port → 「端口 NNNN」/ "port NNNN" 文本回退 */
 export function parsePortFromLine(rawLine) {
   const line = stripAnsi(rawLine);
   if (!line) return null;
@@ -25,6 +25,10 @@ export function parsePortFromLine(rawLine) {
   }
 
   let m = line.match(/(?:127\.0\.0\.1|localhost|0\.0\.0\.0)[:=](\d{2,5})/i);
+  if (m) return Number(m[1]);
+
+  // 中文项目常见形状：服务器运行在端口 3000 / 监听端口：8080 / 端口号为 4123
+  m = line.match(/端口(?:号)?\s*(?:[:：]|为|是)?\s*(\d{2,5})/);
   if (m) return Number(m[1]);
 
   m = line.match(/\bport\b[^\d]{0,12}(\d{2,5})\b/i);

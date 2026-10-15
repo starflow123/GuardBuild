@@ -76,7 +76,7 @@ npm run test:rust      # Rust Host
   "start": {
     "cmd": "node",
     "args": ["server.js"],
-    "env": { "PORT": "0" },
+    "env": { "PORT": "${GB_PORT}" },
     "readyPattern": "GB_LISTEN",
     "readyTimeoutMs": 20000
   },
@@ -88,6 +88,7 @@ npm run test:rust      # Rust Host
     "bodyTemplate": { "email": "{email}", "password": "{password}" },
     "credentialPath": "authentication.token"
   },
+  "responses": { "list": "data.items", "entity": "data.order" },
   "identities": [
     { "name": "alice", "email": "alice@example.com", "password": "alice123", "role": "user" },
     { "name": "admin", "email": "admin@example.com", "password": "admin123", "role": "admin" }
@@ -96,9 +97,10 @@ npm run test:rust      # Rust Host
 }
 ```
 
-- `start`：`env.PORT=0` 让服务自选端口；就绪以 `readyPattern` 在 stdout 出现为准（解析前先剥 ANSI 色码，依次识别行内 JSON `port` → `host:port` → `listening on port NNNN` 三种形状）
+- `start`：就绪以 `readyPattern` 在 stdout 出现为准（解析前先剥 ANSI 色码，依次识别行内 JSON `port` → `host:port` → 「端口 NNNN」/ `listening on port NNNN` 文本形状）。端口两种写法任选：`env.PORT=0` 让服务自选端口（要求服务把真实端口打进就绪行）；硬编码端口或打印字面量的服务改用 **`${GB_PORT}` 槽位**——宿主每次 spawn 前分配一个空闲端口注入，`cmd` / `args` / `env` 均可使用（修复阶段会先停止原始实例，验收实例与原始实例不再争用端口）
 - `prepare`：目标启动前按序执行的前置命令（安装依赖 / 构建），`cwd` 相对项目根；在「原始工作区」与「隔离 worktree」各执行一次——修复阶段的验收不依赖原工作区的构建产物
 - `login`：登录契约——`path` 指定登录端点（优先级高于静态分析候选）；`bodyTemplate` 适配非 `username` 的请求体形状，值支持 `{name}` / `{username}` / `{email}` / `{password}` 占位符；`credentialPath` 支持点路径（如 `authentication.token`），`credentialHeader` / `credentialPrefix` 缺省为 `Authorization` / `Bearer `
+- `responses`：声明列表 / 单体资源在响应 JSON 中的位置（点路径，如 `data.items`）；不声明时自适应——列表找「顶层数组 → 首个含 `id` 的对象数组」，单体找「首个对象值字段 → 响应自身」；资源名参与用例文案（`order` 显示为「订单」）
 - `identities`：支持 `username` / `email` / 自定义 `fields` 三种形状；至少 2 个，否则回退到内置演示身份；`role: "admin"` 的身份用于管理端用例
 - `scopes`：仅 CI gate 模式读取，作为「预声明授权」白名单；桌面模式不生效（仍逐次征求用户授权）
 
@@ -106,9 +108,11 @@ npm run test:rust      # Rust Host
 
 - 服务依赖构建产物（`tsc` / 打包）→ 把构建命令放进 `prepare`，gate 与桌面模式都会在启动前执行，无需手工预生成
 - 登录不是 `/api/login`、不是 `{username, password}`、token 不在顶层 → 用 `login` 契约显式声明；引擎先后尝试「契约声明 → 静态分析候选 → `/api/login`」，成功后固化优先级
+- 列表 / 单体不在响应顶层（如 `{ "code": 0, "data": { "items": [] } }`）→ 用 `responses` 契约声明 `list` / `entity` 点路径；不声明时靠自适应探测，形状歧义（多个对象数组）时建议显式声明
 - 登录失败会给出归因：凭据错误（401/403）、端点不存在（404/405）、服务端异常（5xx），并提示检查契约对应字段
 - Windows 上 `npm` / `npx` 等 `.cmd` shim 自动解析（沿 `PATH` × `PATHEXT` 查找），契约里直接写 `npm` / `npx` 即可
-- 服务启动时有端口自检（对声明端口做 connect / 占用检查）→ 与 `env.PORT=0` 冲突（gate 的原始 / 修复实例并发运行，固定端口会争用）；可用启动 hook 让端口 0 视为可用，或确保服务在自检失败时不退出
+- 服务硬编码端口、启动脚本不支持 `PORT=0`、或就绪行只打印字面量端口 → 契约改用 `${GB_PORT}` 槽位（宿主分配空闲端口注入，解析不到就绪端口时直接回退到分配值）
+- 目标项目不是 git 仓库 / 尚无提交基线 → 修复阶段会在创建隔离 worktree 前预检并给出明确指引（`git init && git add -A && git commit -m baseline`）
 
 ## CI 门禁接入（GitHub Actions）
 

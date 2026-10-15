@@ -82,7 +82,7 @@ export async function handleRequest(req, res) {
       checks: ["authenticated", "owner-filter"], decision: "allow",
       note: "按归属过滤，仅返回当前用户的订单",
     });
-    return json(res, 200, { orders });
+    return json(res, 200, { code: 0, data: { items: orders, total: orders.length } });
   }
 
   // ---- 订单：详情 ----
@@ -107,7 +107,7 @@ export async function handleRequest(req, res) {
       checks: ["authenticated"], decision: "no-check",
       note: "查询订单后直接返回，未校验订单归属",
     });
-    return json(res, 200, { order });
+    return json(res, 200, { code: 0, meta: { handler: "orders.get" }, data: order });
   }
 
   // ---- 订单：取消 ----
@@ -136,7 +136,7 @@ export async function handleRequest(req, res) {
       checks: ["authenticated"], decision: "no-check",
       note: "取消订单前未校验订单归属",
     });
-    return json(res, 200, { ok: true, order });
+    return json(res, 200, { code: 0, meta: { handler: "orders.cancel" }, data: order });
   }
 
   // ---- 管理端：全部订单 ----
@@ -157,7 +157,7 @@ export async function handleRequest(req, res) {
       checks: ["authenticated", "role:admin"], decision: "allow",
       note: "管理员可查看全部订单",
     });
-    return json(res, 200, { orders: store.orders });
+    return json(res, 200, { code: 0, data: { items: store.orders, total: store.orders.length } });
   }
 
   // ---- 管理端：代取消订单 ----
@@ -187,7 +187,7 @@ export async function handleRequest(req, res) {
       checks: ["authenticated", "role:admin"], decision: "allow",
       note: "管理员代取消订单",
     });
-    return json(res, 200, { ok: true, order });
+    return json(res, 200, { code: 0, meta: { handler: "admin.orders.cancel" }, data: order });
   }
 
   return json(res, 404, { error: "not found", path: pathname });

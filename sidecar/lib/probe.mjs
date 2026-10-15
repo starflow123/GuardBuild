@@ -29,6 +29,60 @@ function trimBody(text, limit = 4000) {
   return text.length > limit ? `${text.slice(0, limit)}…（截断，共 ${text.length} 字节）` : text;
 }
 
+function getByDotPath(obj, path) {
+  let node = obj;
+  for (const key of String(path).split(".")) {
+    if (node == null || typeof node !== "object") return undefined;
+    node = node[key];
+  }
+  return node;
+}
+
+/**
+ * 列表响应取数组（形状自适应）：契约点路径 > 顶层数组 > 含 id 对象元素的数组 > 首个对象数组 > 首个数组。
+ * 未找到任何数组时返回 null（供断言区分「空列表」与「形状不符」）。
+ */
+export function extractListItems(json, arrayPath = null) {
+  if (arrayPath) {
+    const node = getByDotPath(json, arrayPath);
+    return Array.isArray(node) ? node : null;
+  }
+  if (Array.isArray(json)) return json;
+  if (json && typeof json === "object") {
+    const arrays = Object.values(json).filter(Array.isArray);
+    if (arrays.length === 0) return null;
+    const withId = arrays.find((a) => a.some((x) => x && typeof x === "object" && "id" in x));
+    const withObjects = arrays.find((a) => a.some((x) => x && typeof x === "object"));
+    return withId ?? withObjects ?? arrays[0];
+  }
+  return null;
+}
+
+/** 单体响应取实体对象（形状自适应）：契约点路径 > 首个对象值字段 > 响应自身。 */
+export function extractEntity(json, entityPath = null) {
+  if (!json || typeof json !== "object" || Array.isArray(json)) return null;
+  if (entityPath) {
+    const node = getByDotPath(json, entityPath);
+    return node && typeof node === "object" && !Array.isArray(node) ? node : null;
+  }
+  for (const v of Object.values(json)) {
+    if (v && typeof v === "object" && !Array.isArray(v)) return v;
+  }
+  return json;
+}
+
+/** 资源名标签：order 显示为「订单」，其它资源名原样展示，未知回退「资源」。 */
+function resourceLabel(ctx) {
+  const r = ctx.plan?.resource;
+  if (r === "order") return "订单";
+  return r && r !== "resource" ? r : "资源";
+}
+
+/** 归属字段读取：兼容 userId / user_id / ownerId / owner_id / uid 命名 */
+function ownerOf(obj) {
+  return obj?.userId ?? obj?.user_id ?? obj?.ownerId ?? obj?.owner_id ?? obj?.uid ?? null;
+}
+
 /** 经 Host 发起一次 HTTP 请求（可携带保险库身份） */
 async function httpJson(ctx, opts) {
   const {
@@ -129,7 +183,7 @@ function pickUser(json, loginCfg) {
       .reduce((o, k) => (o && typeof o === "object" ? o[k] : undefined), json);
     if (v && typeof v === "object") return v;
   }
-  const direct = json.user ?? json.authentication?.user ?? null;
+  const direct = json.user ?? json.data?.user ?? json.authentication?.user ?? null;
   return direct && typeof direct === "object" ? direct : null;
 }
 
@@ -242,12 +296,12 @@ async function discoverResources(ctx, baseUrl, loggedIn) {
   for (const ident of loggedIn) {
     if (ident.role === "admin") continue;
     const res = await httpJson(ctx, { baseUrl, method: "GET", path: listPath, identity: ident.name });
-    const items = Array.isArray(res.json?.orders) ? res.json.orders : Array.isArray(res.json) ? res.json : [];
+    const items = extractListItems(res.json, ctx.targetConfig?.responses?.list ?? null) ?? [];
     byUser[ident.name] = items;
     ctx.emit({
       kind: "discovery",
       severity: SEVERITY.INFO,
-      message: `资源发现：「${ident.name}」名下可见 ${items.length} 个${ctx.plan.resource === "order" ? "订单" : ctx.plan.resource}`,
+      message: `资源发现：「${ident.name}」名下可见 ${items.length} 个${resourceLabel(ctx)}`,
       data: { identity: ident.name, count: items.length, ids: items.map((o) => o.id) },
     });
   }
@@ -282,8 +336,9 @@ function pickTargets(byUser, loggedIn) {
   };
 }
 
-function fillId(path, id) {
-  return path.replace(":id", String(id));
+/** 填充路径参数（任意 :param 形态，不限于 :id） */
+function fillParams(path, id) {
+  return path.replace(/:[A-Za-z_]\w*/g, String(id));
 }
 
 const okStatus = (s) => s >= 200 && s < 300;
@@ -324,224 +379,241 @@ function verifyBusiness(res, expectStatus, detailFn) {
 }
 
 /** 构建一个阶段内的全部用例（攻击 + 业务），攻击目标对象由发现阶段确定 */
-function buildCases(ctx, targets) {
-  const readPath = ctx.plan.readCandidate?.path ?? "/api/orders/:id";
-  const cancelPath = ctx.plan.cancelCandidate?.path ?? "/api/orders/:id/cancel";
-  const adminListPath = ctx.plan.adminListEndpoint?.path ?? "/api/admin/orders";
-  const adminCancelPath = ctx.plan.adminCancelEndpoint?.path ?? "/api/admin/orders/:id/cancel";
+export function buildCases(ctx, targets) {
+  const readPath = ctx.plan.readCandidate?.fullPath ?? ctx.plan.readCandidate?.path ?? null;
+  const cancelPath = ctx.plan.cancelCandidate?.fullPath ?? ctx.plan.cancelCandidate?.path ?? null;
+  const adminListPath = ctx.plan.adminListEndpoint?.path ?? null;
+  const adminCancelPath = ctx.plan.adminCancelEndpoint?.path ?? null;
+  const listPath = ctx.plan.listEndpoint?.path ?? null;
   const readKey = ctx.plan.readCandidate?.routeKeys?.[0] ?? "orders.get";
   const cancelKey = ctx.plan.cancelCandidate?.routeKeys?.[0] ?? "orders.cancel";
-  const listPath = ctx.plan.listEndpoint?.path ?? "/api/orders";
   const { attacker, victim } = targets;
+  const label = resourceLabel(ctx);
 
   const cases = [];
 
-  // —— 攻击用例 ——
-  const readTarget = targets.readTarget;
-  cases.push({
-    id: "attack-read-foreign",
-    category: CASE_CATEGORY.ATTACK,
-    name: `${attacker.name} 读取 ${victim.name} 的订单 #${readTarget.id}`,
-    identity: attacker.name,
-    method: "GET",
-    path: fillId(readPath, readTarget.id),
-    routeKey: readKey,
-    expect: "越权读取他人订单应被拒绝（401/403/404）",
-    verify: (res, phase) => {
-      const o = res.json?.order;
-      const leaked = o && o.id === readTarget.id;
-      const detail = leaked
-        ? `证据：返回订单 #${o.id}（归属 ${o.userId}，金额 ${o.amount}，状态 ${o.status}）`
-        : "";
-      return verifyAttack(res, phase, detail);
-    },
-    crossProof: (res) => {
-      const o = res.json?.order;
-      if (!o || o.id !== readTarget.id) return null;
-      const ownerOk = !victim.user?.id || o.userId === victim.user.id;
-      if (!ownerOk) return null;
-      return {
-        note: `响应对象 #${o.id} 与请求目标一致，归属 ${o.userId}${victim.user?.id ? "（与受害人身份一致）" : ""}`,
-      };
-    },
-    impact: (res) => (okStatus(res.status) ? `可读取他人订单详情及字段（id/userId/amount/address 等）` : null),
-  });
+  // —— 攻击用例（仅在计划中存在对应端点时构建，不虚构回退路径）——
+  if (readPath) {
+    const readTarget = targets.readTarget;
+    cases.push({
+      id: "attack-read-foreign",
+      category: CASE_CATEGORY.ATTACK,
+      name: `${attacker.name} 读取 ${victim.name} 的${label} #${readTarget.id}`,
+      identity: attacker.name,
+      method: "GET",
+      path: fillParams(readPath, readTarget.id),
+      routeKey: readKey,
+      expect: `越权读取他人${label}应被拒绝（401/403/404）`,
+      verify: (res, phase) => {
+        const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
+        const leaked = o && o.id === readTarget.id;
+        const detail = leaked
+          ? `证据：返回${label} #${o.id}（归属 ${ownerOf(o)}，金额 ${o.amount}，状态 ${o.status}）`
+          : "";
+        return verifyAttack(res, phase, detail);
+      },
+      crossProof: (res) => {
+        const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
+        if (!o || o.id !== readTarget.id) return null;
+        const ownerOk = !victim.user?.id || ownerOf(o) === victim.user.id;
+        if (!ownerOk) return null;
+        return {
+          note: `响应对象 #${o.id} 与请求目标一致，归属 ${ownerOf(o)}${victim.user?.id ? "（与受害人身份一致）" : ""}`,
+        };
+      },
+      impact: (res) => (okStatus(res.status) ? `可读取他人${label}详情及字段（id/userId/amount/address 等）` : null),
+    });
+  }
 
-  const cancelTarget = targets.attackCancelTarget;
-  cases.push({
-    id: "attack-cancel-foreign",
-    category: CASE_CATEGORY.ATTACK,
-    name: `${attacker.name} 取消 ${victim.name} 的订单 #${cancelTarget.id}`,
-    identity: attacker.name,
-    method: "POST",
-    path: fillId(cancelPath, cancelTarget.id),
-    routeKey: cancelKey,
-    expect: "越权取消他人订单应被拒绝（401/403/404）",
-    verify: (res, phase) => {
-      const o = res.json?.order;
-      const changed = o && o.status === "cancelled" && o.userId === victim.user?.id;
-      const detail = changed ? `证据：订单 #${o.id}（归属 ${o.userId}）状态已被改为 cancelled` : "";
-      return verifyAttack(res, phase, detail);
-    },
-    crossProof: (res) => {
-      const o = res.json?.order;
-      if (!o || o.id !== cancelTarget.id) return null;
-      if (victim.user?.id && o.userId !== victim.user.id) return null;
-      return {
-        note: `被操对象 #${o.id} 归属 ${o.userId}${o.status === "cancelled" ? "，状态已变更为 cancelled" : ""}`,
-      };
-    },
-    impact: (res) => {
-      const o = res.json?.order;
-      return o && o.status === "cancelled" ? `可越权取消他人订单（业务破坏）` : null;
-    },
-  });
+  if (cancelPath) {
+    const cancelTarget = targets.attackCancelTarget;
+    cases.push({
+      id: "attack-cancel-foreign",
+      category: CASE_CATEGORY.ATTACK,
+      name: `${attacker.name} 取消 ${victim.name} 的${label} #${cancelTarget.id}`,
+      identity: attacker.name,
+      method: "POST",
+      path: fillParams(cancelPath, cancelTarget.id),
+      routeKey: cancelKey,
+      expect: `越权取消他人${label}应被拒绝（401/403/404）`,
+      verify: (res, phase) => {
+        const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
+        const changed = o && o.status === "cancelled" && ownerOf(o) === victim.user?.id;
+        const detail = changed ? `证据：${label} #${o.id}（归属 ${ownerOf(o)}）状态已被改为 cancelled` : "";
+        return verifyAttack(res, phase, detail);
+      },
+      crossProof: (res) => {
+        const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
+        if (!o || o.id !== cancelTarget.id) return null;
+        if (victim.user?.id && ownerOf(o) !== victim.user.id) return null;
+        return {
+          note: `被操对象 #${o.id} 归属 ${ownerOf(o)}${o.status === "cancelled" ? "，状态已变更为 cancelled" : ""}`,
+        };
+      },
+      impact: (res) => {
+        const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
+        return o && o.status === "cancelled" ? `可越权取消他人${label}（业务破坏）` : null;
+      },
+    });
+  }
 
   // —— 业务用例（回归防线）——
   const own = targets.ownReadTarget;
-  cases.push({
-    id: "business-read-own",
-    category: CASE_CATEGORY.BUSINESS,
-    name: `${attacker.name} 读取自己的订单 #${own.id}`,
-    identity: attacker.name,
-    method: "GET",
-    path: fillId(readPath, own.id),
-    routeKey: readKey,
-    expect: "本人订单应正常可见（200，且归属本人）",
-    verify: (res) =>
-      verifyBusiness(res, 200, () => {
-        const o = res.json?.order;
-        if (!o) return "FAIL:响应缺少 order 字段";
-        if (o.id !== own.id) return `FAIL:返回了错误的订单 #${o.id}`;
-        if (o.userId !== attacker.user?.id) return `FAIL:订单归属异常 ${o.userId}`;
-        return `返回订单 #${o.id}，归属 ${o.userId}`;
-      }),
-  });
+  if (readPath) {
+    cases.push({
+      id: "business-read-own",
+      category: CASE_CATEGORY.BUSINESS,
+      name: `${attacker.name} 读取自己的${label} #${own.id}`,
+      identity: attacker.name,
+      method: "GET",
+      path: fillParams(readPath, own.id),
+      routeKey: readKey,
+      expect: `本人${label}应正常可见（200，且归属本人）`,
+      verify: (res) =>
+        verifyBusiness(res, 200, () => {
+          const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
+          if (!o) return `FAIL:响应缺少${label}对象`;
+          if (o.id !== own.id) return `FAIL:返回了错误的${label} #${o.id}`;
+          if (ownerOf(o) !== attacker.user?.id) return `FAIL:${label}归属异常 ${ownerOf(o)}`;
+          return `返回${label} #${o.id}，归属 ${ownerOf(o)}`;
+        }),
+    });
+  }
 
-  cases.push({
-    id: "business-list-own",
-    category: CASE_CATEGORY.BUSINESS,
-    name: `${attacker.name} 查询订单列表仅见本人订单`,
-    identity: attacker.name,
-    method: "GET",
-    path: listPath,
-    routeKey: ctx.plan.listEndpoint?.routeKey ?? "orders.list",
-    expect: "列表应只包含本人订单（owner-filter 保持有效）",
-    verify: (res) =>
-      verifyBusiness(res, 200, () => {
-        const arr = Array.isArray(res.json?.orders) ? res.json.orders : null;
-        if (!arr) return "FAIL:响应缺少 orders 数组";
-        const foreign = arr.filter((o) => o.userId !== attacker.user?.id);
-        if (foreign.length > 0) return `FAIL:列表泄露他人订单 ${foreign.map((o) => o.id).join(",")}`;
-        return `共 ${arr.length} 条，全部归属 ${attacker.user?.id}`;
-      }),
-  });
+  if (listPath) {
+    cases.push({
+      id: "business-list-own",
+      category: CASE_CATEGORY.BUSINESS,
+      name: `${attacker.name} 查询${label}列表仅见本人${label}`,
+      identity: attacker.name,
+      method: "GET",
+      path: listPath,
+      routeKey: ctx.plan.listEndpoint?.routeKey ?? "orders.list",
+      expect: `列表应只包含本人${label}（owner-filter 保持有效）`,
+      verify: (res) =>
+        verifyBusiness(res, 200, () => {
+          const arr = extractListItems(res.json, ctx.targetConfig?.responses?.list ?? null);
+          if (!arr) return `FAIL:响应中未找到${label}列表`;
+          const foreign = arr.filter((o) => ownerOf(o) !== attacker.user?.id);
+          if (foreign.length > 0) return `FAIL:列表泄露他人${label} ${foreign.map((o) => o.id).join(",")}`;
+          return `共 ${arr.length} 条，全部归属 ${attacker.user?.id}`;
+        }),
+    });
+  }
 
-  if (targets.ownCancelTarget) {
+  if (cancelPath && targets.ownCancelTarget) {
     const c = targets.ownCancelTarget;
     cases.push({
       id: "business-cancel-own",
       category: CASE_CATEGORY.BUSINESS,
-      name: `${attacker.name} 取消自己的订单 #${c.id}`,
+      name: `${attacker.name} 取消自己的${label} #${c.id}`,
       identity: attacker.name,
       method: "POST",
-      path: fillId(cancelPath, c.id),
+      path: fillParams(cancelPath, c.id),
       routeKey: cancelKey,
-      expect: "本人已支付订单应可正常取消（200）",
+      expect: `本人已支付${label}应可正常取消（200）`,
       verify: (res) =>
         verifyBusiness(res, 200, () => {
-          const o = res.json?.order;
-          if (!o) return "FAIL:响应缺少 order 字段";
+          const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
+          if (!o) return `FAIL:响应缺少${label}对象`;
           if (o.status !== "cancelled") return `FAIL:状态未变更（${o.status}）`;
-          return `订单 #${o.id} 已置为 cancelled`;
+          return `${label} #${o.id} 已置为 cancelled`;
         }),
     });
   }
 
-  if (targets.ownNotCancellable) {
+  if (cancelPath && targets.ownNotCancellable) {
     const s = targets.ownNotCancellable;
     cases.push({
       id: "business-shipped-guard",
       category: CASE_CATEGORY.BUSINESS,
-      name: `${attacker.name} 取消已发货订单 #${s.id} 被业务规则拒绝`,
+      name: `${attacker.name} 取消已发货${label} #${s.id} 被业务规则拒绝`,
       identity: attacker.name,
       method: "POST",
-      path: fillId(cancelPath, s.id),
+      path: fillParams(cancelPath, s.id),
       routeKey: cancelKey,
-      expect: "状态非 paid 的订单不可取消（409），业务规则保持有效",
+      expect: `状态非 paid 的${label}不可取消（409），业务规则保持有效`,
       verify: (res) =>
         verifyBusiness(res, 409, () => {
           const s2 = res.json?.status;
-          return s2 ? `返回当前状态 ${s2}` : "订单状态保护生效";
+          return s2 ? `返回当前状态 ${s2}` : `${label}状态保护生效`;
         }),
     });
   }
 
-  cases.push({
-    id: "business-admin-list",
-    category: CASE_CATEGORY.BUSINESS,
-    name: `管理员查看全部订单`,
-    identity: "admin",
-    method: "GET",
-    path: adminListPath,
-    routeKey: ctx.plan.adminListEndpoint?.routeKey ?? "admin.orders.list",
-    expect: "管理员应可查看全部订单（200，跨多个归属）",
-    verify: (res) =>
-      verifyBusiness(res, 200, () => {
-        const arr = Array.isArray(res.json?.orders) ? res.json.orders : null;
-        if (!arr) return "FAIL:响应缺少 orders 数组";
-        const owners = new Set(arr.map((o) => o.userId));
-        if (owners.size < 2) return `FAIL:仅见单一归属（${[...owners].join(",")}）`;
-        return `可见 ${arr.length} 条，覆盖 ${owners.size} 个归属`;
-      }),
-  });
+  if (adminListPath) {
+    cases.push({
+      id: "business-admin-list",
+      category: CASE_CATEGORY.BUSINESS,
+      name: `管理员查看全部${label}`,
+      identity: "admin",
+      method: "GET",
+      path: adminListPath,
+      routeKey: ctx.plan.adminListEndpoint?.routeKey ?? "admin.orders.list",
+      expect: `管理员应可查看全部${label}（200，跨多个归属）`,
+      verify: (res) =>
+        verifyBusiness(res, 200, () => {
+          const arr = extractListItems(res.json, ctx.targetConfig?.responses?.list ?? null);
+          if (!arr) return `FAIL:响应中未找到${label}列表`;
+          const owners = new Set(arr.map((o) => ownerOf(o)));
+          if (owners.size < 2) return `FAIL:仅见单一归属（${[...owners].join(",")}）`;
+          return `可见 ${arr.length} 条，覆盖 ${owners.size} 个归属`;
+        }),
+    });
+  }
 
-  const adminTarget = targets.adminCancelTarget;
-  cases.push({
-    id: "business-admin-cancel",
-    category: CASE_CATEGORY.BUSINESS,
-    name: `管理员代取消 ${victim.name} 的订单 #${adminTarget.id}`,
-    identity: "admin",
-    method: "POST",
-    path: fillId(adminCancelPath, adminTarget.id),
-    routeKey: ctx.plan.adminCancelEndpoint?.routeKey ?? "admin.orders.cancel",
-    expect: "管理员合法代操作应保持可用（200）",
-    verify: (res) =>
-      verifyBusiness(res, 200, () => {
-        const o = res.json?.order;
-        if (!o) return "FAIL:响应缺少 order 字段";
-        if (o.status !== "cancelled") return `FAIL:状态未变更（${o.status}）`;
-        return `订单 #${o.id}（归属 ${o.userId}）已由管理员取消`;
-      }),
-  });
+  if (adminCancelPath) {
+    const adminTarget = targets.adminCancelTarget;
+    cases.push({
+      id: "business-admin-cancel",
+      category: CASE_CATEGORY.BUSINESS,
+      name: `管理员代取消 ${victim.name} 的${label} #${adminTarget.id}`,
+      identity: "admin",
+      method: "POST",
+      path: fillParams(adminCancelPath, adminTarget.id),
+      routeKey: ctx.plan.adminCancelEndpoint?.routeKey ?? "admin.orders.cancel",
+      expect: "管理员合法代操作应保持可用（200）",
+      verify: (res) =>
+        verifyBusiness(res, 200, () => {
+          const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
+          if (!o) return `FAIL:响应缺少${label}对象`;
+          if (o.status !== "cancelled") return `FAIL:状态未变更（${o.status}）`;
+          return `${label} #${o.id}（归属 ${ownerOf(o)}）已由管理员取消`;
+        }),
+    });
+  }
 
-  cases.push({
-    id: "business-nonadmin-denied",
-    category: CASE_CATEGORY.BUSINESS,
-    name: `${victim.name}（普通用户）访问管理端被拒绝`,
-    identity: victim.name,
-    method: "GET",
-    path: adminListPath,
-    routeKey: ctx.plan.adminListEndpoint?.routeKey ?? "admin.orders.list",
-    expect: "普通用户访问管理端应被拒绝（403），角色校验保持有效",
-    verify: (res) => verifyBusiness(res, 403, () => "角色校验（role:admin）生效"),
-  });
+  if (adminListPath) {
+    cases.push({
+      id: "business-nonadmin-denied",
+      category: CASE_CATEGORY.BUSINESS,
+      name: `${victim.name}（普通用户）访问管理端被拒绝`,
+      identity: victim.name,
+      method: "GET",
+      path: adminListPath,
+      routeKey: ctx.plan.adminListEndpoint?.routeKey ?? "admin.orders.list",
+      expect: "普通用户访问管理端应被拒绝（403），角色校验保持有效",
+      verify: (res) => verifyBusiness(res, 403, () => "角色校验（role:admin）生效"),
+    });
+  }
 
-  cases.push({
-    id: "business-unauth-401",
-    category: CASE_CATEGORY.BUSINESS,
-    name: `未登录访问订单详情被拒绝`,
-    identity: null,
-    method: "GET",
-    path: fillId(readPath, own.id),
-    routeKey: readKey,
-    expect: "未认证请求应被拒绝（401），认证入口保持有效",
-    verify: (res) => {
-      if (res.status === 401) return { verdict: VERDICT.PASSED, actual: "HTTP 401，认证拦截生效" };
-      if (res.status === 403) return { verdict: VERDICT.PASSED, actual: "HTTP 403，认证拦截生效" };
-      return { verdict: VERDICT.REGRESSED, actual: `HTTP ${res.status}（预期 401/403），认证被绕过或异常放行` };
-    },
-  });
+  if (readPath) {
+    cases.push({
+      id: "business-unauth-401",
+      category: CASE_CATEGORY.BUSINESS,
+      name: `未登录访问${label}详情被拒绝`,
+      identity: null,
+      method: "GET",
+      path: fillParams(readPath, own.id),
+      routeKey: readKey,
+      expect: "未认证请求应被拒绝（401），认证入口保持有效",
+      verify: (res) => {
+        if (res.status === 401) return { verdict: VERDICT.PASSED, actual: "HTTP 401，认证拦截生效" };
+        if (res.status === 403) return { verdict: VERDICT.PASSED, actual: "HTTP 403，认证拦截生效" };
+        return { verdict: VERDICT.REGRESSED, actual: `HTTP ${res.status}（预期 401/403），认证被绕过或异常放行` };
+      },
+    });
+  }
 
   return cases;
 }

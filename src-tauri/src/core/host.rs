@@ -391,6 +391,7 @@ impl Host {
         cap!("git.writeback", cap_git_writeback);
         cap!("git.rollback", cap_git_rollback);
         cap!("proc.spawn", cap_proc_spawn);
+        cap!("proc.allocPort", cap_proc_alloc_port);
         cap!("proc.waitForOutput", cap_proc_wait_output);
         cap!("proc.waitExit", cap_proc_wait_exit);
         cap!("proc.logs", cap_proc_logs);
@@ -1108,6 +1109,20 @@ impl Host {
             json!({ "pid": rec.pid, "cmd": p.cmd, "args": rec.args, "cwd": rec.cwd.to_string_lossy() }),
         );
         Ok(json!({ "pid": rec.pid, "cmd": rec.cmd, "cwd": rec.cwd.to_string_lossy() }))
+    }
+
+    fn cap_proc_alloc_port(&self, params: Value) -> HostResult<Value> {
+        let p: TokenParam = jget(&params)?;
+        let _ = self.session_of_token(&p.token)?;
+        // 绑定 127.0.0.1:0 让内核挑选空闲端口后立即释放，交由目标进程使用
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0))
+            .map_err(|e| HostError::Proc(format!("无法分配空闲端口: {e}")))?;
+        let port = listener
+            .local_addr()
+            .map_err(|e| HostError::Proc(format!("无法读取分配端口: {e}")))?
+            .port();
+        drop(listener);
+        Ok(json!({ "port": port }))
     }
 
     fn cap_proc_wait_output(&self, params: Value) -> HostResult<Value> {

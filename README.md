@@ -130,7 +130,7 @@ npm run test:rust      # Rust Host
 | 退出码 | verdict | 含义 |
 | --- | --- | --- |
 | 0 | `no_candidates` / `not_reproducible` | 无漏洞证据 |
-| 1 | `vulnerable`（附已验证补丁） | 漏洞证据成立：`patchStatus: verified`（通过双重验收）或 `verify_failed`（修复未通过验收，附证据） |
+| 1 | `vulnerable`（附已验证补丁）/ `vulnerable_unfixed` | 漏洞证据成立：`patchStatus: verified`（通过双重验收）、`verify_failed`（修复未通过验收，附证据），或 `vulnerable_unfixed`（攻击已复现但候选无可自动修复端点，需人工修复） |
 | 2 | `failed` / `aborted` / `timeout` | 执行失败（契约 / 环境 / 内部错误 / 超时 / 中断） |
 
 - 输出：`verdict`、`exit-code`、`patch-hash`；报告目录含 `report.json`、`report.md`、`gate.json`（GB_GATE 裁决行）、`gate.log`

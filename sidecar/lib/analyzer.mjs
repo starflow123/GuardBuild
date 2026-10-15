@@ -67,6 +67,9 @@ const ROLE_GUARD = /role\s*[!=]==?\s*["'`]admin["'`]|isAdmin|hasRole\s*\(|requir
 // 认证
 const AUTH_GUARD = /authenticate\s*\(|requireAuth|requireLogin|ensureAuth|auth\s*\.\s*user|req\s*\.\s*user|getUser\s*\(/;
 
+// 公开端点路径段（登录/注册等）：无鉴权属预期公开，不作为越权候选
+const PUBLIC_PATH = /\/(?:login|logout|sign-?in|sign-?up|register|registration|auth|token|refresh|password|forgot|captcha)\b/i;
+
 // 归属过滤（列表接口按归属过滤）：兼容 userId/user_id 与 where 变量赋值形态
 const OWNER_FILTER =
   /filter\s*\(\s*\(?[^)]*\)?\s*=>[^)]*\.user_?[Ii][Dd]\s*[!=]==|where\s*:?\s*\{[^}]*\buser_?[Ii][Dd]\b|where\s*=[^;\n]*\buser_?[Ii][Dd]\b/;
@@ -393,6 +396,22 @@ export async function analyzeProject(ctx) {
         ...ep,
         kind: "idor-suspect",
         resource: guessResource(fullPath, s.text),
+      });
+    } else if (
+      // 可疑「无鉴权访问」：按 ID 取单体资源 + 无认证 + 路径含用户可控标识符（:param）；
+      // 登录/注册等预期公开端点、以及 /notice 这类固定键查询（无路径参数）不在此列
+      sinks.length > 0 &&
+      !hasAuth &&
+      !hasOwnerGuard &&
+      !hasRoleGuard &&
+      /:[A-Za-z_]\w*/.test(path ?? "") &&
+      !PUBLIC_PATH.test(path ?? "") &&
+      !PUBLIC_PATH.test(fullPath ?? "")
+    ) {
+      candidates.push({
+        ...ep,
+        kind: "no-auth-suspect",
+        resource: guessResource(fullPath ?? path, s.text),
       });
     }
   }

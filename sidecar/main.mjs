@@ -434,7 +434,10 @@ async function stageAnalyze(ctx) {
     resource: c.resource,
     kind: c.kind,
     sinkCalls: c.sinkCalls,
-    reason: "按对象 ID 取资源但未见归属校验（IDOR 静态线索）",
+    reason:
+      c.kind === "no-auth-suspect"
+        ? "按对象 ID 取资源且未见认证守卫（无鉴权静态线索）"
+        : "按对象 ID 取资源但未见归属校验（IDOR 静态线索）",
   }));
   emit(ctx, {
     kind: "analyze",
@@ -457,7 +460,7 @@ async function stageAnalyze(ctx) {
   }
 
   ctx.plan = buildProbePlan(ctx.analysis, { loginPathOverride: ctx.loginConfig?.path ?? null });
-  if (!ctx.plan.readCandidate && !ctx.plan.cancelCandidate) {
+  if (!ctx.plan.readCandidate && !ctx.plan.cancelCandidate && !ctx.plan.unauthReadCandidate) {
     throw new SessionError("无法构建探测计划：候选端点中缺少可探测的单体资源接口", {
       code: "plan_incomplete",
       hint: `已发现 ${cands.length} 个候选端点，但均不含「按 ID 取单体资源」的路径（如 GET /api/orders/:id）。请确认项目中存在带路径参数的资源接口，或在 guardbuild.json 中补充契约`,
@@ -468,6 +471,7 @@ async function stageAnalyze(ctx) {
     resource: ctx.plan.resource,
     readPath: ctx.plan.readCandidate?.fullPath ?? ctx.plan.readCandidate?.path ?? null,
     cancelPath: ctx.plan.cancelCandidate?.fullPath ?? ctx.plan.cancelCandidate?.path ?? null,
+    unauthReadPath: ctx.plan.unauthReadCandidate?.fullPath ?? ctx.plan.unauthReadCandidate?.path ?? null,
     listPath: ctx.plan.listEndpoint?.path ?? null,
   };
   pushView(ctx);
@@ -724,8 +728,14 @@ async function failSession(ctx, e) {
   const outcome =
     payload.code === "no_candidates" ? "no_candidates"
     : payload.code === "attack_not_reproducible" ? "not_reproducible"
+    : payload.code === "no_patchable_candidates" ? "vulnerable_unfixed"
     : "failed";
-  await emitReport(ctx, { outcome, exitCode: outcome === "failed" ? 2 : 0, state: STATE.ERROR, error: payload });
+  await emitReport(ctx, {
+    outcome,
+    exitCode: outcome === "failed" ? 2 : outcome === "vulnerable_unfixed" ? 1 : 0,
+    state: STATE.ERROR,
+    error: payload,
+  });
   ctx.view.error = payload;
   emit(ctx, {
     kind: "session",

@@ -53,10 +53,21 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
   pushLogin("/api/login");
 
   const cancelCandidate =
-    candidates.find((c) => c.method === "POST" && (epPath(c) ?? "").endsWith("/cancel")) ?? null;
-  const readCandidate = candidates.find((c) => c.method === "GET" && paramCount(epPath(c)) === 1) ?? null;
+    candidates.find(
+      (c) => c.kind === "idor-suspect" && c.method === "POST" && (epPath(c) ?? "").endsWith("/cancel")
+    ) ?? null;
+  const readCandidate =
+    candidates.find(
+      (c) => c.kind === "idor-suspect" && c.method === "GET" && paramCount(epPath(c)) === 1
+    ) ?? null;
+  // 无鉴权候选：匿名读取用例的靶点（与 IDOR 槽位互斥，不做自动修复）
+  const unauthReadCandidate =
+    candidates.find(
+      (c) => c.kind === "no-auth-suspect" && c.method === "GET" && paramCount(epPath(c)) === 1
+    ) ?? null;
 
-  const resource = readCandidate?.resource ?? cancelCandidate?.resource ?? "resource";
+  const resource =
+    readCandidate?.resource ?? cancelCandidate?.resource ?? unauthReadCandidate?.resource ?? "resource";
 
   // 列表/管理端点优先选择与资源名匹配的路径（避免把别的资源列表当作探测目标）
   const byResource = (list) =>
@@ -83,6 +94,7 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
     resource,
     readCandidate: readCandidate ?? null,
     cancelCandidate: cancelCandidate ?? null,
+    unauthReadCandidate: unauthReadCandidate ?? null,
     listEndpoint: list ? { path: epPath(list), routeKey: list.routeKeys?.[0] ?? null } : null,
     adminListEndpoint: adminList ? { path: epPath(adminList), routeKey: adminList.routeKeys?.[0] ?? null } : null,
     adminCancelEndpoint: adminCancel ? { path: epPath(adminCancel), routeKey: adminCancel.routeKeys?.[0] ?? null } : null,

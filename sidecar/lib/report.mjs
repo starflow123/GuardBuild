@@ -34,6 +34,8 @@ function headline(outcome, patchStatus) {
         : "发现可利用的对象级越权（IDOR）漏洞，已生成双重验收通过的修复补丁（gate 未写回工作区）";
     case "no_candidates":
       return "静态分析未发现对象级越权候选端点";
+    case "vulnerable_unfixed":
+      return "发现可复现的越权漏洞证据；但候选中没有可自动修复的对象级越权端点，未生成修复补丁";
     case "not_reproducible":
       return "存在静态候选，但攻击在运行期不可复现（可能已有运行期防护）";
     case "failed":
@@ -57,6 +59,9 @@ function suggestions(r) {
     lines.push(`- 补丁保留在隔离 worktree：\`${r.patch?.worktree}\`。`);
   } else if (outcome === "no_candidates") {
     lines.push("- 当前策略仅覆盖对象级越权（IDOR）场景类；如需其它漏洞类别，请扩展策略包与契约。");
+  } else if (outcome === "vulnerable_unfixed") {
+    lines.push("- 漏洞证据已建立（修复前攻击成功），但静态候选中没有可自动修复的对象级越权端点（自动修复仅覆盖带认证的 IDOR 场景）。");
+    lines.push("- 请对照 report.json 中各攻击用例（如纵向越权、无鉴权读取）定位端点并人工加固，再重跑 GuardBuild gate 验证。");
   } else if (outcome === "not_reproducible") {
     lines.push("- 攻击在修复前即不可复现，未建立漏洞基线；请核对 guardbuild.json 的身份契约与目标的资源发现接口。");
   } else if (outcome === "failed") {

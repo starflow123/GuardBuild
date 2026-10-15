@@ -319,9 +319,30 @@ test("buildProbePlan: 任意 :param 单体接口识别 + fullPath 优先 + 旧�
 
   const legacy = buildProbePlan({
     endpoints: [mk({ path: "/api/orders", hasOwnerFilter: true })],
-    candidates: [mk({ path: "/api/orders/:id" })],
+    candidates: [mk({ path: "/api/orders/:id", kind: "idor-suspect" })],
   });
   assert.equal(legacy.readCandidate.path, "/api/orders/:id", "无 fullPath 时应回退声明路径");
+});
+
+test("buildProbePlan: 无鉴权候选入独立槽位，且不占用 IDOR 槽位", () => {
+  const mk = (over = {}) => ({ method: "GET", path: null, fullPath: null, routeKeys: [], ...over });
+  const both = buildProbePlan({
+    endpoints: [],
+    candidates: [
+      mk({ path: "/:id", fullPath: "/api/orders/:id", resource: "order", kind: "idor-suspect" }),
+      mk({ path: "/:id", fullPath: "/api/feeds/:id", resource: "feed", kind: "no-auth-suspect" }),
+    ],
+  });
+  assert.equal(both.readCandidate.fullPath, "/api/orders/:id", "IDOR 候选进 readCandidate 槽位");
+  assert.equal(both.unauthReadCandidate.fullPath, "/api/feeds/:id", "无鉴权候选进独立槽位");
+
+  const onlyNoAuth = buildProbePlan({
+    endpoints: [],
+    candidates: [mk({ path: "/:id", fullPath: "/api/feeds/:id", resource: "feed", kind: "no-auth-suspect" })],
+  });
+  assert.equal(onlyNoAuth.readCandidate, null, "无鉴权候选不得占用 IDOR 槽位（不做自动修复）");
+  assert.ok(onlyNoAuth.unauthReadCandidate, "仅无鉴权候选时仍可构建读取计划");
+  assert.equal(onlyNoAuth.unauthReadCandidate.resource, "feed");
 });
 
 test("buildCases: 条件化构建（无 cancel/admin 端点不虚构用例）+ 任意 :param 填充 + 顺序保持", () => {
@@ -369,6 +390,7 @@ test("buildCases: 条件化构建（无 cancel/admin 端点不虚构用例）+ �
     [
       "attack-read-foreign",
       "attack-cancel-foreign",
+      "attack-vertical-escalation",
       "business-read-own",
       "business-list-own",
       "business-cancel-own",
@@ -380,6 +402,54 @@ test("buildCases: 条件化构建（无 cancel/admin 端点不虚构用例）+ �
     ],
     "端点齐全时用例顺序与既有 e2e 基线一致"
   );
+});
+
+test("buildCases: 垂直越权（victim 身份访问 admin 列表）与匿名读取用例的判定语义", () => {
+  const ctx = {
+    plan: {
+      resource: "order",
+      readCandidate: { fullPath: "/api/orders/:id", routeKeys: ["orders.get"] },
+      unauthReadCandidate: { fullPath: "/api/feeds/:id", routeKeys: ["feeds.get"] },
+      listEndpoint: { path: "/api/orders", routeKey: "orders.list" },
+      adminListEndpoint: { path: "/api/admin/orders", routeKey: "admin.orders.list" },
+    },
+    targetConfig: null,
+  };
+  const targets = {
+    attacker: { name: "alice", user: { id: 1 } },
+    victim: { name: "bob", user: { id: 2 } },
+    readTarget: { id: 11 },
+    attackCancelTarget: { id: 12 },
+    adminCancelTarget: { id: 13 },
+    ownReadTarget: { id: 14 },
+    ownCancelTarget: null,
+    ownNotCancellable: null,
+  };
+  const cases = buildCases(ctx, targets);
+  const ids = cases.map((c) => c.id);
+  assert.ok(ids.includes("attack-vertical-escalation"), "应有纵向越权攻击用例");
+  assert.ok(ids.includes("attack-anonymous-read"), "应有匿名读取攻击用例");
+
+  const vert = cases.find((c) => c.id === "attack-vertical-escalation");
+  assert.equal(vert.identity, "bob", "纵向越权以普通用户（victim）身份发起");
+  assert.equal(vert.path, "/api/admin/orders");
+  assert.equal(
+    vert.verify({ status: 200, json: { orders: [{ id: 1, userId: 2 }, { id: 2, userId: 1 }] } }, "pre").verdict,
+    "vulnerable",
+    "普通用户拿到管理端数据应判定可利用"
+  );
+  assert.equal(vert.verify({ status: 403, json: {} }, "post").verdict, "blocked", "修复后 403 应判定攻击被阻断");
+
+  const anon = cases.find((c) => c.id === "attack-anonymous-read");
+  assert.equal(anon.identity, null, "匿名用例不携带任何身份");
+  assert.equal(anon.path, "/api/feeds/11", ":param 应填充目标对象 ID");
+  assert.equal(
+    anon.verify({ status: 200, json: { id: 11, userId: 2 } }, "pre").verdict,
+    "vulnerable",
+    "未携带凭证拿到对象应判定可利用"
+  );
+  assert.equal(anon.verify({ status: 401, json: {} }, "post").verdict, "blocked", "修复后 401 应判定攻击被阻断");
+  assert.ok(anon.crossProof({ status: 200, json: { id: 11, userId: 2 } }), "匿名响应归属应与请求目标一致");
 });
 
 test("buildCases: 归属字段兼容 snake_case（user_id）与 data 包裹响应", () => {
@@ -702,6 +772,48 @@ test("analyzeProject: adminRequired 命名识别为角色校验（抑制候选�
   assert.equal(a.candidates.length, 0, "带角色校验的端点不应进入候选");
 });
 
+test("analyzeProject: 无鉴权端点识别为 no-auth-suspect（登录路径/无参查询被抑制）", async () => {
+  const R = "\\\\?\\D:\\p";
+  const content = [
+    'const app = require("express")();',
+    'app.get("/api/posts/:id", async (req, res) => {',
+    "  const post = await Post.findById(req.params.id);",
+    "  res.json(post);",
+    "});",
+    'app.get("/api/settings/notice", async (req, res) => {',
+    "  const row = await Setting.findOne({ where: { key: 'system_notice' } });",
+    "  res.json({ data: row });",
+    "});",
+    'app.post("/api/users/login", async (req, res) => {',
+    "  const user = await User.findOne({ where: { username: req.body.username } });",
+    "  res.json({ token: 'x' });",
+    "});",
+  ].join("\n");
+  const a = await analyzeProject({
+    projectRoot: R,
+    tokens: { project: "tok" },
+    rpc: {
+      request: async (method) => {
+        if (method === "fs.list") return { entries: [{ path: `${R}\\src\\app.js`, kind: "file", size: 400 }] };
+        if (method === "fs.read") return { content, size: 400, redacted: false, redactions: [] };
+        throw new Error(`不应调用 ${method}`);
+      },
+    },
+  });
+  const post = a.candidates.find((c) => c.fullPath === "/api/posts/:id");
+  assert.ok(post, "无鉴权却按路径 ID 取资源的端点应入候选");
+  assert.equal(post.kind, "no-auth-suspect");
+  assert.equal(post.hasAuth, false);
+  assert.ok(
+    !a.candidates.some((c) => (c.fullPath ?? c.path ?? "").includes("login")),
+    "登录路径属预期公开端点，不应成为越权候选"
+  );
+  assert.ok(
+    !a.candidates.some((c) => (c.fullPath ?? c.path ?? "").includes("/settings/notice")),
+    "无路径参数的固定键查询（公共配置读取）不应成为越权候选"
+  );
+});
+
 test("createPatch: 非 git 项目预检给出可操作诊断（不尝试 worktree）", async () => {
   const calls = [];
   const ctx = {
@@ -749,4 +861,28 @@ test("createPatch: 无提交基线的仓库归类为 no_baseline_commit", async 
     () => createPatch(ctx),
     (e) => e.code === "no_baseline_commit" && /基线提交/.test(e.hint)
   );
+});
+
+test("createPatch: 仅无鉴权候选（攻击已复现）归类为 no_patchable_candidates，不放行为无漏洞", async () => {
+  const calls = [];
+  const ctx = {
+    projectRoot: "D:/p",
+    sessionId: "s1",
+    tokens: { worktree: "tok_wt", project: "tok_p" },
+    analysis: { candidates: [{ kind: "no-auth-suspect", file: "D:/p/src/app.js", method: "GET", path: "/x/:id" }] },
+    emit: () => {},
+    db: { insertPatch: () => {} },
+    rpc: {
+      request: async (method) => {
+        calls.push(method);
+        throw new Error(`不应调用 ${method}`);
+      },
+    },
+  };
+  await assert.rejects(
+    () => createPatch(ctx),
+    (e) => e.code === "no_patchable_candidates" && /人工修复/.test(e.hint),
+    "应归类为 no_patchable_candidates 并给出人工修复指引"
+  );
+  assert.deepEqual(calls, [], "无可修复候选时不应触碰 RPC（worktree 等）");
 });

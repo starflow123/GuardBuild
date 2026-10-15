@@ -27,9 +27,11 @@ export class PatchError extends Error {
 export async function createPatch(ctx) {
   const candidates = (ctx.analysis?.candidates ?? []).filter((c) => c.kind === "idor-suspect");
   if (candidates.length === 0) {
-    throw new PatchError("静态分析未发现可修复的候选端点（无对象级越权线索）", {
-      code: "no_candidates",
-      hint: "目标项目可能没有暴露此类模式，或需要人工指定修复范围",
+    // 到达此处说明攻击已复现（stageReproduce 已通过），但候选中没有可自动修复的
+    // IDOR 端点（如仅无鉴权/纵向越权证据）——不得退化为「无漏洞」放行
+    throw new PatchError("攻击证据已建立，但没有可自动修复的对象级越权候选端点", {
+      code: "no_patchable_candidates",
+      hint: "自动修复仅覆盖「带认证但缺归属校验」的 IDOR 场景；请对照证据中的攻击用例人工修复该端点后重跑 gate",
     });
   }
 

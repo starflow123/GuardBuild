@@ -5,7 +5,8 @@
 //!   --gate            CI gate 模式：按 guardbuild.json.scopes 预声明授权（via=policy）、
 //!                     自动批准补丁、结构性禁止写回；到终态输出 GB_GATE 并按约定退出码结束：
 //!                       0 = 未发现可利用漏洞（no_candidates / attack_not_reproducible）
-//!                       1 = 漏洞证据成立（writeback_pending 附已验证补丁；verify_failed 附证据）
+//!                       1 = 漏洞证据成立（writeback_pending 附已验证补丁；verify_failed 附证据；
+//!                           vulnerable_unfixed 表示攻击已复现但无可自动修复候选）
 //!                       2 = 执行失败（环境/契约/内部错误/超时）
 //!   --report <dir>    报告输出目录（report.emit 的落盘位置）
 //!
@@ -153,6 +154,7 @@ fn spawn_gate_watcher(host: Arc<Host>) {
                     let (exit_code, verdict) = match code {
                         "no_candidates" => (0, "no_candidates"),
                         "attack_not_reproducible" => (0, "not_reproducible"),
+                        "no_patchable_candidates" => (1, "vulnerable_unfixed"),
                         _ => (2, "failed"),
                     };
                     let mut p = base(verdict);

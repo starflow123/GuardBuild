@@ -382,6 +382,7 @@ function verifyBusiness(res, expectStatus, detailFn) {
 export function buildCases(ctx, targets) {
   const readPath = ctx.plan.readCandidate?.fullPath ?? ctx.plan.readCandidate?.path ?? null;
   const cancelPath = ctx.plan.cancelCandidate?.fullPath ?? ctx.plan.cancelCandidate?.path ?? null;
+  const unauthReadPath = ctx.plan.unauthReadCandidate?.fullPath ?? ctx.plan.unauthReadCandidate?.path ?? null;
   const adminListPath = ctx.plan.adminListEndpoint?.path ?? null;
   const adminCancelPath = ctx.plan.adminCancelEndpoint?.path ?? null;
   const listPath = ctx.plan.listEndpoint?.path ?? null;
@@ -453,6 +454,69 @@ export function buildCases(ctx, targets) {
       impact: (res) => {
         const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
         return o && o.status === "cancelled" ? `可越权取消他人${label}（业务破坏）` : null;
+      },
+    });
+  }
+
+  if (adminListPath) {
+    cases.push({
+      id: "attack-vertical-escalation",
+      category: CASE_CATEGORY.ATTACK,
+      name: `${victim.name}（普通用户）访问管理端${label}列表`,
+      identity: victim.name,
+      method: "GET",
+      path: adminListPath,
+      routeKey: ctx.plan.adminListEndpoint?.routeKey ?? "admin.orders.list",
+      expect: "普通用户访问管理端应被拒绝（401/403/404）",
+      verify: (res, phase) => {
+        const arr = extractListItems(res.json, ctx.targetConfig?.responses?.list ?? null);
+        const leaked = arr && arr.length > 0;
+        const detail = leaked
+          ? `证据：返回 ${arr.length} 条${label}（归属 ${[...new Set(arr.map((o) => ownerOf(o)))].join(",")}），纵向越权可览全局数据`
+          : "";
+        return verifyAttack(res, phase, detail);
+      },
+      crossProof: (res) => {
+        const arr = extractListItems(res.json, ctx.targetConfig?.responses?.list ?? null);
+        if (!arr || arr.length === 0) return null;
+        const foreign = arr.filter((o) => ownerOf(o) !== victim.user?.id).length;
+        if (foreign === 0) return null;
+        return { note: `普通用户响应含 ${foreign} 条他人${label}（跨归属全局列表）` };
+      },
+      impact: (res) => {
+        const arr = extractListItems(res.json, ctx.targetConfig?.responses?.list ?? null);
+        return arr && arr.length > 0 ? `可越权查看全站${label}（角色校验缺失）` : null;
+      },
+    });
+  }
+
+  if (unauthReadPath) {
+    const anonTarget = targets.readTarget;
+    cases.push({
+      id: "attack-anonymous-read",
+      category: CASE_CATEGORY.ATTACK,
+      name: `未携带凭证读取${label} #${anonTarget.id}（无鉴权端点）`,
+      identity: null,
+      method: "GET",
+      path: fillParams(unauthReadPath, anonTarget.id),
+      routeKey: ctx.plan.unauthReadCandidate?.routeKeys?.[0] ?? null,
+      expect: `未认证读取${label}应被拒绝（401/403/404）`,
+      verify: (res, phase) => {
+        const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
+        const leaked = o && o.id === anonTarget.id;
+        const detail = leaked
+          ? `证据：匿名请求即返回${label} #${o.id}（归属 ${ownerOf(o)}），无需任何认证`
+          : "";
+        return verifyAttack(res, phase, detail);
+      },
+      crossProof: (res) => {
+        const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
+        if (!o || o.id !== anonTarget.id) return null;
+        return { note: `匿名响应对象 #${o.id} 与请求目标一致，归属 ${ownerOf(o)}` };
+      },
+      impact: (res) => {
+        const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
+        return o && o.id === anonTarget.id ? `未认证即可读取任意${label}详情（认证缺失）` : null;
       },
     });
   }

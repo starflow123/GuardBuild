@@ -345,6 +345,32 @@ test("buildProbePlan: 无鉴权候选入独立槽位，且不占用 IDOR 槽位"
   assert.equal(onlyNoAuth.unauthReadCandidate.resource, "feed");
 });
 
+test("buildProbePlan: 每类候选取 top-K（去重）+ 单槽位为首元素（N-5）", () => {
+  const mk = (over = {}) => ({ method: "GET", path: null, fullPath: null, routeKeys: [], ...over });
+  const plan = buildProbePlan({
+    endpoints: [],
+    candidates: [
+      mk({ fullPath: "/api/a/:id", resource: "a", kind: "no-auth-suspect" }),
+      mk({ fullPath: "/api/a/:id", resource: "a", kind: "no-auth-suspect" }), // 重复 method+path 应去重
+      mk({ fullPath: "/api/b/:id", resource: "b", kind: "no-auth-suspect" }),
+      mk({ fullPath: "/api/c/:id", resource: "c", kind: "no-auth-suspect" }),
+      mk({ fullPath: "/api/d/:id", resource: "d", kind: "no-auth-suspect" }), // 超出 top-3 应被截断
+      mk({ fullPath: "/api/orders/:id", resource: "order", kind: "idor-suspect" }),
+      mk({ method: "POST", fullPath: "/api/orders/:id/cancel", resource: "order", kind: "idor-suspect" }),
+    ],
+  });
+  assert.deepEqual(
+    plan.unauthReadCandidates.map((c) => c.fullPath),
+    ["/api/a/:id", "/api/b/:id", "/api/c/:id"],
+    "无鉴权候选应去重并截断到 top-3"
+  );
+  assert.equal(plan.unauthReadCandidate, plan.unauthReadCandidates[0], "单槽位应为首元素（兼容消费方）");
+  assert.deepEqual(plan.readCandidates.map((c) => c.fullPath), ["/api/orders/:id"]);
+  assert.deepEqual(plan.cancelCandidates.map((c) => c.fullPath), ["/api/orders/:id/cancel"]);
+  assert.deepEqual(plan.readCandidates, [plan.readCandidate]);
+  assert.deepEqual(plan.cancelCandidates, [plan.cancelCandidate]);
+});
+
 test("buildCases: 条件化构建（无 cancel/admin 端点不虚构用例）+ 任意 :param 填充 + 顺序保持", () => {
   const mkCtx = (plan) => ({ plan, targetConfig: null });
   const targets = {
@@ -456,6 +482,55 @@ test("buildCases: 身份/目标缺失时跳过对应槽位（不虚构、不崩�
     "匿名探测目标只服务匿名越权用例（越权读需 victim）"
   );
   assert.equal(anonOnly[0].path, "/api/feeds/11", "匿名用例 :param 应填充匿名探测到的对象 ID");
+});
+
+test("buildCases: 多候选逐一构建攻击用例（基名 + -2 后缀，N-5）", () => {
+  const ctx = {
+    plan: {
+      resource: "order",
+      readCandidates: [
+        { fullPath: "/api/orders/:id", routeKeys: ["orders.get"] },
+        { fullPath: "/api/invoices/:id", routeKeys: ["invoices.get"] },
+      ],
+      unauthReadCandidates: [
+        { fullPath: "/api/feeds/:id", routeKeys: ["feeds.get"] },
+        { fullPath: "/api/loves/:id", routeKeys: ["loves.get"] },
+      ],
+      listEndpoint: { path: "/api/orders", routeKey: "orders.list" },
+    },
+    targetConfig: null,
+  };
+  const targets = {
+    attacker: { name: "alice", user: { id: 1 } },
+    victim: { name: "bob", user: { id: 2 } },
+    admin: null,
+    readTarget: { id: 11 },
+    attackCancelTarget: null,
+    adminCancelTarget: null,
+    ownReadTarget: { id: 14 },
+    ownCancelTarget: null,
+    ownNotCancellable: null,
+    anonTargets: [
+      { path: "/api/feeds/:id", item: { id: 21 } },
+      { path: "/api/loves/:id", item: { id: 31 } },
+    ],
+  };
+  const cases = buildCases(ctx, targets);
+  assert.deepEqual(
+    cases.filter((c) => c.category === "attack").map((c) => c.id),
+    ["attack-read-foreign", "attack-read-foreign-2", "attack-anonymous-read", "attack-anonymous-read-2"],
+    "每类候选按序构建，首候选保持基名"
+  );
+  const read2 = cases.find((c) => c.id === "attack-read-foreign-2");
+  assert.equal(read2.path, "/api/invoices/11", "第二读取候选应使用自身端点路径");
+  const anon2 = cases.find((c) => c.id === "attack-anonymous-read-2");
+  assert.equal(anon2.path, "/api/loves/31", "第二匿名候选应使用该路径匿名探测到的对象 ID");
+  assert.equal(anon2.routeKey, "loves.get");
+  assert.equal(
+    anon2.verify({ status: 200, json: { id: 31, userId: 3 } }, "pre").verdict,
+    "vulnerable",
+    "多候选的判定语义与单候选一致"
+  );
 });
 
 test("buildCases: 垂直越权（victim 身份访问 admin 列表）与匿名读取用例的判定语义", () => {

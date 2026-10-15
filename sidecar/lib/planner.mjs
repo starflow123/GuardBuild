@@ -14,6 +14,9 @@ export const DEFAULT_IDENTITIES = [
   { name: "admin", username: "admin", password: "admin123", role: "admin" },
 ];
 
+/** 每类候选参与动态探测的上限（top-K，避免候选泛滥时探测膨胀） */
+export const PROBE_TOP_K = 3;
+
 export function loadIdentities() {
   const raw = process.env.GUARDBUILD_IDENTITIES;
   if (!raw) return DEFAULT_IDENTITIES;
@@ -52,19 +55,33 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
   if (analysisLogin) pushLogin(epPath(analysisLogin));
   pushLogin("/api/login");
 
-  const cancelCandidate =
-    candidates.find(
-      (c) => c.kind === "idor-suspect" && c.method === "POST" && (epPath(c) ?? "").endsWith("/cancel")
-    ) ?? null;
-  const readCandidate =
-    candidates.find(
-      (c) => c.kind === "idor-suspect" && c.method === "GET" && paramCount(epPath(c)) === 1
-    ) ?? null;
+  // 每类取 top-K 候选逐一探测；单槽位（首元素）保留既有语义与消费方兼容
+  const topK = (pred, k = PROBE_TOP_K) => {
+    const seen = new Set();
+    const out = [];
+    for (const c of candidates) {
+      if (!pred(c)) continue;
+      const key = `${c.method} ${epPath(c)}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      out.push(c);
+      if (out.length >= k) break;
+    }
+    return out;
+  };
+  const cancelCandidates = topK(
+    (c) => c.kind === "idor-suspect" && c.method === "POST" && (epPath(c) ?? "").endsWith("/cancel")
+  );
+  const readCandidates = topK(
+    (c) => c.kind === "idor-suspect" && c.method === "GET" && paramCount(epPath(c)) === 1
+  );
   // 无鉴权候选：匿名读取用例的靶点（与 IDOR 槽位互斥，不做自动修复）
-  const unauthReadCandidate =
-    candidates.find(
-      (c) => c.kind === "no-auth-suspect" && c.method === "GET" && paramCount(epPath(c)) === 1
-    ) ?? null;
+  const unauthReadCandidates = topK(
+    (c) => c.kind === "no-auth-suspect" && c.method === "GET" && paramCount(epPath(c)) === 1
+  );
+  const cancelCandidate = cancelCandidates[0] ?? null;
+  const readCandidate = readCandidates[0] ?? null;
+  const unauthReadCandidate = unauthReadCandidates[0] ?? null;
 
   const resource =
     readCandidate?.resource ?? cancelCandidate?.resource ?? unauthReadCandidate?.resource ?? "resource";
@@ -92,9 +109,12 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
     loginPath: loginCandidates[0],
     loginCandidates,
     resource,
-    readCandidate: readCandidate ?? null,
-    cancelCandidate: cancelCandidate ?? null,
-    unauthReadCandidate: unauthReadCandidate ?? null,
+    readCandidate,
+    cancelCandidate,
+    unauthReadCandidate,
+    readCandidates,
+    cancelCandidates,
+    unauthReadCandidates,
     listEndpoint: list ? { path: epPath(list), routeKey: list.routeKeys?.[0] ?? null } : null,
     adminListEndpoint: adminList ? { path: epPath(adminList), routeKey: adminList.routeKeys?.[0] ?? null } : null,
     adminCancelEndpoint: adminCancel ? { path: epPath(adminCancel), routeKey: adminCancel.routeKeys?.[0] ?? null } : null,

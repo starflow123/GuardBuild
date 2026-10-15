@@ -72,10 +72,13 @@ export function extractEntity(json, entityPath = null) {
 }
 
 /** 资源名标签：order 显示为「订单」，其它资源名原样展示，未知回退「资源」。 */
-function resourceLabel(ctx) {
-  const r = ctx.plan?.resource;
+function resourceLabelOf(r) {
   if (r === "order") return "订单";
   return r && r !== "resource" ? r : "资源";
+}
+
+function resourceLabel(ctx) {
+  return resourceLabelOf(ctx.plan?.resource);
 }
 
 /** 归属字段读取：兼容 userId / user_id / ownerId / owner_id / uid 命名 */
@@ -307,18 +310,39 @@ async function discoverViaAnonymousProbe(ctx, baseUrl, path) {
 }
 
 /**
+ * 计划槽位读取：多候选数组（planner top-K）优先，回退单槽位（兼容旧计划对象）。
+ * kind: "read" | "cancel" | "unauthRead"
+ */
+function planCandidates(ctx, kind) {
+  const arr = ctx.plan?.[`${kind}Candidates`];
+  if (Array.isArray(arr) && arr.length > 0) return arr;
+  const single = ctx.plan?.[kind === "unauthRead" ? "unauthReadCandidate" : `${kind}Candidate`];
+  return single ? [single] : [];
+}
+
+function candPath(cand) {
+  return cand?.fullPath ?? cand?.path ?? null;
+}
+
+/**
  * 发现资源归属。优先各身份的按归属列表接口；
- * 无列表接口时可回退匿名 ID 探测（仅依赖无鉴权单体接口，服务匿名用例）；
+ * 无列表接口时可回退匿名 ID 探测（逐个无鉴权候选路径探测，服务匿名用例）；
  * 两者皆无且计划不依赖对象归属时返回空结果（如仅路径穿越用例）。
- * 返回 { byUser, anonymousItems }。
+ * 返回 { byUser, anonymousItems, anonTargets }。
  */
 async function discoverResources(ctx, baseUrl, loggedIn) {
   const listPath = ctx.plan.listEndpoint?.path;
   if (!listPath) {
-    const unauthPath = ctx.plan.unauthReadCandidate?.fullPath ?? ctx.plan.unauthReadCandidate?.path ?? null;
-    if (unauthPath) {
-      const anonymousItems = await discoverViaAnonymousProbe(ctx, baseUrl, unauthPath);
-      return { byUser: {}, anonymousItems };
+    const unauthCands = planCandidates(ctx, "unauthRead");
+    if (unauthCands.length > 0) {
+      const anonTargets = [];
+      for (const cand of unauthCands) {
+        const p = candPath(cand);
+        if (!p) continue;
+        const items = await discoverViaAnonymousProbe(ctx, baseUrl, p);
+        if (items.length > 0) anonTargets.push({ path: p, item: items[0] });
+      }
+      return { byUser: {}, anonymousItems: anonTargets.map((t) => t.item), anonTargets };
     }
     if (ctx.plan.traversalCandidate) {
       ctx.emit({
@@ -327,7 +351,7 @@ async function discoverResources(ctx, baseUrl, loggedIn) {
         message: "无需资源归属发现：探测计划中的用例不依赖具体对象 ID",
         data: { mode: "not-required" },
       });
-      return { byUser: {}, anonymousItems: [] };
+      return { byUser: {}, anonymousItems: [], anonTargets: [] };
     }
     throw new ProbeError("静态分析未能定位列表接口，无法发现资源归属", {
       code: "no_list_endpoint",
@@ -347,14 +371,14 @@ async function discoverResources(ctx, baseUrl, loggedIn) {
       data: { identity: ident.name, count: items.length, ids: items.map((o) => o.id) },
     });
   }
-  return { byUser, anonymousItems: [] };
+  return { byUser, anonymousItems: [], anonTargets: [] };
 }
 
 /**
  * 从发现结果中挑选攻击/业务用例所需的具体对象（loggedIn 携带登录响应中的 user 对象）。
  * 宽容化：缺少身份/对象时返回 null 槽位，由 buildCases 按槽位条件决定哪些用例可构建。
  */
-function pickTargets(byUser, loggedIn, anonymousItems = []) {
+function pickTargets(byUser, loggedIn, anonymousItems = [], anonTargets = []) {
   const users = loggedIn.filter((i) => i.role !== "admin");
   const attacker = users[0] ?? null;
   const victim = users[1] ?? null; // 归属类用例（越权读/操作）需要第二个普通用户，缺则跳过该槽位
@@ -373,6 +397,7 @@ function pickTargets(byUser, loggedIn, anonymousItems = []) {
     ownReadTarget: attackerItems[0] ?? null,
     ownCancelTarget: attackerPaid[1] ?? attackerPaid[0] ?? null,
     ownNotCancellable: attackerItems.find((o) => o.status !== "paid") ?? null,
+    anonTargets,
   };
 }
 
@@ -437,36 +462,44 @@ function verifyBusiness(res, expectStatus, detailFn) {
 
 /** 构建一个阶段内的全部用例（攻击 + 业务），攻击目标对象由发现阶段确定 */
 export function buildCases(ctx, targets) {
-  const readPath = ctx.plan.readCandidate?.fullPath ?? ctx.plan.readCandidate?.path ?? null;
-  const cancelPath = ctx.plan.cancelCandidate?.fullPath ?? ctx.plan.cancelCandidate?.path ?? null;
-  const unauthReadPath = ctx.plan.unauthReadCandidate?.fullPath ?? ctx.plan.unauthReadCandidate?.path ?? null;
+  // 每类候选 top-K 逐一构建攻击用例；首个候选保持基名（兼容既有报告/测试/e2e）
+  const readCands = planCandidates(ctx, "read");
+  const cancelCands = planCandidates(ctx, "cancel");
+  const unauthCands = planCandidates(ctx, "unauthRead");
+  const readPath = candPath(readCands[0]);
+  const cancelPath = candPath(cancelCands[0]);
   const adminListPath = ctx.plan.adminListEndpoint?.path ?? null;
   const adminCancelPath = ctx.plan.adminCancelEndpoint?.path ?? null;
   const listPath = ctx.plan.listEndpoint?.path ?? null;
-  const readKey = ctx.plan.readCandidate?.routeKeys?.[0] ?? "orders.get";
-  const cancelKey = ctx.plan.cancelCandidate?.routeKeys?.[0] ?? "orders.cancel";
+  const readKey = readCands[0]?.routeKeys?.[0] ?? "orders.get";
+  const cancelKey = cancelCands[0]?.routeKeys?.[0] ?? "orders.cancel";
   const { attacker, victim, admin } = targets;
   const label = resourceLabel(ctx);
 
   const cases = [];
 
   // —— 攻击用例（仅在计划中存在对应端点且身份/目标齐备时构建，不虚构回退路径）——
-  if (readPath && targets.readTarget && attacker && victim) {
+  for (const [i, cand] of readCands.entries()) {
+    const path = candPath(cand);
+    if (!path || !targets.readTarget || !attacker || !victim) continue;
     const readTarget = targets.readTarget;
+    const suffix = i === 0 ? "" : `-${i + 1}`;
+    const multi = readCands.length > 1 ? `（${path}）` : "";
+    const candLabel = resourceLabelOf(cand.resource ?? ctx.plan?.resource);
     cases.push({
-      id: "attack-read-foreign",
+      id: `attack-read-foreign${suffix}`,
       category: CASE_CATEGORY.ATTACK,
-      name: `${attacker.name} 读取 ${victim.name} 的${label} #${readTarget.id}`,
+      name: `${attacker.name} 读取 ${victim.name} 的${candLabel} #${readTarget.id}${multi}`,
       identity: attacker.name,
       method: "GET",
-      path: fillParams(readPath, readTarget.id),
-      routeKey: readKey,
-      expect: `越权读取他人${label}应被拒绝（401/403/404）`,
+      path: fillParams(path, readTarget.id),
+      routeKey: cand.routeKeys?.[0] ?? readKey,
+      expect: `越权读取他人${candLabel}应被拒绝（401/403/404）`,
       verify: (res, phase) => {
         const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
         const leaked = o && String(o.id) === String(readTarget.id);
         const detail = leaked
-          ? `证据：返回${label} #${o.id}（归属 ${ownerOf(o)}，金额 ${o.amount}，状态 ${o.status}）`
+          ? `证据：返回${candLabel} #${o.id}（归属 ${ownerOf(o)}，金额 ${o.amount}，状态 ${o.status}）`
           : "";
         return verifyAttack(res, phase, detail, leaked);
       },
@@ -479,26 +512,31 @@ export function buildCases(ctx, targets) {
           note: `响应对象 #${o.id} 与请求目标一致，归属 ${ownerOf(o)}${victim.user?.id ? "（与受害人身份一致）" : ""}`,
         };
       },
-      impact: (res) => (okStatus(res.status) ? `可读取他人${label}详情及字段（id/userId/amount/address 等）` : null),
+      impact: (res) => (okStatus(res.status) ? `可读取他人${candLabel}详情及字段（id/userId/amount/address 等）` : null),
     });
   }
 
-  if (cancelPath && targets.attackCancelTarget && attacker && victim) {
+  for (const [i, cand] of cancelCands.entries()) {
+    const path = candPath(cand);
+    if (!path || !targets.attackCancelTarget || !attacker || !victim) continue;
     const cancelTarget = targets.attackCancelTarget;
+    const suffix = i === 0 ? "" : `-${i + 1}`;
+    const multi = cancelCands.length > 1 ? `（${path}）` : "";
+    const candLabel = resourceLabelOf(cand.resource ?? ctx.plan?.resource);
     cases.push({
-      id: "attack-cancel-foreign",
+      id: `attack-cancel-foreign${suffix}`,
       category: CASE_CATEGORY.ATTACK,
-      name: `${attacker.name} 取消 ${victim.name} 的${label} #${cancelTarget.id}`,
+      name: `${attacker.name} 取消 ${victim.name} 的${candLabel} #${cancelTarget.id}${multi}`,
       identity: attacker.name,
       method: "POST",
-      path: fillParams(cancelPath, cancelTarget.id),
-      routeKey: cancelKey,
-      expect: `越权取消他人${label}应被拒绝（401/403/404）`,
+      path: fillParams(path, cancelTarget.id),
+      routeKey: cand.routeKeys?.[0] ?? cancelKey,
+      expect: `越权取消他人${candLabel}应被拒绝（401/403/404）`,
       verify: (res, phase) => {
         const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
         const changed =
           o && o.status === "cancelled" && (!victim.user?.id || ownerOf(o) === victim.user.id);
-        const detail = changed ? `证据：${label} #${o.id}（归属 ${ownerOf(o)}）状态已被改为 cancelled` : "";
+        const detail = changed ? `证据：${candLabel} #${o.id}（归属 ${ownerOf(o)}）状态已被改为 cancelled` : "";
         return verifyAttack(res, phase, detail, changed);
       },
       crossProof: (res) => {
@@ -511,7 +549,7 @@ export function buildCases(ctx, targets) {
       },
       impact: (res) => {
         const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
-        return o && o.status === "cancelled" ? `可越权取消他人${label}（业务破坏）` : null;
+        return o && o.status === "cancelled" ? `可越权取消他人${candLabel}（业务破坏）` : null;
       },
     });
   }
@@ -548,22 +586,30 @@ export function buildCases(ctx, targets) {
     });
   }
 
-  const anonTarget = targets.readTarget;
-  if (unauthReadPath && anonTarget) {
+  for (const [i, cand] of unauthCands.entries()) {
+    const path = candPath(cand);
+    if (!path) continue;
+    // 每个候选优先用该路径匿名探测到的对象；缺失时回退通用读目标
+    const anonTarget =
+      targets.anonTargets?.find((t) => t.path === path)?.item ?? targets.readTarget ?? null;
+    if (!anonTarget) continue;
+    const suffix = i === 0 ? "" : `-${i + 1}`;
+    const multiText = unauthCands.length > 1 ? ` ${path}` : "";
+    const candLabel = resourceLabelOf(cand.resource ?? ctx.plan?.resource);
     cases.push({
-      id: "attack-anonymous-read",
+      id: `attack-anonymous-read${suffix}`,
       category: CASE_CATEGORY.ATTACK,
-      name: `未携带凭证读取${label} #${anonTarget.id}（无鉴权端点）`,
+      name: `未携带凭证读取${candLabel} #${anonTarget.id}（无鉴权端点${multiText}）`,
       identity: null,
       method: "GET",
-      path: fillParams(unauthReadPath, anonTarget.id),
-      routeKey: ctx.plan.unauthReadCandidate?.routeKeys?.[0] ?? null,
-      expect: `未认证读取${label}应被拒绝（401/403/404）`,
+      path: fillParams(path, anonTarget.id),
+      routeKey: cand.routeKeys?.[0] ?? null,
+      expect: `未认证读取${candLabel}应被拒绝（401/403/404）`,
       verify: (res, phase) => {
         const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
         const leaked = o && String(o.id) === String(anonTarget.id);
         const detail = leaked
-          ? `证据：匿名请求即返回${label} #${o.id}（归属 ${ownerOf(o)}），无需任何认证`
+          ? `证据：匿名请求即返回${candLabel} #${o.id}（归属 ${ownerOf(o)}），无需任何认证`
           : "";
         return verifyAttack(res, phase, detail, leaked);
       },
@@ -574,7 +620,7 @@ export function buildCases(ctx, targets) {
       },
       impact: (res) => {
         const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
-        return o && o.id === anonTarget.id ? `未认证即可读取任意${label}详情（认证缺失）` : null;
+        return o && o.id === anonTarget.id ? `未认证即可读取任意${candLabel}详情（认证缺失）` : null;
       },
     });
   }
@@ -771,8 +817,8 @@ export async function runPhase(ctx, { phase, baseUrl }) {
   });
 
   const loggedIn = await loginAll(ctx, baseUrl);
-  const { byUser, anonymousItems } = await discoverResources(ctx, baseUrl, loggedIn);
-  const targets = pickTargets(byUser, loggedIn, anonymousItems);
+  const { byUser, anonymousItems, anonTargets } = await discoverResources(ctx, baseUrl, loggedIn);
+  const targets = pickTargets(byUser, loggedIn, anonymousItems, anonTargets);
   const cases = buildCases(ctx, targets);
 
   const attackSlots = cases.filter((c) => c.category === CASE_CATEGORY.ATTACK);
@@ -783,17 +829,18 @@ export async function runPhase(ctx, { phase, baseUrl }) {
     });
   }
   const plannedSlots = [
-    ctx.plan.readCandidate && { slot: "readCandidate", caseId: "attack-read-foreign" },
-    ctx.plan.cancelCandidate && { slot: "cancelCandidate", caseId: "attack-cancel-foreign" },
-    ctx.plan.unauthReadCandidate && { slot: "unauthReadCandidate", caseId: "attack-anonymous-read" },
-  ].filter(Boolean);
-  const builtIds = new Set(cases.map((c) => c.id));
-  const skipped = plannedSlots.filter((s) => !builtIds.has(s.caseId));
+    { slot: "readCandidate", prefix: "attack-read-foreign", count: planCandidates(ctx, "read").length },
+    { slot: "cancelCandidate", prefix: "attack-cancel-foreign", count: planCandidates(ctx, "cancel").length },
+    { slot: "unauthReadCandidate", prefix: "attack-anonymous-read", count: planCandidates(ctx, "unauthRead").length },
+  ].filter((s) => s.count > 0);
+  const skipped = plannedSlots.filter(
+    (s) => !cases.some((c) => c.id === s.prefix || c.id.startsWith(`${s.prefix}-`))
+  );
   if (skipped.length > 0) {
     ctx.emit({
       kind: "discovery",
       severity: SEVERITY.WARN,
-      message: `计划中有 ${skipped.length} 个攻击用例因身份/资源不足被跳过：${skipped.map((s) => s.slot).join("、")}`,
+      message: `计划中有 ${skipped.length} 类攻击用例因身份/资源不足被跳过：${skipped.map((s) => s.slot).join("、")}`,
       data: { skipped },
     });
   }

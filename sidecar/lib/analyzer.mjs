@@ -74,6 +74,33 @@ const PUBLIC_PATH = /\/(?:login|logout|sign-?in|sign-?up|register|registration|a
 const OWNER_FILTER =
   /filter\s*\(\s*\(?[^)]*\)?\s*=>[^)]*\.user_?[Ii][Dd]\s*[!=]==|where\s*:?\s*\{[^}]*\buser_?[Ii][Dd]\b|where\s*=[^;\n]*\buser_?[Ii][Dd]\b/;
 
+// —— 路径穿越线索：文件读取 sink + 请求输入在同段代码内合流 ——
+// sink 覆盖 fs.readFile / sendFile / createReadStream 等读取族（写/删类不在探测范围，避免破坏性操作）
+const FS_READ_SINK =
+  /\b(?:fs(?:\.promises)?\s*\.\s*)?(readFileSync|readFile|createReadStream|sendFileSync|sendFile|readdirSync|readdir|statSync|openSync|open)\s*\(/;
+// 请求输入引用：req.query.x / req.params.x / req.body.x / 数组或字面量下标形态
+const REQ_INPUT = /\breq\s*\.\s*(query|params|body)\b(?:\s*\.\s*([A-Za-z_$][\w$]*)|\[\s*["'`]([^"'`]+)["'`]\s*\])?/g;
+
+/** 检测区块内路径穿越线索：返回离 sink 最近的请求输入 {source, param, sink} 或 null */
+function findTraversalSignal(text) {
+  const re = new RegExp(FS_READ_SINK.source, "g");
+  let m;
+  while ((m = re.exec(text))) {
+    // 取 sink 调用前的窗口：覆盖「输入变量赋值 → 拼接 → 传参」的相邻语句链
+    const from = Math.max(0, m.index - 400);
+    const window = text.slice(from, m.index + 200);
+    let input = null;
+    for (const im of window.matchAll(REQ_INPUT)) input = im; // 保留最后一个（离 sink 最近）
+    if (!input) continue;
+    return {
+      source: input[1],
+      param: input[2] ?? input[3] ?? null,
+      sink: m[1],
+    };
+  }
+  return null;
+}
+
 // —— 挂载级鉴权：app.use("/api/x", authRequired, router) / router.use(authenticate) ——
 // 真实 Express 项目常把鉴权放在挂载点或文件顶部，路由文件正文中看不到守卫，
 // 仅测区块文本会把「有认证」误判为 false，导致候选漏检。
@@ -412,6 +439,17 @@ export async function analyzeProject(ctx) {
         ...ep,
         kind: "no-auth-suspect",
         resource: guessResource(fullPath ?? path, s.text),
+      });
+    }
+
+    // 可疑「路径穿越」：文件读取 sink 的相邻语句链中出现请求输入（读取族，无修复策略）
+    const traversal = findTraversalSignal(s.text);
+    if (traversal) {
+      candidates.push({
+        ...ep,
+        kind: "traversal-suspect",
+        resource: traversal.param ?? guessResource(fullPath ?? path, s.text),
+        traversal,
       });
     }
   }

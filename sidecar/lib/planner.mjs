@@ -82,9 +82,16 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
   const cancelCandidate = cancelCandidates[0] ?? null;
   const readCandidate = readCandidates[0] ?? null;
   const unauthReadCandidate = unauthReadCandidates[0] ?? null;
+  // 路径穿越候选：文件读取端点含请求输入（无自动修复策略，仅复现取证）
+  const traversalCandidates = topK((c) => c.kind === "traversal-suspect");
+  const traversalCandidate = traversalCandidates[0] ?? null;
 
   const resource =
-    readCandidate?.resource ?? cancelCandidate?.resource ?? unauthReadCandidate?.resource ?? "resource";
+    readCandidate?.resource ??
+    cancelCandidate?.resource ??
+    unauthReadCandidate?.resource ??
+    traversalCandidate?.resource ??
+    "resource";
 
   // 列表/管理端点优先选择与资源名匹配的路径（避免把别的资源列表当作探测目标）
   const byResource = (list) =>
@@ -112,9 +119,11 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
     readCandidate,
     cancelCandidate,
     unauthReadCandidate,
+    traversalCandidate,
     readCandidates,
     cancelCandidates,
     unauthReadCandidates,
+    traversalCandidates,
     listEndpoint: list ? { path: epPath(list), routeKey: list.routeKeys?.[0] ?? null } : null,
     adminListEndpoint: adminList ? { path: epPath(adminList), routeKey: adminList.routeKeys?.[0] ?? null } : null,
     adminCancelEndpoint: adminCancel ? { path: epPath(adminCancel), routeKey: adminCancel.routeKeys?.[0] ?? null } : null,

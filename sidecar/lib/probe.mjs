@@ -460,6 +460,30 @@ function verifyBusiness(res, expectStatus, detailFn) {
   return { verdict: VERDICT.PASSED, actual: `HTTP ${res.status}${content ? `，${content}` : ""}` };
 }
 
+// —— 路径穿越用例辅助 ——
+
+/** package.json 特征字段：≥2 个同时出现即视为回读到目标文件内容 */
+const PKG_MARKERS = ['"name"', '"version"', '"dependencies"'];
+const TRAVERSAL_PAYLOADS = ["../package.json", "../../package.json", "../../../package.json"];
+
+function traversalLeak(body, localName = null) {
+  if (typeof body !== "string" || !body) return false;
+  const hits = PKG_MARKERS.filter((m) => body.includes(m)).length;
+  if (hits >= 2) return true;
+  return !!localName && body.includes(`"${localName}"`);
+}
+
+/** 生成一次穿越尝试的请求路径：query 形态追加参数，params 形态替换路径段（编码变体保活） */
+function traversalAttemptPath(routePath, trav, payload, encoded) {
+  if (trav.source === "params" && trav.param) {
+    return routePath.replace(`:${trav.param}`, encoded ? payload.replace(/\//g, "%2F") : payload);
+  }
+  const param = trav.param ?? "file";
+  const value = encoded ? encodeURIComponent(payload) : payload;
+  const sep = routePath.includes("?") ? "&" : "?";
+  return `${routePath}${sep}${param}=${value}`;
+}
+
 /** 构建一个阶段内的全部用例（攻击 + 业务），攻击目标对象由发现阶段确定 */
 export function buildCases(ctx, targets) {
   // 每类候选 top-K 逐一构建攻击用例；首个候选保持基名（兼容既有报告/测试/e2e）
@@ -622,6 +646,85 @@ export function buildCases(ctx, targets) {
         const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
         return o && o.id === anonTarget.id ? `未认证即可读取任意${candLabel}详情（认证缺失）` : null;
       },
+    });
+  }
+
+  // —— 路径穿越攻击用例：对逐条 payload 尝试，命中泄露证据即停（无修复策略，仅取证）——
+  for (const [i, cand] of planCandidates(ctx, "traversal").entries()) {
+    const routePath = candPath(cand);
+    if (!routePath) continue;
+    const trav = cand.traversal ?? {};
+    const suffix = i === 0 ? "" : `-${i + 1}`;
+    const travIdentity = victim?.name ?? attacker?.name ?? null;
+    const firstAttempt = traversalAttemptPath(routePath, trav, TRAVERSAL_PAYLOADS[0], false);
+    cases.push({
+      id: `attack-path-traversal${suffix}`,
+      category: CASE_CATEGORY.ATTACK,
+      name: `路径穿越读取服务器文件（${routePath}${trav.param ? ` · 参数 ${trav.param}` : ""}）`,
+      identity: travIdentity,
+      method: "GET",
+      path: firstAttempt,
+      routeKey: cand.routeKeys?.[0] ?? null,
+      expect: "路径穿越读取应被拒绝（400/403/404），不得回读目标文件内容",
+      send: async (c, baseUrl) => {
+        // 本机 package.json 的 name 值用作交叉证据：回读内容须与本机文件一致
+        let localName = null;
+        try {
+          const root = String(c.projectRoot ?? "").replace(/[\\/]+$/, "");
+          const rd = await c.rpc.request(RPC_TO_HOST.FS_READ, {
+            token: c.tokens.project,
+            path: `${root}/package.json`,
+            redact: true,
+          });
+          localName = JSON.parse(rd.content)?.name ?? null;
+        } catch {
+          /* 无本地文件则仅用通用特征 */
+        }
+        let last = null;
+        let lastPath = firstAttempt;
+        let firstErr = null;
+        let hit = null;
+        let hitPath = null;
+        for (const payload of TRAVERSAL_PAYLOADS) {
+          for (const encoded of [false, true]) {
+            const p = traversalAttemptPath(routePath, trav, payload, encoded);
+            try {
+              const res = await httpJson(c, { baseUrl, method: "GET", path: p, identity: travIdentity });
+              last = res;
+              lastPath = p;
+              if (traversalLeak(res.body, localName)) {
+                hit = res;
+                hitPath = p;
+                break;
+              }
+            } catch (e) {
+              if (!firstErr) firstErr = e;
+            }
+          }
+          if (hit) break;
+        }
+        if (!last) throw firstErr ?? new ProbeError(`路径穿越探测请求全部失败（${routePath}）`, { code: "probe_request_failed" });
+        const chosen = hit ?? last;
+        chosen._traversalProof = { localName, matched: !!hit, attemptPath: hitPath ?? lastPath };
+        return { res: chosen, path: hitPath ?? lastPath, method: "GET" };
+      },
+      verify: (res, phase) => {
+        const localName = res._traversalProof?.localName ?? null;
+        const leaked = traversalLeak(res.body, localName);
+        const detail = leaked
+          ? `证据：响应体含 package.json 特征字段${localName ? `（项目名 ${localName} 与本机一致）` : ""}，实际请求 ${res._traversalProof?.attemptPath ?? ""}`
+          : "";
+        return verifyAttack(res, phase, detail, leaked);
+      },
+      crossProof: (res) => {
+        const proof = res._traversalProof;
+        if (!proof?.matched || !proof.localName) return null;
+        return { note: `回读内容与本机 package.json 一致（项目名 ${proof.localName}），确证服务器任意文件读取` };
+      },
+      impact: (res) =>
+        traversalLeak(res.body, res._traversalProof?.localName ?? null)
+          ? "可通过 ../ 穿越读取服务器任意文件（源码、配置、密钥等敏感信息）"
+          : null,
     });
   }
 
@@ -832,6 +935,7 @@ export async function runPhase(ctx, { phase, baseUrl }) {
     { slot: "readCandidate", prefix: "attack-read-foreign", count: planCandidates(ctx, "read").length },
     { slot: "cancelCandidate", prefix: "attack-cancel-foreign", count: planCandidates(ctx, "cancel").length },
     { slot: "unauthReadCandidate", prefix: "attack-anonymous-read", count: planCandidates(ctx, "unauthRead").length },
+    { slot: "traversalCandidate", prefix: "attack-path-traversal", count: planCandidates(ctx, "traversal").length },
   ].filter((s) => s.count > 0);
   const skipped = plannedSlots.filter(
     (s) => !cases.some((c) => c.id === s.prefix || c.id.startsWith(`${s.prefix}-`))
@@ -847,15 +951,26 @@ export async function runPhase(ctx, { phase, baseUrl }) {
 
   const evidence = [];
   for (const kase of cases) {
-    const res = await httpJson(ctx, {
-      baseUrl,
-      method: kase.method,
-      path: kase.path,
-      identity: kase.identity,
-      body: kase.body ?? null,
-    });
+    let res;
+    let sentPath = kase.path;
+    let sentMethod = kase.method;
+    if (kase.send) {
+      // 自定义发送器（如路径穿越的多 payload 尝试），返回实际命中的请求
+      const out = await kase.send(ctx, baseUrl);
+      res = out.res;
+      sentPath = out.path ?? kase.path;
+      sentMethod = out.method ?? kase.method;
+    } else {
+      res = await httpJson(ctx, {
+        baseUrl,
+        method: kase.method,
+        path: kase.path,
+        identity: kase.identity,
+        body: kase.body ?? null,
+      });
+    }
     const fresh = await fetchNewDecisions(ctx, baseUrl);
-    const decision = matchDecision(fresh, kase);
+    const decision = matchDecision(fresh, { method: sentMethod, path: sentPath, routeKey: kase.routeKey });
     const { verdict, actual } = kase.verify(res, phase);
     const impact = kase.impact ? kase.impact(res) : null;
     const cross = kase.crossProof ? kase.crossProof(res) : null;
@@ -867,10 +982,10 @@ export async function runPhase(ctx, { phase, baseUrl }) {
       sessionId: ctx.sessionId,
       phase,
       identity: kase.identity ?? "(anonymous)",
-      method: kase.method,
-      endpoint: kase.path,
+      method: sentMethod,
+      endpoint: sentPath,
       request: {
-        url: `${baseUrl.replace(/\/+$/, "")}${kase.path}`,
+        url: `${baseUrl.replace(/\/+$/, "")}${sentPath}`,
         headers: kase.identity
           ? { Authorization: `Bearer ***vault:${kase.identity}***`, "Content-Type": "application/json" }
           : { "Content-Type": "application/json" },

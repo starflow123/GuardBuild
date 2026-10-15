@@ -371,6 +371,26 @@ test("buildProbePlan: 每类候选取 top-K（去重）+ 单槽位为首元素�
   assert.deepEqual(plan.cancelCandidates, [plan.cancelCandidate]);
 });
 
+test("buildProbePlan: 路径穿越候选入独立槽位（去重 + 首元素 + resource 回退）", () => {
+  const mk = (over = {}) => ({ method: "GET", path: null, fullPath: null, routeKeys: [], ...over });
+  const plan = buildProbePlan({
+    endpoints: [],
+    candidates: [
+      mk({ fullPath: "/v1/beer-pic/", resource: "picture", kind: "traversal-suspect" }),
+      mk({ fullPath: "/v1/beer-pic/", resource: "picture", kind: "traversal-suspect" }), // 重复 method+path 应去重
+      mk({ fullPath: "/v1/files/:filename", resource: "file", kind: "traversal-suspect" }),
+    ],
+  });
+  assert.deepEqual(
+    plan.traversalCandidates.map((c) => c.fullPath),
+    ["/v1/beer-pic/", "/v1/files/:filename"],
+    "穿越候选应去重（同 method+path 仅留一份）"
+  );
+  assert.equal(plan.traversalCandidate, plan.traversalCandidates[0], "单槽位应为首元素");
+  assert.equal(plan.resource, "picture", "无其它候选时 resource 回退到穿越候选");
+  assert.equal(plan.readCandidate, null, "穿越候选不得占用 IDOR 槽位");
+});
+
 test("buildCases: 条件化构建（无 cancel/admin 端点不虚构用例）+ 任意 :param 填充 + 顺序保持", () => {
   const mkCtx = (plan) => ({ plan, targetConfig: null });
   const targets = {
@@ -531,6 +551,55 @@ test("buildCases: 多候选逐一构建攻击用例（基名 + -2 后缀，N-5�
     "vulnerable",
     "多候选的判定语义与单候选一致"
   );
+});
+
+test("buildCases: 路径穿越用例构建（query/params 形态 + 泄露证据判定）", () => {
+  const ctx = {
+    plan: {
+      resource: "resource",
+      traversalCandidates: [
+        { fullPath: "/v1/beer-pic/", traversal: { source: "query", param: "picture", sink: "readFile" } },
+        { fullPath: "/v1/files/:filename", traversal: { source: "params", param: "filename", sink: "readFile" } },
+      ],
+    },
+    targetConfig: null,
+  };
+  const targets = {
+    attacker: { name: "alice", user: { id: 1 } },
+    victim: { name: "bob", user: { id: 2 } },
+    readTarget: null,
+    attackCancelTarget: null,
+    adminCancelTarget: null,
+    ownReadTarget: null,
+    ownCancelTarget: null,
+    ownNotCancellable: null,
+  };
+  const cases = buildCases(ctx, targets);
+  assert.deepEqual(
+    cases.map((c) => c.id),
+    ["attack-path-traversal", "attack-path-traversal-2"],
+    "逐候选构建穿越用例（基名 + -2 后缀），且不虚构其它类别"
+  );
+  const q = cases[0];
+  assert.equal(q.path, "/v1/beer-pic/?picture=../package.json", "query 形态应追加 payload 参数");
+  assert.equal(q.identity, "bob", "穿越用例携带 victim 身份（兼容需登录端点）");
+  assert.equal(typeof q.send, "function", "穿越用例自带多 payload 发送器");
+  const leakedBody = '{"name":"vuln-node-js","version":"1.0.0","dependencies":{}}';
+  const hitRes = {
+    status: 200,
+    body: leakedBody,
+    _traversalProof: { localName: "vuln-node-js", matched: true, attemptPath: "/v1/beer-pic/?picture=../package.json" },
+  };
+  assert.equal(q.verify(hitRes, "pre").verdict, "vulnerable", "回读到 package.json 特征应判定可利用");
+  assert.ok(q.crossProof(hitRes), "本机项目名一致时应给出内容交叉证明");
+  const missRes = {
+    status: 200,
+    body: "error",
+    _traversalProof: { localName: "vuln-node-js", matched: false, attemptPath: "/v1/beer-pic/?picture=../../../package.json" },
+  };
+  assert.equal(q.verify(missRes, "pre").verdict, "inconclusive", "2xx 但无泄露证据不得判定可利用");
+  assert.equal(q.crossProof(missRes), null, "未命中时不应给出交叉证明");
+  assert.equal(cases[1].path, "/v1/files/../package.json", "params 形态应以 payload 替换路径段");
 });
 
 test("buildCases: 垂直越权（victim 身份访问 admin 列表）与匿名读取用例的判定语义", () => {
@@ -1031,6 +1100,45 @@ test("analyzeProject: 无鉴权端点识别为 no-auth-suspect（登录路径/�
   assert.ok(
     !a.candidates.some((c) => (c.fullPath ?? c.path ?? "").includes("/settings/notice")),
     "无路径参数的固定键查询（公共配置读取）不应成为越权候选"
+  );
+});
+
+test("analyzeProject: 路径穿越线索识别（fs 读取 + req 输入合流，固定路径不误报）", async () => {
+  const R = "\\\\?\\D:\\p";
+  const content = [
+    'const app = require("express")();',
+    'const fs = require("fs");',
+    'const path = require("path");',
+    'app.get("/v1/beer-pic/", (req, res) => {',
+    "  var filename = req.query.picture,",
+    "  filePath = `../../../uploads/${filename}`;",
+    "  fs.readFile(path.join(__dirname, filePath), function (err, data) {",
+    '    if (err) return res.send("error");',
+    "    res.send(data);",
+    "  });",
+    "});",
+    'app.get("/api/avatar", (req, res) => {',
+    "  fs.readFile(path.join(__dirname, 'public', 'avatar.jpg'), (err, data) => res.send(data));",
+    "});",
+  ].join("\n");
+  const a = await analyzeProject({
+    projectRoot: R,
+    tokens: { project: "tok" },
+    rpc: {
+      request: async (method) => {
+        if (method === "fs.list") return { entries: [{ path: `${R}\\src\\app.js`, kind: "file", size: 800 }] };
+        if (method === "fs.read") return { content, size: 800, redacted: false, redactions: [] };
+        throw new Error(`不应调用 ${method}`);
+      },
+    },
+  });
+  const trav = a.candidates.find((c) => c.kind === "traversal-suspect");
+  assert.ok(trav, "文件读取 sink 的相邻语句链含请求输入时应入穿越候选");
+  assert.equal(trav.fullPath, "/v1/beer-pic/");
+  assert.deepEqual(trav.traversal, { source: "query", param: "picture", sink: "readFile" });
+  assert.ok(
+    !a.candidates.some((c) => (c.fullPath ?? c.path ?? "").includes("/api/avatar")),
+    "固定路径的文件读取不应误报为穿越候选"
   );
 });
 

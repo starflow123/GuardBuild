@@ -437,14 +437,16 @@ async function stageAnalyze(ctx) {
     reason:
       c.kind === "no-auth-suspect"
         ? "按对象 ID 取资源且未见认证守卫（无鉴权静态线索）"
-        : "按对象 ID 取资源但未见归属校验（IDOR 静态线索）",
+        : c.kind === "traversal-suspect"
+          ? "文件读取包含请求可控路径片段（路径穿越静态线索）"
+          : "按对象 ID 取资源但未见归属校验（IDOR 静态线索）",
   }));
   emit(ctx, {
     kind: "analyze",
     severity: cands.length > 0 ? SEVERITY.WARN : SEVERITY.INFO,
     message:
       cands.length > 0
-        ? `静态分析完成：扫描 ${ctx.analysis.fileCount} 个文件，发现 ${cands.length} 个对象级越权候选`
+        ? `静态分析完成：扫描 ${ctx.analysis.fileCount} 个文件，发现 ${cands.length} 个安全候选端点`
         : `静态分析完成：扫描 ${ctx.analysis.fileCount} 个文件，未发现对象级越权线索`,
     data: { fileCount: ctx.analysis.fileCount, candidates: ctx.view.findings },
   });
@@ -455,15 +457,20 @@ async function stageAnalyze(ctx) {
     }${d.readFailures > 0 ? `，读取失败 ${d.readFailures} 个` : ""}）`;
     throw new SessionError(`${scanned}，未发现对象级资源接口线索`, {
       code: "no_candidates",
-      hint: `${scanned}。请确认项目包含「按对象 ID 取资源」的 HTTP 接口（如 /api/orders/:id），或调整 guardbuild.json 的 scopes 后重试`,
+      hint: `${scanned}。请确认项目包含「按对象 ID 取资源」的 HTTP 接口（如 /api/orders/:id）或「文件读取含请求可控路径」的接口（路径穿越线索），或调整 guardbuild.json 的 scopes 后重试`,
     });
   }
 
   ctx.plan = buildProbePlan(ctx.analysis, { loginPathOverride: ctx.loginConfig?.path ?? null });
-  if (!ctx.plan.readCandidate && !ctx.plan.cancelCandidate && !ctx.plan.unauthReadCandidate) {
+  if (
+    !ctx.plan.readCandidate &&
+    !ctx.plan.cancelCandidate &&
+    !ctx.plan.unauthReadCandidate &&
+    !ctx.plan.traversalCandidate
+  ) {
     throw new SessionError("无法构建探测计划：候选端点中缺少可探测的单体资源接口", {
       code: "plan_incomplete",
-      hint: `已发现 ${cands.length} 个候选端点，但均不含「按 ID 取单体资源」的路径（如 GET /api/orders/:id）。请确认项目中存在带路径参数的资源接口，或在 guardbuild.json 中补充契约`,
+      hint: `已发现 ${cands.length} 个候选端点，但均不含「按 ID 取单体资源」的路径（如 GET /api/orders/:id），或文件读取线索。请确认项目中存在带路径参数的资源接口，或在 guardbuild.json 中补充契约`,
     });
   }
   ctx.view.plan = {
@@ -472,6 +479,7 @@ async function stageAnalyze(ctx) {
     readPath: ctx.plan.readCandidate?.fullPath ?? ctx.plan.readCandidate?.path ?? null,
     cancelPath: ctx.plan.cancelCandidate?.fullPath ?? ctx.plan.cancelCandidate?.path ?? null,
     unauthReadPath: ctx.plan.unauthReadCandidate?.fullPath ?? ctx.plan.unauthReadCandidate?.path ?? null,
+    traversalPath: ctx.plan.traversalCandidate?.fullPath ?? ctx.plan.traversalCandidate?.path ?? null,
     listPath: ctx.plan.listEndpoint?.path ?? null,
   };
   pushView(ctx);

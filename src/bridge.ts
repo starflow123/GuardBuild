@@ -91,7 +91,15 @@ export interface View {
   startedAt?: number;
   updatedAt?: number;
   findings?: FindingItem[];
-  plan?: { loginPath: string; resource: string; readPath: string | null; cancelPath: string | null; listPath: string | null };
+  plan?: {
+    loginPath: string;
+    resource: string;
+    readPath: string | null;
+    cancelPath: string | null;
+    unauthReadPath?: string | null;
+    traversalPath?: string | null;
+    listPath: string | null;
+  };
   evidence?: EvidenceItem[];
   phases?: Record<string, unknown>;
   targets?: Record<string, { pid: number; port: number; url: string; role?: string }>;

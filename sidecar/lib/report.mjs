@@ -33,7 +33,7 @@ function headline(outcome, patchStatus) {
         ? "发现可利用的对象级越权（IDOR）漏洞；修复补丁未通过双重验收，需人工审查证据"
         : "发现可利用的对象级越权（IDOR）漏洞，已生成双重验收通过的修复补丁（gate 未写回工作区）";
     case "no_candidates":
-      return "静态分析未发现对象级越权候选端点";
+      return "静态分析未发现可探测的安全候选端点（对象级越权 / 路径穿越线索）";
     case "vulnerable_unfixed":
       return "发现可复现的越权漏洞证据；但候选中没有可自动修复的对象级越权端点，未生成修复补丁";
     case "not_reproducible":
@@ -61,7 +61,7 @@ function suggestions(r) {
     lines.push("- 当前策略仅覆盖对象级越权（IDOR）场景类；如需其它漏洞类别，请扩展策略包与契约。");
   } else if (outcome === "vulnerable_unfixed") {
     lines.push("- 漏洞证据已建立（修复前攻击成功），但静态候选中没有可自动修复的对象级越权端点（自动修复仅覆盖带认证的 IDOR 场景）。");
-    lines.push("- 请对照 report.json 中各攻击用例（如纵向越权、无鉴权读取）定位端点并人工加固，再重跑 GuardBuild gate 验证。");
+    lines.push("- 请对照 report.json 中各攻击用例（如纵向越权、无鉴权读取、路径穿越）定位端点并人工加固，再重跑 GuardBuild gate 验证。");
   } else if (outcome === "not_reproducible") {
     lines.push("- 攻击在修复前即不可复现，未建立漏洞基线；请核对 guardbuild.json 的身份契约与目标的资源发现接口。");
   } else if (outcome === "failed") {
@@ -116,7 +116,7 @@ function renderMarkdown(r) {
   );
 
   parts.push(`## 摘要\n`);
-  const summaryLines = [`- 静态发现：${r.summary.findingCount} 个对象级越权候选`];
+  const summaryLines = [`- 静态发现：${r.summary.findingCount} 个安全候选端点`];
   summaryLines.push(`- 修复前证据（pre）：${pre.length} 条，其中 vulnerable ${preVuln} 条`);
   const preGrades = r.summary.phases?.pre?.grades;
   if (preGrades) {

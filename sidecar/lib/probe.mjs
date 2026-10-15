@@ -283,13 +283,55 @@ export async function loginAll(ctx, baseUrl) {
   });
 }
 
-/** 通过各身份的列表接口发现资源归属（owner → 对象列表） */
+const ANON_PROBE_MAX_ID = 10;
+const ANON_PROBE_MAX_ITEMS = 3;
+
+/** 无列表接口时的回退：用匿名 ID 探测收集可见对象（打匿名越权本就不需要账号发现） */
+async function discoverViaAnonymousProbe(ctx, baseUrl, path) {
+  const anonymousItems = [];
+  for (let id = 1; id <= ANON_PROBE_MAX_ID && anonymousItems.length < ANON_PROBE_MAX_ITEMS; id += 1) {
+    const res = await httpJson(ctx, { baseUrl, method: "GET", path: fillParams(path, id), identity: null });
+    const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
+    if (o && String(o.id) === String(id)) anonymousItems.push(o);
+  }
+  ctx.emit({
+    kind: "discovery",
+    severity: anonymousItems.length > 0 ? SEVERITY.INFO : SEVERITY.WARN,
+    message:
+      anonymousItems.length > 0
+        ? `资源发现（匿名探测回退）：无按归属过滤的列表接口，在 ${path} 匿名探测到 ${anonymousItems.length} 个公开可见对象`
+        : `资源发现（匿名探测回退）：无列表接口，且 ${path} 匿名 ID 探测未找到可见对象`,
+    data: { mode: "anonymous-probe", path, ids: anonymousItems.map((o) => o.id) },
+  });
+  return anonymousItems;
+}
+
+/**
+ * 发现资源归属。优先各身份的按归属列表接口；
+ * 无列表接口时可回退匿名 ID 探测（仅依赖无鉴权单体接口，服务匿名用例）；
+ * 两者皆无且计划不依赖对象归属时返回空结果（如仅路径穿越用例）。
+ * 返回 { byUser, anonymousItems }。
+ */
 async function discoverResources(ctx, baseUrl, loggedIn) {
   const listPath = ctx.plan.listEndpoint?.path;
   if (!listPath) {
+    const unauthPath = ctx.plan.unauthReadCandidate?.fullPath ?? ctx.plan.unauthReadCandidate?.path ?? null;
+    if (unauthPath) {
+      const anonymousItems = await discoverViaAnonymousProbe(ctx, baseUrl, unauthPath);
+      return { byUser: {}, anonymousItems };
+    }
+    if (ctx.plan.traversalCandidate) {
+      ctx.emit({
+        kind: "discovery",
+        severity: SEVERITY.INFO,
+        message: "无需资源归属发现：探测计划中的用例不依赖具体对象 ID",
+        data: { mode: "not-required" },
+      });
+      return { byUser: {}, anonymousItems: [] };
+    }
     throw new ProbeError("静态分析未能定位列表接口，无法发现资源归属", {
       code: "no_list_endpoint",
-      hint: "当前策略要求目标项目存在按归属过滤的列表接口（如 GET /api/orders）",
+      hint: "当前策略要求目标项目存在按归属过滤的列表接口（如 GET /api/orders），或至少一个无鉴权单体资源接口（如 GET /api/users/:id，用于匿名探测回退）",
     });
   }
   const byUser = {};
@@ -305,34 +347,32 @@ async function discoverResources(ctx, baseUrl, loggedIn) {
       data: { identity: ident.name, count: items.length, ids: items.map((o) => o.id) },
     });
   }
-  return byUser;
+  return { byUser, anonymousItems: [] };
 }
 
-/** 从发现结果中挑选攻击/业务用例所需的具体对象（loggedIn 携带登录响应中的 user 对象） */
-function pickTargets(byUser, loggedIn) {
+/**
+ * 从发现结果中挑选攻击/业务用例所需的具体对象（loggedIn 携带登录响应中的 user 对象）。
+ * 宽容化：缺少身份/对象时返回 null 槽位，由 buildCases 按槽位条件决定哪些用例可构建。
+ */
+function pickTargets(byUser, loggedIn, anonymousItems = []) {
   const users = loggedIn.filter((i) => i.role !== "admin");
-  if (users.length < 2) {
-    throw new ProbeError("探测计划需要至少两个普通用户身份", { code: "need_two_users" });
-  }
-  const attacker = users[0];
-  const victim = users[1];
-  const attackerOrders = byUser[attacker.name] ?? [];
-  const victimOrders = byUser[victim.name] ?? [];
-  if (victimOrders.length === 0 || attackerOrders.length === 0) {
-    throw new ProbeError("资源发现结果不足：至少需要双方各自可见的对象", { code: "insufficient_resources" });
-  }
-  const victimPaid = victimOrders.filter((o) => o.status === "paid");
-  const attackerPaid = attackerOrders.filter((o) => o.status === "paid");
-  const attackerNotCancellable = attackerOrders.find((o) => o.status !== "paid") ?? null;
+  const attacker = users[0] ?? null;
+  const victim = users[1] ?? null; // 归属类用例（越权读/操作）需要第二个普通用户，缺则跳过该槽位
+  const admin = loggedIn.find((i) => i.role === "admin") ?? null;
+  const attackerItems = attacker ? byUser[attacker.name] ?? [] : [];
+  const victimItems = victim ? byUser[victim.name] ?? [] : [];
+  const victimPaid = victimItems.filter((o) => o.status === "paid");
+  const attackerPaid = attackerItems.filter((o) => o.status === "paid");
   return {
     attacker,
     victim,
-    readTarget: victimOrders[0],
-    attackCancelTarget: victimPaid[0] ?? victimOrders[1] ?? victimOrders[0],
-    adminCancelTarget: victimPaid[1] ?? victimPaid[0] ?? victimOrders[0],
-    ownReadTarget: attackerOrders[0],
+    admin,
+    readTarget: victimItems[0] ?? anonymousItems[0] ?? null,
+    attackCancelTarget: victimPaid[0] ?? victimItems[1] ?? victimItems[0] ?? null,
+    adminCancelTarget: victimPaid[1] ?? victimPaid[0] ?? victimItems[0] ?? null,
+    ownReadTarget: attackerItems[0] ?? null,
     ownCancelTarget: attackerPaid[1] ?? attackerPaid[0] ?? null,
-    ownNotCancellable: attackerNotCancellable,
+    ownNotCancellable: attackerItems.find((o) => o.status !== "paid") ?? null,
   };
 }
 
@@ -344,10 +384,21 @@ function fillParams(path, id) {
 const okStatus = (s) => s >= 200 && s < 300;
 
 /** 攻击用例判定：修复前 = 漏洞可利用；修复后 = 攻击被阻断 */
-function verifyAttack(res, phase, detail) {
+/**
+ * 攻击用例判定。leaked 为「响应中确含越权成功证据」的判定结果：
+ * 2xx 但响应无证据（如 200+{"error":"Not Admin"} 语义拒绝）不得当作放行，
+ * 否则会产生假复现（修复前误报漏洞）。
+ */
+function verifyAttack(res, phase, detail, leaked = true) {
   if (phase === "pre") {
-    if (okStatus(res.status)) {
+    if (okStatus(res.status) && leaked) {
       return { verdict: VERDICT.VULNERABLE, actual: `HTTP ${res.status}，越权请求被放行。${detail ?? ""}` };
+    }
+    if (okStatus(res.status)) {
+      return {
+        verdict: VERDICT.INCONCLUSIVE,
+        actual: `HTTP ${res.status}，但响应未包含越权成功的证据（可能为语义拒绝，如 200+错误体）`,
+      };
     }
     return {
       verdict: VERDICT.INCONCLUSIVE,
@@ -357,8 +408,14 @@ function verifyAttack(res, phase, detail) {
   if (DENIED_STATUS.has(res.status)) {
     return { verdict: VERDICT.BLOCKED, actual: `HTTP ${res.status}，越权请求被拒绝。${detail ?? ""}` };
   }
-  if (okStatus(res.status)) {
+  if (okStatus(res.status) && leaked) {
     return { verdict: VERDICT.REGRESSED, actual: `HTTP ${res.status}，修复后攻击仍可成功，补丁无效。${detail ?? ""}` };
+  }
+  if (okStatus(res.status)) {
+    return {
+      verdict: VERDICT.INCONCLUSIVE,
+      actual: `HTTP ${res.status}，但响应未包含越权成功的证据（可能为语义拒绝），结果无法判定`,
+    };
   }
   return { verdict: VERDICT.INCONCLUSIVE, actual: `HTTP ${res.status}，结果无法判定` };
 }
@@ -388,13 +445,13 @@ export function buildCases(ctx, targets) {
   const listPath = ctx.plan.listEndpoint?.path ?? null;
   const readKey = ctx.plan.readCandidate?.routeKeys?.[0] ?? "orders.get";
   const cancelKey = ctx.plan.cancelCandidate?.routeKeys?.[0] ?? "orders.cancel";
-  const { attacker, victim } = targets;
+  const { attacker, victim, admin } = targets;
   const label = resourceLabel(ctx);
 
   const cases = [];
 
-  // —— 攻击用例（仅在计划中存在对应端点时构建，不虚构回退路径）——
-  if (readPath) {
+  // —— 攻击用例（仅在计划中存在对应端点且身份/目标齐备时构建，不虚构回退路径）——
+  if (readPath && targets.readTarget && attacker && victim) {
     const readTarget = targets.readTarget;
     cases.push({
       id: "attack-read-foreign",
@@ -407,11 +464,11 @@ export function buildCases(ctx, targets) {
       expect: `越权读取他人${label}应被拒绝（401/403/404）`,
       verify: (res, phase) => {
         const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
-        const leaked = o && o.id === readTarget.id;
+        const leaked = o && String(o.id) === String(readTarget.id);
         const detail = leaked
           ? `证据：返回${label} #${o.id}（归属 ${ownerOf(o)}，金额 ${o.amount}，状态 ${o.status}）`
           : "";
-        return verifyAttack(res, phase, detail);
+        return verifyAttack(res, phase, detail, leaked);
       },
       crossProof: (res) => {
         const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
@@ -426,7 +483,7 @@ export function buildCases(ctx, targets) {
     });
   }
 
-  if (cancelPath) {
+  if (cancelPath && targets.attackCancelTarget && attacker && victim) {
     const cancelTarget = targets.attackCancelTarget;
     cases.push({
       id: "attack-cancel-foreign",
@@ -439,9 +496,10 @@ export function buildCases(ctx, targets) {
       expect: `越权取消他人${label}应被拒绝（401/403/404）`,
       verify: (res, phase) => {
         const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
-        const changed = o && o.status === "cancelled" && ownerOf(o) === victim.user?.id;
+        const changed =
+          o && o.status === "cancelled" && (!victim.user?.id || ownerOf(o) === victim.user.id);
         const detail = changed ? `证据：${label} #${o.id}（归属 ${ownerOf(o)}）状态已被改为 cancelled` : "";
-        return verifyAttack(res, phase, detail);
+        return verifyAttack(res, phase, detail, changed);
       },
       crossProof: (res) => {
         const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
@@ -458,7 +516,7 @@ export function buildCases(ctx, targets) {
     });
   }
 
-  if (adminListPath) {
+  if (adminListPath && victim) {
     cases.push({
       id: "attack-vertical-escalation",
       category: CASE_CATEGORY.ATTACK,
@@ -474,7 +532,7 @@ export function buildCases(ctx, targets) {
         const detail = leaked
           ? `证据：返回 ${arr.length} 条${label}（归属 ${[...new Set(arr.map((o) => ownerOf(o)))].join(",")}），纵向越权可览全局数据`
           : "";
-        return verifyAttack(res, phase, detail);
+        return verifyAttack(res, phase, detail, leaked);
       },
       crossProof: (res) => {
         const arr = extractListItems(res.json, ctx.targetConfig?.responses?.list ?? null);
@@ -490,8 +548,8 @@ export function buildCases(ctx, targets) {
     });
   }
 
-  if (unauthReadPath) {
-    const anonTarget = targets.readTarget;
+  const anonTarget = targets.readTarget;
+  if (unauthReadPath && anonTarget) {
     cases.push({
       id: "attack-anonymous-read",
       category: CASE_CATEGORY.ATTACK,
@@ -503,11 +561,11 @@ export function buildCases(ctx, targets) {
       expect: `未认证读取${label}应被拒绝（401/403/404）`,
       verify: (res, phase) => {
         const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
-        const leaked = o && o.id === anonTarget.id;
+        const leaked = o && String(o.id) === String(anonTarget.id);
         const detail = leaked
           ? `证据：匿名请求即返回${label} #${o.id}（归属 ${ownerOf(o)}），无需任何认证`
           : "";
-        return verifyAttack(res, phase, detail);
+        return verifyAttack(res, phase, detail, leaked);
       },
       crossProof: (res) => {
         const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
@@ -523,7 +581,7 @@ export function buildCases(ctx, targets) {
 
   // —— 业务用例（回归防线）——
   const own = targets.ownReadTarget;
-  if (readPath) {
+  if (readPath && own && attacker) {
     cases.push({
       id: "business-read-own",
       category: CASE_CATEGORY.BUSINESS,
@@ -544,7 +602,7 @@ export function buildCases(ctx, targets) {
     });
   }
 
-  if (listPath) {
+  if (listPath && attacker) {
     cases.push({
       id: "business-list-own",
       category: CASE_CATEGORY.BUSINESS,
@@ -565,7 +623,7 @@ export function buildCases(ctx, targets) {
     });
   }
 
-  if (cancelPath && targets.ownCancelTarget) {
+  if (cancelPath && targets.ownCancelTarget && attacker) {
     const c = targets.ownCancelTarget;
     cases.push({
       id: "business-cancel-own",
@@ -586,7 +644,7 @@ export function buildCases(ctx, targets) {
     });
   }
 
-  if (cancelPath && targets.ownNotCancellable) {
+  if (cancelPath && targets.ownNotCancellable && attacker) {
     const s = targets.ownNotCancellable;
     cases.push({
       id: "business-shipped-guard",
@@ -605,12 +663,12 @@ export function buildCases(ctx, targets) {
     });
   }
 
-  if (adminListPath) {
+  if (adminListPath && admin) {
     cases.push({
       id: "business-admin-list",
       category: CASE_CATEGORY.BUSINESS,
       name: `管理员查看全部${label}`,
-      identity: "admin",
+      identity: admin.name,
       method: "GET",
       path: adminListPath,
       routeKey: ctx.plan.adminListEndpoint?.routeKey ?? "admin.orders.list",
@@ -619,20 +677,21 @@ export function buildCases(ctx, targets) {
         verifyBusiness(res, 200, () => {
           const arr = extractListItems(res.json, ctx.targetConfig?.responses?.list ?? null);
           if (!arr) return `FAIL:响应中未找到${label}列表`;
-          const owners = new Set(arr.map((o) => ownerOf(o)));
+          // 归属读取：列表项无归属字段时（如资源本身即用户），以自身 id 视作独立归属
+          const owners = new Set(arr.map((o) => ownerOf(o) ?? o.id));
           if (owners.size < 2) return `FAIL:仅见单一归属（${[...owners].join(",")}）`;
           return `可见 ${arr.length} 条，覆盖 ${owners.size} 个归属`;
         }),
     });
   }
 
-  if (adminCancelPath) {
+  if (adminCancelPath && admin && targets.adminCancelTarget) {
     const adminTarget = targets.adminCancelTarget;
     cases.push({
       id: "business-admin-cancel",
       category: CASE_CATEGORY.BUSINESS,
       name: `管理员代取消 ${victim.name} 的${label} #${adminTarget.id}`,
-      identity: "admin",
+      identity: admin.name,
       method: "POST",
       path: fillParams(adminCancelPath, adminTarget.id),
       routeKey: ctx.plan.adminCancelEndpoint?.routeKey ?? "admin.orders.cancel",
@@ -647,7 +706,7 @@ export function buildCases(ctx, targets) {
     });
   }
 
-  if (adminListPath) {
+  if (adminListPath && victim) {
     cases.push({
       id: "business-nonadmin-denied",
       category: CASE_CATEGORY.BUSINESS,
@@ -657,11 +716,26 @@ export function buildCases(ctx, targets) {
       path: adminListPath,
       routeKey: ctx.plan.adminListEndpoint?.routeKey ?? "admin.orders.list",
       expect: "普通用户访问管理端应被拒绝（403），角色校验保持有效",
-      verify: (res) => verifyBusiness(res, 403, () => "角色校验（role:admin）生效"),
+      verify: (res) => {
+        if (res.status === 403 || res.status === 401) {
+          return { verdict: VERDICT.PASSED, actual: `HTTP ${res.status}，角色校验（role:admin）生效` };
+        }
+        const arr = extractListItems(res.json, ctx.targetConfig?.responses?.list ?? null);
+        if (okStatus(res.status) && arr === null) {
+          return {
+            verdict: VERDICT.PASSED,
+            actual: `HTTP ${res.status} + 错误体（语义拒绝），管理端数据未泄露给普通用户`,
+          };
+        }
+        return {
+          verdict: VERDICT.REGRESSED,
+          actual: `HTTP ${res.status}（预期 403），管理端数据可能被普通用户访问`,
+        };
+      },
     });
   }
 
-  if (readPath) {
+  if (readPath && own) {
     cases.push({
       id: "business-unauth-401",
       category: CASE_CATEGORY.BUSINESS,
@@ -697,9 +771,32 @@ export async function runPhase(ctx, { phase, baseUrl }) {
   });
 
   const loggedIn = await loginAll(ctx, baseUrl);
-  const byUser = await discoverResources(ctx, baseUrl, loggedIn);
-  const targets = pickTargets(byUser, loggedIn);
+  const { byUser, anonymousItems } = await discoverResources(ctx, baseUrl, loggedIn);
+  const targets = pickTargets(byUser, loggedIn, anonymousItems);
   const cases = buildCases(ctx, targets);
+
+  const attackSlots = cases.filter((c) => c.category === CASE_CATEGORY.ATTACK);
+  if (attackSlots.length === 0) {
+    throw new ProbeError("未能构建任何攻击用例（身份或资源发现不足）", {
+      code: "no_attack_cases",
+      hint: "攻击用例需要：至少一个普通用户身份 + 可填充的对象资源（来自列表接口或匿名探测），请检查 guardbuild.json 的身份配置与目标项目的资源可发现性",
+    });
+  }
+  const plannedSlots = [
+    ctx.plan.readCandidate && { slot: "readCandidate", caseId: "attack-read-foreign" },
+    ctx.plan.cancelCandidate && { slot: "cancelCandidate", caseId: "attack-cancel-foreign" },
+    ctx.plan.unauthReadCandidate && { slot: "unauthReadCandidate", caseId: "attack-anonymous-read" },
+  ].filter(Boolean);
+  const builtIds = new Set(cases.map((c) => c.id));
+  const skipped = plannedSlots.filter((s) => !builtIds.has(s.caseId));
+  if (skipped.length > 0) {
+    ctx.emit({
+      kind: "discovery",
+      severity: SEVERITY.WARN,
+      message: `计划中有 ${skipped.length} 个攻击用例因身份/资源不足被跳过：${skipped.map((s) => s.slot).join("、")}`,
+      data: { skipped },
+    });
+  }
 
   const evidence = [];
   for (const kase of cases) {
@@ -799,10 +896,10 @@ export async function runPhase(ctx, { phase, baseUrl }) {
     businessRegressed: businessRecords.filter((e) => e.verdict === VERDICT.REGRESSED).length,
     businessTotal: businessRecords.length,
     targets: {
-      attacker: targets.attacker.name,
-      victim: targets.victim.name,
-      readTarget: targets.readTarget.id,
-      cancelTarget: targets.attackCancelTarget.id,
+      attacker: targets.attacker?.name ?? null,
+      victim: targets.victim?.name ?? null,
+      readTarget: targets.readTarget?.id ?? null,
+      cancelTarget: targets.attackCancelTarget?.id ?? null,
     },
   };
 

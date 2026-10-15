@@ -383,7 +383,7 @@ test("buildCases: 条件化构建（无 cancel/admin 端点不虚构用例）+ �
       adminListEndpoint: { path: "/api/admin/orders", routeKey: "admin.orders.list" },
       adminCancelEndpoint: { path: "/api/admin/orders/:id/cancel", routeKey: "admin.orders.cancel" },
     }),
-    { ...targets, ownCancelTarget: { id: 15 }, ownNotCancellable: { id: 16 } }
+    { ...targets, admin: { name: "admin", role: "admin", user: { id: 3 } }, ownCancelTarget: { id: 15 }, ownNotCancellable: { id: 16 } }
   );
   assert.deepEqual(
     full.map((c) => c.id),
@@ -402,6 +402,60 @@ test("buildCases: 条件化构建（无 cancel/admin 端点不虚构用例）+ �
     ],
     "端点齐全时用例顺序与既有 e2e 基线一致"
   );
+});
+
+test("buildCases: 身份/目标缺失时跳过对应槽位（不虚构、不崩溃）", () => {
+  const ctx = {
+    plan: {
+      resource: "order",
+      readCandidate: { path: "/api/orders/:id", fullPath: "/api/orders/:id", routeKeys: ["orders.get"] },
+      cancelCandidate: {
+        path: "/api/orders/:id/cancel",
+        fullPath: "/api/orders/:id/cancel",
+        routeKeys: ["orders.cancel"],
+      },
+      unauthReadCandidate: { fullPath: "/api/feeds/:id", routeKeys: ["feeds.get"] },
+      listEndpoint: { path: "/api/orders", routeKey: "orders.list" },
+      adminListEndpoint: { path: "/api/admin/orders", routeKey: "admin.orders.list" },
+      adminCancelEndpoint: { path: "/api/admin/orders/:id/cancel", routeKey: "admin.orders.cancel" },
+    },
+    targetConfig: null,
+  };
+  // 仅一名普通用户：归属类攻击/管理员用例应跳过，本人业务用例保留
+  const onlyAttacker = buildCases(ctx, {
+    attacker: { name: "alice", user: { id: 1 } },
+    victim: null,
+    admin: null,
+    readTarget: null,
+    attackCancelTarget: null,
+    adminCancelTarget: null,
+    ownReadTarget: { id: 14 },
+    ownCancelTarget: null,
+    ownNotCancellable: null,
+  });
+  assert.deepEqual(
+    onlyAttacker.map((c) => c.id),
+    ["business-read-own", "business-list-own", "business-unauth-401"],
+    "缺 victim/admin 时不应生成越权攻击与管理员用例"
+  );
+  // 匿名回退路径：readTarget 来自匿名探测（无归属），仅匿名攻击用例可构建
+  const anonOnly = buildCases(ctx, {
+    attacker: { name: "alice", user: { id: 1 } },
+    victim: null,
+    admin: null,
+    readTarget: { id: 11 },
+    attackCancelTarget: null,
+    adminCancelTarget: null,
+    ownReadTarget: null,
+    ownCancelTarget: null,
+    ownNotCancellable: null,
+  });
+  assert.deepEqual(
+    anonOnly.map((c) => c.id),
+    ["attack-anonymous-read", "business-list-own"],
+    "匿名探测目标只服务匿名越权用例（越权读需 victim）"
+  );
+  assert.equal(anonOnly[0].path, "/api/feeds/11", "匿名用例 :param 应填充匿名探测到的对象 ID");
 });
 
 test("buildCases: 垂直越权（victim 身份访问 admin 列表）与匿名读取用例的判定语义", () => {
@@ -450,6 +504,97 @@ test("buildCases: 垂直越权（victim 身份访问 admin 列表）与匿名读
   );
   assert.equal(anon.verify({ status: 401, json: {} }, "post").verdict, "blocked", "修复后 401 应判定攻击被阻断");
   assert.ok(anon.crossProof({ status: 200, json: { id: 11, userId: 2 } }), "匿名响应归属应与请求目标一致");
+});
+
+test("N-7: 攻击用例 2xx 但无泄露证据时不得判定可利用（语义拒绝防误报）", () => {
+  const ctx = {
+    plan: {
+      resource: "order",
+      adminListEndpoint: { path: "/api/admin/orders", routeKey: "admin.orders.list" },
+      unauthReadCandidate: { fullPath: "/api/feeds/:id", routeKeys: ["feeds.get"] },
+    },
+    targetConfig: null,
+  };
+  const targets = {
+    attacker: { name: "alice", user: { id: 1 } },
+    victim: { name: "bob", user: { id: 2 } },
+    readTarget: { id: 11 },
+    attackCancelTarget: null,
+    adminCancelTarget: null,
+    ownReadTarget: null,
+    ownCancelTarget: null,
+    ownNotCancellable: null,
+  };
+  const cases = buildCases(ctx, targets);
+
+  const vert = cases.find((c) => c.id === "attack-vertical-escalation");
+  const denied = vert.verify({ status: 200, json: { error: "Not Admin" } }, "pre");
+  assert.equal(denied.verdict, "inconclusive", "200+错误体属语义拒绝，不得当作漏洞复现");
+  assert.match(denied.actual, /语义拒绝/);
+  assert.equal(
+    vert.verify({ status: 200, json: { error: "Not Admin" } }, "post").verdict,
+    "inconclusive",
+    "修复后 200+错误体同样不得误判为回归失败"
+  );
+
+  const anon = cases.find((c) => c.id === "attack-anonymous-read");
+  assert.equal(
+    anon.verify({ status: 200, json: { error: "Not Found" } }, "pre").verdict,
+    "inconclusive",
+    "匿名端点 200+错误体按语义拒绝处理"
+  );
+  assert.equal(
+    anon.verify({ status: 200, json: { id: 11, userId: 2 } }, "pre").verdict,
+    "vulnerable",
+    "响应含目标对象时仍判定可利用（正当路径不受影响）"
+  );
+});
+
+test("N-7b: 管理端业务用例容忍语义拒绝 + user 资源列表以自身 id 为归属", () => {
+  const ctx = {
+    plan: {
+      resource: "user",
+      adminListEndpoint: { path: "/v1/admin/users", routeKey: "admin.users.list" },
+    },
+    targetConfig: null,
+  };
+  const targets = {
+    attacker: { name: "alice", user: { id: 1 } },
+    victim: { name: "bob", user: { id: 2 } },
+    admin: { name: "amit", role: "admin", user: { id: 3 } },
+    readTarget: null,
+    attackCancelTarget: null,
+    adminCancelTarget: null,
+    ownReadTarget: null,
+    ownCancelTarget: null,
+    ownNotCancellable: null,
+  };
+  const cases = buildCases(ctx, targets);
+
+  const denied = cases.find((c) => c.id === "business-nonadmin-denied");
+  assert.equal(
+    denied.verify({ status: 200, json: { error: "Not Admin, try again" } }).verdict,
+    "passed",
+    "200+错误体属语义拒绝，普通用户未拿到管理端数据"
+  );
+  assert.equal(
+    denied.verify({ status: 200, json: [{ id: 1, email: "x@y.z" }] }).verdict,
+    "regressed",
+    "真的拿到列表仍应判业务回归"
+  );
+  assert.equal(denied.verify({ status: 403, json: {} }).verdict, "passed");
+
+  const adminList = cases.find((c) => c.id === "business-admin-list");
+  assert.equal(
+    adminList.verify({ status: 200, json: [{ id: 1 }, { id: 2 }] }).verdict,
+    "passed",
+    "user 资源列表无归属字段时以自身 id 计归属，多行即多归属"
+  );
+  assert.equal(
+    adminList.verify({ status: 200, json: [{ id: 1 }] }).verdict,
+    "regressed",
+    "仅一行时仍应判覆盖不足"
+  );
 });
 
 test("buildCases: 归属字段兼容 snake_case（user_id）与 data 包裹响应", () => {

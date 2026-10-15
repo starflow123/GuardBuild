@@ -1031,3 +1031,50 @@ test("createPatch: 仅无鉴权候选（攻击已复现）归类为 no_patchable
   );
   assert.deepEqual(calls, [], "无可修复候选时不应触碰 RPC（worktree 等）");
 });
+
+test("N-4: createPatch 链接顶层与子目录 node_modules（含 junction 形态）到 worktree", async () => {
+  const calls = [];
+  const events = [];
+  const ctx = {
+    projectRoot: "D:/p",
+    sessionId: "s1",
+    tokens: { worktree: "tok_wt", project: "tok_p" },
+    analysis: { candidates: [{ kind: "idor-suspect", file: "D:/p/src/app.js", method: "GET", path: "/x/:id" }] },
+    emit: (e) => events.push(e),
+    db: { insertPatch: () => {} },
+    rpc: {
+      request: async (method, params) => {
+        calls.push({ method, params });
+        if (method === "git.status") return { isRepo: true, entries: [] };
+        if (method === "git.worktreeAdd") return { path: "D:/wt/fix-1" };
+        if (method === "fs.list") {
+          return {
+            entries: [
+              { name: "src", path: "D:/p/src", kind: "dir", size: 0 },
+              { name: "node_modules", path: "D:/p/node_modules", kind: "symlink", size: 0 },
+              { name: "backend", path: "D:/p/backend", kind: "dir", size: 0 },
+              { name: "node_modules", path: "D:/p/backend/node_modules", kind: "dir", size: 0 },
+            ],
+          };
+        }
+        if (method === "fs.linkDir") return {};
+        if (method === "fs.stat") throw new Error("not found"); // 目标文件不在 worktree → 无补丁可生成
+        throw new Error(`不应调用 ${method}`);
+      },
+    },
+  };
+  await assert.rejects(() => createPatch(ctx), (e) => e.code === "no_patch_applied");
+  const links = calls.filter((c) => c.method === "fs.linkDir");
+  assert.deepEqual(
+    links.map((l) => l.params.dst),
+    ["D:/wt/fix-1/node_modules", "D:/wt/fix-1/backend/node_modules"],
+    "顶层与子目录 node_modules（含 junction）均应链接到 worktree 对应位置"
+  );
+  assert.ok(
+    links.every((l) => l.params.readToken === "tok_p" && l.params.token === "tok_wt"),
+    "链接以 worktree 写令牌 + project 读令牌组合授权"
+  );
+  const ev = events.find((e) => e.kind === "patch" && /依赖目录链接到隔离工作区/.test(e.message));
+  assert.ok(ev && ev.severity === "info", "应有链接成功事件");
+  assert.deepEqual(ev.data.linked, ["node_modules", "backend/node_modules"]);
+});

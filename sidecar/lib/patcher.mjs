@@ -84,27 +84,53 @@ export async function createPatch(ctx) {
   const worktree = wtRes.path;
   const wtRoot = worktree.replace(/[\\/]+$/, "");
 
-  // 1.5 链接依赖目录（避免在 worktree 中重复安装；失败不致命，交由契约 prepare 兜底）
+  // 1.5 链接依赖目录（顶层与一级子目录的 node_modules，如 monorepo 的 backend/、client/；
+  //     失败不致命，交由契约 prepare 兜底）
+  const rootClean = ctx.projectRoot.replace(/[\\/]+$/, "");
+  let nmDirs = [`${rootClean}/node_modules`];
   try {
-    const srcNm = `${ctx.projectRoot.replace(/[\\/]+$/, "")}/node_modules`;
-    await ctx.rpc.request(RPC_TO_HOST.FS_STAT, { token: ctx.tokens.project, path: srcNm }, { timeoutMs: 15_000 });
-    await ctx.rpc.request(
-      RPC_TO_HOST.FS_LINK_DIR,
-      { token: ctx.tokens.worktree, readToken: ctx.tokens.project, src: srcNm, dst: `${wtRoot}/node_modules` },
-      { timeoutMs: 60_000 }
+    const listing = await ctx.rpc.request(
+      RPC_TO_HOST.FS_LIST,
+      { token: ctx.tokens.project, path: ctx.projectRoot, depth: 2 },
+      { timeoutMs: 30_000 }
     );
+    // 连接点/symlink 形式的 node_modules 报为 symlink，同样纳入（FS_LINK_DIR 会校验目录有效性）
+    const found = (listing.entries ?? []).filter(
+      (e) => (e.kind === "dir" || e.kind === "symlink") && e.name === "node_modules"
+    );
+    if (found.length > 0) nmDirs = found.map((e) => e.path);
+  } catch {
+    /* 目录列表失败时回退为仅链接顶层 node_modules */
+  }
+  const linked = [];
+  const linkFailures = [];
+  for (const srcNm of nmDirs) {
+    const rel = relative(rootClean, srcNm).split(sep).join("/");
+    if (!rel || rel.startsWith("..")) continue;
+    try {
+      await ctx.rpc.request(
+        RPC_TO_HOST.FS_LINK_DIR,
+        { token: ctx.tokens.worktree, readToken: ctx.tokens.project, src: srcNm, dst: `${wtRoot}/${rel}` },
+        { timeoutMs: 60_000 }
+      );
+      linked.push(rel);
+    } catch (e) {
+      linkFailures.push({ rel, reason: e.message });
+    }
+  }
+  if (linked.length > 0) {
     ctx.emit({
       kind: "patch",
       severity: SEVERITY.INFO,
-      message: "已将 node_modules 链接到隔离工作区（复用依赖安装）",
-      data: { src: srcNm, dst: `${wtRoot}/node_modules` },
+      message: `已将 ${linked.length} 个依赖目录链接到隔离工作区（${linked.join("、")}），复用依赖安装`,
+      data: { linked, failures: linkFailures },
     });
-  } catch (e) {
+  } else {
     ctx.emit({
       kind: "patch",
       severity: SEVERITY.WARN,
-      message: `未能链接 node_modules（${e.message}），依赖将由 prepare 步骤处理`,
-      data: {},
+      message: `未能链接依赖目录（${linkFailures.map((f) => f.rel).join("、") || "未发现 node_modules"}），依赖将由 prepare 步骤处理`,
+      data: { failures: linkFailures },
     });
   }
 

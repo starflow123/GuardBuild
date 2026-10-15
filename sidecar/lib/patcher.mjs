@@ -232,13 +232,22 @@ export async function createPatch(ctx) {
   }
 
   if (filePatches.length === 0) {
+    // 跳过原因分两类：候选带策略可用却被环境阻断（文件未提交/读取失败）→ 执行问题（exit 2）；
+    // 其余（无策略匹配该代码形态）→ 漏洞证据成立但无可自动修复候选（vulnerable_unfixed，exit 1）
     const untracked = skipped.filter((s) => s.reason?.includes("未纳入 git 提交"));
-    throw new PatchError("未能为任何候选生成补丁锚点", {
-      code: "no_patch_applied",
-      hint:
-        untracked.length > 0
-          ? `${untracked.length} 个候选文件未提交到 git（worktree 基于 HEAD 检出）；请先 git add/commit 后重试`
-          : "锚点定位失败，可查看跳过原因",
+    if (!skipped.some((s) => s.candidate)) {
+      throw new PatchError("未能为任何候选生成补丁锚点", {
+        code: "no_patch_applied",
+        hint:
+          untracked.length > 0
+            ? `${untracked.length} 个候选文件未提交到 git（worktree 基于 HEAD 检出）；请先 git add/commit 后重试`
+            : "锚点定位失败，可查看跳过原因",
+        details: { skipped },
+      });
+    }
+    throw new PatchError("攻击证据已建立，但候选端点均无可自动修复的代码形态", {
+      code: "no_patchable_candidates",
+      hint: "自动修复仅覆盖可识别归属校验位的 IDOR 形态；请对照证据人工修复该端点后重跑 gate",
       details: { skipped },
     });
   }

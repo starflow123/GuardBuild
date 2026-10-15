@@ -391,6 +391,26 @@ test("buildProbePlan: 路径穿越候选入独立槽位（去重 + 首元素 + r
   assert.equal(plan.readCandidate, null, "穿越候选不得占用 IDOR 槽位");
 });
 
+test("buildProbePlan: 查询参数形态候选（无 :param）进 read 槽位（DVNA 修复）", () => {
+  const plan = buildProbePlan({
+    endpoints: [],
+    candidates: [
+      {
+        kind: "idor-suspect",
+        method: "GET",
+        path: "/modifyproduct",
+        fullPath: "/app/modifyproduct",
+        routeKeys: ["app.modifyproduct"],
+        resource: "product",
+        queryParam: { param: "id", form: "direct" },
+      },
+    ],
+  });
+  assert.ok(plan.readCandidate, "无路径参数但带 queryParam 的候选应进入 read 槽位");
+  assert.equal(plan.readCandidate.fullPath, "/app/modifyproduct");
+  assert.equal(plan.resource, "product");
+});
+
 test("buildCases: 条件化构建（无 cancel/admin 端点不虚构用例）+ 任意 :param 填充 + 顺序保持", () => {
   const mkCtx = (plan) => ({ plan, targetConfig: null });
   const targets = {
@@ -502,6 +522,31 @@ test("buildCases: 身份/目标缺失时跳过对应槽位（不虚构、不崩�
     "匿名探测目标只服务匿名越权用例（越权读需 victim）"
   );
   assert.equal(anonOnly[0].path, "/api/feeds/11", "匿名用例 :param 应填充匿名探测到的对象 ID");
+});
+
+test("buildCases: 查询参数形态攻击用例路径为 ?param=id（无 :param 占位）", () => {
+  const cand = {
+    path: "/modifyproduct",
+    fullPath: "/app/modifyproduct",
+    routeKeys: ["app.modifyproduct"],
+    queryParam: { param: "id", form: "direct" },
+  };
+  const ctx = { plan: { readCandidate: cand, readCandidates: [cand] }, targetConfig: null };
+  const cases = buildCases(ctx, {
+    attacker: { name: "alice", user: { id: 1 } },
+    victim: { name: "bob", user: { id: 2 } },
+    admin: null,
+    readTarget: { id: 11 },
+    attackCancelTarget: null,
+    adminCancelTarget: null,
+    ownReadTarget: { id: 14 },
+    ownCancelTarget: null,
+    ownNotCancellable: null,
+  });
+  const attack = cases.find((c) => c.id === "attack-read-foreign");
+  assert.equal(attack.path, "/app/modifyproduct?id=11", "查询参数候选应构造 ?param=id 形态");
+  const own = cases.find((c) => c.id === "business-read-own");
+  assert.equal(own.path, "/app/modifyproduct?id=14", "本人业务用例同样使用查询参数形态");
 });
 
 test("buildCases: 多候选逐一构建攻击用例（基名 + -2 后缀，N-5）", () => {
@@ -1140,6 +1185,99 @@ test("analyzeProject: 路径穿越线索识别（fs 读取 + req 输入合流，
     !a.candidates.some((c) => (c.fullPath ?? c.path ?? "").includes("/api/avatar")),
     "固定路径的文件读取不应误报为穿越候选"
   );
+});
+
+test("analyzeProject: 查询参数 IDOR（req.query 直引 / 变量中转两种形态）", async () => {
+  const R = "\\\\?\\D:\\p";
+  const content = [
+    'const router = require("express").Router();',
+    'router.get("/modifyproduct", authHandler.isAuthenticated, async (req, res) => {',
+    "  const product = await db.Product.find({ where: { 'id': req.query.id } });",
+    "  res.json(product);",
+    "});",
+    'router.get("/userinfo", authHandler.isAuthenticated, async (req, res) => {',
+    "  const uid = req.query.userId;",
+    "  const user = await User.findOne({ where: { id: uid } });",
+    "  res.json(user);",
+    "});",
+  ].join("\n");
+  const a = await analyzeProject({
+    projectRoot: R,
+    tokens: { project: "tok" },
+    rpc: {
+      request: async (method) => {
+        if (method === "fs.list") return { entries: [{ path: `${R}\\src\\app.js`, kind: "file", size: 900 }] };
+        if (method === "fs.read") return { content, size: 900, redacted: false, redactions: [] };
+        throw new Error(`不应调用 ${method}`);
+      },
+    },
+  });
+  const c1 = a.candidates.find((c) => c.path === "/modifyproduct");
+  assert.ok(c1, "查询参数取数的受保护路由应入 IDOR 候选");
+  assert.equal(c1.kind, "idor-suspect");
+  assert.deepEqual(c1.queryParam, { param: "id", form: "direct" });
+  assert.equal(c1.resource, "product", "资源名应从 Model.find 形态推断");
+  const c2 = a.candidates.find((c) => c.path === "/userinfo");
+  assert.ok(c2, "变量中转的查询参数形态同样应入候选");
+  assert.deepEqual(c2.queryParam, { param: "userId", form: "indirect" });
+  assert.equal(c2.resource, "user", "资源名应从查询参数名推断");
+});
+
+test("analyzeProject: 跨文件 handler 引用 + IIFE 挂载（router.get('/x', mw, appHandler.x)）", async () => {
+  const R = "\\\\?\\D:\\dvna";
+  const listing = {
+    entries: [
+      { path: `${R}\\server.js`, kind: "file", size: 500 },
+      { path: `${R}\\routes\\app.js`, kind: "file", size: 500 },
+      { path: `${R}\\core\\appHandler.js`, kind: "file", size: 500 },
+      { path: `${R}\\core\\authHandler.js`, kind: "file", size: 500 },
+    ],
+  };
+  const contents = new Map([
+    [`${R}\\server.js`, "app.use('/app', require('./routes/app')());"],
+    [
+      `${R}\\routes\\app.js`,
+      [
+        'var router = require("express").Router()',
+        'var appHandler = require("../core/appHandler")',
+        'var authHandler = require("../core/authHandler")',
+        "module.exports = function () {",
+        "  router.get('/modifyproduct', authHandler.isAuthenticated, appHandler.modifyProduct)",
+        "}",
+      ].join("\n"),
+    ],
+    [
+      `${R}\\core\\appHandler.js`,
+      [
+        "module.exports.modifyProduct = function (req, res) {",
+        "  db.Product.find({ where: { 'id': req.query.id } }).then(product => {",
+        "    res.json(product)",
+        "  })",
+        "}",
+      ].join("\n"),
+    ],
+    [`${R}\\core\\authHandler.js`, "module.exports.isAuthenticated = function (req, res, next) { next() }"],
+  ]);
+  const a = await analyzeProject({
+    projectRoot: R,
+    tokens: { project: "tok" },
+    rpc: {
+      request: async (method, params) => {
+        if (method === "fs.list") return listing;
+        if (method === "fs.read") {
+          return { content: contents.get(params.path), size: 500, redacted: false, redactions: [] };
+        }
+        throw new Error(`不应调用 ${method}`);
+      },
+    },
+  });
+  const c = a.candidates.find((x) => x.fullPath === "/app/modifyproduct");
+  assert.ok(c, "跨文件 handler 应经 IIFE 挂载前缀还原为候选");
+  assert.equal(c.authSource, "route", "路由中间件的认证引用（authHandler.isAuthenticated）应计为认证");
+  assert.deepEqual(c.queryParam, { param: "id", form: "direct" });
+  assert.equal(c.resource, "product");
+  assert.ok(a.diagnostics.handlerRefsResolved >= 1, "诊断应记录已解析的 handler 引用");
+  assert.equal(a.diagnostics.handlerRefsMissed, 0, "本 fixture 的 handler 引用应全部解析");
 });
 
 test("createPatch: 非 git 项目预检给出可操作诊断（不尝试 worktree）", async () => {

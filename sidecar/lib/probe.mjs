@@ -290,10 +290,11 @@ const ANON_PROBE_MAX_ID = 10;
 const ANON_PROBE_MAX_ITEMS = 3;
 
 /** 无列表接口时的回退：用匿名 ID 探测收集可见对象（打匿名越权本就不需要账号发现） */
-async function discoverViaAnonymousProbe(ctx, baseUrl, path) {
+async function discoverViaAnonymousProbe(ctx, baseUrl, cand) {
+  const path = candPath(cand);
   const anonymousItems = [];
   for (let id = 1; id <= ANON_PROBE_MAX_ID && anonymousItems.length < ANON_PROBE_MAX_ITEMS; id += 1) {
-    const res = await httpJson(ctx, { baseUrl, method: "GET", path: fillParams(path, id), identity: null });
+    const res = await httpJson(ctx, { baseUrl, method: "GET", path: fillCandPath(cand, id), identity: null });
     const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
     if (o && String(o.id) === String(id)) anonymousItems.push(o);
   }
@@ -339,7 +340,7 @@ async function discoverResources(ctx, baseUrl, loggedIn) {
       for (const cand of unauthCands) {
         const p = candPath(cand);
         if (!p) continue;
-        const items = await discoverViaAnonymousProbe(ctx, baseUrl, p);
+        const items = await discoverViaAnonymousProbe(ctx, baseUrl, cand);
         if (items.length > 0) anonTargets.push({ path: p, item: items[0] });
       }
       return { byUser: {}, anonymousItems: anonTargets.map((t) => t.item), anonTargets };
@@ -404,6 +405,18 @@ function pickTargets(byUser, loggedIn, anonymousItems = [], anonTargets = []) {
 /** 填充路径参数（任意 :param 形态，不限于 :id） */
 function fillParams(path, id) {
   return path.replace(/:[A-Za-z_]\w*/g, String(id));
+}
+
+/** 按候选构造请求路径：查询参数形态（?param=id，idor-suspect/queryParam 候选）或路径参数填充 */
+function fillCandPath(cand, id) {
+  const path = candPath(cand);
+  if (!path) return null;
+  if (cand?.queryParam && !/:[A-Za-z_]\w*/.test(path)) {
+    const sep = path.includes("?") ? "&" : "?";
+    const name = cand.queryParam.param || "id";
+    return `${path}${sep}${name}=${encodeURIComponent(String(id))}`;
+  }
+  return fillParams(path, id);
 }
 
 const okStatus = (s) => s >= 200 && s < 300;
@@ -516,7 +529,7 @@ export function buildCases(ctx, targets) {
       name: `${attacker.name} 读取 ${victim.name} 的${candLabel} #${readTarget.id}${multi}`,
       identity: attacker.name,
       method: "GET",
-      path: fillParams(path, readTarget.id),
+      path: fillCandPath(cand, readTarget.id),
       routeKey: cand.routeKeys?.[0] ?? readKey,
       expect: `越权读取他人${candLabel}应被拒绝（401/403/404）`,
       verify: (res, phase) => {
@@ -553,7 +566,7 @@ export function buildCases(ctx, targets) {
       name: `${attacker.name} 取消 ${victim.name} 的${candLabel} #${cancelTarget.id}${multi}`,
       identity: attacker.name,
       method: "POST",
-      path: fillParams(path, cancelTarget.id),
+      path: fillCandPath(cand, cancelTarget.id),
       routeKey: cand.routeKeys?.[0] ?? cancelKey,
       expect: `越权取消他人${candLabel}应被拒绝（401/403/404）`,
       verify: (res, phase) => {
@@ -626,7 +639,7 @@ export function buildCases(ctx, targets) {
       name: `未携带凭证读取${candLabel} #${anonTarget.id}（无鉴权端点${multiText}）`,
       identity: null,
       method: "GET",
-      path: fillParams(path, anonTarget.id),
+      path: fillCandPath(cand, anonTarget.id),
       routeKey: cand.routeKeys?.[0] ?? null,
       expect: `未认证读取${candLabel}应被拒绝（401/403/404）`,
       verify: (res, phase) => {
@@ -737,7 +750,7 @@ export function buildCases(ctx, targets) {
       name: `${attacker.name} 读取自己的${label} #${own.id}`,
       identity: attacker.name,
       method: "GET",
-      path: fillParams(readPath, own.id),
+      path: fillCandPath(readCands[0], own.id),
       routeKey: readKey,
       expect: `本人${label}应正常可见（200，且归属本人）`,
       verify: (res) =>
@@ -780,7 +793,7 @@ export function buildCases(ctx, targets) {
       name: `${attacker.name} 取消自己的${label} #${c.id}`,
       identity: attacker.name,
       method: "POST",
-      path: fillParams(cancelPath, c.id),
+      path: fillCandPath(cancelCands[0], c.id),
       routeKey: cancelKey,
       expect: `本人已支付${label}应可正常取消（200）`,
       verify: (res) =>
@@ -801,7 +814,7 @@ export function buildCases(ctx, targets) {
       name: `${attacker.name} 取消已发货${label} #${s.id} 被业务规则拒绝`,
       identity: attacker.name,
       method: "POST",
-      path: fillParams(cancelPath, s.id),
+      path: fillCandPath(cancelCands[0], s.id),
       routeKey: cancelKey,
       expect: `状态非 paid 的${label}不可取消（409），业务规则保持有效`,
       verify: (res) =>
@@ -891,7 +904,7 @@ export function buildCases(ctx, targets) {
       name: `未登录访问${label}详情被拒绝`,
       identity: null,
       method: "GET",
-      path: fillParams(readPath, own.id),
+      path: fillCandPath(readCands[0], own.id),
       routeKey: readKey,
       expect: "未认证请求应被拒绝（401），认证入口保持有效",
       verify: (res) => {

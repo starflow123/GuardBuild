@@ -54,8 +54,9 @@ export function selectSourceFiles(listing, { maxFiles = MAX_FILES } = {}) {
 const ANCHOR_EXPRESS = /^\s*(?:app|router|server|api)\s*\.\s*(get|post|put|patch|delete)\s*\(\s*["'`]([^"'`]+)["'`]/;
 const ANCHOR_METHOD = /^\s*if\s*\(\s*method\s*===\s*["'`]([A-Za-z]+)["'`]/;
 
-// 资源获取 sink：按 ID 读取单个对象
-const SINK = /\b(find[A-Za-z]*ById|findById|findByPk|findOne|findUnique|getById|findOrderById|findByIdOrThrow)\s*\(/;
+// 资源获取 sink：按 ID 读取单个对象（ORM 单查族 + Sequelize/Mongo 的 Model.find({…}) 对象查询形态）
+const SINK =
+  /\b(find[A-Za-z]*ById|findById|findByPk|findOne|findUnique|getById|findOrderById|findByIdOrThrow)\s*\(|([A-Za-z_$][\w$]*\.find)\s*\(\s*\{/;
 
 // 归属校验：出现 userId 与请求者的比较（=== / !== / == / !=）
 const OWNER_GUARD =
@@ -138,10 +139,10 @@ function splitArgsTopLevel(s) {
   return out;
 }
 
-/** 收集 obj.use(...) 调用，参数按括号配平切分 */
-function collectUseCalls(text) {
+/** 收集 obj.method(...) 调用（括号配平切分参数）；methodPattern 为正则片段，如 "use" 或 "get|post|…" */
+function collectMemberCalls(text, methodPattern) {
   const calls = [];
-  const re = /\b([A-Za-z_$][\w$]*)\s*\.\s*use\s*\(/g;
+  const re = new RegExp(`\\b([A-Za-z_$][\\w$]*)\\s*\\.\\s*(${methodPattern})\\s*\\(`, "g");
   let m;
   while ((m = re.exec(text))) {
     const open = re.lastIndex - 1;
@@ -164,13 +165,52 @@ function collectUseCalls(text) {
         }
       }
     }
-    if (end > open) calls.push({ obj: m[1], args: splitArgsTopLevel(text.slice(open + 1, end)) });
+    if (end > open) {
+      calls.push({ obj: m[1], method: m[2], args: splitArgsTopLevel(text.slice(open + 1, end)), index: m.index });
+    }
   }
   return calls;
 }
 
+const collectUseCalls = (text) => collectMemberCalls(text, "use");
+const collectRouteCalls = (text) => collectMemberCalls(text, "get|post|put|patch|delete");
+
 const isStringLit = (a) => /^["'`][^"'`]*["'`]$/.test(a);
 const isBareIdent = (a) => /^[A-Za-z_$][\w$]*$/.test(a);
+// 认证中间件引用：裸标识符或成员访问链（authenticate / authHandler.isAuthenticated），名称含认证语义
+const isAuthMwRef = (a) =>
+  /^[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*$/.test(a) && AUTH_MW_NAME.test(a);
+
+/** IIFE require 挂载目标：require("./routes/app")() → "./routes/app"；非该形态返回 null */
+function iifeRequireTarget(a) {
+  const m = /^require\s*\(\s*["'](\.[^"']+)["']\s*\)/.exec(a);
+  if (!m) return null;
+  let i = m[0].length;
+  while (i < a.length && /\s/.test(a[i])) i += 1;
+  return a[i] === "(" ? m[1] : null;
+}
+
+/** 构建 局部标识符 → 相对模块路径 映射（const/let/var x = require('./x') 与 import x from './x'） */
+function buildRequiresMap(content) {
+  const requires = new Map();
+  for (const m of content.matchAll(
+    /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\(\s*["'](\.[^"']+)["']\s*\)/g
+  )) {
+    requires.set(m[1], m[2]);
+  }
+  for (const m of content.matchAll(/import\s+([A-Za-z_$][\w$]*)\s+from\s+["'](\.[^"']+)["']/g)) {
+    requires.set(m[1], m[2]);
+  }
+  return requires;
+}
+
+/** 在已知文件集合中解析模块 spec 对应的真实文件路径（补扩展名 / index 形态） */
+function resolveModuleFile(dir, spec, known) {
+  for (const cand of resolveModuleCandidates(dir, spec)) {
+    if (known.has(cand)) return cand;
+  }
+  return null;
+}
 
 function joinNormalize(dir, spec) {
   // 保留前导斜杠：Host 返回的真实路径带 \\?\ 扩展前缀（归一化后为 //?/…），
@@ -219,15 +259,7 @@ export function collectFileAuthGuards(files) {
   for (const f of files) {
     const filePath = normalizePath(f.path);
     const content = f.content ?? "";
-    const requires = new Map();
-    for (const m of content.matchAll(
-      /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*require\(\s*["'](\.[^"']+)["']\s*\)/g
-    )) {
-      requires.set(m[1], m[2]);
-    }
-    for (const m of content.matchAll(/import\s+([A-Za-z_$][\w$]*)\s+from\s+["'](\.[^"']+)["']/g)) {
-      requires.set(m[1], m[2]);
-    }
+    const requires = buildRequiresMap(content);
     const dir = filePath.slice(0, filePath.lastIndexOf("/"));
     for (const call of collectUseCalls(content)) {
       // router.use(authenticate)：无路径的全局认证中间件 → 本文件整体受保护
@@ -238,32 +270,194 @@ export function collectFileAuthGuards(files) {
       if (!isStringLit(call.args[0])) continue;
       const mountPath = call.args[0].slice(1, -1);
       const middlewares = call.args.slice(1);
-      const hasAuth = middlewares.some((a) => isBareIdent(a) && AUTH_MW_NAME.test(a));
+      const hasAuth = middlewares.some(isAuthMwRef);
       if (hasAuth) diag.mountsWithAuth += 1;
-      const target = [...middlewares].reverse().find(isBareIdent);
-      if (!target) continue;
-      const spec = requires.get(target);
-      if (spec) {
-        for (const cand of resolveModuleCandidates(dir, spec)) {
-          if (known.has(cand)) {
-            if (!mountPrefixes.has(cand)) mountPrefixes.set(cand, mountPath);
-            if (hasAuth) {
-              mountGuarded.add(cand);
-              diag.resolvedModules += 1;
-            }
-            break;
-          }
+      // 挂载目标：IIFE 形态（app.use("/app", require("./routes/app")())）优先；
+      // 否则取最后一个 bare ident（router 变量）并跨文件解析，失败时回退同文件检查
+      let mountTarget = null;
+      for (const a of middlewares) {
+        const spec = iifeRequireTarget(a);
+        if (!spec) continue;
+        mountTarget = resolveModuleFile(dir, spec, known);
+        if (mountTarget) break;
+      }
+      let target = null;
+      if (!mountTarget) {
+        target = [...middlewares].reverse().find(isBareIdent) ?? null;
+        if (target) {
+          const spec = requires.get(target);
+          if (spec) mountTarget = resolveModuleFile(dir, spec, known);
+        }
+      }
+      if (mountTarget) {
+        if (!mountPrefixes.has(mountTarget)) mountPrefixes.set(mountTarget, mountPath);
+        if (hasAuth) {
+          mountGuarded.add(mountTarget);
+          diag.resolvedModules += 1;
         }
         continue;
       }
       // 同文件内定义的 router（const router = express.Router()）→ 保守视为整文件受保护
-      if (new RegExp(`(?:const|let|var|function)\\s+${target}\\b`).test(content)) {
+      if (target && new RegExp(`(?:const|let|var|function)\\s+${target}\\b`).test(content)) {
         if (!mountPrefixes.has(filePath)) mountPrefixes.set(filePath, mountPath);
         if (hasAuth) selfGuarded.add(filePath);
       }
     }
   }
   return { mountGuarded, selfGuarded, mountPrefixes, diag };
+}
+
+// —— 跨文件 handler 引用：router.get("/x", authMw, appHandler.x) 的实体在别的文件 ——
+
+/** 从开括号 openIdx（须为 {）找到配平闭括号位置；跳过字符串/模板/注释；未配平返回 -1 */
+export function braceSpan(text, openIdx) {
+  if (text[openIdx] !== "{") return -1;
+  let depth = 0;
+  let quote = null;
+  for (let i = openIdx; i < text.length; i += 1) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === "\\") i += 1;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "/" && text[i + 1] === "/") {
+      const nl = text.indexOf("\n", i);
+      if (nl < 0) break;
+      i = nl;
+      continue;
+    }
+    if (ch === "/" && text[i + 1] === "*") {
+      const close = text.indexOf("*/", i + 2);
+      if (close < 0) break;
+      i = close + 1;
+      continue;
+    }
+    if (ch === "{") depth += 1;
+    else if (ch === "}") {
+      depth -= 1;
+      if (depth === 0) return i;
+    }
+  }
+  return -1;
+}
+
+/** 从 from 起找第一个「括号深度为 0」的 {（即函数体开括号），跳过参数列表与字符串；找不到返回 -1 */
+function findBodyOpen(text, from) {
+  let depth = 0;
+  let quote = null;
+  for (let i = from; i < text.length; i += 1) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === "\\") i += 1;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") quote = ch;
+    else if (ch === "(" || ch === "[") depth += 1;
+    else if (ch === ")" || ch === "]") depth -= 1;
+    else if (ch === "{") {
+      if (depth === 0) return i;
+      depth += 1;
+    } else if (ch === "}") depth -= 1;
+    else if (ch === ";" && depth === 0) return -1;
+  }
+  return -1;
+}
+
+const RE_ESCAPE = /[.*+?^${}()|[\]\\]/g;
+const escRe = (s) => s.replace(RE_ESCAPE, "\\$&");
+
+/** 提取导出函数体文本。支持：module.exports.X = function/箭头、exports.X = function、function X、module.exports = { X: function } */
+export function extractExportedFunction(content, name) {
+  if (!content || !name) return null;
+  const n = escRe(name);
+  const patterns = [
+    new RegExp(`module\\.exports\\s*\\.\\s*${n}\\s*=\\s*(?:async\\s+)?function\\b`, "g"),
+    new RegExp(`exports\\s*\\.\\s*${n}\\s*=\\s*(?:async\\s+)?function\\b`, "g"),
+    new RegExp(`module\\.exports\\s*\\.\\s*${n}\\s*=\\s*(?:async\\s+)?(?:\\([^)]*\\)|[A-Za-z_$][\\w$]*)\\s*=>`, "g"),
+    new RegExp(`(?:^|[\\n;])\\s*(?:async\\s+)?function\\s+${n}\\s*\\(`, "g"),
+    new RegExp(`module\\.exports\\s*=\\s*\\{[\\s\\S]{0,2000}?\\b${n}\\s*:\\s*(?:async\\s+)?function\\b`, "g"),
+  ];
+  for (const re of patterns) {
+    const m = re.exec(content);
+    if (!m) continue;
+    const open = findBodyOpen(content, m.index + m[0].length);
+    if (open < 0) continue;
+    const end = braceSpan(content, open);
+    if (end < 0) continue;
+    return { text: content.slice(m.index, end + 1), index: m.index };
+  }
+  return null;
+}
+
+/**
+ * 跨文件 handler 引用解析：路由文件只声明路径/中间件/handler 引用，
+ * 函数体在同项目另一文件（module.exports.x = function…）。把函数体转成「伪区块」
+ * 参与候选检测：sink / 归属校验 / 查询参数都取自函数体文本。
+ * 返回 { sections, diag }。
+ */
+export function collectHandlerSections(files, authGuards) {
+  const known = new Set(files.map((f) => normalizePath(f.path)));
+  const byPath = new Map(files.map((f) => [normalizePath(f.path), f]));
+  const sections = [];
+  const seen = new Set();
+  const diag = { handlerRefs: 0, handlerResolved: 0, handlerMissed: 0 };
+  for (const f of files) {
+    const filePath = normalizePath(f.path);
+    const content = f.content ?? "";
+    const requires = buildRequiresMap(content);
+    const dir = filePath.slice(0, filePath.lastIndexOf("/"));
+    const routeGuarded = authGuards.mountGuarded.has(filePath) || authGuards.selfGuarded.has(filePath);
+    for (const call of collectRouteCalls(content)) {
+      if (!isStringLit(call.args[0])) continue;
+      const middlewares = call.args.slice(1);
+      const refMatch = /^([A-Za-z_$][\w$]*)\s*\.\s*([A-Za-z_$][\w$]*)$/.exec(middlewares[middlewares.length - 1] ?? "");
+      if (!refMatch) continue;
+      const [, ns, fn] = refMatch;
+      const spec = requires.get(ns);
+      if (!spec) continue;
+      diag.handlerRefs += 1;
+      const targetPath = resolveModuleFile(dir, spec, known);
+      const targetFile = targetPath ? byPath.get(targetPath) : null;
+      const exported = targetFile ? extractExportedFunction(targetFile.content ?? "", fn) : null;
+      if (!exported) {
+        diag.handlerMissed += 1;
+        continue;
+      }
+      diag.handlerResolved += 1;
+      const declaredPath = call.args[0].slice(1, -1);
+      // 认证判定只看 handler 之前的中间件位；末位是 handler 引用本身，不参与
+      const forcedAuth = routeGuarded || middlewares.slice(0, -1).some(isAuthMwRef);
+      const key = `${targetPath}#${fn}#${call.method} ${declaredPath}`;
+      if (seen.has(key)) continue;
+      seen.add(key);
+      sections.push({
+        file: targetPath,
+        startLine: (targetFile.content ?? "").slice(0, exported.index).split("\n").length,
+        method: call.method.toUpperCase(),
+        style: "express-handler",
+        declaredPath,
+        mountPrefixOverride: authGuards.mountPrefixes.get(filePath) ?? null,
+        forcedAuth,
+        text: exported.text,
+      });
+    }
+  }
+  return { sections, diag };
+}
+
+/** 区块的路由声明中是否含认证中间件引用（router.get("/x", authHandler.isAuthenticated, …)） */
+function sectionRouteMwAuth(text) {
+  for (const call of collectRouteCalls(text)) {
+    if (!isStringLit(call.args[0])) continue;
+    if (call.args.slice(1).some(isAuthMwRef)) return true;
+  }
+  return false;
 }
 
 export function translatePathRegex(regexLiteral) {
@@ -338,9 +532,81 @@ function extractEndpoints(section) {
 function extractSinks(section) {
   const out = [];
   for (const m of section.text.matchAll(new RegExp(SINK.source, "g"))) {
-    out.push({ call: m[1], index: m.index });
+    out.push({ call: m[1] ?? m[2], index: m.index });
   }
   return out;
+}
+
+/** 取调用实参文本（openIdx 处的 ( 起，括号配平到 )），窗口超过 cap 或未闭合返回 null */
+function callArgsSpan(text, openIdx, cap = 300) {
+  if (text[openIdx] !== "(") return null;
+  let depth = 0;
+  let quote = null;
+  for (let i = openIdx; i < text.length && i - openIdx <= cap; i += 1) {
+    const ch = text[i];
+    if (quote) {
+      if (ch === "\\") i += 1;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") quote = ch;
+    else if (ch === "(") depth += 1;
+    else if (ch === ")") {
+      depth -= 1;
+      if (depth === 0) return text.slice(openIdx + 1, i);
+    }
+  }
+  return null;
+}
+
+/**
+ * 查询参数形态的越权线索：sink 实参中出现 req.query.X。
+ *  - direct：`find({ where: { id: req.query.id } })` —— 实参内直接引用
+ *  - indirect：先 `const id = req.query.id` 赋值，变量再出现在实参内
+ * 返回 { param, form } 或 null。
+ */
+export function findQueryParamSink(text) {
+  const sinkRe = new RegExp(SINK.source, "g");
+  let m;
+  while ((m = sinkRe.exec(text))) {
+    const openIdx = m.index + m[0].lastIndexOf("(");
+    const argsText = callArgsSpan(text, openIdx);
+    if (!argsText) continue;
+    let direct = null;
+    for (const im of argsText.matchAll(new RegExp(REQ_INPUT.source, "g"))) {
+      if (im[1] === "query") direct = im;
+    }
+    if (direct) return { param: direct[2] ?? direct[3] ?? null, form: "direct" };
+    const windowText = text.slice(Math.max(0, m.index - 400), m.index);
+    for (const am of windowText.matchAll(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([^;\n]{0,200})/g)) {
+      const rhs = am[2];
+      if (!/\breq\s*\.\s*query\b/.test(rhs)) continue;
+      if (!new RegExp(`\\b${am[1]}\\b`).test(argsText)) continue;
+      const pm = /req\s*\.\s*query\s*(?:\.\s*([A-Za-z_$][\w$]*)|\[\s*["'`]([^"'`]+)["'`]\s*\])/.exec(rhs);
+      return { param: pm?.[1] ?? pm?.[2] ?? null, form: "indirect" };
+    }
+  }
+  return null;
+}
+
+/** 从查询参数名推断资源：user_id → user / productId → product；无有效词根返回 null */
+function resourceFromQueryParam(param) {
+  if (!param) return null;
+  const base = String(param).replace(/[_-]?id$/i, "");
+  if (base.length < 3) return null;
+  return singular(base.toLowerCase());
+}
+
+/** 从 Model.find({…}) 形态推断资源名：db.Product.find → product；排除工具对象名 */
+const MODEL_UTIL = new Set(["db", "this", "self", "ctx", "req", "res", "module", "exports", "conn", "client", "collection", "store"]);
+function resourceFromModel(text) {
+  for (const m of text.matchAll(/(?:^|[^\w$])([A-Za-z_$][\w$]*)\s*\.\s*find[A-Za-z]*\s*\(/g)) {
+    if (MODEL_UTIL.has(m[1].toLowerCase())) continue;
+    const name = m[1].replace(/[_-]?id$/i, "");
+    if (name.length < 3) continue;
+    return singular(name.toLowerCase());
+  }
+  return null;
 }
 
 function extractRouteKeys(section) {
@@ -379,15 +645,20 @@ export async function analyzeProject(ctx) {
 
   // 跨文件鉴权线索（挂载级 / 文件级中间件），补偿区块文本看不到的守卫
   const authGuards = collectFileAuthGuards(readContents);
+  // 跨文件 handler 引用（router.get("/x", mw, appHandler.x)）→ 伪区块
+  const handlerScan = collectHandlerSections(readContents, authGuards);
 
   const endpoints = [];
   const candidates = [];
-  for (const s of sections) {
+  for (const s of [...sections, ...handlerScan.sections]) {
     const eps = extractEndpoints(s);
     const sinks = extractSinks(s);
     const routeKeys = extractRouteKeys(s);
     const normFile = normalizePath(s.file);
-    const inlineAuth = AUTH_GUARD.test(s.text);
+    const path = s.declaredPath ?? eps[0]?.path ?? null;
+    const hasPathParam = /:[A-Za-z_]\w*/.test(path ?? "");
+    const queryParam = !hasPathParam && sinks.length > 0 ? findQueryParamSink(s.text) : null;
+    const inlineAuth = AUTH_GUARD.test(s.text) || sectionRouteMwAuth(s.text) || s.forcedAuth === true;
     const mountAuth =
       !inlineAuth && (authGuards.mountGuarded.has(normFile) || authGuards.selfGuarded.has(normFile));
     const hasAuth = inlineAuth || mountAuth;
@@ -395,8 +666,7 @@ export async function analyzeProject(ctx) {
     const hasRoleGuard = ROLE_GUARD.test(s.text);
     const hasOwnerFilter = OWNER_FILTER.test(s.text);
     const matchVars = extractMatchVars(s);
-    const path = eps[0]?.path ?? null;
-    const mountPrefix = authGuards.mountPrefixes.get(normFile) ?? null;
+    const mountPrefix = s.mountPrefixOverride ?? authGuards.mountPrefixes.get(normFile) ?? null;
     const fullPath = path ? joinUrl(mountPrefix, path) : null;
 
     const ep = {
@@ -409,37 +679,33 @@ export async function analyzeProject(ctx) {
       routeKeys,
       matchVars,
       hasAuth,
-      authSource: inlineAuth ? "inline" : mountAuth ? "mount" : null,
+      authSource: s.forcedAuth === true ? "route" : inlineAuth ? "inline" : mountAuth ? "mount" : null,
       hasOwnerGuard,
       hasRoleGuard,
       hasOwnerFilter,
       sinkCalls: sinks.map((x) => x.call),
     };
+    if (queryParam) ep.queryParam = queryParam;
     endpoints.push(ep);
+
+    const resource =
+      resourceFromQueryParam(queryParam?.param) ?? resourceFromModel(s.text) ?? guessResource(fullPath, s.text);
 
     // 可疑 IDOR：按 ID 取单体资源 + 有认证 + 无归属校验 + 无角色限制
     if (sinks.length > 0 && hasAuth && !hasOwnerGuard && !hasRoleGuard) {
-      candidates.push({
-        ...ep,
-        kind: "idor-suspect",
-        resource: guessResource(fullPath, s.text),
-      });
+      candidates.push({ ...ep, kind: "idor-suspect", resource });
     } else if (
-      // 可疑「无鉴权访问」：按 ID 取单体资源 + 无认证 + 路径含用户可控标识符（:param）；
-      // 登录/注册等预期公开端点、以及 /notice 这类固定键查询（无路径参数）不在此列
+      // 可疑「无鉴权访问」：按 ID 取单体资源 + 无认证 + 路径含 :param 或查询参数标识符；
+      // 登录/注册等预期公开端点不在此列
       sinks.length > 0 &&
       !hasAuth &&
       !hasOwnerGuard &&
       !hasRoleGuard &&
-      /:[A-Za-z_]\w*/.test(path ?? "") &&
+      (hasPathParam || queryParam) &&
       !PUBLIC_PATH.test(path ?? "") &&
       !PUBLIC_PATH.test(fullPath ?? "")
     ) {
-      candidates.push({
-        ...ep,
-        kind: "no-auth-suspect",
-        resource: guessResource(fullPath ?? path, s.text),
-      });
+      candidates.push({ ...ep, kind: "no-auth-suspect", resource });
     }
 
     // 可疑「路径穿越」：文件读取 sink 的相邻语句链中出现请求输入（读取族，无修复策略）
@@ -465,6 +731,9 @@ export async function analyzeProject(ctx) {
     mountAuthFiles: authGuards.mountGuarded.size,
     selfAuthFiles: authGuards.selfGuarded.size,
     mountPrefixFiles: authGuards.mountPrefixes.size,
+    handlerSections: handlerScan.sections.length,
+    handlerRefsResolved: handlerScan.diag.handlerResolved,
+    handlerRefsMissed: handlerScan.diag.handlerMissed,
   };
 
   return { fileCount: files.length, readFiles, sections, endpoints, candidates, diagnostics };

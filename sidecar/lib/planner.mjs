@@ -73,11 +73,11 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
     (c) => c.kind === "idor-suspect" && c.method === "POST" && (epPath(c) ?? "").endsWith("/cancel")
   );
   const readCandidates = topK(
-    (c) => c.kind === "idor-suspect" && c.method === "GET" && paramCount(epPath(c)) === 1
+    (c) => c.kind === "idor-suspect" && c.method === "GET" && (paramCount(epPath(c)) === 1 || !!c.queryParam)
   );
   // 无鉴权候选：匿名读取用例的靶点（与 IDOR 槽位互斥，不做自动修复）
   const unauthReadCandidates = topK(
-    (c) => c.kind === "no-auth-suspect" && c.method === "GET" && paramCount(epPath(c)) === 1
+    (c) => c.kind === "no-auth-suspect" && c.method === "GET" && (paramCount(epPath(c)) === 1 || !!c.queryParam)
   );
   const cancelCandidate = cancelCandidates[0] ?? null;
   const readCandidate = readCandidates[0] ?? null;

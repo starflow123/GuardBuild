@@ -128,6 +128,7 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
     adminListEndpoint: adminList ? { path: epPath(adminList), routeKey: adminList.routeKeys?.[0] ?? null } : null,
     adminCancelEndpoint: adminCancel ? { path: epPath(adminCancel), routeKey: adminCancel.routeKeys?.[0] ?? null } : null,
     candidates,
+    supabase: analysis.supabase ?? null,
   };
 }
 

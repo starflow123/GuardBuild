@@ -4,6 +4,7 @@
  *
  * 分析只读取经 Host 脱敏后的内容；判定为启发式，最终以动态复现证据为准。
  */
+import { detectSupabase } from "./supabase.mjs";
 
 const SOURCE_EXT = [".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py"];
 const MAX_FILES = 64;
@@ -720,6 +721,14 @@ export async function analyzeProject(ctx) {
     }
   }
 
+  // Supabase / PostgREST 适配器：静态检测（失败不阻塞主流程，密钥值不进入返回值以外展示面）
+  let supabase = null;
+  try {
+    supabase = await detectSupabase(ctx, { readContents });
+  } catch {
+    supabase = null;
+  }
+
   const diagnostics = {
     totalEntries: listing.entries.length,
     candidateFiles: allCandidates.length,
@@ -734,9 +743,13 @@ export async function analyzeProject(ctx) {
     handlerSections: handlerScan.sections.length,
     handlerRefsResolved: handlerScan.diag.handlerResolved,
     handlerRefsMissed: handlerScan.diag.handlerMissed,
+    supabaseDetected: !!supabase,
+    supabaseTables: supabase?.tables?.length ?? 0,
+    supabaseProbeable: !!supabase?.probeable,
+    supabaseServiceRoleLeak: !!supabase?.serviceRoleLeak,
   };
 
-  return { fileCount: files.length, readFiles, sections, endpoints, candidates, diagnostics };
+  return { fileCount: files.length, readFiles, sections, endpoints, candidates, diagnostics, supabase };
 }
 
 function guessResource(pathHint, text) {

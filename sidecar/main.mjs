@@ -17,6 +17,7 @@ import { buildProbePlan, loadIdentities } from "./lib/planner.mjs";
 import { loadTargetConfig, DEFAULT_START, startUsesPortSlot, renderStart } from "./lib/targetconfig.mjs";
 import { parsePortFromLine, stripAnsi } from "./lib/readyline.mjs";
 import { runPhase, ProbeError } from "./lib/probe.mjs";
+import { runSupabasePhase, isLoopbackHostname } from "./lib/supabase.mjs";
 import { createPatch, writebackPatch, rollbackWorkspace, PatchError } from "./lib/patcher.mjs";
 import { emitReport } from "./lib/report.mjs";
 import {
@@ -91,6 +92,8 @@ function createCtx(params) {
     loginConfig: null,
     analysis: null,
     plan: null,
+    supabaseLeaks: 0,
+    serviceRoleLeak: null,
     view: {
       sessionId: params.sessionId,
       projectRoot: params.projectRoot,
@@ -105,6 +108,7 @@ function createCtx(params) {
       phases: {},
       targets: {},
       patch: null,
+      supabase: null,
       acceptance: null,
       error: null,
     },
@@ -216,14 +220,53 @@ function compactEvidence(r) {
 
 // ---------- Host 能力封装 ----------
 
-async function requestScope(ctx, kind, reason) {
-  emit(ctx, { kind: "scope", severity: SEVERITY.INFO, message: `申请作用域: ${kind}（${reason}）`, data: { kind } });
-  const res = await ctx.rpc.request(
-    RPC_TO_HOST.AUTH_REQUEST_SCOPE,
-    { token: ctx.tokens.project, kind, reason },
-    { timeoutMs: 240_000 }
-  );
+async function requestScope(ctx, kind, reason, host = null) {
+  emit(ctx, {
+    kind: "scope",
+    severity: SEVERITY.INFO,
+    message: `申请作用域: ${kind}${host ? ` @ ${host}` : ""}（${reason}）`,
+    data: { kind, host },
+  });
+  const params = { token: ctx.tokens.project, kind, reason };
+  if (host) params.host = host;
+  const res = await ctx.rpc.request(RPC_TO_HOST.AUTH_REQUEST_SCOPE, params, { timeoutMs: 240_000 });
   return res.token;
+}
+
+function urlHostAndScheme(rawUrl) {
+  try {
+    const u = new URL(rawUrl);
+    return { host: u.hostname.toLowerCase(), scheme: u.protocol.replace(/:$/, "").toLowerCase() };
+  } catch {
+    return { host: null, scheme: null };
+  }
+}
+
+/** Supabase 探测所需网络令牌：回环复用 net.probe（允许 http）；远程仅 https 且需 net.egress @ host */
+async function ensureSupabaseToken(ctx, rawUrl) {
+  const { host, scheme } = urlHostAndScheme(rawUrl);
+  if (!host) {
+    throw new SessionError(`无法解析 Supabase 项目 URL：${rawUrl}`, {
+      code: "supabase_bad_url",
+      hint: "请检查 guardbuild.json 的 supabase.url 或项目 .env 中的 SUPABASE_URL 是否为合法 URL",
+    });
+  }
+  if (isLoopbackHostname(host)) return ctx.tokens.net;
+  if (scheme !== "https") {
+    throw new SessionError(`Supabase 远程探测仅支持 https：${rawUrl}`, {
+      code: "supabase_insecure_url",
+      hint: "明文 http 仅用于本机回环探测；远程项目请使用 https 的 Supabase URL",
+    });
+  }
+  if (ctx.tokens.egress && ctx.tokens.egressHost === host) return ctx.tokens.egress;
+  ctx.tokens.egress = await requestScope(
+    ctx,
+    SCOPE_KINDS.NET_EGRESS,
+    `向 ${host} 发起 Supabase/PostgREST 数据暴露探测`,
+    host
+  );
+  ctx.tokens.egressHost = host;
+  return ctx.tokens.egress;
 }
 
 async function spawnTarget(ctx, { cwd, label, role = "target" }) {
@@ -412,6 +455,31 @@ function acceptanceVerdict(summary) {
   };
 }
 
+/** 合并同一阶段的两份 summary（本地探测 + Supabase 探测）：计数字段相加，任一份缺失则返回另一份 */
+function mergeSummary(base, add) {
+  if (!base) return add ?? null;
+  if (!add) return base;
+  const num = (v) => (Number.isFinite(v) ? v : 0);
+  const counts = { ...base.counts };
+  for (const [k, v] of Object.entries(add.counts ?? {})) counts[k] = num(counts[k]) + num(v);
+  const grades = { ...base.grades };
+  for (const [k, v] of Object.entries(add.grades ?? {})) grades[k] = num(grades[k]) + num(v);
+  return {
+    ...base,
+    counts,
+    grades,
+    total: num(base.total) + num(add.total),
+    attackRepro: num(base.attackRepro) + num(add.attackRepro),
+    attackBlocked: num(base.attackBlocked) + num(add.attackBlocked),
+    attackRegressed: num(base.attackRegressed) + num(add.attackRegressed),
+    businessPassed: num(base.businessPassed) + num(add.businessPassed),
+    businessRegressed: num(base.businessRegressed) + num(add.businessRegressed),
+    businessTotal: num(base.businessTotal) + num(add.businessTotal),
+    supabaseLeak: num(add.leaks ?? add.supabaseLeak),
+    targets: { ...(base.targets ?? {}), ...(add.targets ?? {}) },
+  };
+}
+
 // ---------- 工作流各阶段 ----------
 
 async function stageAnalyze(ctx) {
@@ -424,6 +492,7 @@ async function stageAnalyze(ctx) {
   emit(ctx, { kind: "analyze", severity: SEVERITY.INFO, message: `开始静态分析项目（${ctx.projectRoot}）`, data: {} });
   ctx.analysis = await analyzeProject(ctx);
   const cands = ctx.analysis.candidates ?? [];
+  const supa = ctx.analysis.supabase ?? null;
   ctx.view.findings = cands.map((c) => ({
     id: shortId("fi"),
     method: c.method,
@@ -441,16 +510,60 @@ async function stageAnalyze(ctx) {
           ? "文件读取包含请求可控路径片段（路径穿越静态线索）"
           : "按对象 ID 取资源但未见归属校验（IDOR 静态线索）",
   }));
+  if (supa) {
+    for (const t of supa.tables ?? []) {
+      ctx.view.findings.push({
+        id: shortId("fi"),
+        method: "SUPABASE",
+        path: `table:${t.name}`,
+        routePath: null,
+        file: t.file,
+        startLine: t.line,
+        resource: t.name,
+        kind: "supabase-table",
+        sinkCalls: [],
+        reason: "Supabase 表引用（匿名可读性由动态探测验证；RLS 缺失即数据暴露）",
+      });
+    }
+    if (supa.serviceRoleLeak) {
+      ctx.view.findings.push({
+        id: shortId("fi"),
+        method: "SUPABASE",
+        path: supa.serviceRoleLeak.name ? `env:${supa.serviceRoleLeak.name}` : `file:${supa.serviceRoleLeak.file ?? "?"}`,
+        routePath: null,
+        file: supa.serviceRoleLeak.file ?? null,
+        startLine: supa.serviceRoleLeak.line ?? null,
+        resource: "service_role",
+        kind: "supabase-service-role-leak",
+        sinkCalls: [],
+        reason: `service_role 密钥出现在客户端可见位置（${supa.serviceRoleLeak.source}）——可绕过 RLS 读写全库`,
+      });
+    }
+  }
+  const supaNote = supa
+    ? `，并检测到 Supabase（${(supa.tables ?? []).length} 个表引用${supa.serviceRoleLeak ? "，含 service_role 客户端暴露" : ""}）`
+    : "";
   emit(ctx, {
     kind: "analyze",
-    severity: cands.length > 0 ? SEVERITY.WARN : SEVERITY.INFO,
+    severity: cands.length > 0 || supa?.serviceRoleLeak ? SEVERITY.WARN : SEVERITY.INFO,
     message:
       cands.length > 0
-        ? `静态分析完成：扫描 ${ctx.analysis.fileCount} 个文件，发现 ${cands.length} 个安全候选端点`
-        : `静态分析完成：扫描 ${ctx.analysis.fileCount} 个文件，未发现对象级越权线索`,
-    data: { fileCount: ctx.analysis.fileCount, candidates: ctx.view.findings },
+        ? `静态分析完成：扫描 ${ctx.analysis.fileCount} 个文件，发现 ${cands.length} 个安全候选端点${supaNote}`
+        : `静态分析完成：扫描 ${ctx.analysis.fileCount} 个文件，未发现对象级越权线索${supaNote}`,
+    data: {
+      fileCount: ctx.analysis.fileCount,
+      candidates: ctx.view.findings,
+      supabase: supa
+        ? {
+            url: supa.url,
+            tables: (supa.tables ?? []).map((t) => t.name),
+            probeable: !!supa.probeable,
+            serviceRoleLeak: supa.serviceRoleLeak ?? null,
+          }
+        : null,
+    },
   });
-  if (cands.length === 0) {
+  if (cands.length === 0 && !supa) {
     const d = ctx.analysis.diagnostics ?? {};
     const scanned = `已扫描 ${d.scannedFiles ?? 0} 个源文件（项目共 ${d.candidateFiles ?? 0} 个候选源文件${
       d.outputDirFiles > 0 ? `，其中产物目录 ${d.outputDirFiles} 个` : ""
@@ -461,16 +574,33 @@ async function stageAnalyze(ctx) {
     });
   }
 
+  if (supa) {
+    ctx.view.supabase = {
+      detected: true,
+      url: supa.url,
+      urlSource: supa.urlSource ?? null,
+      tables: (supa.tables ?? []).map((t) => t.name),
+      probeable: !!supa.probeable,
+      anonKeyFound: !!supa.anonKey,
+      leaks: 0,
+      serviceRoleLeak: supa.serviceRoleLeak ?? null,
+    };
+  }
+
   ctx.plan = buildProbePlan(ctx.analysis, { loginPathOverride: ctx.loginConfig?.path ?? null });
+  const supaProbeable = ctx.plan.supabase?.probeable === true;
+  const supaStaticLeak = !!ctx.plan.supabase?.serviceRoleLeak;
   if (
     !ctx.plan.readCandidate &&
     !ctx.plan.cancelCandidate &&
     !ctx.plan.unauthReadCandidate &&
-    !ctx.plan.traversalCandidate
+    !ctx.plan.traversalCandidate &&
+    !supaProbeable &&
+    !supaStaticLeak
   ) {
     throw new SessionError("无法构建探测计划：候选端点中缺少可探测的单体资源接口", {
       code: "plan_incomplete",
-      hint: `已发现 ${cands.length} 个候选端点，但均不含「按 ID 取单体资源」的路径（如 GET /api/orders/:id），或文件读取线索。请确认项目中存在带路径参数的资源接口，或在 guardbuild.json 中补充契约`,
+      hint: `已发现 ${cands.length} 个候选端点，但均不含「按 ID 取单体资源」的路径（如 GET /api/orders/:id）、文件读取线索，也未定位到可探测的 Supabase 项目（需 URL + anon key + 至少一个表引用）。请确认目标接口形态或在 guardbuild.json 中补充契约/supabase 配置`,
     });
   }
   ctx.view.plan = {
@@ -489,32 +619,92 @@ async function stageAnalyze(ctx) {
 async function stageReproduce(ctx) {
   ensureAlive(ctx);
   setState(ctx, STATE.PROBING);
-  await runPrepare(ctx, { cwd: ctx.projectRoot, label: "原始工作区" });
-  const target = await spawnTarget(ctx, { cwd: ctx.projectRoot, label: "原始工作区（修复前）", role: "target-pre" });
-  ctx.procs.original = target;
-  ctx.view.targets.original = { ...target, role: "原始工作区（修复前）" };
-  pushView(ctx);
 
-  const pre = await runPhase(ctx, { phase: "pre", baseUrl: target.url });
-  ctx.pushEvidence(pre.evidence);
-  ctx.view.phases.pre = pre.summary;
-  ctx.view.baseline = acceptanceVerdict(pre.summary);
-  pushView(ctx);
+  const plan = ctx.plan ?? {};
+  const hasLocalProbes = !!(
+    plan.readCandidate || plan.cancelCandidate || plan.unauthReadCandidate || plan.traversalCandidate
+  );
+  const supa = plan.supabase ?? null;
 
-  if (pre.summary.attackRepro === 0) {
+  let pre = null;
+  if (hasLocalProbes) {
+    await runPrepare(ctx, { cwd: ctx.projectRoot, label: "原始工作区" });
+    const target = await spawnTarget(ctx, { cwd: ctx.projectRoot, label: "原始工作区（修复前）", role: "target-pre" });
+    ctx.procs.original = target;
+    ctx.view.targets.original = { ...target, role: "原始工作区（修复前）" };
+    pushView(ctx);
+
+    pre = await runPhase(ctx, { phase: "pre", baseUrl: target.url });
+    ctx.pushEvidence(pre.evidence);
+    ctx.view.phases.pre = pre.summary;
+    ctx.view.baseline = acceptanceVerdict(pre.summary);
+    pushView(ctx);
+  } else {
+    emit(ctx, {
+      kind: "probing",
+      severity: SEVERITY.INFO,
+      message: "未发现可本地复现的越权/穿越候选，跳过本地目标启动（仅进行 Supabase 探测）",
+      phase: STATE.PROBING,
+      data: {},
+    });
+  }
+
+  let supaRes = null;
+  if (supa?.probeable) {
+    const token = await ensureSupabaseToken(ctx, supa.url);
+    supaRes = await runSupabasePhase(ctx, { phase: "pre", token });
+    if (supaRes.evidence.length > 0) ctx.pushEvidence(supaRes.evidence);
+    ctx.view.phases.pre = mergeSummary(ctx.view.phases.pre ?? null, supaRes.summary);
+    pushView(ctx);
+  }
+  const supaLeaks = supaRes?.leaks ?? 0;
+  ctx.supabaseLeaks = supaLeaks;
+  ctx.serviceRoleLeak = supa?.serviceRoleLeak ?? null;
+  if (ctx.view.supabase) ctx.view.supabase = { ...ctx.view.supabase, leaks: supaLeaks };
+
+  const mergedRepro = (pre?.summary?.attackRepro ?? 0) + supaLeaks;
+  if (mergedRepro === 0 && !ctx.serviceRoleLeak) {
     throw new SessionError("攻击用例在修复前即无法复现，无法建立漏洞基线", {
       code: "attack_not_reproducible",
-      hint: "目标端点可能已有防护，或身份/资源发现结果不符合预期",
-      details: pre.summary,
+      hint: hasLocalProbes
+        ? "目标端点可能已有防护，或身份/资源发现结果不符合预期；Supabase 各表匿名不可读出数据（RLS 已生效）"
+        : "Supabase 各表匿名均不可读出数据（RLS 已生效或表为空），且未见 service_role 客户端暴露",
+      details: ctx.view.phases.pre ?? supaRes?.summary ?? null,
     });
   }
   setState(ctx, STATE.EVIDENCED);
-  return pre;
+  return pre ?? supaRes;
 }
 
 async function stagePatch(ctx) {
   ensureAlive(ctx);
   setState(ctx, STATE.PATCHING);
+
+  // Supabase 数据暴露属数据库策略/密钥管理问题，不在代码层自动修复 → 直接判定漏洞未修复（gate exit 1）
+  const supaLeaks = ctx.supabaseLeaks ?? 0;
+  const serviceRoleLeak = ctx.serviceRoleLeak ?? null;
+  if (supaLeaks > 0 || serviceRoleLeak) {
+    const leakTables = (ctx.view.supabase?.tables ?? []).slice(0, 8);
+    const hints = [];
+    if (supaLeaks > 0) {
+      hints.push(
+        `对匿名可读的表启用行级安全（RLS）并按操作建策略：ALTER TABLE <表名> ENABLE ROW LEVEL SECURITY; CREATE POLICY ... USING (auth.uid() = user_id)（泄露表：${leakTables.join("、")}）`
+      );
+    }
+    if (serviceRoleLeak) {
+      hints.push(
+        `立即在 Supabase 控制台吊销并轮换 service_role 密钥（它能绕过 RLS 读写全库），将其移出客户端可见位置（source: ${serviceRoleLeak.source}${serviceRoleLeak.name ? `, env: ${serviceRoleLeak.name}` : ""}${serviceRoleLeak.file ? `, file: ${serviceRoleLeak.file}` : ""}）`
+      );
+    }
+    throw new SessionError(
+      `检测到 Supabase 数据暴露（RLS 缺失 ${supaLeaks} 个表${serviceRoleLeak ? "，且 service_role 密钥客户端暴露" : ""}）——属数据库策略/密钥管理问题，不在代码层自动修复`,
+      {
+        code: "no_patchable_candidates",
+        hint: `${hints.join("；")}。修复后重跑 GuardBuild gate 验证（应转为 exit 0）。`,
+        details: { supabaseLeaks: supaLeaks, serviceRoleLeak, leakTables },
+      }
+    );
+  }
 
   // 隔离验收需再启动一个实例：先停止原始实例，避免固定端口互撞
   // （原始实例在复现阶段已完成使命；写回后复核会重新拉起）

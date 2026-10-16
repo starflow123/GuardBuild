@@ -35,6 +35,7 @@ hex = "0.4"
 regex = "1"
 uuid = { version = "1", features = ["v4"] }
 url = "2"
+native-tls = "0.2"
 rfd = { version = "0.15", optional = true }
 thiserror = "2"
 

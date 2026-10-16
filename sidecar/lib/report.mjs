@@ -26,7 +26,8 @@ function esc(v) {
   return String(v ?? "").replace(/\|/g, "\\|").replace(/\n/g, " ");
 }
 
-function headline(outcome, patchStatus) {
+function headline(outcome, patchStatus, supabase) {
+  const supaCritical = supabase && ((supabase.leaks ?? 0) > 0 || supabase.serviceRoleLeak);
   switch (outcome) {
     case "vulnerable":
       return patchStatus === "verify_failed"
@@ -35,8 +36,16 @@ function headline(outcome, patchStatus) {
     case "no_candidates":
       return "静态分析未发现可探测的安全候选端点（对象级越权 / 路径穿越线索）";
     case "vulnerable_unfixed":
+      if (supaCritical) {
+        return supabase.leaks > 0
+          ? `发现 Supabase 数据暴露（${supabase.leaks} 个表匿名可读，RLS 缺失${supabase.serviceRoleLeak ? "；并检出 service_role 密钥客户端暴露" : ""}）——属数据库策略/密钥问题，不在代码层自动修复`
+          : "发现 Supabase service_role 密钥客户端暴露（可绕过 RLS 读写全库）——需轮换密钥，不在代码层自动修复";
+      }
       return "发现可复现的越权漏洞证据；但候选中没有可自动修复的对象级越权端点，未生成修复补丁";
     case "not_reproducible":
+      if (supabase && !supaCritical) {
+        return "存在 Supabase 线索，但匿名探测未读出数据（RLS 已生效）且未见 service_role 暴露（可能已有防护）";
+      }
       return "存在静态候选，但攻击在运行期不可复现（可能已有运行期防护）";
     case "failed":
       return "诊断执行失败，未能完成漏洞验证闭环";
@@ -49,6 +58,7 @@ function headline(outcome, patchStatus) {
 
 function suggestions(r) {
   const { outcome, patchStatus } = r.verdict;
+  const supabase = r.supabase ?? null;
   const lines = [];
   if (outcome === "vulnerable" && patchStatus === "verified") {
     lines.push(`- 隔离 worktree 中已存在通过双重验收的修复补丁（\`${r.patch?.hash?.slice(0, 12)}…\`），gate 未写回原工作区。`);
@@ -58,12 +68,33 @@ function suggestions(r) {
     lines.push("- 补丁未通过双重验收（存在未阻断攻击或业务回归），请对照 post 证据中的 regressed/inconclusive 用例人工审查。");
     lines.push(`- 补丁保留在隔离 worktree：\`${r.patch?.worktree}\`。`);
   } else if (outcome === "no_candidates") {
-    lines.push("- 当前策略仅覆盖对象级越权（IDOR）场景类；如需其它漏洞类别，请扩展策略包与契约。");
+    lines.push("- 当前策略覆盖对象级越权（IDOR）/ 无鉴权读取 / 路径穿越 / Supabase 数据暴露等场景类；如需其它漏洞类别，请扩展策略包与契约。");
   } else if (outcome === "vulnerable_unfixed") {
-    lines.push("- 漏洞证据已建立（修复前攻击成功），但静态候选中没有可自动修复的对象级越权端点（自动修复仅覆盖带认证的 IDOR 场景）。");
-    lines.push("- 请对照 report.json 中各攻击用例（如纵向越权、无鉴权读取、路径穿越）定位端点并人工加固，再重跑 GuardBuild gate 验证。");
+    if (supabase && ((supabase.leaks ?? 0) > 0 || supabase.serviceRoleLeak)) {
+      if ((supabase.leaks ?? 0) > 0) {
+        lines.push(
+          `- 匿名（仅携公开 anon key）可读出 Supabase 表数据，证明 RLS（行级安全）缺失或策略过宽：${(supabase.tables ?? []).join("、")}。`
+        );
+        lines.push(
+          "- 在数据库侧启用并配置 RLS（无法在应用代码中修复）：`ALTER TABLE <表名> ENABLE ROW LEVEL SECURITY;` 后为 SELECT/INSERT/UPDATE/DELETE `CREATE POLICY ... USING (auth.uid() = user_id)`。"
+        );
+      }
+      if (supabase.serviceRoleLeak) {
+        lines.push(
+          `- 检出 service_role 密钥出现在客户端可见位置（${supabase.serviceRoleLeak.source}）：它能绕过 RLS 读写全库，请立即在 Supabase 控制台吊销并轮换，切勿置于 NEXT_PUBLIC_/VITE_/REACT_APP_ 等前端环境变量或前端源码中。`
+        );
+      }
+      lines.push("- 加固后重跑 GuardBuild gate，应转为 exit 0（not_reproducible / no_candidates）。");
+    } else {
+      lines.push("- 漏洞证据已建立（修复前攻击成功），但静态候选中没有可自动修复的对象级越权端点（自动修复仅覆盖带认证的 IDOR 场景）。");
+      lines.push("- 请对照 report.json 中各攻击用例（如纵向越权、无鉴权读取、路径穿越）定位端点并人工加固，再重跑 GuardBuild gate 验证。");
+    }
   } else if (outcome === "not_reproducible") {
-    lines.push("- 攻击在修复前即不可复现，未建立漏洞基线；请核对 guardbuild.json 的身份契约与目标的资源发现接口。");
+    if (supabase) {
+      lines.push("- Supabase 匿名探测未读出数据（RLS 生效或表为空），未见 service_role 暴露；如仍有顾虑，请在数据库侧核对 RLS 策略与密钥管理。");
+    } else {
+      lines.push("- 攻击在修复前即不可复现，未建立漏洞基线；请核对 guardbuild.json 的身份契约与目标的资源发现接口。");
+    }
   } else if (outcome === "failed") {
     lines.push(`- 执行失败（${r.error?.code}）：${r.error?.message ?? ""}${r.error?.hint ? `；建议：${r.error.hint}` : ""}`);
   } else {
@@ -130,6 +161,13 @@ function renderMarkdown(r) {
     );
   }
   if (r.patch) summaryLines.push(`- 补丁：\`${r.patch.hash?.slice(0, 12)}…\`（${r.patch.files?.length ?? 0} 个文件，${esc(r.patch.status)}）`);
+  const sb = r.summary.supabase;
+  if (sb?.detected) {
+    const bits = [`URL \`${esc(sb.url ?? "—")}\``, `表引用 ${sb.tables?.length ?? 0} 个`];
+    if (sb.serviceRoleLeak) bits.push(`service_role 暴露（${esc(sb.serviceRoleLeak.source)}）`);
+    if (sb.leaks) bits.push(`匿名可读 ${sb.leaks} 个表`);
+    summaryLines.push(`- Supabase：${bits.join("，")}`);
+  }
   if (r.summary.start) summaryLines.push(`- 启动契约：\`${esc(r.summary.start.cmd)} ${esc((r.summary.start.args ?? []).join(" "))}\`（就绪模式 ${esc(r.summary.start.readyPattern)}）`);
   if (r.error) summaryLines.push(`- 错误：\`${esc(r.error.code)}\` — ${esc(r.error.message)}`);
   parts.push(summaryLines.join("\n") + "\n");
@@ -197,6 +235,7 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
   const byPhase = (p) => evidence.filter((e) => e.phase === p);
   const finalState = state ?? view.state;
   const start = ctx.targetConfig?.start ?? null;
+  const supabase = view.supabase ?? null;
   const r = {
     schema: "guardbuild.report/1",
     generatedAt: Date.now(),
@@ -214,7 +253,7 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
       outcome,
       exitCode,
       patchStatus,
-      headline: headline(outcome, patchStatus),
+      headline: headline(outcome, patchStatus, supabase),
     },
     summary: {
       findingCount: (view.findings ?? []).length,
@@ -222,8 +261,10 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
       evidence: { pre: byPhase("pre").length, post: byPhase("post").length, postWriteback: byPhase("post_writeback").length },
       phases: view.phases ?? {},
       acceptance: view.acceptance ?? null,
+      supabase,
       start: start ? { cmd: start.cmd, args: start.args, readyPattern: start.readyPattern } : null,
     },
+    supabase,
     evidence: { pre: byPhase("pre"), post: byPhase("post"), postWriteback: byPhase("post_writeback") },
     patch: view.patch
       ? {

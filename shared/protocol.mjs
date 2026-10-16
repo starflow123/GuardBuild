@@ -74,6 +74,7 @@ export const SCOPE_KINDS = {
   WORKTREE_WRITE: "worktree.write",
   PROC_SPAWN: "proc.spawn",
   NET_PROBE: "net.probe",
+  NET_EGRESS: "net.egress",
   WORKSPACE_WRITE: "workspace.write",
   WORKSPACE_ROLLBACK: "workspace.rollback",
 };
@@ -90,6 +91,10 @@ export const SCOPE_POLICY = {
   "worktree.write": { consent: CONSENT_CLASS.CONFIRM, desc: "在隔离的 Git worktree 中生成修复补丁" },
   "proc.spawn": { consent: CONSENT_CLASS.CONFIRM, desc: "启动目标项目进程与 Node 运行时（仅限项目目录内）" },
   "net.probe": { consent: CONSENT_CLASS.CONFIRM, desc: "向本机回环地址发送诊断探测请求" },
+  "net.egress": {
+    consent: CONSENT_CLASS.CONFIRM,
+    desc: "向显式声明的主机发送 HTTPS 请求（Supabase/PostgREST 数据暴露探测；gate 需在 guardbuild.json 声明 net.egress:<host>）",
+  },
   "workspace.write": { consent: CONSENT_CLASS.USER_ONLY, desc: "将用户批准的补丁写回原工作区（需展示 Diff 后手动授权）" },
   "workspace.rollback": { consent: CONSENT_CLASS.USER_ONLY, desc: "回滚写回操作，恢复原工作区文件" },
 };

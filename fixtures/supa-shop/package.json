@@ -1,0 +1,7 @@
+{
+  "name": "supa-shop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "SupaShop - Supabase 前端示例（GuardBuild 诊断靶场：RLS 缺失导致匿名可读用户数据）"
+}

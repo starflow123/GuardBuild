@@ -24,6 +24,9 @@ pub enum Scope {
     ProcSpawn { roots: Vec<String> },
     #[serde(rename = "net.probe")]
     NetProbe {},
+    /// 向用户显式声明的主机发起 HTTPS 探测（Supabase/PostgREST 等远端数据接口）。
+    #[serde(rename = "net.egress")]
+    NetEgress { host: String },
     /// 仅能由用户在 UI 批准 Diff 后由 Host 下发，Sidecar 无法申请。
     #[serde(rename = "workspace.write")]
     WorkspaceWrite { root: String, patch_hash: String },
@@ -39,6 +42,7 @@ impl Scope {
             Scope::WorktreeWrite { .. } => "worktree.write",
             Scope::ProcSpawn { .. } => "proc.spawn",
             Scope::NetProbe { .. } => "net.probe",
+            Scope::NetEgress { .. } => "net.egress",
             Scope::WorkspaceWrite { .. } => "workspace.write",
             Scope::WorkspaceRollback { .. } => "workspace.rollback",
         }
@@ -58,6 +62,7 @@ impl Scope {
             Scope::WorktreeWrite { root } => format!("worktree.write @ {root}"),
             Scope::ProcSpawn { roots } => format!("proc.spawn @ [{}]", roots.join(", ")),
             Scope::NetProbe {} => "net.probe @ loopback".to_string(),
+            Scope::NetEgress { host } => format!("net.egress @ {host}"),
             Scope::WorkspaceWrite { root, patch_hash } => {
                 format!("workspace.write @ {root} (patch {})", &patch_hash[..8.min(patch_hash.len())])
             }
@@ -66,6 +71,22 @@ impl Scope {
             }
         }
     }
+}
+
+/// 归一化 egress 目标主机：仅接受 DNS 形态主机名（小写字母/数字/点/连字符，至少一个点），
+/// 拒绝携带端口、协议、路径或空白的输入，防止把 "https://x/a" 或 "x:443" 当作主机声明。
+pub fn normalize_egress_host(raw: &str) -> Option<String> {
+    let h = raw.trim().to_lowercase();
+    if h.is_empty() || h.len() > 253 || !h.contains('.') {
+        return None;
+    }
+    if !h.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-') {
+        return None;
+    }
+    if h.starts_with('.') || h.ends_with('.') || h.contains("..") {
+        return None;
+    }
+    Some(h)
 }
 
 /// 作用域授权令牌：Host 签发的唯一凭证载体。
@@ -277,6 +298,21 @@ impl Token {
         }
     }
 
+    /// 校验：允许对用户显式声明的主机发起 HTTPS 探测（主机名大小写不敏感精确匹配）。
+    pub fn require_egress(&self, host: &str) -> HostResult<()> {
+        let host_lc = host.to_lowercase();
+        if any_scope(self, |s| match s {
+            Scope::NetEgress { host: h } => h.to_lowercase() == host_lc,
+            _ => false,
+        }) {
+            Ok(())
+        } else {
+            Err(HostError::ScopeDenied(format!(
+                "向 {host} 发起 HTTPS 探测需要 net.egress @ {host} 授权（仅可由用户批准，或由 gate 在 guardbuild.json 中预声明 net.egress:{host}）"
+            )))
+        }
+    }
+
     /// 校验：写回工作区，必须与特定补丁哈希绑定。
     pub fn require_workspace_write(&self, root: &Path, patch_hash: &str) -> HostResult<()> {
         if any_scope(self, |s| match s {
@@ -347,6 +383,33 @@ mod tests {
         assert!(!w.requestable_by_sidecar());
         assert!(!r.requestable_by_sidecar());
         assert!(Scope::NetProbe {}.requestable_by_sidecar());
+        assert!(Scope::NetEgress { host: "db.example.com".into() }.requestable_by_sidecar());
+    }
+
+    #[test]
+    fn egress_host_must_match_declared_host() {
+        let token = Token {
+            id: "t2".into(),
+            session_id: "s1".into(),
+            scopes: vec![Scope::NetEgress { host: "abc123.supabase.co".into() }],
+            issued_at: now_ms(),
+            expires_at: now_ms() + 1000,
+            via: "user".into(),
+        };
+        assert!(token.require_egress("abc123.supabase.co").is_ok());
+        assert!(token.require_egress("ABC123.Supabase.CO").is_ok()); // 大小写不敏感
+        assert!(token.require_egress("evil.example.com").is_err());
+        assert!(token.require_egress("supabase.co").is_err());
+    }
+
+    #[test]
+    fn normalize_egress_host_rejects_non_host_shapes() {
+        assert_eq!(normalize_egress_host(" ABC.supabase.co "), Some("abc.supabase.co".into()));
+        assert_eq!(normalize_egress_host("https://abc.supabase.co"), None);
+        assert_eq!(normalize_egress_host("abc.supabase.co:443"), None);
+        assert_eq!(normalize_egress_host("localhost"), None);
+        assert_eq!(normalize_egress_host(""), None);
+        assert_eq!(normalize_egress_host("a..b.com"), None);
     }
 
     #[test]

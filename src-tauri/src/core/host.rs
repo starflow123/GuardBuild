@@ -466,6 +466,8 @@ impl Host {
             #[serde(rename = "kind")]
             kind: String,
             #[serde(default)]
+            host: Option<String>,
+            #[serde(default)]
             note: Option<String>,
             #[serde(default)]
             reason: Option<String>,
@@ -496,6 +498,15 @@ impl Host {
                 ],
             },
             "net.probe" => Scope::NetProbe {},
+            "net.egress" => {
+                let raw = p.host.as_deref().unwrap_or("");
+                let host = crate::core::token::normalize_egress_host(raw).ok_or_else(|| {
+                    HostError::InvalidParams(format!(
+                        "net.egress 需要合法的主机名（如 abc.supabase.co），收到: {raw:?}"
+                    ))
+                })?;
+                Scope::NetEgress { host }
+            }
             "workspace.write" | "workspace.rollback" => {
                 self.push_event(
                     "security",
@@ -517,18 +528,24 @@ impl Host {
             _ => "confirm",
         };
 
+        // gate 预声明匹配键：net.egress 与具体主机绑定（net.egress:<host>），其余按 kind 匹配
+        let grant_key = match &scope {
+            Scope::NetEgress { host } => format!("net.egress:{host}"),
+            _ => p.kind.clone(),
+        };
+
         let approved = if consent_class == "auto" {
             true
         } else if self.cfg.gate {
             // CI gate：无人工交互，仅在预声明作用域内批准（策略授权）
-            let granted = self.cfg.granted_scopes.iter().any(|s| s == p.kind.as_str());
+            let granted = self.cfg.granted_scopes.iter().any(|s| s == &grant_key);
             if !granted {
                 self.push_event(
                     "security",
                     "consent",
                     "warn",
-                    &format!("CI gate 拒绝了未预声明的作用域: {}", p.kind),
-                    json!({ "requested": p.kind, "granted": self.cfg.granted_scopes }),
+                    &format!("CI gate 拒绝了未预声明的作用域: {grant_key}"),
+                    json!({ "requested": &grant_key, "granted": self.cfg.granted_scopes }),
                 );
             }
             granted
@@ -1262,10 +1279,21 @@ impl Host {
         let _ = self.session_of_token(&p.token)?;
         let url = Url::parse(&p.url).map_err(|e| HostError::InvalidParams(format!("非法 URL: {e}")))?;
         let host = url.host_str().unwrap_or("").to_string();
+        let scheme = url.scheme().to_string();
         {
             let tokens = self.tokens.read().unwrap();
             let token = tokens.require(&p.token)?;
-            token.require_net(&host)?;
+            // 回环 → net.probe；远程主机 → net.egress（宿主名精确绑定，且仅允许 https）
+            if matches!(host.as_str(), "127.0.0.1" | "localhost" | "::1" | "[::1]") {
+                token.require_net(&host)?;
+            } else {
+                if scheme != "https" {
+                    return Err(HostError::ScopeDenied(format!(
+                        "net.egress 仅支持 https（明文 http 仅限本机回环探测）: {scheme}://{host}"
+                    )));
+                }
+                token.require_egress(&host)?;
+            }
         }
         if p.method.eq_ignore_ascii_case("CONNECT") || p.method.eq_ignore_ascii_case("TRACE") {
             return Err(HostError::InvalidParams("不允许的 HTTP 方法".into()));

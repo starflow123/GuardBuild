@@ -5,6 +5,7 @@ const SCOPE_DESC: Record<string, string> = {
   "worktree.write": "在隔离的 Git worktree 中生成修复补丁",
   "proc.spawn": "启动目标项目进程与 Node 运行时（仅限项目目录内）",
   "net.probe": "向本机回环地址（127.0.0.1）发送诊断探测请求",
+  "net.egress": "向显式声明的远程主机发送 HTTPS 请求（Supabase/PostgREST 数据暴露探测）",
   "workspace.write": "将批准的补丁写回原工作区",
   "workspace.rollback": "回滚写回操作，恢复原工作区文件",
 };

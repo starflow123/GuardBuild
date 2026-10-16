@@ -11,6 +11,7 @@
  *              "credentialPrefix": "Bearer " },
  *   "responses": { "list": "orders", "entity": "order" },
  *   "identities": [{ "name": "alice", "email": "alice@example.com", "password": "alice123", "role": "user" }],
+ *   "supabase": { "envFile": ".env", "url": "https://xyz.supabase.co", "anonKey": "eyJ…", "tables": ["profiles"] },
  *   "scopes": ["project.read", "worktree.write", "proc.spawn", "net.probe"]
  * }
  *
@@ -170,6 +171,24 @@ function normalizeResponses(raw) {
   return { list, entity };
 }
 
+/** Supabase 覆盖项：显式指定环境文件 / 项目 URL / anon key / 表名（缺省由静态检测自动发现） */
+function normalizeSupabase(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const out = {};
+  if (typeof raw.envFile === "string" && raw.envFile.trim()) out.envFile = raw.envFile.trim();
+  else if (Array.isArray(raw.envFile)) {
+    const l = raw.envFile.filter((x) => typeof x === "string" && x.trim()).map((x) => x.trim());
+    if (l.length) out.envFile = l;
+  }
+  if (typeof raw.url === "string" && raw.url.trim()) out.url = raw.url.trim();
+  if (typeof raw.anonKey === "string" && raw.anonKey.trim()) out.anonKey = raw.anonKey.trim();
+  if (Array.isArray(raw.tables)) {
+    const t = raw.tables.filter((x) => typeof x === "string" && /^[A-Za-z_][A-Za-z0-9_]*$/.test(x));
+    if (t.length) out.tables = [...new Set(t)];
+  }
+  return Object.keys(out).length ? out : null;
+}
+
 function fallback(source, invalid = null) {
   return {
     source,
@@ -179,6 +198,7 @@ function fallback(source, invalid = null) {
     login: null,
     prepare: null,
     responses: null,
+    supabase: null,
     scopes: null,
   };
 }
@@ -217,6 +237,7 @@ export async function loadTargetConfig(ctx) {
     login: normalizeLogin(parsed.login),
     prepare: normalizePrepare(parsed.prepare),
     responses: normalizeResponses(parsed.responses),
+    supabase: normalizeSupabase(parsed.supabase),
     scopes: Array.isArray(parsed.scopes)
       ? parsed.scopes.filter((x) => typeof x === "string" && x)
       : null,

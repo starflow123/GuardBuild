@@ -26,6 +26,10 @@ jobs:
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
 
+      - name: 安装 Linux TLS 依赖（native-tls/openssl）
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config
+
       - name: Cargo 构建缓存
         uses: Swatinem/rust-cache@v2
         with:
@@ -44,6 +48,9 @@ jobs:
       - name: 主工作流 E2E（31 断言）
         run: node scripts/e2e-headless.mjs
 
+      - name: Supabase 适配器 E2E（RLS 探测 + 密钥暴露，本机 mock）
+        run: node scripts/e2e-supabase.mjs
+
       - name: 上传报告与证据库
         if: always()
         uses: actions/upload-artifact@v4
@@ -55,3 +62,5 @@ jobs:
             .demo-gate/reports
             .demo-gate/data/guardbuild.db
             .demo/data/guardbuild.db
+            .demo-supabase/reports
+            .demo-supabase/data/guardbuild.db

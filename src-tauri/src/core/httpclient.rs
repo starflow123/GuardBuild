@@ -2,12 +2,18 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::time::{Duration, Instant};
 
+use native_tls::{TlsConnector, TlsStream};
 use serde::{Deserialize, Serialize};
 use url::Url;
 
 use super::error::{HostError, HostResult};
 
 pub const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024; // 2 MiB
+
+/// 读写通道抽象：明文 TCP 与 TLS 包装后共享同一调用面。
+trait ReadWrite: Read + Write {}
+impl ReadWrite for TcpStream {}
+impl ReadWrite for TlsStream<TcpStream> {}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HttpResponse {
@@ -35,8 +41,9 @@ fn default_port(scheme: &str) -> u16 {
     }
 }
 
-/// 极简 HTTP/1.1 客户端：仅支持明文 HTTP（探测目标限定为本机回环），
+/// 极简 HTTP/1.1 客户端：支持明文 HTTP（回环探测）与 HTTPS（native-tls，net.egress 探测），
 /// 支持 Content-Length 与 chunked 两种响应体；始终使用 Connection: close。
+/// 协议/主机策略由调用方（host.rs 作用域校验）把关，这里只负责传输。
 pub fn request(
     url: &Url,
     method: &str,
@@ -46,9 +53,9 @@ pub fn request(
 ) -> HostResult<HttpResponse> {
     let started = Instant::now();
     let scheme = url.scheme();
-    if scheme != "http" {
+    if scheme != "http" && scheme != "https" {
         return Err(HostError::Network(format!(
-            "仅支持 http:// 明文协议（回环探测）: {scheme}"
+            "仅支持 http/https 协议: {scheme}"
         )));
     }
     let host = url
@@ -73,14 +80,24 @@ pub fn request(
             .ok_or_else(|| HostError::Network(format!("无法解析 {host}:{port}")))?
     };
 
-    let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
+    let tcp = TcpStream::connect_timeout(&addr, Duration::from_secs(5))
         .map_err(|e| HostError::Network(format!("连接 {addr} 失败: {e}")))?;
-    stream
-        .set_read_timeout(Some(timeout))
+    tcp.set_read_timeout(Some(timeout))
         .map_err(|e| HostError::Network(e.to_string()))?;
-    stream
-        .set_write_timeout(Some(Duration::from_secs(10)))
+    tcp.set_write_timeout(Some(Duration::from_secs(10)))
         .map_err(|e| HostError::Network(e.to_string()))?;
+
+    // https：在已连接的 TCP 上做 TLS 握手（系统根证书校验；SNI 用主机名）
+    let mut stream: Box<dyn ReadWrite> = if scheme == "https" {
+        let connector =
+            TlsConnector::new().map_err(|e| HostError::Network(format!("TLS 初始化失败: {e}")))?;
+        let tls = connector
+            .connect(&host, tcp)
+            .map_err(|e| HostError::Network(format!("TLS 握手失败（{host}）: {e}")))?;
+        Box::new(tls)
+    } else {
+        Box::new(tcp)
+    };
 
     let body_bytes = body.map(|b| b.as_bytes().to_vec()).unwrap_or_default();
     let host_header = if port == 80 {
@@ -243,5 +260,15 @@ mod tests {
         let r = request(&url, "GET", &[], None, Duration::from_secs(5)).unwrap();
         assert_eq!(r.status, 200);
         assert!(r.body.contains("\"ok\":true"));
+    }
+
+    /// 真实 HTTPS 冒烟（需公网）：`cargo test -- --ignored https_smoke_external`
+    #[test]
+    #[ignore = "需要公网访问，手动执行以验证 TLS 链路"]
+    fn https_smoke_external() {
+        let url = Url::parse("https://example.com/").unwrap();
+        let r = request(&url, "GET", &[], None, Duration::from_secs(15)).unwrap();
+        assert_eq!(r.status, 200, "status={}", r.status);
+        assert!(r.body.contains("Example Domain"), "响应体未包含预期内容");
     }
 }

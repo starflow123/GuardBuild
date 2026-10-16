@@ -5,12 +5,14 @@ export type ScopeKind =
   | "worktree.write"
   | "proc.spawn"
   | "net.probe"
+  | "net.egress"
   | "workspace.write"
   | "workspace.rollback";
 
 export interface ScopeRequest {
   kind: ScopeKind;
   root?: string;
+  host?: string;
   hosts?: string[];
   note?: string;
 }

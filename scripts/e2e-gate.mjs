@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 /**
- * CI gate 模式演练：以 6 个目标分别驱动 guardbuild-headless --gate，验证
+ * CI gate 模式演练：以 7 个目标分别驱动 guardbuild-headless --gate，验证
  *   ① 漏洞目标        → exit 1（verdict=vulnerable, patchStatus=verified，附双重验收）
  *   ② 已修复目标      → exit 0（verdict=no_candidates，静态即无候选）
  *   ③ 运行期防护目标  → exit 0（verdict=not_reproducible，静态有候选但攻击不可复现）
@@ -9,6 +9,8 @@
  *                        email 登录 + 嵌套 token 提取 + npm prepare 步骤）
  *   ⑥ 无鉴权端点目标  → exit 1（verdict=vulnerable_unfixed：攻击已复现但仅有无鉴权
  *                        候选，无可自动修复 IDOR——必须放行为「漏洞证据成立」而非 exit 0）
+ *   ⑦ Drizzle 取数目标 → exit 1（verdict=vulnerable_unfixed：链式取数端点证据成立，
+ *                        但无自动修复模板；且列表形态（归属过滤）不得误报为候选）
  *
  * 同时校验 gate 的权限语义：
  *   - 作用域令牌经策略预声明签发（via=policy），全程无 GB_CONSENT 交互
@@ -115,14 +117,14 @@ function readReport(round) {
 }
 
 async function main() {
-  console.log("[GATE] 0/6 准备演示目录…");
+  console.log("[GATE] 0/7 准备演示目录…");
   rmSync(demoDir, { recursive: true, force: true });
   const seed = spawnSync(process.execPath, [path.join(repoRoot, "scripts", "seed-demo.mjs"), demoDir], { encoding: "utf8" });
   if (seed.status !== 0) throw new Error(`seed-demo 失败: ${seed.stderr || seed.stdout}`);
   if (!existsSync(exe)) throw new Error(`未找到无头宿主: ${exe}（先 cargo build --no-default-features --bin guardbuild-headless）`);
 
   // ---------- ① 漏洞目标 → exit 1 ----------
-  console.log("\n[GATE] 1/6 漏洞目标：期望 exit 1（漏洞证据成立 + 已验证补丁）…");
+  console.log("\n[GATE] 1/7 漏洞目标：期望 exit 1（漏洞证据成立 + 已验证补丁）…");
   const vulnWs = path.join(demoDir, "vibeshop");
   const r1 = await runGate(vulnWs, "r1");
   const g1 = r1.gate ?? {};
@@ -186,7 +188,7 @@ async function main() {
   check("已获取管线修复产物（隔离 worktree）", !!fixedAppJs && !fixedAppJs.includes('decision: "no-check"'), "");
 
   // ---------- ② 已修复目标 → exit 0 ----------
-  console.log("\n[GATE] 2/6 已修复目标：期望 exit 0（静态无候选）…");
+  console.log("\n[GATE] 2/7 已修复目标：期望 exit 0（静态无候选）…");
   const fixedWs = makeWorkspace("fixed-shop", {
     mutate: (ws) => writeFileSync(path.join(ws, "src", "app.js"), fixedAppJs ?? ""),
   });
@@ -197,7 +199,7 @@ async function main() {
   check("报告一致（no_candidates/exit 0）", rep2?.verdict?.outcome === "no_candidates" && rep2?.verdict?.exitCode === 0, `outcome=${rep2?.verdict?.outcome}`);
 
   // ---------- ③ 运行期防护目标 → exit 0 ----------
-  console.log("\n[GATE] 3/6 运行期防护目标：期望 exit 0（攻击不可复现）…");
+  console.log("\n[GATE] 3/7 运行期防护目标：期望 exit 0（攻击不可复现）…");
   const guardedWs = makeWorkspace("guarded-shop", {
     mutate: (ws) => {
       const server = path.join(ws, "server.js");
@@ -226,7 +228,7 @@ async function main() {
   check("报告一致（not_reproducible/exit 0）", rep3?.verdict?.outcome === "not_reproducible" && rep3?.verdict?.exitCode === 0, `outcome=${rep3?.verdict?.outcome}`);
 
   // ---------- ④ 契约凭证错误 → exit 2 ----------
-  console.log("\n[GATE] 4/6 契约凭证错误：期望 exit 2（执行失败）…");
+  console.log("\n[GATE] 4/7 契约凭证错误：期望 exit 2（执行失败）…");
   const badWs = makeWorkspace("badlogin-shop", {
     mutate: (ws) => writeFileSync(path.join(ws, "guardbuild.json"), JSON.stringify({
       identities: [
@@ -244,7 +246,7 @@ async function main() {
     `outcome=${rep4?.verdict?.outcome} error=${rep4?.error?.code}`);
 
   // ---------- ⑤ 真实形状目标（ANSI 就绪行 + 产物诱饵）→ exit 1 ----------
-  console.log("\n[GATE] 5/6 真实形状目标：期望 exit 1（人类可读 ANSI 就绪行 + 源码优先选择）…");
+  console.log("\n[GATE] 5/7 真实形状目标：期望 exit 1（人类可读 ANSI 就绪行 + 源码优先选择）…");
   const legacyWs = makeWorkspace("legacy-shop", { fixtureDir: path.join(repoRoot, "fixtures", "legacy-shop") });
   const r5 = await runGate(legacyWs, "r5");
   const g5 = r5.gate ?? {};
@@ -266,7 +268,7 @@ async function main() {
     `findings=${f5.length}：[${f5.map((f) => path.basename(f.file)).join(", ")}]`);
 
   // ---------- ⑥ 无鉴权端点目标 → exit 1（vulnerable_unfixed）----------
-  console.log("\n[GATE] 6/6 无鉴权端点目标：期望 exit 1（攻击已复现但无可自动修复候选）…");
+  console.log("\n[GATE] 6/7 无鉴权端点目标：期望 exit 1（攻击已复现但无可自动修复候选）…");
   const unauthWs = makeWorkspace("unauth-shop", {
     mutate: (ws) => {
       const appJsPath = path.join(ws, "src", "app.js");
@@ -351,6 +353,111 @@ async function main() {
   db6.close();
   check("pre 存在匿名可利用证据（漏洞基线成立）", anonVuln >= 1, `anonymous vulnerable 证据=${anonVuln}`);
   check("未生成补丁（无可自动修复候选）", patch6 === 0, `patches=${patch6}`);
+
+  // ---------- ⑦ Drizzle 链式取数目标 → exit 1（vulnerable_unfixed）----------
+  console.log("\n[GATE] 7/7 Drizzle 取数目标：期望 exit 1（链式取数证据成立但无修复模板；列表形态不误报）…");
+  const drizzleWs = makeWorkspace("drizzle-shop", {
+    mutate: (ws) => {
+      const appJsPath = path.join(ws, "src", "app.js");
+      let src = readFileSync(appJsPath, "utf8");
+      const swap = (find, repl) => {
+        if (!src.includes(find)) throw new Error(`[drizzle-shop] 变异锚点未匹配: ${find.slice(0, 60)}…`);
+        src = src.replace(find, repl);
+      };
+      // 引入链式查询垫片（select().from().where(eq)）
+      swap(
+        'import { store, findOrderById, publicUser } from "./data.js";',
+        'import { store, findOrderById, publicUser } from "./data.js";\nimport { db, ordersTable, eq } from "./drizzle-lite.js";'
+      );
+      // 详情路由：ORM helper 单查 → Drizzle 链式取数（静态 sink 形态变化，HTTP 契约与归属缺陷不变）
+      swap(
+        `    const orderId = Number(orderDetailMatch[1]);
+    const order = findOrderById(orderId);`,
+        `    const orderId = Number(orderDetailMatch[1]);
+    const [order = null] = await db.select().from(ordersTable).where(eq(ordersTable.id, orderId));`
+      );
+      // 取消路由：同样改用链式取数
+      swap(
+        `    const orderId = Number(orderCancelMatch[1]);
+    const order = findOrderById(orderId);`,
+        `    const orderId = Number(orderCancelMatch[1]);
+    const [order = null] = await db.select().from(ordersTable).where(eq(ordersTable.id, orderId));`
+      );
+      writeFileSync(appJsPath, src);
+      writeFileSync(
+        path.join(ws, "src", "drizzle-lite.js"),
+        [
+          "/** 迷你 Drizzle 垫片：仅实现本次演练用到的链式查询面（select().from().where(eq)） */",
+          'import { store } from "./data.js";',
+          "",
+          'export const ordersTable = { id: "id", userId: "userId" };',
+          "",
+          "export function eq(column, value) {",
+          "  return { column, value };",
+          "}",
+          "",
+          "export const db = {",
+          "  select() {",
+          "    return {",
+          "      from() {",
+          "        const rows = store.orders;",
+          "        return {",
+          "          where(cond) {",
+          "            return Promise.resolve(rows.filter((r) => r[cond.column] === cond.value));",
+          "          },",
+          "        };",
+          "      },",
+          "    };",
+          "  },",
+          "};",
+          "",
+        ].join("\n")
+      );
+    },
+  });
+  const r7 = await runGate(drizzleWs, "r7");
+  const g7 = r7.gate ?? {};
+  check("退出码 = 1（漏洞证据成立）", r7.code === 1, `code=${r7.code}`);
+  check(
+    "verdict=vulnerable_unfixed（链式取数无可自动修复候选）",
+    g7.verdict === "vulnerable_unfixed" && g7.error?.code === "no_patchable_candidates",
+    `verdict=${g7.verdict} code=${g7.error?.code} state=${g7.state}`
+  );
+  const rep7 = readReport("r7");
+  const findings7 = rep7?.summary?.findings ?? [];
+  check(
+    "Drizzle 端点入静态候选（GET /api/orders/:id + POST /api/orders/:id/cancel）",
+    findings7.some((f) => f.kind === "idor-suspect" && f.method === "GET" && f.path === "/api/orders/:id") &&
+      findings7.some((f) => f.kind === "idor-suspect" && f.method === "POST" && f.path === "/api/orders/:id/cancel"),
+    `findings=${findings7.map((f) => `${f.method} ${f.path}`).join("、")}`
+  );
+  check(
+    "列表形态（归属过滤路由）未被误报为候选",
+    !findings7.some((f) => f.path === "/api/orders" || f.path === "/api/my-orders"),
+    `findings=${findings7.map((f) => `${f.method} ${f.path}`).join("、")}`
+  );
+  const pre7 = rep7?.evidence?.pre ?? [];
+  const readEv7 = pre7.find((e) => e.caseId === "attack-read-foreign");
+  check("pre 证据：越权读取被放行（attack-read-foreign → vulnerable）", readEv7?.verdict === "vulnerable", `verdict=${readEv7?.verdict}`);
+  check(
+    "越权读取证据为强证据（服务端决策轨迹 strong + 受害订单内容）",
+    readEv7?.evidenceGrade === "strong" && String(readEv7?.actual ?? "").includes("u_1002"),
+    `grade=${readEv7?.evidenceGrade}`
+  );
+  check(
+    "pre 证据：越权取消被放行（attack-cancel-foreign → vulnerable）",
+    pre7.find((e) => e.caseId === "attack-cancel-foreign")?.verdict === "vulnerable",
+    ""
+  );
+  check("未生成补丁（链式取数形态无修复模板）", (rep7?.patch ?? null) === null, `patch=${rep7?.patch ? "有" : "无"}`);
+  check("错误指引要求人工修复", String(g7.error?.hint ?? "").includes("人工修复"), "");
+  const db7 = new DatabaseSync(dbPath, { readOnly: true });
+  const sid7 = g7.sessionId;
+  const pre7n = db7.prepare("SELECT COUNT(*) n FROM evidence WHERE session_id = ? AND phase='pre' AND verdict='vulnerable'").get(sid7).n;
+  const patch7 = db7.prepare("SELECT COUNT(*) n FROM patches WHERE session_id = ?").get(sid7).n;
+  db7.close();
+  check("DB：pre 越权证据入库（读取/取消 ≥ 2 条）", pre7n >= 2, `pre vulnerable=${pre7n}`);
+  check("DB：未写入补丁记录", patch7 === 0, `patches=${patch7}`);
 
   // ---------- 汇总 ----------
   const passed = checks.filter((c) => c.pass).length;

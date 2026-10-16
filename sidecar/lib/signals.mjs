@@ -3,9 +3,14 @@
  * 由 analyzer 主分析器与各框架适配器（nextjs 等）共用，保证判定口径一致。
  */
 
-// 资源获取 sink：按 ID 读取单个对象（ORM 单查族 + Sequelize/Mongo 的 Model.find({…}) 对象查询形态）
+// 资源获取 sink：按 ID 读取单个对象。
+//  - 单查族：findById/find…ById(OrThrow)（Mongoose/手写 helper）、findByPk（Sequelize）、
+//    findUnique(OrThrow)/findFirst(OrThrow)（Prisma，含 Drizzle 关系式查询）、findOneBy/findOneOrFail（TypeORM）
+//  - 对象查询形态：Model.find({…})（原生 Mongo 驱动）
+//  - Drizzle 链式取数：db.select(…).from(表)(.中间链式调用)*.where((and()?)eq(…))
+//    —— 以 eq( 收尾，便于 findQueryParamSink 从 where 实参中识别查询参数
 export const SINK =
-  /\b(find[A-Za-z]*ById|findById|findByPk|findOne|findUnique|getById|findOrderById|findByIdOrThrow)\s*\(|([A-Za-z_$][\w$]*\.find)\s*\(\s*\{/;
+  /\b(find[A-Za-z]*ById(?:OrThrow)?|findByPk|findOneBy|findOneOrFail|findOne|findUnique(?:OrThrow)?|findFirst(?:OrThrow)?|getById)\s*\(|([A-Za-z_$][\w$]*\.find)\s*\(\s*\{|([A-Za-z_$][\w$]*)\s*\.\s*select\s*\([^)]*\)\s*\.\s*from\s*\([^)]*\)(?:\s*\.\s*[A-Za-z_$][\w$]*\s*\([^)]*\))*\s*\.\s*where\s*\(\s*(?:and\s*\(\s*)?eq\s*\(/;
 
 // 归属校验：出现 userId 与请求者的比较（=== / !== / == / !=）
 export const OWNER_GUARD =
@@ -25,9 +30,10 @@ export const AUTH_GUARD =
 export const PUBLIC_PATH =
   /\/(?:login|logout|sign-?in|sign-?up|register|registration|auth|token|refresh|password|forgot|captcha)\b/i;
 
-// 归属过滤（列表接口按归属过滤）：兼容 userId/user_id、where 赋值与 Prisma/Drizzle 归约形态
+// 归属过滤（列表接口按归属过滤）：兼容 userId/user_id、where 赋值、Drizzle 的 eq(表.userId,…)
+// 与 Supabase/PostgREST 的 eq("user_id",…) 归约形态
 export const OWNER_FILTER =
-  /filter\s*\(\s*\(?[^)]*\)?\s*=>[^)]*\.user_?[Ii][Dd]\s*[!=]==|where\s*:?\s*\{[^}]*\buser_?[Ii][Dd]\b|where\s*=[^;\n]*\buser_?[Ii][Dd]\b/;
+  /filter\s*\(\s*\(?[^)]*\)?\s*=>[^)]*\.user_?[Ii][Dd]\s*[!=]==|where\s*:?\s*\{[^}]*\buser_?[Ii][Dd]\b|where\s*=[^;\n]*\buser_?[Ii][Dd]\b|eq\s*\(\s*[\w$]+\s*\.\s*user_?[Ii][Dd]\b|eq\s*\(\s*["'`]user_?[Ii][Dd]["'`]/;
 
 // —— 路径穿越线索：文件读取 sink + 请求输入在同段代码内合流 ——
 // sink 覆盖 fs.readFile / sendFile / createReadStream 等读取族（写/删类不在探测范围，避免破坏性操作）
@@ -111,7 +117,17 @@ export function findQueryParamSink(text) {
   const sinkRe = new RegExp(SINK.source, "g");
   let m;
   while ((m = sinkRe.exec(text))) {
-    const openIdx = m.index + m[0].lastIndexOf("(");
+    // Drizzle 链：扫描窗口取 where 的整体实参（and(eq(…), eq(…)) 内任一位置出现查询参数均可识别）；
+    // 其余形态取 sink 调用自身的实参窗口
+    let openIdx;
+    if (m[3]) {
+      const whereIdx = m[0].lastIndexOf("where");
+      const parenRel = whereIdx < 0 ? -1 : m[0].indexOf("(", whereIdx);
+      if (parenRel < 0) continue;
+      openIdx = m.index + parenRel;
+    } else {
+      openIdx = m.index + m[0].lastIndexOf("(");
+    }
     const argsText = callArgsSpan(text, openIdx);
     if (!argsText) continue;
     let direct = null;

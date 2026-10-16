@@ -442,7 +442,7 @@ function extractEndpoints(section) {
 function extractSinks(section) {
   const out = [];
   for (const m of section.text.matchAll(new RegExp(SINK.source, "g"))) {
-    out.push({ call: m[1] ?? m[2], index: m.index });
+    out.push({ call: m[1] ?? m[2] ?? (m[3] ? `${m[3]}.select-where` : null), index: m.index });
   }
   return out;
 }
@@ -464,6 +464,12 @@ function resourceFromModel(text) {
     const name = m[1].replace(/(?:Service|Repository|Repo|Model|Client)$/, "").replace(/[_-]?id$/i, "");
     if (name.length < 3) continue;
     return singular(name.toLowerCase());
+  }
+  // Drizzle 链式取数：.select().from(ordersTable) → order（剥去 Table/Schema 后缀）
+  const dr = /\.\s*select\s*\([^)]*\)\s*\.\s*from\s*\(\s*([A-Za-z_$][\w$]*)\s*\)/.exec(text);
+  if (dr && !MODEL_UTIL.has(dr[1].toLowerCase())) {
+    const name = dr[1].replace(/(?:Table|Schema)$/i, "").replace(/[_-]?id$/i, "");
+    if (name.length >= 3) return singular(name.toLowerCase());
   }
   return null;
 }
@@ -529,6 +535,9 @@ export async function analyzeProject(ctx) {
     const hasOwnerGuard = OWNER_GUARD.test(s.text);
     const hasRoleGuard = ROLE_GUARD.test(s.text);
     const hasOwnerFilter = OWNER_FILTER.test(s.text);
+    // 列表形态（归属过滤 + 无对象引用参数）：findFirst/单查族也常用于「取列表首条」，
+    // 无 :param/查询参数时不可被动态寻址，抑制为噪声而非 IDOR 候选
+    const listShaped = hasOwnerFilter && !hasPathParam && !queryParam;
     const matchVars = extractMatchVars(s);
     const mountPrefix = s.mountPrefixOverride ?? authGuards.mountPrefixes.get(normFile) ?? null;
     const fullPath = path ? joinUrl(mountPrefix, path) : null;
@@ -557,7 +566,7 @@ export async function analyzeProject(ctx) {
       resourceFromQueryParam(queryParam?.param) ?? resourceFromModel(s.text) ?? guessResource(fullPath, s.text);
 
     // 可疑 IDOR：按 ID 取单体资源 + 有认证 + 无归属校验 + 无角色限制
-    if (sinks.length > 0 && hasAuth && !hasOwnerGuard && !hasRoleGuard) {
+    if (sinks.length > 0 && hasAuth && !hasOwnerGuard && !hasRoleGuard && !listShaped) {
       candidates.push({ ...ep, kind: "idor-suspect", resource });
     } else if (
       // 可疑「无鉴权访问」：按 ID 取单体资源 + 无认证 + 路径含 :param 或查询参数标识符；

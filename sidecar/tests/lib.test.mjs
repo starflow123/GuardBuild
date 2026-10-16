@@ -20,6 +20,7 @@ import { methodStyleOps, expressStyleOps, findRecordDecisionBlock, buildProbePla
 import { buildLoginBody, classifyLoginFailure, extractListItems, extractEntity, buildCases } from "../lib/probe.mjs";
 import { loadTargetConfig, startUsesPortSlot, renderStart, PORT_SLOT } from "../lib/targetconfig.mjs";
 import { createPatch } from "../lib/patcher.mjs";
+import { SINK, OWNER_FILTER, findQueryParamSink } from "../lib/signals.mjs";
 
 const fixturePath = fileURLToPath(new URL("../../fixtures/vibeshop/src/app.js", import.meta.url));
 const fixture = readFileSync(fixturePath, "utf8");
@@ -1221,6 +1222,142 @@ test("analyzeProject: 查询参数 IDOR（req.query 直引 / 变量中转两种�
   assert.ok(c2, "变量中转的查询参数形态同样应入候选");
   assert.deepEqual(c2.queryParam, { param: "userId", form: "indirect" });
   assert.equal(c2.resource, "user", "资源名应从查询参数名推断");
+});
+
+test("signals: SINK 覆盖 Prisma/TypeORM 单查变体（findMany 列表查询不误报）", () => {
+  assert.ok(SINK.test("await prisma.order.findUniqueOrThrow({ where: { id } })"), "findUniqueOrThrow");
+  assert.ok(SINK.test("await db.order.findFirst({ where: { id } })"), "findFirst");
+  assert.ok(SINK.test("await repo.findOneBy({ id })"), "findOneBy");
+  assert.ok(SINK.test("await repo.findOneOrFail({ where: { id } })"), "findOneOrFail");
+  assert.ok(SINK.test("await orderRepo.findByIdOrThrow(id)"), "findByIdOrThrow");
+  assert.ok(
+    !SINK.test("const list = await db.order.findMany({ where: { userId } });"),
+    "findMany 为列表查询，不应识别为单查 sink"
+  );
+});
+
+test("signals: findQueryParamSink 覆盖 Drizzle 链式形态（直引 / and 组合 / 变量中转）", () => {
+  const direct = "const order = await db.select().from(orders).where(eq(orders.id, req.query.id));";
+  assert.deepEqual(findQueryParamSink(direct), { param: "id", form: "direct" });
+
+  const combined = [
+    "const rows = await db.select().from(orders)",
+    "  .where(and(eq(orders.userId, req.user.id), eq(orders.id, req.query.orderId)));",
+  ].join("\n");
+  assert.deepEqual(findQueryParamSink(combined), { param: "orderId", form: "direct" }, "and() 组合内任意位置的查询参数");
+
+  const indirect = [
+    "const orderId = req.query.orderId;",
+    "const rows = await db.select().from(orders).where(eq(orders.id, orderId));",
+  ].join("\n");
+  assert.deepEqual(findQueryParamSink(indirect), { param: "orderId", form: "indirect" });
+});
+
+test("signals: OWNER_FILTER 覆盖 Drizzle/Supabase 归约形态", () => {
+  assert.ok(OWNER_FILTER.test("where(and(eq(orders.userId, req.user.id), eq(orders.id, id)))"), "eq(表.userId,…)");
+  assert.ok(OWNER_FILTER.test('.eq("user_id", auth.user.id)'), 'supabase .eq("user_id",…)');
+  assert.ok(OWNER_FILTER.test(".eq('userId', uid)"), "supabase .eq('userId',…)");
+  assert.ok(!OWNER_FILTER.test("where(eq(orders.id, orderId))"), "仅按对象 id 的查询不是归属过滤");
+});
+
+test("analyzeProject: Prisma/TypeORM 单查变体入 IDOR 候选", async () => {
+  const R = "\\\\?\\D:\\p";
+  const content = [
+    'const express = require("express");',
+    "const router = express.Router();",
+    "router.use(authenticate);",
+    'router.get("/api/invoices/:id", async (req, res) => {',
+    "  const invoice = await prisma.invoice.findUniqueOrThrow({ where: { id: Number(req.params.id) } });",
+    "  res.json({ invoice });",
+    "});",
+    'router.get("/api/reports/:id", async (req, res) => {',
+    "  const report = await db.report.findFirst({ where: { id: Number(req.params.id) } });",
+    "  res.json({ report });",
+    "});",
+    'router.get("/api/teams/:id", async (req, res) => {',
+    "  const team = await teamRepo.findOneOrFail({ where: { id: req.params.id } });",
+    "  res.json({ team });",
+    "});",
+  ].join("\n");
+  const a = await analyzeProject({
+    projectRoot: R,
+    tokens: { project: "tok" },
+    rpc: {
+      request: async (method) => {
+        if (method === "fs.list") return { entries: [{ path: `${R}\\src\\app.js`, kind: "file", size: 600 }] };
+        if (method === "fs.read") return { content, size: 600, redacted: false, redactions: [] };
+        throw new Error(`不应调用 ${method}`);
+      },
+    },
+  });
+  const inv = a.candidates.find((c) => c.path === "/api/invoices/:id");
+  assert.ok(inv, "findUniqueOrThrow 形态应入候选");
+  assert.equal(inv.kind, "idor-suspect");
+  assert.equal(inv.resource, "invoice");
+  assert.equal(inv.hasAuth, true, "router.use(authenticate) 应计为认证");
+  const rep = a.candidates.find((c) => c.path === "/api/reports/:id");
+  assert.ok(rep, "findFirst 形态应入候选");
+  assert.equal(rep.resource, "report");
+  const team = a.candidates.find((c) => c.path === "/api/teams/:id");
+  assert.ok(team, "findOneOrFail 形态应入候选");
+  assert.equal(team.resource, "team", "teamRepo 应剥去 Repo 后缀");
+});
+
+test("analyzeProject: Drizzle 链式取数（路径参数 / 查询参数 / 列表形态抑制）", async () => {
+  const R = "\\\\?\\D:\\p";
+  const content = [
+    'const express = require("express");',
+    'const { eq } = require("drizzle-orm");',
+    'const { db, ordersTable } = require("./db");',
+    "const router = express.Router();",
+    "router.use(authenticate);",
+    'router.get("/api/orders/:id", async (req, res) => {',
+    "  const rows = await db.select().from(ordersTable).where(eq(ordersTable.id, Number(req.params.id)));",
+    "  res.json({ order: rows[0] ?? null });",
+    "});",
+    'router.get("/api/order-lookup", async (req, res) => {',
+    "  const rows = await db.select().from(ordersTable).where(eq(ordersTable.id, req.query.orderId));",
+    "  res.json({ order: rows[0] ?? null });",
+    "});",
+    'router.get("/api/my-orders", async (req, res) => {',
+    "  const recent = await db.select().from(ordersTable).where(eq(ordersTable.userId, req.user.id));",
+    "  res.json({ orders: recent });",
+    "});",
+  ].join("\n");
+  const a = await analyzeProject({
+    projectRoot: R,
+    tokens: { project: "tok" },
+    rpc: {
+      request: async (method) => {
+        if (method === "fs.list") return { entries: [{ path: `${R}\\src\\app.js`, kind: "file", size: 800 }] };
+        if (method === "fs.read") return { content, size: 800, redacted: false, redactions: [] };
+        throw new Error(`不应调用 ${method}`);
+      },
+    },
+  });
+  const detail = a.candidates.find((c) => c.path === "/api/orders/:id");
+  assert.ok(detail, "Drizzle 链式取数应识别为单查 sink");
+  assert.equal(detail.kind, "idor-suspect");
+  assert.equal(detail.resource, "order", "资源名应从 .from(ordersTable) 推断（剥 Table 后缀）");
+
+  const lookup = a.candidates.find((c) => c.path === "/api/order-lookup");
+  assert.ok(lookup, "Drizzle 查询参数形态应入 IDOR 候选");
+  assert.deepEqual(lookup.queryParam, { param: "orderId", form: "direct" });
+
+  assert.equal(
+    a.endpoints.find((e) => e.path === "/api/my-orders")?.hasOwnerFilter,
+    true,
+    "eq(表.userId, …) 应识别为归属过滤"
+  );
+  assert.ok(
+    !a.candidates.some((c) => c.path === "/api/my-orders"),
+    "列表形态（归属过滤 + 无对象引用参数）不应成为候选"
+  );
+
+  const plan = buildProbePlan(a);
+  assert.equal(plan.readCandidate?.path, "/api/orders/:id");
+  assert.equal(plan.listEndpoint?.path, "/api/my-orders");
+  assert.equal(plan.resource, "order");
 });
 
 test("analyzeProject: 跨文件 handler 引用 + IIFE 挂载（router.get('/x', mw, appHandler.x)）", async () => {

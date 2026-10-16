@@ -241,7 +241,12 @@ export function expressStyleOps(content, cand) {
 
 export const FIX_STRATEGIES = [
   { name: "owner-guard-after-fetch", styles: ["method"], builder: methodStyleOps, desc: "资源获取后注入归属校验（手写路由）" },
-  { name: "express-owner-guard", styles: ["express"], builder: expressStyleOps, desc: "findById 后注入归属校验（Express）" },
+  {
+    name: "express-owner-guard",
+    styles: ["express", "express-handler"],
+    builder: expressStyleOps,
+    desc: "findById 后注入归属校验（Express）",
+  },
 ];
 
 export function scopeRequestFor(kind) {

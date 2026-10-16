@@ -187,6 +187,9 @@ export async function createPatch(ctx) {
       let applied = false;
       let lastErr = null;
       for (const strat of FIX_STRATEGIES) {
+        // 风格门控：候选代码形态与策略不匹配时不得强行套用（如把 Express 的 req.user.id
+        // 守卫注入 Next.js route handler）。无 style 字段的候选保持既有全试行为。
+        if (cand.style && !strat.styles.includes(cand.style)) continue;
         try {
           const candOps = strat.builder(content, cand);
           ops.push(...candOps);

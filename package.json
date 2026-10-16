@@ -19,7 +19,8 @@
     "seed-demo": "node scripts/seed-demo.mjs",
     "e2e": "node scripts/e2e-headless.mjs",
     "e2e:gate": "node scripts/e2e-gate.mjs",
-    "e2e:supabase": "node scripts/e2e-supabase.mjs"
+    "e2e:supabase": "node scripts/e2e-supabase.mjs",
+    "e2e:next": "node scripts/e2e-next.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.9.0",

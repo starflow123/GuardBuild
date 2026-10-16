@@ -1,0 +1,21 @@
+{
+  "start": {
+    "cmd": "node",
+    "args": ["server.js"],
+    "env": { "PORT": "0" },
+    "readyPattern": "已就绪",
+    "readyTimeoutMs": 20000
+  },
+  "login": {
+    "path": "/api/login",
+    "bodyTemplate": { "email": "{email}", "password": "{password}" },
+    "credentialPath": "token"
+  },
+  "responses": { "list": "orders", "entity": "order" },
+  "identities": [
+    { "name": "alice", "email": "alice@next.shop", "password": "alice123", "role": "user" },
+    { "name": "bob", "email": "bob@next.shop", "password": "bob123", "role": "user" },
+    { "name": "admin", "email": "admin@next.shop", "password": "admin123", "role": "admin" }
+  ],
+  "scopes": ["project.read", "worktree.write", "proc.spawn", "net.probe"]
+}

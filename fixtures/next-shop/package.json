@@ -1,0 +1,10 @@
+{
+  "name": "next-shop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "NextShop - Next.js App Router 风格示例订单服务（GuardBuild 诊断靶场：route handler 含对象级越权）",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

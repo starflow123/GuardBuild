@@ -13,6 +13,16 @@
  *  - 响应体经 Host 脱敏后才返回给 Sidecar（写入证据的仍是掩码形式）
  */
 import { RPC_TO_HOST, VERDICT, CASE_CATEGORY, SEVERITY, shortId } from "../../shared/protocol.mjs";
+import {
+  INPUT_VARIANTS,
+  encodeInput,
+  inputRejected,
+  isTrpcCandidate,
+  looksLikeTrpcProcPath,
+  trpcRequest,
+  unwrapTrpcEnvelope,
+  variantAt,
+} from "./trpcwire.mjs";
 
 export class ProbeError extends Error {
   constructor(message, { code = "probe_failed", hint = null } = {}) {
@@ -131,6 +141,10 @@ async function httpJson(ctx, opts) {
   } catch {
     /* 非 JSON 响应 */
   }
+  // tRPC 响应信封（{result:{data:…}} / superjson 再包一层）在此统一解开，
+  // 上层 extractEntity/extractListItems 与契约 responses.list/entity 因此无需感知框架形态。
+  // 判定严格（顶层仅 result 且含 data），REST 目标响应不受影响。
+  if (json !== null) json = unwrapTrpcEnvelope(json);
   return { ...res, json };
 }
 
@@ -236,17 +250,40 @@ export async function loginAll(ctx, baseUrl) {
   for (const path of candidates) {
     const loggedIn = [];
     let failed = false;
+    // 登录端点是 tRPC 过程（末段形如 auth.login）时，请求体形态（superjson 包裹与否）未知，
+    // 按变体检索到能用第一个身份取回凭据的形态后再为其余身份复用
+    const isTrpcProc = looksLikeTrpcProcPath(path);
     for (const ident of ctx.identities) {
-      const res = await httpJson(ctx, {
-        baseUrl,
-        method: "POST",
-        path,
-        body: JSON.stringify(buildLoginBody(ident, cfg)),
-        storeAs: ident.name,
-        credentialPath: cfg?.credentialPath ?? "token",
-        credentialPrefix: cfg?.credentialPrefix ?? "Bearer ",
-        credentialHeader: cfg?.credentialHeader ?? null,
-      });
+      const bodyPlain = buildLoginBody(ident, cfg);
+      const wraps = isTrpcProc ? [true, false] : [false];
+      let res = null;
+      for (const wrap of wraps) {
+        res = await httpJson(ctx, {
+          baseUrl,
+          method: "POST",
+          path,
+          body: isTrpcProc ? encodeInput(bodyPlain, wrap) : JSON.stringify(bodyPlain),
+          storeAs: ident.name,
+          credentialPath: cfg?.credentialPath ?? "token",
+          credentialPrefix: cfg?.credentialPrefix ?? "Bearer ",
+          credentialHeader: cfg?.credentialHeader ?? null,
+        });
+        if (okStatus(res.status) && res.storedIdentity === ident.name) {
+          if (isTrpcProc && ctx._trpcWrap == null) {
+            ctx._trpcWrap = wrap;
+            ctx._trpcVariant = wrap ? 0 : 1;
+            ctx.emit({
+              kind: "identity",
+              severity: SEVERITY.INFO,
+              message: `tRPC 登录请求体形态确认：${wrap ? "superjson 包裹" : "裸 JSON"}`,
+              data: { wrap, endpoint: path },
+            });
+          }
+          break;
+        }
+        if (isTrpcProc && inputRejected(res)) continue; // 形态问题，换下一种
+        break;
+      }
       if (okStatus(res.status) && res.storedIdentity === ident.name) {
         const user = pickUser(res.json, cfg);
         ctx.emit({
@@ -294,7 +331,8 @@ async function discoverViaAnonymousProbe(ctx, baseUrl, cand) {
   const path = candPath(cand);
   const anonymousItems = [];
   for (let id = 1; id <= ANON_PROBE_MAX_ID && anonymousItems.length < ANON_PROBE_MAX_ITEMS; id += 1) {
-    const res = await httpJson(ctx, { baseUrl, method: "GET", path: fillCandPath(cand, id), identity: null });
+    const req = candRequest(ctx, cand, id);
+    const res = await httpJson(ctx, { baseUrl, method: "GET", path: req.path, identity: null });
     const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
     if (o && String(o.id) === String(id)) anonymousItems.push(o);
   }
@@ -419,6 +457,101 @@ function fillCandPath(cand, id) {
   return fillParams(path, id);
 }
 
+/**
+ * 用例请求构造的统一入口：tRPC 候选按线上协议生成 URL/body（input 放 ?input= 或请求体，
+ * 编码形态取协商结果 ctx._trpcVariant），其余候选保持 REST 形态。
+ */
+function candRequest(ctx, cand, id) {
+  if (!isTrpcCandidate(cand)) return { path: fillCandPath(cand, id), body: null };
+  const req = trpcRequest(cand, id, variantAt(ctx._trpcVariant ?? 0));
+  if (!req) return { path: fillCandPath(cand, id), body: null };
+  return { path: req.path, body: req.body };
+}
+
+/** 计划里是否存在需要 input 的 tRPC 候选 */
+function planHasTrpc(ctx) {
+  const list = ctx.plan?.candidates ?? [];
+  return list.some((c) => isTrpcCandidate(c) && c.trpc?.addressable);
+}
+
+/**
+ * input 变体尝试顺序：已知的 superjson 形态（来自登录协商）优先，其次不翻转 ID 类型。
+ * 返回 INPUT_VARIANTS 下标序列，协商与登录共用，保证「试错」次数最少。
+ */
+function orderedVariants(ctx) {
+  const idx = INPUT_VARIANTS.map((_, i) => i);
+  const knownWrap = ctx._trpcWrap;
+  idx.sort((a, b) => {
+    const va = variantAt(a);
+    const vb = variantAt(b);
+    let d = 0;
+    if (knownWrap != null) d += (va.wrap === knownWrap ? 0 : 2) - (vb.wrap === knownWrap ? 0 : 2);
+    d += (va.flip ? 1 : 0) - (vb.flip ? 1 : 0);
+    return d || a - b;
+  });
+  return idx;
+}
+
+/**
+ * tRPC input 编码协商：服务端是否使用 superjson、ID 是 number 还是 string，静态分析无法确证，
+ * 发一次只读请求按响应判别（400/BAD_REQUEST = input 形态被 zod 拒绝，其余状态说明 input 已被接受）。
+ * 必须携带身份——tRPC 中间件先于 input 校验，未登录时恒返回 401，无法区分两种形态。
+ * 仅使用查询（GET）过程，绝不用变更过程做协商，避免产生副作用。
+ */
+async function negotiateTrpcInput(ctx, baseUrl, loggedIn) {
+  if (ctx._trpcNegotiated || !planHasTrpc(ctx)) return;
+  ctx._trpcNegotiated = true; // 只协商一次（post 阶段沿用同一形态）；失败也不重复试探
+  const ident = loggedIn.find((i) => i.role !== "admin") ?? loggedIn[0] ?? null;
+  // 只用查询（GET）过程协商：变更过程有副作用。受保护查询须带身份（中间件先于 input 校验，
+  // 无身份恒返回 401 无法判别形态）；无鉴权查询可匿名判别。
+  const probes = [];
+  for (const c of ctx.plan.readCandidates ?? []) {
+    if (isTrpcCandidate(c) && ident) probes.push({ cand: c, identity: ident.name });
+  }
+  for (const c of ctx.plan.unauthReadCandidates ?? []) {
+    if (isTrpcCandidate(c)) probes.push({ cand: c, identity: null });
+  }
+  const pick = probes[0] ?? null;
+  if (!pick) {
+    ctx._trpcVariant ??= 0;
+    ctx.emit({
+      kind: "discovery",
+      severity: SEVERITY.WARN,
+      message: "tRPC input 编码未协商（无可用作只读试探的查询过程或无可用身份），按默认 superjson 形态探测",
+      data: { variant: ctx._trpcVariant, reason: ident ? "no_read_candidate" : "no_identity" },
+    });
+    return;
+  }
+  for (const i of orderedVariants(ctx)) {
+    const req = trpcRequest(pick.cand, 1, variantAt(i));
+    if (!req) break;
+    const res = await httpJson(ctx, {
+      baseUrl,
+      method: req.method,
+      path: req.path,
+      identity: pick.identity,
+      body: req.body,
+    });
+    if (inputRejected(res)) continue;
+    ctx._trpcVariant = i;
+    ctx._trpcWrap = variantAt(i).wrap;
+    ctx.emit({
+      kind: "discovery",
+      severity: SEVERITY.INFO,
+      message: `tRPC input 编码协商成功：${variantAt(i).wrap ? "superjson 包裹" : "裸 JSON"}${variantAt(i).flip ? "（ID 类型翻转）" : ""}（HTTP ${res.status}）`,
+      data: { variant: i, wrap: variantAt(i).wrap, flip: variantAt(i).flip, status: res.status, probe: req.path },
+    });
+    return;
+  }
+  ctx._trpcVariant = 0;
+  ctx.emit({
+    kind: "discovery",
+    severity: SEVERITY.WARN,
+    message: `tRPC input 编码协商失败：${INPUT_VARIANTS.length} 种形态均被拒绝（HTTP 400），后续探测可能无法复现`,
+    data: { variant: 0, probe: candPath(pick.cand) },
+  });
+}
+
 const okStatus = (s) => s >= 200 && s < 300;
 
 /** 攻击用例判定：修复前 = 漏洞可利用；修复后 = 攻击被阻断 */
@@ -523,13 +656,15 @@ export function buildCases(ctx, targets) {
     const suffix = i === 0 ? "" : `-${i + 1}`;
     const multi = readCands.length > 1 ? `（${path}）` : "";
     const candLabel = resourceLabelOf(cand.resource ?? ctx.plan?.resource);
+    const req = candRequest(ctx, cand, readTarget.id);
     cases.push({
       id: `attack-read-foreign${suffix}`,
       category: CASE_CATEGORY.ATTACK,
       name: `${attacker.name} 读取 ${victim.name} 的${candLabel} #${readTarget.id}${multi}`,
       identity: attacker.name,
       method: "GET",
-      path: fillCandPath(cand, readTarget.id),
+      path: req.path,
+      body: req.body,
       routeKey: cand.routeKeys?.[0] ?? readKey,
       expect: `越权读取他人${candLabel}应被拒绝（401/403/404）`,
       verify: (res, phase) => {
@@ -560,13 +695,15 @@ export function buildCases(ctx, targets) {
     const suffix = i === 0 ? "" : `-${i + 1}`;
     const multi = cancelCands.length > 1 ? `（${path}）` : "";
     const candLabel = resourceLabelOf(cand.resource ?? ctx.plan?.resource);
+    const req = candRequest(ctx, cand, cancelTarget.id);
     cases.push({
       id: `attack-cancel-foreign${suffix}`,
       category: CASE_CATEGORY.ATTACK,
       name: `${attacker.name} 取消 ${victim.name} 的${candLabel} #${cancelTarget.id}${multi}`,
       identity: attacker.name,
-      method: "POST",
-      path: fillCandPath(cand, cancelTarget.id),
+      method: cand.method ?? "POST",
+      path: req.path,
+      body: req.body,
       routeKey: cand.routeKeys?.[0] ?? cancelKey,
       expect: `越权取消他人${candLabel}应被拒绝（401/403/404）`,
       verify: (res, phase) => {
@@ -633,13 +770,15 @@ export function buildCases(ctx, targets) {
     const suffix = i === 0 ? "" : `-${i + 1}`;
     const multiText = unauthCands.length > 1 ? ` ${path}` : "";
     const candLabel = resourceLabelOf(cand.resource ?? ctx.plan?.resource);
+    const req = candRequest(ctx, cand, anonTarget.id);
     cases.push({
       id: `attack-anonymous-read${suffix}`,
       category: CASE_CATEGORY.ATTACK,
       name: `未携带凭证读取${candLabel} #${anonTarget.id}（无鉴权端点${multiText}）`,
       identity: null,
       method: "GET",
-      path: fillCandPath(cand, anonTarget.id),
+      path: req.path,
+      body: req.body,
       routeKey: cand.routeKeys?.[0] ?? null,
       expect: `未认证读取${candLabel}应被拒绝（401/403/404）`,
       verify: (res, phase) => {
@@ -744,13 +883,15 @@ export function buildCases(ctx, targets) {
   // —— 业务用例（回归防线）——
   const own = targets.ownReadTarget;
   if (readPath && own && attacker) {
+    const ownReq = candRequest(ctx, readCands[0], own.id);
     cases.push({
       id: "business-read-own",
       category: CASE_CATEGORY.BUSINESS,
       name: `${attacker.name} 读取自己的${label} #${own.id}`,
       identity: attacker.name,
       method: "GET",
-      path: fillCandPath(readCands[0], own.id),
+      path: ownReq.path,
+      body: ownReq.body,
       routeKey: readKey,
       expect: `本人${label}应正常可见（200，且归属本人）`,
       verify: (res) =>
@@ -787,13 +928,15 @@ export function buildCases(ctx, targets) {
 
   if (cancelPath && targets.ownCancelTarget && attacker) {
     const c = targets.ownCancelTarget;
+    const ownCancelReq = candRequest(ctx, cancelCands[0], c.id);
     cases.push({
       id: "business-cancel-own",
       category: CASE_CATEGORY.BUSINESS,
       name: `${attacker.name} 取消自己的${label} #${c.id}`,
       identity: attacker.name,
       method: "POST",
-      path: fillCandPath(cancelCands[0], c.id),
+      path: ownCancelReq.path,
+      body: ownCancelReq.body,
       routeKey: cancelKey,
       expect: `本人已支付${label}应可正常取消（200）`,
       verify: (res) =>
@@ -808,13 +951,15 @@ export function buildCases(ctx, targets) {
 
   if (cancelPath && targets.ownNotCancellable && attacker) {
     const s = targets.ownNotCancellable;
+    const shippedReq = candRequest(ctx, cancelCands[0], s.id);
     cases.push({
       id: "business-shipped-guard",
       category: CASE_CATEGORY.BUSINESS,
       name: `${attacker.name} 取消已发货${label} #${s.id} 被业务规则拒绝`,
       identity: attacker.name,
       method: "POST",
-      path: fillCandPath(cancelCands[0], s.id),
+      path: shippedReq.path,
+      body: shippedReq.body,
       routeKey: cancelKey,
       expect: `状态非 paid 的${label}不可取消（409），业务规则保持有效`,
       verify: (res) =>
@@ -898,13 +1043,15 @@ export function buildCases(ctx, targets) {
   }
 
   if (readPath && own) {
+    const anonReq = candRequest(ctx, readCands[0], own.id);
     cases.push({
       id: "business-unauth-401",
       category: CASE_CATEGORY.BUSINESS,
       name: `未登录访问${label}详情被拒绝`,
       identity: null,
       method: "GET",
-      path: fillCandPath(readCands[0], own.id),
+      path: anonReq.path,
+      body: anonReq.body,
       routeKey: readKey,
       expect: "未认证请求应被拒绝（401），认证入口保持有效",
       verify: (res) => {
@@ -933,6 +1080,7 @@ export async function runPhase(ctx, { phase, baseUrl }) {
   });
 
   const loggedIn = await loginAll(ctx, baseUrl);
+  await negotiateTrpcInput(ctx, baseUrl, loggedIn);
   const { byUser, anonymousItems, anonTargets } = await discoverResources(ctx, baseUrl, loggedIn);
   const targets = pickTargets(byUser, loggedIn, anonymousItems, anonTargets);
   const cases = buildCases(ctx, targets);

@@ -13,6 +13,7 @@ guardbuild-data/
 .demo-supabase/
 .demo-next/
 .demo-nest/
+.demo-trpc/
 guardbuild.db*
 *.tsbuildinfo
 

@@ -21,7 +21,8 @@
     "e2e:gate": "node scripts/e2e-gate.mjs",
     "e2e:supabase": "node scripts/e2e-supabase.mjs",
     "e2e:next": "node scripts/e2e-next.mjs",
-    "e2e:nest": "node scripts/e2e-nest.mjs"
+    "e2e:nest": "node scripts/e2e-nest.mjs",
+    "e2e:trpc": "node scripts/e2e-trpc.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.9.0",

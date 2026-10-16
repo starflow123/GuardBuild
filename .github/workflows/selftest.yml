@@ -57,6 +57,9 @@ jobs:
       - name: NestJS 适配器 E2E（装饰器路由解析 + 越权/穿越复现，本机垫片）
         run: node scripts/e2e-nest.mjs
 
+      - name: tRPC 适配器 E2E（过程路径组装 + input 编码协商，本机垫片）
+        run: node scripts/e2e-trpc.mjs
+
       - name: 上传报告与证据库
         if: always()
         uses: actions/upload-artifact@v4

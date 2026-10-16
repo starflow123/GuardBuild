@@ -1806,14 +1806,81 @@ impl SessionMetaExt for Option<&SessionMeta> {
 }
 
 /// 极简 JSON 点路径取值（"data.token" / "token"）
+///
+/// 先剥协议信封（tRPC 成功信封 `{result:{data:…}}`、superjson 的 `{json,meta?}`），
+/// 使契约里的 credentialPath 只写业务字段名（如 "token"），与服务端是否套 transformer 无关。
+/// 判定严格：仅当顶层只有一个 `result` 键且其内含 `data` 时才解包，普通 REST 响应不受影响。
 fn json_path(body: &str, path: &str) -> Option<String> {
     let v: Value = serde_json::from_str(body).ok()?;
-    let mut cur = &v;
+    let mut cur = unwrap_wire_envelope(&v);
     for seg in path.split('.') {
         cur = cur.get(seg)?;
     }
     match cur {
         Value::String(s) => Some(s.clone()),
         _ => None,
+    }
+}
+
+/// 反复剥去 `{result:{data:…}}` 与 `{json:…}` 信封，直到取到业务载荷
+fn unwrap_wire_envelope<'a>(v: &'a Value) -> &'a Value {
+    let mut cur = v;
+    loop {
+        if let Some(data) = cur
+            .as_object()
+            .filter(|o| o.len() == 1)
+            .and_then(|o| o.get("result"))
+            .and_then(|r| r.get("data"))
+        {
+            cur = data;
+            continue;
+        }
+        let superjson_inner = cur.as_object().and_then(|o| {
+            if o.contains_key("json") && o.keys().all(|k| k == "json" || k == "meta") {
+                o.get("json")
+            } else {
+                None
+            }
+        });
+        if let Some(inner) = superjson_inner {
+            cur = inner;
+            continue;
+        }
+        return cur;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_path_reads_plain_and_nested_paths() {
+        assert_eq!(json_path(r#"{"token":"abc"}"#, "token").as_deref(), Some("abc"));
+        assert_eq!(
+            json_path(r#"{"authentication":{"token":"abc"}}"#, "authentication.token").as_deref(),
+            Some("abc")
+        );
+        assert_eq!(json_path(r#"{"token":123}"#, "token"), None);
+    }
+
+    #[test]
+    fn json_path_unwraps_trpc_and_superjson_envelopes() {
+        // tRPC + superjson：token 位于 result.data.json
+        assert_eq!(
+            json_path(
+                r#"{"result":{"data":{"json":{"token":"t1","user":{"id":"u_1"}},"meta":{"values":{}}}}}"#,
+                "token"
+            )
+            .as_deref(),
+            Some("t1")
+        );
+        // tRPC 无 transformer
+        assert_eq!(
+            json_path(r#"{"result":{"data":{"token":"t2"}}}"#, "token").as_deref(),
+            Some("t2")
+        );
+        // 业务字段自身叫 result：顶层不满足「仅一个 result 键且内含 data」，不解包
+        assert_eq!(json_path(r#"{"result":{"a":1},"token":"keep"}"#, "token").as_deref(), Some("keep"));
     }
 }

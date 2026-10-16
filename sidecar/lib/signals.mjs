@@ -20,11 +20,11 @@ export const OWNER_GUARD =
 export const ROLE_GUARD =
   /role\s*[!=]==?\s*["'`]admin["'`]|isAdmin|hasRole\s*\(|requireRole|adminRequired|requireAdmin|ensureAdmin|adminGuard|@Roles\s*\(/i;
 
-// 认证：Express/手写中间件族 + Next.js/现代框架的会话获取族 + NestJS 守卫装饰器族
+// 认证：Express/手写中间件族 + Next.js/现代框架的会话获取族 + NestJS 守卫装饰器族 + tRPC/上下文会话族
 // （getServerSession=NextAuth、auth()=Clerk、currentUser()=Clerk、getToken=NextAuth/Clerk、
-//  @UseGuards(JwtAuthGuard)=NestJS 等）
+//  @UseGuards(JwtAuthGuard)=NestJS、ctx.user/ctx.session/ctx.auth=tRPC 上下文族）
 export const AUTH_GUARD =
-  /authenticate\s*\(|requireAuth|requireLogin|ensureAuth|auth\s*\.\s*user|req\s*\.\s*user|getUser\s*\(|getServerSession|getServerAuthSession|getToken\s*\(|currentUser\s*\(|getAuth\s*\(|\bauth\s*\(\s*\)|withAuth|isAuthenticated|requireUser|assertAuth|UseGuards\s*\(/;
+  /authenticate\s*\(|requireAuth|requireLogin|ensureAuth|auth\s*\.\s*user|req\s*\.\s*user|\bctx\s*\.\s*(?:user|session|auth)\b|getUser\s*\(|getServerSession|getServerAuthSession|getToken\s*\(|currentUser\s*\(|getAuth\s*\(|\bauth\s*\(\s*\)|withAuth|isAuthenticated|requireUser|assertAuth|UseGuards\s*\(/;
 
 // 公开端点路径段（登录/注册等）：无鉴权属预期公开，不作为越权候选
 export const PUBLIC_PATH =

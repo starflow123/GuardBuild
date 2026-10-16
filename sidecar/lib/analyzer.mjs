@@ -7,6 +7,7 @@
 import { detectSupabase } from "./supabase.mjs";
 import { collectNextSections } from "./nextjs.mjs";
 import { collectNestSections } from "./nestjs.mjs";
+import { collectTrpcSections } from "./trpc.mjs";
 import {
   SINK,
   OWNER_GUARD,
@@ -235,6 +236,9 @@ export function collectFileAuthGuards(files) {
     const requires = buildRequiresMap(content);
     const dir = filePath.slice(0, filePath.lastIndexOf("/"));
     for (const call of collectUseCalls(content)) {
+      // tRPC 构建器链（protectedProcedure.use(isAuthed)）不是 Express 挂载：
+      // 其鉴权在区块链上判定，不能据此把整个路由文件标为受保护（否则公开过程会被误判有认证）
+      if (/procedure/i.test(call.obj)) continue;
       // router.use(authenticate)：无路径的全局认证中间件 → 本文件整体受保护
       if (call.args.length >= 1 && isBareIdent(call.args[0]) && AUTH_MW_NAME.test(call.args[0])) {
         selfGuarded.add(filePath);
@@ -517,10 +521,12 @@ export async function analyzeProject(ctx) {
   const nextScan = collectNextSections(readContents, projectRoot);
   // NestJS 适配器：@Controller/@Get… 装饰器路由 → 伪区块（style: "nest"）
   const nestScan = collectNestSections(readContents);
+  // tRPC 适配器：createTRPCRouter 路由树 → 伪区块（style: "trpc"，路径含挂载前缀与点连接过程名）
+  const trpcScan = collectTrpcSections(readContents, projectRoot);
 
   const endpoints = [];
   const candidates = [];
-  for (const s of [...sections, ...handlerScan.sections, ...nextScan.sections, ...nestScan.sections]) {
+  for (const s of [...sections, ...handlerScan.sections, ...nextScan.sections, ...nestScan.sections, ...trpcScan.sections]) {
     const eps = extractEndpoints(s);
     const sinks = extractSinks(s);
     const routeKeys = extractRouteKeys(s);
@@ -533,11 +539,13 @@ export async function analyzeProject(ctx) {
       !inlineAuth && (authGuards.mountGuarded.has(normFile) || authGuards.selfGuarded.has(normFile));
     const hasAuth = inlineAuth || mountAuth;
     const hasOwnerGuard = OWNER_GUARD.test(s.text);
-    const hasRoleGuard = ROLE_GUARD.test(s.text);
+    const hasRoleGuard = ROLE_GUARD.test(s.text) || s.roleGuard === true;
     const hasOwnerFilter = OWNER_FILTER.test(s.text);
+    // 可寻址性：路径参数 / 查询参数 / tRPC 标量输入字段——不可寻址的对象无法动态复现，不作越权候选
+    const addressable = hasPathParam || !!queryParam || !!s.trpc?.addressable;
     // 列表形态（归属过滤 + 无对象引用参数）：findFirst/单查族也常用于「取列表首条」，
-    // 无 :param/查询参数时不可被动态寻址，抑制为噪声而非 IDOR 候选
-    const listShaped = hasOwnerFilter && !hasPathParam && !queryParam;
+    // 无可寻址参数时不可被动态寻址，抑制为噪声而非 IDOR 候选
+    const listShaped = hasOwnerFilter && !addressable;
     const matchVars = extractMatchVars(s);
     const mountPrefix = s.mountPrefixOverride ?? authGuards.mountPrefixes.get(normFile) ?? null;
     const fullPath = path ? joinUrl(mountPrefix, path) : null;
@@ -558,6 +566,7 @@ export async function analyzeProject(ctx) {
       hasRoleGuard,
       hasOwnerFilter,
       sinkCalls: sinks.map((x) => x.call),
+      trpc: s.trpc ?? null,
     };
     if (queryParam) ep.queryParam = queryParam;
     endpoints.push(ep);
@@ -566,16 +575,16 @@ export async function analyzeProject(ctx) {
       resourceFromQueryParam(queryParam?.param) ?? resourceFromModel(s.text) ?? guessResource(fullPath, s.text);
 
     // 可疑 IDOR：按 ID 取单体资源 + 有认证 + 无归属校验 + 无角色限制
-    if (sinks.length > 0 && hasAuth && !hasOwnerGuard && !hasRoleGuard && !listShaped) {
+    if (sinks.length > 0 && hasAuth && !hasOwnerGuard && !hasRoleGuard && !listShaped && (!s.trpc || addressable)) {
       candidates.push({ ...ep, kind: "idor-suspect", resource });
     } else if (
-      // 可疑「无鉴权访问」：按 ID 取单体资源 + 无认证 + 路径含 :param 或查询参数标识符；
+      // 可疑「无鉴权访问」：按 ID 取单体资源 + 无认证 + 可寻址（:param / 查询参数 / tRPC 输入字段）；
       // 登录/注册等预期公开端点不在此列
       sinks.length > 0 &&
       !hasAuth &&
       !hasOwnerGuard &&
       !hasRoleGuard &&
-      (hasPathParam || queryParam) &&
+      addressable &&
       !PUBLIC_PATH.test(path ?? "") &&
       !PUBLIC_PATH.test(fullPath ?? "")
     ) {
@@ -624,6 +633,11 @@ export async function analyzeProject(ctx) {
     nestControllers: nestScan.diag.nestControllers,
     nestHandlers: nestScan.diag.nestHandlers,
     nestGlobalPrefix: nestScan.diag.nestGlobalPrefix,
+    trpcFiles: trpcScan.diag.trpcFiles,
+    trpcRouters: trpcScan.diag.trpcRouters,
+    trpcProcedures: trpcScan.diag.trpcProcedures,
+    trpcPrefix: trpcScan.diag.trpcPrefix,
+    trpcRefsResolved: trpcScan.diag.trpcRefsResolved,
     supabaseDetected: !!supabase,
     supabaseTables: supabase?.tables?.length ?? 0,
     supabaseProbeable: !!supabase?.probeable,

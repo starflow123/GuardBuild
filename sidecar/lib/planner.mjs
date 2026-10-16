@@ -69,15 +69,21 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
     }
     return out;
   };
+  // 可寻址：REST 的单个 :param / 查询参数形态，或 tRPC 的标量输入字段（ID 放 ?input= 或请求体）
+  const addressable = (c) => paramCount(epPath(c)) === 1 || !!c.queryParam || !!c.trpc?.addressable;
+  const trpcProcLast = (c) => String(c.trpc?.procPath ?? "").split(".").pop() ?? "";
   const cancelCandidates = topK(
-    (c) => c.kind === "idor-suspect" && c.method === "POST" && (epPath(c) ?? "").endsWith("/cancel")
+    (c) =>
+      c.kind === "idor-suspect" &&
+      c.method === "POST" &&
+      ((epPath(c) ?? "").endsWith("/cancel") || (!!c.trpc && /cancel/i.test(trpcProcLast(c))))
   );
   const readCandidates = topK(
-    (c) => c.kind === "idor-suspect" && c.method === "GET" && (paramCount(epPath(c)) === 1 || !!c.queryParam)
+    (c) => c.kind === "idor-suspect" && c.method === "GET" && addressable(c)
   );
   // 无鉴权候选：匿名读取用例的靶点（与 IDOR 槽位互斥，不做自动修复）
   const unauthReadCandidates = topK(
-    (c) => c.kind === "no-auth-suspect" && c.method === "GET" && (paramCount(epPath(c)) === 1 || !!c.queryParam)
+    (c) => c.kind === "no-auth-suspect" && c.method === "GET" && addressable(c)
   );
   const cancelCandidate = cancelCandidates[0] ?? null;
   const readCandidate = readCandidates[0] ?? null;

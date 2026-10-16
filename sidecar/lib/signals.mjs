@@ -11,14 +11,15 @@ export const SINK =
 export const OWNER_GUARD =
   /(?:\.userId|\.ownerId|\.uid|\.authorId)\s*[!=]==?\s*[^,;\n]+|user\s*\.\s*id\s*[!=]==?\s*[^;,\n]*\.(?:userId|ownerId|uid)|(?:req|request|auth|ctx)\s*\.\s*user\s*[!=]==?/;
 
-// 角色校验
+// 角色校验（@Roles 为 NestJS 装饰器族）
 export const ROLE_GUARD =
-  /role\s*[!=]==?\s*["'`]admin["'`]|isAdmin|hasRole\s*\(|requireRole|adminRequired|requireAdmin|ensureAdmin|adminGuard/i;
+  /role\s*[!=]==?\s*["'`]admin["'`]|isAdmin|hasRole\s*\(|requireRole|adminRequired|requireAdmin|ensureAdmin|adminGuard|@Roles\s*\(/i;
 
-// 认证：Express/手写中间件族 + Next.js/现代框架的会话获取族
-// （getServerSession=NextAuth、auth()=Clerk、currentUser()=Clerk、getToken=NextAuth/Clerk 等）
+// 认证：Express/手写中间件族 + Next.js/现代框架的会话获取族 + NestJS 守卫装饰器族
+// （getServerSession=NextAuth、auth()=Clerk、currentUser()=Clerk、getToken=NextAuth/Clerk、
+//  @UseGuards(JwtAuthGuard)=NestJS 等）
 export const AUTH_GUARD =
-  /authenticate\s*\(|requireAuth|requireLogin|ensureAuth|auth\s*\.\s*user|req\s*\.\s*user|getUser\s*\(|getServerSession|getServerAuthSession|getToken\s*\(|currentUser\s*\(|getAuth\s*\(|\bauth\s*\(\s*\)|withAuth|isAuthenticated|requireUser|assertAuth/;
+  /authenticate\s*\(|requireAuth|requireLogin|ensureAuth|auth\s*\.\s*user|req\s*\.\s*user|getUser\s*\(|getServerSession|getServerAuthSession|getToken\s*\(|currentUser\s*\(|getAuth\s*\(|\bauth\s*\(\s*\)|withAuth|isAuthenticated|requireUser|assertAuth|UseGuards\s*\(/;
 
 // 公开端点路径段（登录/注册等）：无鉴权属预期公开，不作为越权候选
 export const PUBLIC_PATH =
@@ -61,6 +62,12 @@ export function findTraversalSignal(text) {
       let sp = null;
       for (const sm of window.matchAll(spGetRe())) sp = sm;
       if (sp) return { source: "searchParams", param: sp[1], sink: m[1] };
+      // NestJS 装饰器参数绑定：@Query("file") file → 绑定变量出现在 sink 附近
+      const qm = /@Query\s*\(\s*["'`]([^"'`]+)["'`]\s*\)\s*([A-Za-z_$][\w$]*)/.exec(window);
+      if (qm) {
+        const rest = window.slice(qm.index + qm[0].length);
+        if (new RegExp(`\\b${qm[2]}\\b`).test(rest)) return { source: "query", param: qm[1], sink: m[1] };
+      }
       continue;
     }
     return {
@@ -123,6 +130,9 @@ export function findQueryParamSink(text) {
       const sm = SP_GET.exec(rhs);
       if (sm) return { param: sm[1], form: "indirect" };
     }
+    // NestJS 装饰器参数绑定：@Query("id") id → sink 实参引用该变量
+    const qm = /@Query\s*\(\s*["'`]([^"'`]+)["'`]\s*\)\s*([A-Za-z_$][\w$]*)/.exec(windowText);
+    if (qm && new RegExp(`\\b${qm[2]}\\b`).test(argsText)) return { param: qm[1], form: "indirect" };
   }
   return null;
 }

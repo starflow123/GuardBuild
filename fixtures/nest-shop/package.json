@@ -1,0 +1,10 @@
+{
+  "name": "nest-shop",
+  "version": "0.4.0",
+  "private": true,
+  "description": "NestShop - 示例订单服务（GuardBuild 诊断靶场：NestJS 装饰器路由 + 对象级越权漏洞）",
+  "dependencies": {},
+  "scripts": {
+    "start": "node server.js"
+  }
+}

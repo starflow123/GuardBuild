@@ -6,6 +6,7 @@
  */
 import { detectSupabase } from "./supabase.mjs";
 import { collectNextSections } from "./nextjs.mjs";
+import { collectNestSections } from "./nestjs.mjs";
 import {
   SINK,
   OWNER_GUARD,
@@ -459,7 +460,8 @@ const MODEL_UTIL = new Set(["db", "this", "self", "ctx", "req", "res", "module",
 function resourceFromModel(text) {
   for (const m of text.matchAll(/(?:^|[^\w$])([A-Za-z_$][\w$]*)\s*\.\s*find[A-Za-z]*\s*\(/g)) {
     if (MODEL_UTIL.has(m[1].toLowerCase())) continue;
-    const name = m[1].replace(/[_-]?id$/i, "");
+    // NestJS 等分层写法：ordersService.findOne → 剥去服务后缀再归约
+    const name = m[1].replace(/(?:Service|Repository|Repo|Model|Client)$/, "").replace(/[_-]?id$/i, "");
     if (name.length < 3) continue;
     return singular(name.toLowerCase());
   }
@@ -507,10 +509,12 @@ export async function analyzeProject(ctx) {
   const handlerScan = collectHandlerSections(readContents, authGuards);
   // Next.js 适配器：app/**/route.ts 与 pages/api/** → 伪区块（style: "next-api"）
   const nextScan = collectNextSections(readContents, projectRoot);
+  // NestJS 适配器：@Controller/@Get… 装饰器路由 → 伪区块（style: "nest"）
+  const nestScan = collectNestSections(readContents);
 
   const endpoints = [];
   const candidates = [];
-  for (const s of [...sections, ...handlerScan.sections, ...nextScan.sections]) {
+  for (const s of [...sections, ...handlerScan.sections, ...nextScan.sections, ...nestScan.sections]) {
     const eps = extractEndpoints(s);
     const sinks = extractSinks(s);
     const routeKeys = extractRouteKeys(s);
@@ -607,6 +611,10 @@ export async function analyzeProject(ctx) {
     nextAppFiles: nextScan.diag.nextAppFiles,
     nextPagesFiles: nextScan.diag.nextPagesFiles,
     nextSections: nextScan.sections.length,
+    nestFiles: nestScan.diag.nestFiles,
+    nestControllers: nestScan.diag.nestControllers,
+    nestHandlers: nestScan.diag.nestHandlers,
+    nestGlobalPrefix: nestScan.diag.nestGlobalPrefix,
     supabaseDetected: !!supabase,
     supabaseTables: supabase?.tables?.length ?? 0,
     supabaseProbeable: !!supabase?.probeable,

@@ -54,6 +54,9 @@ jobs:
       - name: Next.js 适配器 E2E（App Router 解析 + 越权复现，本机垫片）
         run: node scripts/e2e-next.mjs
 
+      - name: NestJS 适配器 E2E（装饰器路由解析 + 越权/穿越复现，本机垫片）
+        run: node scripts/e2e-nest.mjs
+
       - name: 上传报告与证据库
         if: always()
         uses: actions/upload-artifact@v4
@@ -69,3 +72,5 @@ jobs:
             .demo-supabase/data/guardbuild.db
             .demo-next/reports
             .demo-next/data/guardbuild.db
+            .demo-nest/reports
+            .demo-nest/data/guardbuild.db

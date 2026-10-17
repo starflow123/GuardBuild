@@ -163,9 +163,9 @@ npm run test:rust      # Rust Host
 
 ## 已知边界
 
-- 动态用例当前聚焦 Node.js HTTP/JSON 服务形态；其它技术栈需要自定义启动契约与用例（尚未泛化）
-- Windows 全链路已实测；Linux / macOS 构建与运行尚未在真实环境验证（CI 矩阵已配置，待首次运行）
-- GitHub Action 已按 runner 脚本逐字本地模拟，尚未在真实 runner 上运行
+- 静态路由适配已覆盖：Express 风格、Next.js（App/Pages Router）、NestJS、tRPC、GraphQL、Supabase/PostgREST、Python（FastAPI/Flask/Django + DRF）；NestJS / GraphQL / Python 等形态暂不提供自动补丁（证据成立时按 `vulnerable_unfixed` 阻断并给人工修复指引）
+- Flask/Django 的自定义路由注册、异步视图与中间件级鉴权等边缘形态仍可能漏检；动态复现要求项目能按 `guardbuild.json` 启动，并具备可登录的测试身份
+- Windows 全链路已实测；Linux 由 CI 矩阵持续验证（ubuntu-latest + windows-latest），macOS 尚未覆盖
 - 已在 OWASP Juice Shop v20.3.0 上完成全链路 dogfood（Windows，真实依赖与启动链）：静态分析 → email 登录 → 越权复现 → 隔离修复 → 双重验收 `patchStatus=verified`；靶点为注入式 IDOR 样例（非 Juice Shop 自身漏洞），据此修复 10 项真实项目接入失败点
 
 ## 开发备注

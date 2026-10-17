@@ -9,6 +9,7 @@ import { collectNextSections } from "./nextjs.mjs";
 import { collectNestSections } from "./nestjs.mjs";
 import { collectTrpcSections } from "./trpc.mjs";
 import { collectGraphqlSections } from "./graphql.mjs";
+import { collectPythonSections } from "./python.mjs";
 import {
   SINK,
   OWNER_GUARD,
@@ -49,7 +50,7 @@ export function scoreFile(rawPath) {
   const p = normalizePath(rawPath); // Windows 路径须先归一，否则 /src/ 加分与深度惩罚失效
   const lower = p.toLowerCase();
   let s = 0;
-  if (/(route|router|app|server|api|controller|handler|schema|graphql|resolv)/.test(lower)) s += 10;
+  if (/(route|router|app|server|api|controller|handler|schema|graphql|resolv|urls|views|endpoints|blueprint|resources|main)/.test(lower)) s += 10;
   if (lower.includes("/src/")) s += 5;
   if (lower.includes("index")) s -= 3;
   if (lower.includes("test") || lower.includes("spec")) s -= 20;
@@ -477,6 +478,17 @@ function resourceFromModel(text) {
     const name = dr[1].replace(/(?:Table|Schema)$/i, "").replace(/[_-]?id$/i, "");
     if (name.length >= 3) return singular(name.toLowerCase());
   }
+  // Python 取数形态：db.query(Order) / Order.objects.get / get_object_or_404(Order) → order
+  const pyModel =
+    /\.\s*query\s*\(\s*([A-Z][A-Za-z0-9_]*)\s*\)/.exec(text) ??
+    /\b([A-Z][A-Za-z0-9_]*)\s*\.\s*objects\s*\.\s*(?:get|filter)\s*\(/.exec(text) ??
+    /\b([A-Z][A-Za-z0-9_]*)\s*\.\s*query\s*\.\s*(?:get|filter)/.exec(text) ??
+    /\b(?:db|session)\s*\.\s*get\s*\(\s*([A-Z][A-Za-z0-9_]*)/.exec(text) ??
+    /\bget_object_or_404\s*\(\s*([A-Z][A-Za-z0-9_]*)/.exec(text);
+  if (pyModel) {
+    const name = pyModel[1].replace(/Model$/, "").replace(/[_-]?id$/i, "");
+    if (name.length >= 3) return singular(name.toLowerCase());
+  }
   return null;
 }
 
@@ -528,26 +540,31 @@ export async function analyzeProject(ctx) {
   // GraphQL 适配器：SDL schema + resolver/directive/shield 鉴权线索 → 伪区块（style: "graphql"，
   // declaredPath 为唯一 HTTP 端点，寻址信息在 s.graphql 而非 URL）
   const graphqlScan = collectGraphqlSections(readContents, projectRoot);
+  // Python 适配器：FastAPI/Flask/Django(DRF) 路由 → 伪区块（style: "python"，
+  // 路径已折叠路由前缀并归一化为 :param；取数/鉴权信号随区块携带）
+  const pythonScan = collectPythonSections(readContents);
 
   const endpoints = [];
   const candidates = [];
-  for (const s of [...sections, ...handlerScan.sections, ...nextScan.sections, ...nestScan.sections, ...trpcScan.sections, ...graphqlScan.sections]) {
+  for (const s of [...sections, ...handlerScan.sections, ...nextScan.sections, ...nestScan.sections, ...trpcScan.sections, ...graphqlScan.sections, ...pythonScan.sections]) {
     const eps = extractEndpoints(s);
-    const sinks = extractSinks(s);
+    const sinks = [...extractSinks(s), ...(s.sinkHints ?? [])];
     const routeKeys = s.routeKeys ?? extractRouteKeys(s);
     const normFile = normalizePath(s.file);
     const path = s.declaredPath ?? eps[0]?.path ?? null;
     const hasPathParam = /:[A-Za-z_]\w*/.test(path ?? "");
-    // GraphQL 区块已带 declaredPath（完整端点），且 sink 判定走 s.graphql，不再做查询参数定位
+    // GraphQL 区块已带 declaredPath（完整端点），且 sink 判定走 s.graphql，不再做查询参数定位；
+    // Python 区块的查询参数来自签名/request.args 等，由适配器直接携带
     const queryParam =
-      !hasPathParam && sinks.length > 0 && !s.graphql ? findQueryParamSink(s.text) : null;
+      s.queryParamHint ??
+      (!hasPathParam && sinks.length > 0 && !s.graphql ? findQueryParamSink(s.text) : null);
     const inlineAuth = AUTH_GUARD.test(s.text) || sectionRouteMwAuth(s.text) || s.forcedAuth === true;
     const mountAuth =
       !inlineAuth && (authGuards.mountGuarded.has(normFile) || authGuards.selfGuarded.has(normFile));
     const hasAuth = inlineAuth || mountAuth;
-    const hasOwnerGuard = OWNER_GUARD.test(s.text);
+    const hasOwnerGuard = OWNER_GUARD.test(s.text) || s.ownerGuard === true;
     const hasRoleGuard = ROLE_GUARD.test(s.text) || s.roleGuard === true;
-    const hasOwnerFilter = OWNER_FILTER.test(s.text);
+    const hasOwnerFilter = OWNER_FILTER.test(s.text) || s.ownerFilter === true;
     // 可寻址性：路径参数 / 查询参数 / tRPC 标量输入字段 / GraphQL 单标量 ID 参数——
     // 不可寻址的对象无法动态复现，不作越权候选
     const addressable = hasPathParam || !!queryParam || !!s.trpc?.addressable || !!s.graphql?.addressable;
@@ -669,6 +686,15 @@ export async function analyzeProject(ctx) {
     graphqlEndpoint: graphqlScan.diag.graphqlEndpoint,
     graphqlAuthSource: graphqlScan.diag.graphqlAuthSource,
     graphqlLoginField: graphqlScan.diag.graphqlLoginField,
+    pythonFiles: pythonScan.diag.pythonFiles,
+    pythonFastapiFiles: pythonScan.diag.fastapiFiles,
+    pythonFastapiRoutes: pythonScan.diag.fastapiRoutes,
+    pythonFlaskFiles: pythonScan.diag.flaskFiles,
+    pythonFlaskRoutes: pythonScan.diag.flaskRoutes,
+    pythonDjangoFiles: pythonScan.diag.djangoFiles,
+    pythonDjangoUrls: pythonScan.diag.djangoUrls,
+    pythonDrfViewSets: pythonScan.diag.drfViewSets,
+    pythonSections: pythonScan.sections.length,
     supabaseDetected: !!supabase,
     supabaseTables: supabase?.tables?.length ?? 0,
     supabaseProbeable: !!supabase?.probeable,

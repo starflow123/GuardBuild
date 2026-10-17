@@ -264,10 +264,15 @@ impl Token {
             .file_stem()
             .map(|s| s.to_string_lossy().to_lowercase())
             .unwrap_or_default();
-        let allowed_cmd = base == "node" || base == "npm" || base == "npx" || cmd == node_bin;
+        // 开发服务器启动器：Node 与 Python 生态（gate 仅用它启动项目声明的目标进程）
+        const LAUNCHERS: &[&str] = &[
+            "node", "npm", "npx", "python", "python3", "py", "uvicorn", "gunicorn", "hypercorn",
+            "flask", "fastapi", "uv",
+        ];
+        let allowed_cmd = LAUNCHERS.contains(&base.as_str()) || cmd == node_bin;
         if !allowed_cmd {
             return Err(HostError::ScopeDenied(format!(
-                "命令 `{cmd}` 不在允许列表（node/npm/npx）内"
+                "命令 `{cmd}` 不在允许列表（node/npm/npx 或 Python 启动器 python/uvicorn/flask 等）内"
             )));
         }
         if any_scope(self, |s| match s {

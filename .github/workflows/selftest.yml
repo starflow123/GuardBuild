@@ -23,6 +23,14 @@ jobs:
         with:
           node-version: '24'
 
+      - name: 安装 Python（FastAPI 演练）
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: 安装 FastAPI 运行时依赖
+        run: python -m pip install --quiet fastapi uvicorn
+
       - name: 安装 Rust 工具链
         uses: dtolnay/rust-toolchain@stable
 
@@ -63,6 +71,9 @@ jobs:
       - name: GraphQL 适配器 E2E（SDL 字段级越权 + 两种拒绝语义流派 + 内省降级）
         run: node scripts/e2e-graphql.mjs
 
+      - name: Python 适配器 E2E（FastAPI 真实 uvicorn + 越权/匿名/修复三分支）
+        run: node scripts/e2e-python.mjs
+
       - name: 上传报告与证据库
         if: always()
         uses: actions/upload-artifact@v4
@@ -84,3 +95,5 @@ jobs:
             .demo-trpc/data/guardbuild.db
             .demo-graphql/reports
             .demo-graphql/data/guardbuild.db
+            .demo-python/reports
+            .demo-python/data/guardbuild.db

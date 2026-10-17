@@ -1,0 +1,21 @@
+{
+  "start": {
+    "cmd": "python",
+    "args": ["main.py"],
+    "env": { "PORT": "${GB_PORT}", "PYTHONUNBUFFERED": "1" },
+    "readyPattern": "Uvicorn running on",
+    "readyTimeoutMs": 30000
+  },
+  "login": {
+    "path": "/api/login",
+    "bodyTemplate": { "email": "{email}", "password": "{password}" },
+    "credentialPath": "token"
+  },
+  "responses": { "list": "orders", "entity": "order" },
+  "identities": [
+    { "name": "alice", "email": "alice@py.shop", "password": "alice123", "role": "user" },
+    { "name": "bob", "email": "bob@py.shop", "password": "bob123", "role": "user" },
+    { "name": "admin", "email": "admin@py.shop", "password": "admin123", "role": "admin" }
+  ],
+  "scopes": ["project.read", "worktree.write", "proc.spawn", "net.probe"]
+}

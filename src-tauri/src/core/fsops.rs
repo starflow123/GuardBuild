@@ -9,6 +9,26 @@ use super::error::{HostError, HostResult};
 pub const MAX_READ_BYTES: u64 = 1024 * 1024; // 1 MiB
 pub const MAX_LIST_ENTRIES: usize = 4000;
 
+/// 依赖/虚拟环境/缓存目录：不属于项目源码，且虚拟环境常含数千文件，
+/// 若不跳过会挤占 MAX_LIST_ENTRIES 配额，导致真正的源码目录（如 app/api）未被列举。
+const SKIP_DIRS: &[&str] = &[
+    "node_modules",
+    ".git",
+    ".venv",
+    "venv",
+    "site-packages",
+    "__pycache__",
+    ".tox",
+    ".nox",
+    ".pytest_cache",
+    ".mypy_cache",
+    ".ruff_cache",
+];
+
+fn skip_dir(name: &str) -> bool {
+    SKIP_DIRS.iter().any(|s| s.eq_ignore_ascii_case(name))
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DirEntryInfo {
     pub name: String,
@@ -69,7 +89,7 @@ pub fn list_dir(dir: &Path, depth: usize) -> HostResult<Vec<DirEntryInfo>> {
         if out.len() >= MAX_LIST_ENTRIES {
             break;
         }
-        if kind == "dir" && name != "node_modules" && name != ".git" && depth > 1 {
+        if kind == "dir" && !skip_dir(&name) && depth > 1 {
             let mut sub = list_dir(&p, depth - 1)?;
             if out.len() + sub.len() > MAX_LIST_ENTRIES {
                 sub.truncate(MAX_LIST_ENTRIES.saturating_sub(out.len()));
@@ -166,5 +186,56 @@ pub fn link_dir(src: &Path, dst: &Path) -> HostResult<()> {
     {
         std::os::unix::fs::symlink(src, dst)
             .map_err(|e| HostError::Io(format!("{:?} -> {:?}: {e}", src, dst)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_proj(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "guardbuild-fsops-{tag}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn list_dir_skips_virtualenv_and_cache_dirs() {
+        let root = temp_proj("skip");
+        fs::create_dir_all(root.join("app/api/v1")).unwrap();
+        fs::write(root.join("app/api/v1/articles.py"), "x").unwrap();
+        fs::create_dir_all(root.join(".venv/Lib/site-packages/fastapi")).unwrap();
+        fs::write(root.join(".venv/Lib/site-packages/fastapi/routing.py"), "x").unwrap();
+        fs::create_dir_all(root.join("__pycache__")).unwrap();
+        fs::write(root.join("__pycache__/main.py"), "x").unwrap();
+
+        let entries = list_dir(&root, 6).unwrap();
+        let paths: Vec<String> = entries.iter().map(|e| e.path.clone()).collect();
+        assert!(
+            paths.iter().any(|p| p.ends_with("articles.py")),
+            "真实源码应被列举: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.contains("site-packages") || p.contains("routing.py")),
+            "虚拟环境内容不应被列举: {paths:?}"
+        );
+        assert!(
+            !paths.iter().any(|p| p.ends_with("__pycache__/main.py") || p.ends_with("__pycache__\\main.py")),
+            "缓存目录内容不应被列举: {paths:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn list_dir_keeps_source_dir_named_app_and_src() {
+        let root = temp_proj("keep");
+        fs::create_dir_all(root.join("src/routes")).unwrap();
+        fs::write(root.join("src/routes/orders.ts"), "x").unwrap();
+        let entries = list_dir(&root, 6).unwrap();
+        assert!(entries.iter().any(|e| e.path.ends_with("orders.ts")));
+        let _ = fs::remove_dir_all(&root);
     }
 }

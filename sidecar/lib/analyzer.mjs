@@ -36,6 +36,8 @@ const MAX_FILE_BYTES = 128 * 1024;
 
 // 编译/生成产物目录：同分时让位于真实源码
 const OUTPUT_DIR = /(^|\/)(build|dist|out|coverage|\.next|\.nuxt)(\/|$)/;
+// 依赖/虚拟环境/缓存目录：不是项目源码；宿主 fs.list 已跳过，此处防御性过滤第三方列举来源
+const VENDOR_DIR = /(^|\/)(node_modules|\.git|\.venv|venv|site-packages|__pycache__|\.tox|\.nox|\.pytest_cache|\.mypy_cache|\.ruff_cache)(\/|$)/;
 
 export function normalizePath(p) {
   return String(p).replace(/\\/g, "/");
@@ -51,10 +53,12 @@ export function scoreFile(rawPath) {
   const lower = p.toLowerCase();
   let s = 0;
   if (/(route|router|app|server|api|controller|handler|schema|graphql|resolv|urls|views|endpoints|blueprint|resources|main)/.test(lower)) s += 10;
+  // 路由/接口目录强于同深度的模型/配置文件；否则大项目里 MAX_FILES 会被 app/models 等占满
+  if (/(^|\/)(api|routes?|routers?|controllers?|views|endpoints|handlers?|resolvers?|urls|graphql)(\/|\.|$)/.test(lower)) s += 8;
   if (lower.includes("/src/")) s += 5;
-  if (lower.includes("index")) s -= 3;
+  if (lower.includes("index") || lower.includes("__init__")) s -= 3;
   if (lower.includes("test") || lower.includes("spec")) s -= 20;
-  if (lower.includes("node_modules") || lower.includes(".git")) s -= 100;
+  if (lower.includes("node_modules") || lower.includes(".git") || VENDOR_DIR.test(lower)) s -= 100;
   if (OUTPUT_DIR.test(lower)) s -= 15;
   s -= p.split("/").length; // 越浅越优先
   return s;
@@ -63,7 +67,12 @@ export function scoreFile(rawPath) {
 /** 从 fs.list 结果中筛出候选源文件（扩展名 + 大小过滤） */
 export function filterSourceFiles(listing) {
   return listing.filter(
-    (e) => e.kind === "file" && SOURCE_EXT.includes(extOf(e.path)) && e.size > 0 && e.size < MAX_FILE_BYTES
+    (e) =>
+      e.kind === "file" &&
+      SOURCE_EXT.includes(extOf(e.path)) &&
+      e.size > 0 &&
+      e.size < MAX_FILE_BYTES &&
+      !VENDOR_DIR.test(normalizePath(e.path))
   );
 }
 

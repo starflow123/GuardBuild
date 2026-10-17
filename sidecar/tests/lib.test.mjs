@@ -77,6 +77,45 @@ test("selectSourceFiles: 产物诱饵不挤占源码分析槽位（Windows 路�
   assert.ok(picked.every((f) => f.score !== undefined), "应附带评分");
 });
 
+test("filterSourceFiles/selectSourceFiles: 虚拟环境与缓存目录不参与分析（.venv 挤占槽位）", () => {
+  const listing = [];
+  for (let i = 1; i <= 30; i++) {
+    listing.push({
+      kind: "file",
+      path: `D:\\p\\.venv\\Lib\\site-packages\\fastapi\\route-${String(i).padStart(2, "0")}.py`,
+      size: 100,
+    });
+    listing.push({
+      kind: "file",
+      path: `D:\\p\\__pycache__\\route-${String(i).padStart(2, "0")}.py`,
+      size: 100,
+    });
+  }
+  listing.push({ kind: "file", path: "D:\\p\\app\\api\\v1\\articles.py", size: 100 });
+  assert.equal(filterSourceFiles(listing).length, 1, "只应保留真实源码");
+  const picked = selectSourceFiles(listing, { maxFiles: 5 });
+  assert.equal(picked.length, 1);
+  assert.equal(picked[0].path, "D:\\p\\app\\api\\v1\\articles.py");
+  assert.ok(
+    scoreFile("D:/p/.venv/Lib/site-packages/fastapi/routing.py") <
+      scoreFile("D:/p/app/api/v1/articles.py"),
+    "虚拟环境评分应低于真实源码"
+  );
+});
+
+test("selectSourceFiles: 大项目中路由/接口目录优先于同深度模型文件", () => {
+  const listing = [];
+  for (let i = 1; i <= 80; i++) {
+    listing.push({ kind: "file", path: `D:/p/app/models/model-${String(i).padStart(2, "0")}.py`, size: 100 });
+  }
+  for (let i = 1; i <= 10; i++) {
+    listing.push({ kind: "file", path: `D:/p/app/api/v1/resource-${String(i).padStart(2, "0")}.py`, size: 100 });
+  }
+  const picked = selectSourceFiles(listing, { maxFiles: 20 });
+  const apiCount = picked.filter((f) => f.path.includes("/app/api/")).length;
+  assert.equal(apiCount, 10, `路由文件应全部入选（实际 ${apiCount}/10）`);
+});
+
 test("parsePortFromLine: ANSI 色码人类可读就绪行（真实项目形状）", () => {
   const juiceShopLine = "info: \u001b[36mServer listening on port \u001b[1m3000\u001b[22m\u001b[39m";
   assert.equal(parsePortFromLine(juiceShopLine), 3000);

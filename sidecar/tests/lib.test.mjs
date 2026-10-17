@@ -1399,6 +1399,80 @@ test("analyzeProject: Drizzle 链式取数（路径参数 / 查询参数 / 列�
   assert.equal(plan.resource, "order");
 });
 
+test("analyzeProject: 裸 SQL helper 取数（dbGet/db.get/pool.query/prepare().get）", async () => {
+  const R = "\\\\?\\D:\\p";
+  const publicSrc = [
+    'const express = require("express");',
+    'const router = express.Router();',
+    "function dbGet(sql, params) { return db.get(sql, params); }",
+    'router.get("/api/user/:id", async (req, res) => {',
+    "  const user = await dbGet('SELECT id, username, email FROM users WHERE id = ?', [req.params.id]);",
+    "  res.json(user);",
+    "});",
+  ].join("\n");
+  const authedSrc = [
+    'const express = require("express");',
+    'const router = express.Router();',
+    "router.use(authenticate);",
+    'router.get("/api/invoices/:id", async (req, res) => {',
+    "  const [rows] = await pool.query('SELECT * FROM invoices WHERE id = ?', [req.params.id]);",
+    "  res.json(rows[0] ?? null);",
+    "});",
+    'router.get("/api/notes/:id", async (req, res) => {',
+    "  const note = db.prepare('SELECT * FROM notes WHERE id = ?').get(req.params.id);",
+    "  res.json(note);",
+    "});",
+    'router.get("/api/products/search", async (req, res) => {',
+    "  const rows = await dbAll('SELECT * FROM products WHERE name LIKE ?', [req.query.q]);",
+    "  res.json(rows);",
+    "});",
+  ].join("\n");
+  const contents = new Map([
+    [`${R}\\src\\public.js`, publicSrc],
+    [`${R}\\src\\app.js`, authedSrc],
+  ]);
+  const a = await analyzeProject({
+    projectRoot: R,
+    tokens: { project: "tok" },
+    rpc: {
+      request: async (method, params) => {
+        if (method === "fs.list") {
+          return {
+            entries: [
+              { path: `${R}\\src\\public.js`, kind: "file", size: 400 },
+              { path: `${R}\\src\\app.js`, kind: "file", size: 900 },
+            ],
+          };
+        }
+        if (method === "fs.read") {
+          const content = contents.get(params.path);
+          return { content, size: content.length, redacted: false, redactions: [] };
+        }
+        throw new Error(`不应调用 ${method}`);
+      },
+    },
+  });
+  const anonymous = a.candidates.find((c) => c.path === "/api/user/:id");
+  assert.ok(anonymous, "dbGet(…) 单行 helper 应入候选");
+  assert.equal(anonymous.kind, "no-auth-suspect");
+  assert.equal(anonymous.resource, "user");
+  assert.deepEqual(anonymous.sinkCalls, ["dbGet"]);
+
+  const poolQuery = a.candidates.find((c) => c.path === "/api/invoices/:id");
+  assert.ok(poolQuery, "pool.query(…) 应入候选");
+  assert.equal(poolQuery.kind, "idor-suspect");
+  assert.deepEqual(poolQuery.sinkCalls, ["pool.query"]);
+
+  const prepared = a.candidates.find((c) => c.path === "/api/notes/:id");
+  assert.ok(prepared, "db.prepare(…).get(…) 应入候选");
+  assert.deepEqual(prepared.sinkCalls, ["db.prepare.get"]);
+
+  assert.ok(
+    !a.candidates.some((c) => c.path === "/api/products/search"),
+    "dbAll(…) 列表族不应成为单查候选"
+  );
+});
+
 test("analyzeProject: 跨文件 handler 引用 + IIFE 挂载（router.get('/x', mw, appHandler.x)）", async () => {
   const R = "\\\\?\\D:\\dvna";
   const listing = {

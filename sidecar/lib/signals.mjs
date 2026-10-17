@@ -9,8 +9,11 @@
 //  - 对象查询形态：Model.find({…})（原生 Mongo 驱动）
 //  - Drizzle 链式取数：db.select(…).from(表)(.中间链式调用)*.where((and()?)eq(…))
 //    —— 以 eq( 收尾，便于 findQueryParamSink 从 where 实参中识别查询参数
+//  - 裸 SQL 驱动/helper：dbGet(…) 等单行 helper、db.get(…)/pool.query(…)、
+//    db.prepare(sql).get(…)（better-sqlite3）——vibecoding 项目常见的无 ORM 取数形态；
+//    只收单行读取族（get/query），dbAll/all 等列表族不在此列，避免列表端点误报
 export const SINK =
-  /\b(find[A-Za-z]*ById(?:OrThrow)?|findByPk|findOneBy|findOneOrFail|findOne|findUnique(?:OrThrow)?|findFirst(?:OrThrow)?|getById)\s*\(|([A-Za-z_$][\w$]*\.find)\s*\(\s*\{|([A-Za-z_$][\w$]*)\s*\.\s*select\s*\([^)]*\)\s*\.\s*from\s*\([^)]*\)(?:\s*\.\s*[A-Za-z_$][\w$]*\s*\([^)]*\))*\s*\.\s*where\s*\(\s*(?:and\s*\(\s*)?eq\s*\(/;
+  /\b(find[A-Za-z]*ById(?:OrThrow)?|findByPk|findOneBy|findOneOrFail|findOne|findUnique(?:OrThrow)?|findFirst(?:OrThrow)?|getById)\s*\(|([A-Za-z_$][\w$]*\.find)\s*\(\s*\{|([A-Za-z_$][\w$]*)\s*\.\s*select\s*\([^)]*\)\s*\.\s*from\s*\([^)]*\)(?:\s*\.\s*[A-Za-z_$][\w$]*\s*\([^)]*\))*\s*\.\s*where\s*\(\s*(?:and\s*\(\s*)?eq\s*\(|((?:db|database|conn|connection|sqlite|pool|client|knex)\s*\.\s*(?:prepare\s*\([^;\n]*\)\s*\.\s*)?(?:get|query))\s*\(|((?:dbGet|dbOne|dbQuery|queryOne|getOne|fetchOne|fetchRow|getRow|selectOne))\s*\(/;
 
 // 归属校验：出现 userId 与请求者的比较（=== / !== / == / !=）
 export const OWNER_GUARD =

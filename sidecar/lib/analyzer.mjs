@@ -458,7 +458,16 @@ function extractEndpoints(section) {
 function extractSinks(section) {
   const out = [];
   for (const m of section.text.matchAll(new RegExp(SINK.source, "g"))) {
-    out.push({ call: m[1] ?? m[2] ?? (m[3] ? `${m[3]}.select-where` : null), index: m.index });
+    const rawReceiver = m[4]?.replace(/\s+/g, "");
+    out.push({
+      call:
+        m[1] ??
+        m[2] ??
+        (m[3] ? `${m[3]}.select-where` : null) ??
+        (rawReceiver ? rawReceiver.replace(/\.prepare\([^;\n]*\)\./, ".prepare.") : null) ??
+        m[5],
+      index: m.index,
+    });
   }
   return out;
 }

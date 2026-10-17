@@ -60,6 +60,9 @@ jobs:
       - name: tRPC 适配器 E2E（过程路径组装 + input 编码协商，本机垫片）
         run: node scripts/e2e-trpc.mjs
 
+      - name: GraphQL 适配器 E2E（SDL 字段级越权 + 两种拒绝语义流派 + 内省降级）
+        run: node scripts/e2e-graphql.mjs
+
       - name: 上传报告与证据库
         if: always()
         uses: actions/upload-artifact@v4
@@ -77,3 +80,7 @@ jobs:
             .demo-next/data/guardbuild.db
             .demo-nest/reports
             .demo-nest/data/guardbuild.db
+            .demo-trpc/reports
+            .demo-trpc/data/guardbuild.db
+            .demo-graphql/reports
+            .demo-graphql/data/guardbuild.db

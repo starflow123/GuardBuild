@@ -8,6 +8,7 @@ import { detectSupabase } from "./supabase.mjs";
 import { collectNextSections } from "./nextjs.mjs";
 import { collectNestSections } from "./nestjs.mjs";
 import { collectTrpcSections } from "./trpc.mjs";
+import { collectGraphqlSections } from "./graphql.mjs";
 import {
   SINK,
   OWNER_GUARD,
@@ -27,7 +28,8 @@ import {
 // 兼容既有测试/调用方：信号工具从 signals.mjs 统一导出后经此处再导出
 export { braceSpan, findQueryParamSink } from "./signals.mjs";
 
-const SOURCE_EXT = [".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py"];
+// `.graphql/.gql` 为 SDL schema 文件：GraphQL 适配器的主要分析对象
+const SOURCE_EXT = [".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py", ".graphql", ".gql"];
 const MAX_FILES = 64;
 const MAX_FILE_BYTES = 128 * 1024;
 
@@ -47,7 +49,7 @@ export function scoreFile(rawPath) {
   const p = normalizePath(rawPath); // Windows 路径须先归一，否则 /src/ 加分与深度惩罚失效
   const lower = p.toLowerCase();
   let s = 0;
-  if (/(route|router|app|server|api|controller|handler)/.test(lower)) s += 10;
+  if (/(route|router|app|server|api|controller|handler|schema|graphql|resolv)/.test(lower)) s += 10;
   if (lower.includes("/src/")) s += 5;
   if (lower.includes("index")) s -= 3;
   if (lower.includes("test") || lower.includes("spec")) s -= 20;
@@ -523,17 +525,22 @@ export async function analyzeProject(ctx) {
   const nestScan = collectNestSections(readContents);
   // tRPC 适配器：createTRPCRouter 路由树 → 伪区块（style: "trpc"，路径含挂载前缀与点连接过程名）
   const trpcScan = collectTrpcSections(readContents, projectRoot);
+  // GraphQL 适配器：SDL schema + resolver/directive/shield 鉴权线索 → 伪区块（style: "graphql"，
+  // declaredPath 为唯一 HTTP 端点，寻址信息在 s.graphql 而非 URL）
+  const graphqlScan = collectGraphqlSections(readContents, projectRoot);
 
   const endpoints = [];
   const candidates = [];
-  for (const s of [...sections, ...handlerScan.sections, ...nextScan.sections, ...nestScan.sections, ...trpcScan.sections]) {
+  for (const s of [...sections, ...handlerScan.sections, ...nextScan.sections, ...nestScan.sections, ...trpcScan.sections, ...graphqlScan.sections]) {
     const eps = extractEndpoints(s);
     const sinks = extractSinks(s);
-    const routeKeys = extractRouteKeys(s);
+    const routeKeys = s.routeKeys ?? extractRouteKeys(s);
     const normFile = normalizePath(s.file);
     const path = s.declaredPath ?? eps[0]?.path ?? null;
     const hasPathParam = /:[A-Za-z_]\w*/.test(path ?? "");
-    const queryParam = !hasPathParam && sinks.length > 0 ? findQueryParamSink(s.text) : null;
+    // GraphQL 区块已带 declaredPath（完整端点），且 sink 判定走 s.graphql，不再做查询参数定位
+    const queryParam =
+      !hasPathParam && sinks.length > 0 && !s.graphql ? findQueryParamSink(s.text) : null;
     const inlineAuth = AUTH_GUARD.test(s.text) || sectionRouteMwAuth(s.text) || s.forcedAuth === true;
     const mountAuth =
       !inlineAuth && (authGuards.mountGuarded.has(normFile) || authGuards.selfGuarded.has(normFile));
@@ -541,13 +548,15 @@ export async function analyzeProject(ctx) {
     const hasOwnerGuard = OWNER_GUARD.test(s.text);
     const hasRoleGuard = ROLE_GUARD.test(s.text) || s.roleGuard === true;
     const hasOwnerFilter = OWNER_FILTER.test(s.text);
-    // 可寻址性：路径参数 / 查询参数 / tRPC 标量输入字段——不可寻址的对象无法动态复现，不作越权候选
-    const addressable = hasPathParam || !!queryParam || !!s.trpc?.addressable;
+    // 可寻址性：路径参数 / 查询参数 / tRPC 标量输入字段 / GraphQL 单标量 ID 参数——
+    // 不可寻址的对象无法动态复现，不作越权候选
+    const addressable = hasPathParam || !!queryParam || !!s.trpc?.addressable || !!s.graphql?.addressable;
     // 列表形态（归属过滤 + 无对象引用参数）：findFirst/单查族也常用于「取列表首条」，
     // 无可寻址参数时不可被动态寻址，抑制为噪声而非 IDOR 候选
     const listShaped = hasOwnerFilter && !addressable;
     const matchVars = extractMatchVars(s);
-    const mountPrefix = s.mountPrefixOverride ?? authGuards.mountPrefixes.get(normFile) ?? null;
+    // GraphQL 端点即完整 URL（detectGraphqlEndpoint 已含挂载前缀），不能再叠加 Express 挂载前缀
+    const mountPrefix = s.style === "graphql" ? null : s.mountPrefixOverride ?? authGuards.mountPrefixes.get(normFile) ?? null;
     const fullPath = path ? joinUrl(mountPrefix, path) : null;
 
     const ep = {
@@ -567,20 +576,32 @@ export async function analyzeProject(ctx) {
       hasOwnerFilter,
       sinkCalls: sinks.map((x) => x.call),
       trpc: s.trpc ?? null,
+      graphql: s.graphql ?? null,
     };
     if (queryParam) ep.queryParam = queryParam;
     endpoints.push(ep);
 
     const resource =
-      resourceFromQueryParam(queryParam?.param) ?? resourceFromModel(s.text) ?? guessResource(fullPath, s.text);
+      (s.graphql ? singular(String(s.graphql.resultType ?? "").toLowerCase()) : null) ||
+      (resourceFromQueryParam(queryParam?.param) ?? resourceFromModel(s.text) ?? guessResource(fullPath, s.text));
+
+    // 取数证据：传统代码看 sink 调用；GraphQL 看 SDL 里的单对象 ID 参数（无代码 sink 概念）
+    const sinkish = sinks.length > 0 || !!s.graphql;
 
     // 可疑 IDOR：按 ID 取单体资源 + 有认证 + 无归属校验 + 无角色限制
-    if (sinks.length > 0 && hasAuth && !hasOwnerGuard && !hasRoleGuard && !listShaped && (!s.trpc || addressable)) {
+    if (
+      sinkish &&
+      hasAuth &&
+      !hasOwnerGuard &&
+      !hasRoleGuard &&
+      !listShaped &&
+      ((!s.trpc && !s.graphql) || addressable)
+    ) {
       candidates.push({ ...ep, kind: "idor-suspect", resource });
     } else if (
-      // 可疑「无鉴权访问」：按 ID 取单体资源 + 无认证 + 可寻址（:param / 查询参数 / tRPC 输入字段）；
+      // 可疑「无鉴权访问」：按 ID 取单体资源 + 无认证 + 可寻址（:param / 查询参数 / tRPC 输入字段 / GraphQL ID 参数）；
       // 登录/注册等预期公开端点不在此列
-      sinks.length > 0 &&
+      sinkish &&
       !hasAuth &&
       !hasOwnerGuard &&
       !hasRoleGuard &&
@@ -592,7 +613,9 @@ export async function analyzeProject(ctx) {
     }
 
     // 可疑「路径穿越」：文件读取 sink 的相邻语句链中出现请求输入（读取族，无修复策略）
-    const traversal = findTraversalSignal(s.text);
+    // GraphQL 区块的 text 含 resolver 体，可能恰好引用文件读取；穿越取证走 HTTP 路径参数，
+    // 与 GraphQL 单端点模型不符，跳过（避免造出无法寻址的伪穿越用例）
+    const traversal = s.graphql ? null : findTraversalSignal(s.text);
     if (traversal) {
       candidates.push({
         ...ep,
@@ -638,13 +661,30 @@ export async function analyzeProject(ctx) {
     trpcProcedures: trpcScan.diag.trpcProcedures,
     trpcPrefix: trpcScan.diag.trpcPrefix,
     trpcRefsResolved: trpcScan.diag.trpcRefsResolved,
+    graphqlFiles: graphqlScan.diag.graphqlFiles,
+    graphqlSdlBlocks: graphqlScan.diag.graphqlSdlBlocks,
+    graphqlTypes: graphqlScan.diag.graphqlTypes,
+    graphqlFields: graphqlScan.diag.graphqlFields,
+    graphqlSections: graphqlScan.sections.length,
+    graphqlEndpoint: graphqlScan.diag.graphqlEndpoint,
+    graphqlAuthSource: graphqlScan.diag.graphqlAuthSource,
+    graphqlLoginField: graphqlScan.diag.graphqlLoginField,
     supabaseDetected: !!supabase,
     supabaseTables: supabase?.tables?.length ?? 0,
     supabaseProbeable: !!supabase?.probeable,
     supabaseServiceRoleLeak: !!supabase?.serviceRoleLeak,
   };
 
-  return { fileCount: files.length, readFiles, sections, endpoints, candidates, diagnostics, supabase };
+  return {
+    fileCount: files.length,
+    readFiles,
+    sections,
+    endpoints,
+    candidates,
+    diagnostics,
+    supabase,
+    graphql: graphqlScan.endpoint ? { endpoint: graphqlScan.endpoint, login: graphqlScan.login } : null,
+  };
 }
 
 function guessResource(pathHint, text) {

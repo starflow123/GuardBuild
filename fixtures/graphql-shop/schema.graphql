@@ -1,0 +1,62 @@
+# GraphQLShop 的 schema-first SDL（apollo-server / express-graphql / graphql-yoga 的常见写法）。
+# 这是 GuardBuild 静态分析的被测对象：字段鉴权来自指令（@auth / @hasRole / @skipAuth），
+# 实现体在 src/resolvers.mjs，两条线索在适配器内合并为同一个候选（见 sidecar/lib/graphql.mjs）。
+
+directive @auth on FIELD_DEFINITION
+directive @hasRole(role: String!) on FIELD_DEFINITION
+directive @skipAuth on FIELD_DEFINITION
+
+type Query {
+  # 复刻漏洞：仅按 id 取单个订单
+  order(id: Int!): Order! @auth
+  # 基线接口：返回体按归属过滤，用作列表/业务用例
+  myOrders: [Order!]! @auth
+  # 复刻漏洞：小票字段声明为公开，匿名即可凭订单号取回地址与金额
+  receipt(id: Int!): Receipt! @skipAuth
+  # 角色守卫：全局列表，仅管理员可见
+  adminOrders: [Order!]! @auth @hasRole(role: "ADMIN")
+}
+
+type Mutation {
+  login(email: String!, password: String!): AuthPayload!
+  # 复刻漏洞：取消订单同样只按 id 定位
+  cancelOrder(id: Int!): Order! @auth
+  # 管理员代取消（合法业务通道，用于回归防线）
+  adminCancelOrder(id: Int!): Order! @auth @hasRole(role: "ADMIN")
+}
+
+enum OrderStatus {
+  paid
+  shipped
+  cancelled
+}
+
+type Order {
+  id: Int!
+  userId: String!
+  title: String!
+  amount: Int!
+  status: OrderStatus!
+  address: String!
+}
+
+type Receipt {
+  id: Int!
+  userId: String!
+  title: String!
+  amount: Int!
+  status: OrderStatus!
+  address: String!
+}
+
+type User {
+  id: String!
+  email: String!
+  name: String!
+  role: String!
+}
+
+type AuthPayload {
+  token: String!
+  user: User!
+}

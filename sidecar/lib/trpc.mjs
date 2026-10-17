@@ -96,8 +96,9 @@ export function detectTrpcPrefix(files, projectRoot = null) {
 /**
  * 对象字面量正文按顶层逗号切分为条目（跳过字符串/注释/嵌套括号）。
  * 返回 [{ key, valStart, valEnd }]；无键条目（数组元素/计算键/展开）跳过。
+ * 导出原因：graphql.mjs 解析 resolver/shield 映射表用的是同一套条目切分。
  */
-function scanEntries(content, from, to) {
+export function scanEntries(content, from, to) {
   const out = [];
   let depth = 0;
   let quote = null;

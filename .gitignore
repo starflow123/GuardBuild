@@ -14,6 +14,7 @@ guardbuild-data/
 .demo-next/
 .demo-nest/
 .demo-trpc/
+.demo-graphql/
 guardbuild.db*
 *.tsbuildinfo
 

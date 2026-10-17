@@ -12,6 +12,46 @@ pub struct RedactionReport {
 
 pub const MASK: &str = "***REDACTED***";
 
+/// 类型注解形态（SDL / TS / zod 等）：`password: String!`、`token: string`、`secret: string[]`。
+/// 这类“值”是类型而不是秘密；脱敏会破坏源码语义（GraphQL SDL 会因此丢字段/丢参数）。
+/// 只对**裸值**分支生效——引号包裹的 `"string"` 仍按秘密处理。
+fn looks_like_type_annotation(value: &str) -> bool {
+    let mut v = value.trim();
+    loop {
+        let trimmed = v
+            .trim_end_matches(['!', '?'])
+            .trim_end_matches("[]")
+            .trim_end();
+        if trimmed == v {
+            break;
+        }
+        v = trimmed;
+    }
+    matches!(
+        v.to_ascii_lowercase().as_str(),
+        "string"
+            | "number"
+            | "boolean"
+            | "bigint"
+            | "symbol"
+            | "unknown"
+            | "any"
+            | "object"
+            | "void"
+            | "null"
+            | "undefined"
+            | "date"
+            | "buffer"
+            | "int"
+            | "float"
+            | "id"
+            | "bool"
+            | "uuid"
+            | "bytes"
+            | "json"
+    )
+}
+
 /// 上下文脱敏引擎。
 ///
 /// 所有从 Host 流向 Sidecar（决策层）或 UI 展示的文本都要经过它：
@@ -85,26 +125,37 @@ impl Redactor {
 
         // 2) 通用规则
         for (re, name) in &self.rules {
-            let count = re.find_iter(&out).count();
+            let mut count = 0usize;
+            out = re
+                .replace_all(&out, |caps: &regex::Captures| {
+                    if *name != "secret_assignment" {
+                        count += 1;
+                        return MASK.to_string();
+                    }
+                    // 类型注解不是秘密：保留原文，避免把源码/SDL 改写成语义不符的文本
+                    if let Some(bare) = caps.get(3) {
+                        if looks_like_type_annotation(bare.as_str()) {
+                            return caps
+                                .get(0)
+                                .map(|m| m.as_str().to_string())
+                                .unwrap_or_default();
+                        }
+                    }
+                    count += 1;
+                    // 保留「键 → 掩码」结构；JSON 引号形式保持响应体为合法 JSON
+                    let whole = caps.get(0).map(|m| m.as_str()).unwrap_or("");
+                    let json_like = whole.contains("\":")
+                        || whole.contains("':")
+                        || whole.starts_with('"')
+                        || whole.starts_with('\'');
+                    if json_like {
+                        format!("\"{}\": \"{}\"", &caps[1], MASK)
+                    } else {
+                        format!("{}={}", &caps[1], MASK)
+                    }
+                })
+                .to_string();
             if count > 0 {
-                out = re
-                    .replace_all(&out, |caps: &regex::Captures| {
-                        if *name != "secret_assignment" {
-                            return MASK.to_string();
-                        }
-                        // 保留「键 → 掩码」结构；JSON 引号形式保持响应体为合法 JSON
-                        let whole = caps.get(0).map(|m| m.as_str()).unwrap_or("");
-                        let json_like = whole.contains("\":")
-                            || whole.contains("':")
-                            || whole.starts_with('"')
-                            || whole.starts_with('\'');
-                        if json_like {
-                            format!("\"{}\": \"{}\"", &caps[1], MASK)
-                        } else {
-                            format!("{}={}", &caps[1], MASK)
-                        }
-                    })
-                    .to_string();
                 reports.push(RedactionReport {
                     pattern: name.to_string(),
                     count,
@@ -159,6 +210,34 @@ mod tests {
             serde_json::from_str(&out).expect("脱敏后的 JSON 必须仍然合法");
         assert_eq!(parsed["user"]["id"], "u_1001");
         assert!(parsed["token"].as_str().unwrap().contains("REDACTED"));
+    }
+
+    #[test]
+    fn keeps_type_annotations_intact() {
+        let r = Redactor::new();
+        let v = Vault::default();
+        // GraphQL SDL：类型声明被改写会让静态分析丢掉 password 参数与 token 字段
+        let sdl = "login(email: String!, password: String!): AuthPayload!\ntype AuthPayload { token: String! user: User! }";
+        let (out, reports) = r.redact(sdl, &v);
+        assert_eq!(out, sdl);
+        assert!(reports.is_empty());
+        // TS 类型注解同理
+        let ts = "password: string;\ntoken?: string;\nsecret: string[];";
+        let (out_ts, _) = r.redact(ts, &v);
+        assert_eq!(out_ts, ts);
+    }
+
+    #[test]
+    fn still_redacts_bare_secret_values() {
+        let r = Redactor::new();
+        let v = Vault::default();
+        let (out, reports) = r.redact("password=hunter2secret\ntoken: sess_9f8a7b6c5d", &v);
+        assert!(!out.contains("hunter2secret"));
+        assert!(!out.contains("sess_9f8a7b6c5d"));
+        assert_eq!(reports.iter().map(|x| x.count).sum::<usize>(), 2);
+        // 引号包裹的 "string" 仍按秘密处理（只有裸类型注解被豁免）
+        let (quoted, _) = r.redact(r#"password: "string""#, &v);
+        assert!(quoted.contains(MASK));
     }
 
     #[test]

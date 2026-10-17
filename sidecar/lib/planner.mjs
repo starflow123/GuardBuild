@@ -39,10 +39,17 @@ function paramCount(p) {
   return String(p ?? "").match(/:[A-Za-z_]\w*/g)?.length ?? 0;
 }
 
+/** 候选的唯一标识：GraphQL 全部过程共用一个 HTTP 端点，必须再带上字段名才不会被 top-K 去重吞掉 */
+function candKey(c) {
+  const base = `${c.method} ${epPath(c)}`;
+  return c.graphql ? `${base} ${c.graphql.root}.${c.graphql.field}` : base;
+}
+
 /** 由静态分析结果构建探测计划；loginPathOverride 来自契约（优先级最高） */
 export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
   const eps = analysis.endpoints;
   const candidates = analysis.candidates;
+  const graphql = analysis.graphql ?? null;
 
   const analysisLogin = eps.find(
     (e) => e.method === "POST" && (epPath(e) ?? "").toLowerCase().includes("login")
@@ -53,6 +60,8 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
   };
   pushLogin(loginPathOverride);
   if (analysisLogin) pushLogin(epPath(analysisLogin));
+  // GraphQL 登录走同一 HTTP 端点的 mutation（请求体由 plan.graphql.login 构造）
+  if (graphql?.login?.path) pushLogin(graphql.login.path);
   pushLogin("/api/login");
 
   // 每类取 top-K 候选逐一探测；单槽位（首元素）保留既有语义与消费方兼容
@@ -61,7 +70,7 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
     const out = [];
     for (const c of candidates) {
       if (!pred(c)) continue;
-      const key = `${c.method} ${epPath(c)}`;
+      const key = candKey(c);
       if (seen.has(key)) continue;
       seen.add(key);
       out.push(c);
@@ -69,22 +78,23 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
     }
     return out;
   };
-  // 可寻址：REST 的单个 :param / 查询参数形态，或 tRPC 的标量输入字段（ID 放 ?input= 或请求体）
-  const addressable = (c) => paramCount(epPath(c)) === 1 || !!c.queryParam || !!c.trpc?.addressable;
+  // 可寻址：REST 的单个 :param / 查询参数形态、tRPC 的标量输入字段、GraphQL 的单标量 ID 参数
+  const addressable = (c) =>
+    paramCount(epPath(c)) === 1 || !!c.queryParam || !!c.trpc?.addressable || !!c.graphql?.addressable;
+  // 读语义：REST/tRPC 走 GET；GraphQL 的 query 过程（传输层仍是 POST）
+  const readShaped = (c) => c.method === "GET" || c.graphql?.op === "query";
   const trpcProcLast = (c) => String(c.trpc?.procPath ?? "").split(".").pop() ?? "";
   const cancelCandidates = topK(
     (c) =>
       c.kind === "idor-suspect" &&
       c.method === "POST" &&
-      ((epPath(c) ?? "").endsWith("/cancel") || (!!c.trpc && /cancel/i.test(trpcProcLast(c))))
+      ((epPath(c) ?? "").endsWith("/cancel") ||
+        (!!c.trpc && /cancel/i.test(trpcProcLast(c))) ||
+        (!!c.graphql && c.graphql.op === "mutation" && /cancel/i.test(c.graphql.field)))
   );
-  const readCandidates = topK(
-    (c) => c.kind === "idor-suspect" && c.method === "GET" && addressable(c)
-  );
+  const readCandidates = topK((c) => c.kind === "idor-suspect" && readShaped(c) && addressable(c));
   // 无鉴权候选：匿名读取用例的靶点（与 IDOR 槽位互斥，不做自动修复）
-  const unauthReadCandidates = topK(
-    (c) => c.kind === "no-auth-suspect" && c.method === "GET" && addressable(c)
-  );
+  const unauthReadCandidates = topK((c) => c.kind === "no-auth-suspect" && readShaped(c) && addressable(c));
   const cancelCandidate = cancelCandidates[0] ?? null;
   const readCandidate = readCandidates[0] ?? null;
   const unauthReadCandidate = unauthReadCandidates[0] ?? null;
@@ -100,23 +110,49 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
     "resource";
 
   // 列表/管理端点优先选择与资源名匹配的路径（避免把别的资源列表当作探测目标）
+  // GraphQL 的过程名在 graphql.field 里（HTTP 路径恒为端点），资源匹配需一并看字段名
   const byResource = (list) =>
-    list.find((e) => epPath(e).toLowerCase().includes(resource.toLowerCase())) ?? list[0] ?? null;
+    list.find((e) => `${epPath(e)} ${e.graphql?.field ?? ""}`.toLowerCase().includes(resource.toLowerCase())) ??
+    list[0] ??
+    null;
   const listFields = eps.filter(
     (e) =>
-      e.method === "GET" &&
+      ((e.method === "GET" && paramCount(epPath(e)) === 0) ||
+        // GraphQL 列表字段：query 过程 + 返回数组 + 无 ID 参数（不可寻址），且带归属过滤
+        (e.graphql && e.graphql.op === "query" && e.graphql.list && !e.graphql.addressable)) &&
       epPath(e) &&
-      paramCount(epPath(e)) === 0 &&
       e.hasOwnerFilter &&
-      !/admin/i.test(epPath(e))
+      !/admin/i.test(epPath(e)) &&
+      !/admin/i.test(e.graphql?.field ?? "")
   );
   const list = byResource(listFields);
-  const adminFields = eps.filter((e) => e.method === "GET" && /admin/i.test(epPath(e) ?? "") && e.hasRoleGuard);
+  const adminFields = eps.filter(
+    (e) =>
+      ((e.method === "GET" && /admin/i.test(epPath(e) ?? "")) ||
+        (e.graphql && e.graphql.op === "query" && /admin/i.test(e.graphql.field))) &&
+      e.hasRoleGuard
+  );
   const adminCancelFields = eps.filter(
-    (e) => e.method === "POST" && /admin/i.test(epPath(e) ?? "") && (epPath(e) ?? "").endsWith("/cancel")
+    (e) =>
+      (e.method === "POST" && /admin/i.test(epPath(e) ?? "") && (epPath(e) ?? "").endsWith("/cancel")) ||
+      (e.graphql &&
+        e.graphql.op === "mutation" &&
+        /admin/i.test(e.graphql.field) &&
+        /cancel/i.test(e.graphql.field))
   );
   const adminList = byResource(adminFields);
   const adminCancel = byResource(adminCancelFields);
+
+  // 端点槽位需携带请求构造信息：GraphQL 走 POST + 文档体，REST 保持 GET/POST 无体
+  const epSlot = (e) =>
+    e
+      ? {
+          path: epPath(e),
+          routeKey: e.routeKeys?.[0] ?? null,
+          method: e.graphql ? "POST" : e.method ?? "GET",
+          graphql: e.graphql ?? null,
+        }
+      : null;
 
   return {
     loginPath: loginCandidates[0],
@@ -130,11 +166,12 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
     cancelCandidates,
     unauthReadCandidates,
     traversalCandidates,
-    listEndpoint: list ? { path: epPath(list), routeKey: list.routeKeys?.[0] ?? null } : null,
-    adminListEndpoint: adminList ? { path: epPath(adminList), routeKey: adminList.routeKeys?.[0] ?? null } : null,
-    adminCancelEndpoint: adminCancel ? { path: epPath(adminCancel), routeKey: adminCancel.routeKeys?.[0] ?? null } : null,
+    listEndpoint: epSlot(list),
+    adminListEndpoint: epSlot(adminList),
+    adminCancelEndpoint: epSlot(adminCancel),
     candidates,
     supabase: analysis.supabase ?? null,
+    graphql,
   };
 }
 

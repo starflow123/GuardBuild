@@ -1,0 +1,21 @@
+{
+  "start": {
+    "cmd": "node",
+    "args": ["server.js"],
+    "env": { "PORT": "0" },
+    "readyPattern": "已就绪",
+    "readyTimeoutMs": 20000
+  },
+  "login": {
+    "path": "/graphql",
+    "bodyTemplate": { "email": "{email}", "password": "{password}" },
+    "credentialPath": "data.login.token",
+    "userPath": "login.user"
+  },
+  "identities": [
+    { "name": "alice", "email": "alice@gqlshop.dev", "password": "alice123", "role": "user" },
+    { "name": "bob", "email": "bob@gqlshop.dev", "password": "bob123", "role": "user" },
+    { "name": "admin", "email": "admin@gqlshop.dev", "password": "admin123", "role": "admin" }
+  ],
+  "scopes": ["project.read", "worktree.write", "proc.spawn", "net.probe"]
+}

@@ -502,6 +502,8 @@ async function stageAnalyze(ctx) {
     startLine: c.startLine,
     resource: c.resource,
     kind: c.kind,
+    // GraphQL 等单端点框架：URL 不携带字段身份，报告须靠 routeKeys 指认修复点
+    routeKeys: c.routeKeys ?? null,
     sinkCalls: c.sinkCalls,
     reason:
       c.kind === "no-auth-suspect"

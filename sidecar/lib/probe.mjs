@@ -23,6 +23,18 @@ import {
   unwrapTrpcEnvelope,
   variantAt,
 } from "./trpcwire.mjs";
+import {
+  graphqlLoginRequest,
+  graphqlPlainRequest,
+  graphqlRequest,
+  introspectionRequest,
+  isGraphqlCandidate,
+  looksLikeGraphqlPath,
+  parseIntrospection,
+  unwrapGraphqlEnvelope,
+  isGraphqlDenied,
+  graphqlShapeRejected,
+} from "./graphqlwire.mjs";
 
 export class ProbeError extends Error {
   constructor(message, { code = "probe_failed", hint = null } = {}) {
@@ -109,6 +121,7 @@ async function httpJson(ctx, opts) {
     credentialPrefix = null,
     credentialHeader = null,
     redact = true,
+    graphql = false,
   } = opts;
   const params = {
     token: ctx.tokens.net,
@@ -145,6 +158,14 @@ async function httpJson(ctx, opts) {
   // 上层 extractEntity/extractListItems 与契约 responses.list/entity 因此无需感知框架形态。
   // 判定严格（顶层仅 result 且含 data），REST 目标响应不受影响。
   if (json !== null) json = unwrapTrpcEnvelope(json);
+  // GraphQL 信封（{data, errors}）只在明确声明为 GraphQL 请求时解开：
+  // 同时把「HTTP 200 + 拒绝错误」记为 graphqlDenied——GraphQL 的授权拒绝在 HTTP 层常不可见。
+  if (graphql && json !== null) {
+    res.jsonRaw = json;
+    res.graphqlDenied = isGraphqlDenied(json);
+    res.graphqlErrored = Array.isArray(json.errors) && json.errors.length > 0;
+    json = unwrapGraphqlEnvelope(json);
+  }
   return { ...res, json };
 }
 
@@ -253,8 +274,18 @@ export async function loginAll(ctx, baseUrl) {
     // 登录端点是 tRPC 过程（末段形如 auth.login）时，请求体形态（superjson 包裹与否）未知，
     // 按变体检索到能用第一个身份取回凭据的形态后再为其余身份复用
     const isTrpcProc = looksLikeTrpcProcPath(path);
+    // GraphQL 登录：同一 HTTP 端点上的 mutation，文档由静态分析出的登录字段（SDL）构造
+    const gqlLogin = ctx.plan.graphql?.login ?? null;
+    const isGqlLogin = !!gqlLogin?.field && path === gqlLogin.path && looksLikeGraphqlPath(path);
     for (const ident of ctx.identities) {
       const bodyPlain = buildLoginBody(ident, cfg);
+      const gqlReq = isGqlLogin ? graphqlLoginRequest(gqlLogin, bodyPlain) : null;
+      if (isGqlLogin && !gqlReq) {
+        throw new ProbeError(`GraphQL 登录字段 ${gqlLogin.field} 的请求文档无法构造`, {
+          code: "graphql_login_shape",
+          hint: `登录 mutation 的入参形态受限于 SDL 声明（当前参数：${(gqlLogin.args ?? []).map((a) => a.name).join("、") || "无"}）；若入参为 input 对象，请在 guardbuild.json 的 login.path 指定 REST 登录端点`,
+        });
+      }
       const wraps = isTrpcProc ? [true, false] : [false];
       let res = null;
       for (const wrap of wraps) {
@@ -262,11 +293,16 @@ export async function loginAll(ctx, baseUrl) {
           baseUrl,
           method: "POST",
           path,
-          body: isTrpcProc ? encodeInput(bodyPlain, wrap) : JSON.stringify(bodyPlain),
+          body: gqlReq
+            ? gqlReq.body
+            : isTrpcProc
+              ? encodeInput(bodyPlain, wrap)
+              : JSON.stringify(bodyPlain),
           storeAs: ident.name,
           credentialPath: cfg?.credentialPath ?? "token",
           credentialPrefix: cfg?.credentialPrefix ?? "Bearer ",
           credentialHeader: cfg?.credentialHeader ?? null,
+          graphql: !!gqlReq,
         });
         if (okStatus(res.status) && res.storedIdentity === ident.name) {
           if (isTrpcProc && ctx._trpcWrap == null) {
@@ -317,7 +353,9 @@ export async function loginAll(ctx, baseUrl) {
 
   const { code, hint } = classifyLoginFailure(attempts);
   const last = attempts[attempts.length - 1];
-  throw new ProbeError(`所有候选登录端点均失败（最后尝试 ${last.path}，HTTP ${last.status}）`, {
+  // 逐个候选端点的实际状态码入消息：单端点框架（GraphQL）的登录失败最易被后一个 404 掩盖
+  const tried = attempts.map((a) => `${a.path}→HTTP ${a.status}`).join("，");
+  throw new ProbeError(`所有候选登录端点均失败（最后尝试 ${last.path}，HTTP ${last.status}；全部尝试：${tried}）`, {
     code,
     hint,
   });
@@ -332,8 +370,15 @@ async function discoverViaAnonymousProbe(ctx, baseUrl, cand) {
   const anonymousItems = [];
   for (let id = 1; id <= ANON_PROBE_MAX_ID && anonymousItems.length < ANON_PROBE_MAX_ITEMS; id += 1) {
     const req = candRequest(ctx, cand, id);
-    const res = await httpJson(ctx, { baseUrl, method: "GET", path: req.path, identity: null });
-    const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
+    const res = await httpJson(ctx, {
+      baseUrl,
+      method: req.method ?? "GET",
+      path: req.path,
+      identity: null,
+      body: req.body,
+      graphql: req.graphql ?? false,
+    });
+    const o = extractEntity(res.json, entityPathFor(ctx, cand.graphql));
     if (o && String(o.id) === String(id)) anonymousItems.push(o);
   }
   ctx.emit({
@@ -361,6 +406,18 @@ function planCandidates(ctx, kind) {
 
 function candPath(cand) {
   return cand?.fullPath ?? cand?.path ?? null;
+}
+
+/**
+ * 响应取值路径。契约（guardbuild.json 的 responses.entity/list）优先；
+ * GraphQL 单次文档只请求一个字段，字段名随候选而变（order / myOrders / adminOrders…），
+ * 契约里的固定点路径无法覆盖，故回退为「本次请求的字段名」。
+ */
+function entityPathFor(ctx, graphql) {
+  return ctx.targetConfig?.responses?.entity ?? graphql?.field ?? null;
+}
+function listPathFor(ctx, graphql) {
+  return ctx.targetConfig?.responses?.list ?? graphql?.field ?? null;
 }
 
 /**
@@ -398,10 +455,18 @@ async function discoverResources(ctx, baseUrl, loggedIn) {
     });
   }
   const byUser = {};
+  const listReq = slotRequest(ctx.plan.listEndpoint);
   for (const ident of loggedIn) {
     if (ident.role === "admin") continue;
-    const res = await httpJson(ctx, { baseUrl, method: "GET", path: listPath, identity: ident.name });
-    const items = extractListItems(res.json, ctx.targetConfig?.responses?.list ?? null) ?? [];
+    const res = await httpJson(ctx, {
+      baseUrl,
+      method: listReq?.method ?? "GET",
+      path: listReq?.path ?? listPath,
+      identity: ident.name,
+      body: listReq?.body ?? null,
+      graphql: listReq?.graphql ?? false,
+    });
+    const items = extractListItems(res.json, listPathFor(ctx, ctx.plan.listEndpoint?.graphql)) ?? [];
     byUser[ident.name] = items;
     ctx.emit({
       kind: "discovery",
@@ -458,14 +523,34 @@ function fillCandPath(cand, id) {
 }
 
 /**
- * 用例请求构造的统一入口：tRPC 候选按线上协议生成 URL/body（input 放 ?input= 或请求体，
- * 编码形态取协商结果 ctx._trpcVariant），其余候选保持 REST 形态。
+ * 用例请求构造的统一入口：tRPC / GraphQL 候选按各自线上协议生成 URL/body
+ *  （tRPC input 放 ?input= 或请求体，编码形态取协商结果 ctx._trpcVariant；
+ *   GraphQL 全部走 POST 端点，文档与变量由 SDL 构造，见 graphqlwire），
+ * 其余候选保持 REST 形态（method 返回 null，由调用方按用例类型沿用 GET/POST 默认）。
  */
 function candRequest(ctx, cand, id) {
-  if (!isTrpcCandidate(cand)) return { path: fillCandPath(cand, id), body: null };
+  if (isGraphqlCandidate(cand)) {
+    const req = graphqlRequest(cand, id, ctx._graphqlCastFlip ?? false);
+    if (req) return { path: req.path, body: req.body, method: req.method, graphql: true };
+    return { path: fillCandPath(cand, id), body: null, method: null, graphql: null };
+  }
+  if (!isTrpcCandidate(cand)) return { path: fillCandPath(cand, id), body: null, method: null, graphql: null };
   const req = trpcRequest(cand, id, variantAt(ctx._trpcVariant ?? 0));
-  if (!req) return { path: fillCandPath(cand, id), body: null };
-  return { path: req.path, body: req.body };
+  if (!req) return { path: fillCandPath(cand, id), body: null, method: null, graphql: null };
+  return { path: req.path, body: req.body, method: req.method, graphql: null };
+}
+
+/**
+ * 计划端点槽位（listEndpoint / adminListEndpoint / adminCancelEndpoint）的请求构造：
+ * GraphQL 用无参数文档（列表/全局视图字段不填 ID），REST 原样返回路径。
+ */
+function slotRequest(slot) {
+  if (!slot?.path) return null;
+  if (slot.graphql) {
+    const req = graphqlPlainRequest(slot.graphql, slot.path);
+    if (req) return { path: req.path, body: req.body, method: req.method, graphql: true };
+  }
+  return { path: slot.path, body: null, method: slot.method ?? "GET", graphql: null };
 }
 
 /** 计划里是否存在需要 input 的 tRPC 候选 */
@@ -552,11 +637,165 @@ async function negotiateTrpcInput(ctx, baseUrl, loggedIn) {
   });
 }
 
+// —— GraphQL 探测层：端点确认（introspection）+ 参数类型协商 ——
+
+/** 计划里是否存在 GraphQL 候选 */
+function planHasGraphql(ctx) {
+  return (ctx.plan?.candidates ?? []).some((c) => isGraphqlCandidate(c));
+}
+
+const gqlWantsNumber = (t) => t === "Int" || t === "Float";
+
+/**
+ * GraphQL 端点确认：向静态分析推出的端点发一次 introspection。
+ * 用途严格限定为两件事——① 证实端点确实是 GraphQL 服务；② 用运行时 schema 校正
+ * 文档构造所需的参数类型与可选字段。绝不据运行时 schema 生成新候选：
+ * 报告里的每一条发现必须能追溯到源码位置，否则无法指认修复点。
+ * 服务端关闭内省（生产环境常见）时降级为 WARN，探测继续走 SDL 构造的文档。
+ */
+async function confirmGraphqlEndpoint(ctx, baseUrl, loggedIn) {
+  if (ctx._graphqlConfirmed || !planHasGraphql(ctx)) return;
+  ctx._graphqlConfirmed = true;
+  const endpoint = ctx.plan.graphql?.endpoint ?? null;
+  if (!endpoint) return;
+  const identity = (loggedIn.find((i) => i.role !== "admin") ?? loggedIn[0] ?? null)?.name ?? null;
+  const req = introspectionRequest(endpoint);
+  let res = null;
+  try {
+    res = await httpJson(ctx, { baseUrl, method: req.method, path: req.path, body: req.body, identity });
+  } catch {
+    res = null;
+  }
+  const info = res ? parseIntrospection(res.json ?? res.jsonRaw) : null;
+  if (!info) {
+    ctx.emit({
+      kind: "discovery",
+      severity: SEVERITY.WARN,
+      message: `GraphQL introspection 不可用（${endpoint} 未返回 schema，可能已关闭内省）：查询文档完全按源码 SDL 构造`,
+      data: { endpoint, status: res?.status ?? null },
+    });
+    return;
+  }
+  ctx._graphqlSchema = info;
+  // 运行时类型 vs SDL 声明类型：不一致记入诊断，并据此决定 ID 投放形态
+  const stale = [];
+  const wantsNumberByRuntime = new Map();
+  for (const c of ctx.plan.candidates ?? []) {
+    if (!isGraphqlCandidate(c) || !c.graphql?.addressable || c.graphql.arg?.form !== "scalar") continue;
+    const key = `${c.graphql.root}.${c.graphql.field}`;
+    const rt = info.fields[key];
+    if (!rt) {
+      stale.push({ field: key, reason: "运行时 schema 中不存在该字段" });
+      continue;
+    }
+    const rtArg = (rt.args ?? []).find((a) => a.name === c.graphql.arg.name) ?? null;
+    if (!rtArg) {
+      stale.push({ field: key, reason: `运行时字段无参数 ${c.graphql.arg.name}` });
+      continue;
+    }
+    wantsNumberByRuntime.set(key, gqlWantsNumber(rtArg.typeName));
+    if (rtArg.typeName !== c.graphql.arg.typeName) {
+      stale.push({ field: key, reason: `参数类型：SDL 声明 ${c.graphql.arg.typeName}，运行时 ${rtArg.typeName}` });
+    }
+  }
+  const consistent = stale.length === 0;
+  ctx.emit({
+    kind: "discovery",
+    severity: consistent ? SEVERITY.INFO : SEVERITY.WARN,
+    message: consistent
+      ? `GraphQL 端点确认：${endpoint} 可 introspection，运行时 schema 与源码 SDL 一致（根字段 ${Object.keys(info.fields).length} 个）`
+      : `GraphQL 端点确认：${endpoint} 可 introspection，但 ${stale.length} 处与源码 SDL 不一致（${stale.map((s) => `${s.field}: ${s.reason}`).join("；")}）`,
+    data: { endpoint, fields: Object.keys(info.fields).length, stale },
+  });
+  if (wantsNumberByRuntime.size > 0) ctx._graphqlArgNumbers = wantsNumberByRuntime;
+}
+
+/**
+ * GraphQL 参数投放协商：ID 是数值（Int!）还是字符串（ID!/String!）由 schema 决定，
+ * SDL 与运行时不一致时文档会被直接拒（HTTP 400 / GRAPHQL_VALIDATION_FAILED）。
+ * 优先采用 introspection 给出的运行时类型；否则发一次只读试探，被拒即翻转。
+ * 只用查询（op=query）过程试探，绝不用变更过程，避免产生副作用。
+ */
+async function negotiateGraphqlCast(ctx, baseUrl, loggedIn) {
+  if (ctx._graphqlNegotiated || !planHasGraphql(ctx)) return;
+  ctx._graphqlNegotiated = true;
+  const ident = loggedIn.find((i) => i.role !== "admin") ?? loggedIn[0] ?? null;
+  const probes = [];
+  for (const c of ctx.plan.readCandidates ?? []) {
+    if (isGraphqlCandidate(c) && c.graphql?.addressable && c.graphql.op === "query") {
+      probes.push({ cand: c, identity: ident?.name ?? null });
+    }
+  }
+  for (const c of ctx.plan.unauthReadCandidates ?? []) {
+    if (isGraphqlCandidate(c) && c.graphql?.addressable) probes.push({ cand: c, identity: null });
+  }
+  const pick = probes[0] ?? null;
+  if (!pick) {
+    ctx.emit({
+      kind: "discovery",
+      severity: SEVERITY.WARN,
+      message: "GraphQL 参数形态未协商（无可用作只读试探的查询字段），按 SDL 声明类型探测",
+      data: { reason: "no_read_candidate" },
+    });
+    return;
+  }
+  // introspection 已知运行时类型：直接判定是否需要翻转，无需试错
+  const key = `${pick.cand.graphql.root}.${pick.cand.graphql.field}`;
+  const runtime = ctx._graphqlArgNumbers?.get(key);
+  if (runtime !== undefined) {
+    ctx._graphqlCastFlip = runtime !== gqlWantsNumber(pick.cand.graphql.arg?.typeName);
+    if (ctx._graphqlCastFlip) {
+      ctx.emit({
+        kind: "discovery",
+        severity: SEVERITY.INFO,
+        message: `GraphQL 参数形态按 introspection 校正：${key} 的 ID 改为 ${runtime ? "数值" : "字符串"}投放`,
+        data: { field: key, flip: true, source: "introspection" },
+      });
+    } else {
+      // 一致也要留痕：后面的探测文档为何按 SDL 投放，报告与排障需要这个决策依据
+      ctx.emit({
+        kind: "discovery",
+        severity: SEVERITY.INFO,
+        message: `GraphQL 参数形态协商完成：${key} 的运行时参数类型与源码 SDL 一致（${pick.cand.graphql.arg?.typeName}），按声明投放`,
+        data: { field: key, flip: false, source: "introspection" },
+      });
+    }
+    return;
+  }
+  for (const flip of [false, true]) {
+    const req = graphqlRequest(pick.cand, 1, flip);
+    if (!req) break;
+    const res = await httpJson(ctx, {
+      baseUrl,
+      method: req.method,
+      path: req.path,
+      identity: pick.identity,
+      body: req.body,
+      graphql: true,
+    });
+    if (graphqlShapeRejected(res)) continue;
+    ctx._graphqlCastFlip = flip;
+    ctx.emit({
+      kind: "discovery",
+      severity: SEVERITY.INFO,
+      message: `GraphQL 参数形态协商成功：${key} 按 SDL 类型${flip ? "（翻转投放）" : "原样投放"}（HTTP ${res.status}）`,
+      data: { field: key, flip, status: res.status, probe: req.path },
+    });
+    return;
+  }
+  ctx.emit({
+    kind: "discovery",
+    severity: SEVERITY.WARN,
+    message: `GraphQL 参数形态协商失败：${key} 的两种 ID 形态均被拒（HTTP 400/校验错误），后续探测可能无法复现`,
+    data: { field: key, probe: candPath(pick.cand) },
+  });
+}
+
 const okStatus = (s) => s >= 200 && s < 300;
 
-/** 攻击用例判定：修复前 = 漏洞可利用；修复后 = 攻击被阻断 */
 /**
- * 攻击用例判定。leaked 为「响应中确含越权成功证据」的判定结果：
+ * 攻击用例判定（修复前 = 漏洞可利用；修复后 = 攻击被阻断）。
+ * leaked 为「响应中确含越权成功证据」的判定结果：
  * 2xx 但响应无证据（如 200+{"error":"Not Admin"} 语义拒绝）不得当作放行，
  * 否则会产生假复现（修复前误报漏洞）。
  */
@@ -568,7 +807,9 @@ function verifyAttack(res, phase, detail, leaked = true) {
     if (okStatus(res.status)) {
       return {
         verdict: VERDICT.INCONCLUSIVE,
-        actual: `HTTP ${res.status}，但响应未包含越权成功的证据（可能为语义拒绝，如 200+错误体）`,
+        actual: `HTTP ${res.status}，但响应未包含越权成功的证据（${
+          res.graphqlDenied ? "GraphQL 语义拒绝：HTTP 200 + 拒绝错误" : "可能为语义拒绝，如 200+错误体"
+        }）`,
       };
     }
     return {
@@ -576,8 +817,13 @@ function verifyAttack(res, phase, detail, leaked = true) {
       actual: `HTTP ${res.status}，攻击在修复前即无法复现（该端点可能已有防护）`,
     };
   }
-  if (DENIED_STATUS.has(res.status)) {
-    return { verdict: VERDICT.BLOCKED, actual: `HTTP ${res.status}，越权请求被拒绝。${detail ?? ""}` };
+  if (DENIED_STATUS.has(res.status) || res.graphqlDenied) {
+    return {
+      verdict: VERDICT.BLOCKED,
+      actual: res.graphqlDenied && !DENIED_STATUS.has(res.status)
+        ? `HTTP 200 + GraphQL 错误（语义拒绝），越权请求被拒绝。${detail ?? ""}`
+        : `HTTP ${res.status}，越权请求被拒绝。${detail ?? ""}`,
+    };
   }
   if (okStatus(res.status) && leaked) {
     return { verdict: VERDICT.REGRESSED, actual: `HTTP ${res.status}，修复后攻击仍可成功，补丁无效。${detail ?? ""}` };
@@ -594,6 +840,17 @@ function verifyAttack(res, phase, detail, leaked = true) {
 /** 业务用例判定：修复前后都必须保持通过 */
 function verifyBusiness(res, expectStatus, detailFn) {
   if (res.status !== expectStatus) {
+    // GraphQL 的拒绝（认证/授权/业务规则）常以 HTTP 200 + errors 形态返回：
+    // 期望值为错误状态、且内容断言未失败时，按「语义拒绝」认定该保护仍然生效，而非状态码不符的回归
+    if (expectStatus >= 400 && okStatus(res.status) && res.graphqlErrored) {
+      const content = detailFn ? detailFn() : null;
+      if (!String(content ?? "").startsWith("FAIL:")) {
+        return {
+          verdict: VERDICT.PASSED,
+          actual: `HTTP ${res.status} + GraphQL 错误体（语义拒绝，等价于预期 ${expectStatus}）${content ? `，${content}` : ""}`,
+        };
+      }
+    }
     return {
       verdict: VERDICT.REGRESSED,
       actual: `HTTP ${res.status}（预期 ${expectStatus}）${detailFn ? `：${detailFn()}` : ""}`,
@@ -641,6 +898,9 @@ export function buildCases(ctx, targets) {
   const adminListPath = ctx.plan.adminListEndpoint?.path ?? null;
   const adminCancelPath = ctx.plan.adminCancelEndpoint?.path ?? null;
   const listPath = ctx.plan.listEndpoint?.path ?? null;
+  // 计划槽位的实际请求（GraphQL 需带文档体并以 POST 发送；REST 保持原样）
+  const adminListReq = slotRequest(ctx.plan.adminListEndpoint);
+  const listReq = slotRequest(ctx.plan.listEndpoint);
   const readKey = readCands[0]?.routeKeys?.[0] ?? "orders.get";
   const cancelKey = cancelCands[0]?.routeKeys?.[0] ?? "orders.cancel";
   const { attacker, victim, admin } = targets;
@@ -662,13 +922,14 @@ export function buildCases(ctx, targets) {
       category: CASE_CATEGORY.ATTACK,
       name: `${attacker.name} 读取 ${victim.name} 的${candLabel} #${readTarget.id}${multi}`,
       identity: attacker.name,
-      method: "GET",
+      method: req.method ?? "GET",
       path: req.path,
       body: req.body,
+      graphql: req.graphql ?? null,
       routeKey: cand.routeKeys?.[0] ?? readKey,
       expect: `越权读取他人${candLabel}应被拒绝（401/403/404）`,
       verify: (res, phase) => {
-        const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
+        const o = extractEntity(res.json, entityPathFor(ctx, cand.graphql));
         const leaked = o && String(o.id) === String(readTarget.id);
         const detail = leaked
           ? `证据：返回${candLabel} #${o.id}（归属 ${ownerOf(o)}，金额 ${o.amount}，状态 ${o.status}）`
@@ -676,7 +937,7 @@ export function buildCases(ctx, targets) {
         return verifyAttack(res, phase, detail, leaked);
       },
       crossProof: (res) => {
-        const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
+        const o = extractEntity(res.json, entityPathFor(ctx, cand.graphql));
         if (!o || o.id !== readTarget.id) return null;
         const ownerOk = !victim.user?.id || ownerOf(o) === victim.user.id;
         if (!ownerOk) return null;
@@ -701,20 +962,21 @@ export function buildCases(ctx, targets) {
       category: CASE_CATEGORY.ATTACK,
       name: `${attacker.name} 取消 ${victim.name} 的${candLabel} #${cancelTarget.id}${multi}`,
       identity: attacker.name,
-      method: cand.method ?? "POST",
+      method: req.method ?? cand.method ?? "POST",
       path: req.path,
       body: req.body,
+      graphql: req.graphql ?? null,
       routeKey: cand.routeKeys?.[0] ?? cancelKey,
       expect: `越权取消他人${candLabel}应被拒绝（401/403/404）`,
       verify: (res, phase) => {
-        const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
+        const o = extractEntity(res.json, entityPathFor(ctx, cand.graphql));
         const changed =
           o && o.status === "cancelled" && (!victim.user?.id || ownerOf(o) === victim.user.id);
         const detail = changed ? `证据：${candLabel} #${o.id}（归属 ${ownerOf(o)}）状态已被改为 cancelled` : "";
         return verifyAttack(res, phase, detail, changed);
       },
       crossProof: (res) => {
-        const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
+        const o = extractEntity(res.json, entityPathFor(ctx, cand.graphql));
         if (!o || o.id !== cancelTarget.id) return null;
         if (victim.user?.id && ownerOf(o) !== victim.user.id) return null;
         return {
@@ -722,7 +984,7 @@ export function buildCases(ctx, targets) {
         };
       },
       impact: (res) => {
-        const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
+        const o = extractEntity(res.json, entityPathFor(ctx, cand.graphql));
         return o && o.status === "cancelled" ? `可越权取消他人${candLabel}（业务破坏）` : null;
       },
     });
@@ -734,12 +996,14 @@ export function buildCases(ctx, targets) {
       category: CASE_CATEGORY.ATTACK,
       name: `${victim.name}（普通用户）访问管理端${label}列表`,
       identity: victim.name,
-      method: "GET",
-      path: adminListPath,
+      method: adminListReq?.method ?? "GET",
+      path: adminListReq?.path ?? adminListPath,
+      body: adminListReq?.body ?? null,
+      graphql: adminListReq?.graphql ?? null,
       routeKey: ctx.plan.adminListEndpoint?.routeKey ?? "admin.orders.list",
       expect: "普通用户访问管理端应被拒绝（401/403/404）",
       verify: (res, phase) => {
-        const arr = extractListItems(res.json, ctx.targetConfig?.responses?.list ?? null);
+        const arr = extractListItems(res.json, listPathFor(ctx, ctx.plan.adminListEndpoint?.graphql));
         const leaked = arr && arr.length > 0;
         const detail = leaked
           ? `证据：返回 ${arr.length} 条${label}（归属 ${[...new Set(arr.map((o) => ownerOf(o)))].join(",")}），纵向越权可览全局数据`
@@ -747,14 +1011,14 @@ export function buildCases(ctx, targets) {
         return verifyAttack(res, phase, detail, leaked);
       },
       crossProof: (res) => {
-        const arr = extractListItems(res.json, ctx.targetConfig?.responses?.list ?? null);
+        const arr = extractListItems(res.json, listPathFor(ctx, ctx.plan.adminListEndpoint?.graphql));
         if (!arr || arr.length === 0) return null;
         const foreign = arr.filter((o) => ownerOf(o) !== victim.user?.id).length;
         if (foreign === 0) return null;
         return { note: `普通用户响应含 ${foreign} 条他人${label}（跨归属全局列表）` };
       },
       impact: (res) => {
-        const arr = extractListItems(res.json, ctx.targetConfig?.responses?.list ?? null);
+        const arr = extractListItems(res.json, listPathFor(ctx, ctx.plan.adminListEndpoint?.graphql));
         return arr && arr.length > 0 ? `可越权查看全站${label}（角色校验缺失）` : null;
       },
     });
@@ -776,13 +1040,14 @@ export function buildCases(ctx, targets) {
       category: CASE_CATEGORY.ATTACK,
       name: `未携带凭证读取${candLabel} #${anonTarget.id}（无鉴权端点${multiText}）`,
       identity: null,
-      method: "GET",
+      method: req.method ?? "GET",
       path: req.path,
       body: req.body,
+      graphql: req.graphql ?? null,
       routeKey: cand.routeKeys?.[0] ?? null,
       expect: `未认证读取${candLabel}应被拒绝（401/403/404）`,
       verify: (res, phase) => {
-        const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
+        const o = extractEntity(res.json, entityPathFor(ctx, cand.graphql));
         const leaked = o && String(o.id) === String(anonTarget.id);
         const detail = leaked
           ? `证据：匿名请求即返回${candLabel} #${o.id}（归属 ${ownerOf(o)}），无需任何认证`
@@ -790,12 +1055,12 @@ export function buildCases(ctx, targets) {
         return verifyAttack(res, phase, detail, leaked);
       },
       crossProof: (res) => {
-        const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
+        const o = extractEntity(res.json, entityPathFor(ctx, cand.graphql));
         if (!o || o.id !== anonTarget.id) return null;
         return { note: `匿名响应对象 #${o.id} 与请求目标一致，归属 ${ownerOf(o)}` };
       },
       impact: (res) => {
-        const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
+        const o = extractEntity(res.json, entityPathFor(ctx, cand.graphql));
         return o && o.id === anonTarget.id ? `未认证即可读取任意${candLabel}详情（认证缺失）` : null;
       },
     });
@@ -889,14 +1154,15 @@ export function buildCases(ctx, targets) {
       category: CASE_CATEGORY.BUSINESS,
       name: `${attacker.name} 读取自己的${label} #${own.id}`,
       identity: attacker.name,
-      method: "GET",
+      method: ownReq.method ?? "GET",
       path: ownReq.path,
       body: ownReq.body,
+      graphql: ownReq.graphql ?? null,
       routeKey: readKey,
       expect: `本人${label}应正常可见（200，且归属本人）`,
       verify: (res) =>
         verifyBusiness(res, 200, () => {
-          const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
+          const o = extractEntity(res.json, entityPathFor(ctx, readCands[0]?.graphql));
           if (!o) return `FAIL:响应缺少${label}对象`;
           if (o.id !== own.id) return `FAIL:返回了错误的${label} #${o.id}`;
           if (ownerOf(o) !== attacker.user?.id) return `FAIL:${label}归属异常 ${ownerOf(o)}`;
@@ -911,13 +1177,15 @@ export function buildCases(ctx, targets) {
       category: CASE_CATEGORY.BUSINESS,
       name: `${attacker.name} 查询${label}列表仅见本人${label}`,
       identity: attacker.name,
-      method: "GET",
-      path: listPath,
+      method: listReq?.method ?? "GET",
+      path: listReq?.path ?? listPath,
+      body: listReq?.body ?? null,
+      graphql: listReq?.graphql ?? null,
       routeKey: ctx.plan.listEndpoint?.routeKey ?? "orders.list",
       expect: `列表应只包含本人${label}（owner-filter 保持有效）`,
       verify: (res) =>
         verifyBusiness(res, 200, () => {
-          const arr = extractListItems(res.json, ctx.targetConfig?.responses?.list ?? null);
+          const arr = extractListItems(res.json, listPathFor(ctx, ctx.plan.listEndpoint?.graphql));
           if (!arr) return `FAIL:响应中未找到${label}列表`;
           const foreign = arr.filter((o) => ownerOf(o) !== attacker.user?.id);
           if (foreign.length > 0) return `FAIL:列表泄露他人${label} ${foreign.map((o) => o.id).join(",")}`;
@@ -934,14 +1202,15 @@ export function buildCases(ctx, targets) {
       category: CASE_CATEGORY.BUSINESS,
       name: `${attacker.name} 取消自己的${label} #${c.id}`,
       identity: attacker.name,
-      method: "POST",
+      method: ownCancelReq.method ?? "POST",
       path: ownCancelReq.path,
       body: ownCancelReq.body,
+      graphql: ownCancelReq.graphql ?? null,
       routeKey: cancelKey,
       expect: `本人已支付${label}应可正常取消（200）`,
       verify: (res) =>
         verifyBusiness(res, 200, () => {
-          const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
+          const o = extractEntity(res.json, entityPathFor(ctx, cancelCands[0]?.graphql));
           if (!o) return `FAIL:响应缺少${label}对象`;
           if (o.status !== "cancelled") return `FAIL:状态未变更（${o.status}）`;
           return `${label} #${o.id} 已置为 cancelled`;
@@ -957,9 +1226,10 @@ export function buildCases(ctx, targets) {
       category: CASE_CATEGORY.BUSINESS,
       name: `${attacker.name} 取消已发货${label} #${s.id} 被业务规则拒绝`,
       identity: attacker.name,
-      method: "POST",
+      method: shippedReq.method ?? "POST",
       path: shippedReq.path,
       body: shippedReq.body,
+      graphql: shippedReq.graphql ?? null,
       routeKey: cancelKey,
       expect: `状态非 paid 的${label}不可取消（409），业务规则保持有效`,
       verify: (res) =>
@@ -976,13 +1246,15 @@ export function buildCases(ctx, targets) {
       category: CASE_CATEGORY.BUSINESS,
       name: `管理员查看全部${label}`,
       identity: admin.name,
-      method: "GET",
-      path: adminListPath,
+      method: adminListReq?.method ?? "GET",
+      path: adminListReq?.path ?? adminListPath,
+      body: adminListReq?.body ?? null,
+      graphql: adminListReq?.graphql ?? null,
       routeKey: ctx.plan.adminListEndpoint?.routeKey ?? "admin.orders.list",
       expect: `管理员应可查看全部${label}（200，跨多个归属）`,
       verify: (res) =>
         verifyBusiness(res, 200, () => {
-          const arr = extractListItems(res.json, ctx.targetConfig?.responses?.list ?? null);
+          const arr = extractListItems(res.json, listPathFor(ctx, ctx.plan.adminListEndpoint?.graphql));
           if (!arr) return `FAIL:响应中未找到${label}列表`;
           // 归属读取：列表项无归属字段时（如资源本身即用户），以自身 id 视作独立归属
           const owners = new Set(arr.map((o) => ownerOf(o) ?? o.id));
@@ -994,18 +1266,21 @@ export function buildCases(ctx, targets) {
 
   if (adminCancelPath && admin && targets.adminCancelTarget) {
     const adminTarget = targets.adminCancelTarget;
+    const adminCancelReq = candRequest(ctx, ctx.plan.adminCancelEndpoint, adminTarget.id);
     cases.push({
       id: "business-admin-cancel",
       category: CASE_CATEGORY.BUSINESS,
       name: `管理员代取消 ${victim.name} 的${label} #${adminTarget.id}`,
       identity: admin.name,
-      method: "POST",
-      path: fillParams(adminCancelPath, adminTarget.id),
+      method: adminCancelReq.method ?? "POST",
+      path: adminCancelReq.path,
+      body: adminCancelReq.body,
+      graphql: adminCancelReq.graphql ?? null,
       routeKey: ctx.plan.adminCancelEndpoint?.routeKey ?? "admin.orders.cancel",
       expect: "管理员合法代操作应保持可用（200）",
       verify: (res) =>
         verifyBusiness(res, 200, () => {
-          const o = extractEntity(res.json, ctx.targetConfig?.responses?.entity ?? null);
+          const o = extractEntity(res.json, entityPathFor(ctx, ctx.plan.adminCancelEndpoint?.graphql));
           if (!o) return `FAIL:响应缺少${label}对象`;
           if (o.status !== "cancelled") return `FAIL:状态未变更（${o.status}）`;
           return `${label} #${o.id}（归属 ${ownerOf(o)}）已由管理员取消`;
@@ -1019,15 +1294,22 @@ export function buildCases(ctx, targets) {
       category: CASE_CATEGORY.BUSINESS,
       name: `${victim.name}（普通用户）访问管理端被拒绝`,
       identity: victim.name,
-      method: "GET",
-      path: adminListPath,
+      method: adminListReq?.method ?? "GET",
+      path: adminListReq?.path ?? adminListPath,
+      body: adminListReq?.body ?? null,
+      graphql: adminListReq?.graphql ?? null,
       routeKey: ctx.plan.adminListEndpoint?.routeKey ?? "admin.orders.list",
       expect: "普通用户访问管理端应被拒绝（403），角色校验保持有效",
       verify: (res) => {
-        if (res.status === 403 || res.status === 401) {
-          return { verdict: VERDICT.PASSED, actual: `HTTP ${res.status}，角色校验（role:admin）生效` };
+        if (res.status === 403 || res.status === 401 || res.graphqlDenied) {
+          return {
+            verdict: VERDICT.PASSED,
+            actual: res.graphqlDenied && !DENIED_STATUS.has(res.status)
+              ? "HTTP 200 + GraphQL 拒绝（语义拒绝），角色校验（admin）生效"
+              : `HTTP ${res.status}，角色校验（role:admin）生效`,
+          };
         }
-        const arr = extractListItems(res.json, ctx.targetConfig?.responses?.list ?? null);
+        const arr = extractListItems(res.json, listPathFor(ctx, ctx.plan.adminListEndpoint?.graphql));
         if (okStatus(res.status) && arr === null) {
           return {
             verdict: VERDICT.PASSED,
@@ -1049,14 +1331,18 @@ export function buildCases(ctx, targets) {
       category: CASE_CATEGORY.BUSINESS,
       name: `未登录访问${label}详情被拒绝`,
       identity: null,
-      method: "GET",
+      method: anonReq.method ?? "GET",
       path: anonReq.path,
       body: anonReq.body,
+      graphql: anonReq.graphql ?? null,
       routeKey: readKey,
       expect: "未认证请求应被拒绝（401），认证入口保持有效",
       verify: (res) => {
         if (res.status === 401) return { verdict: VERDICT.PASSED, actual: "HTTP 401，认证拦截生效" };
         if (res.status === 403) return { verdict: VERDICT.PASSED, actual: "HTTP 403，认证拦截生效" };
+        if (res.graphqlDenied) {
+          return { verdict: VERDICT.PASSED, actual: `HTTP ${res.status} + GraphQL 拒绝（语义拒绝），认证拦截生效` };
+        }
         return { verdict: VERDICT.REGRESSED, actual: `HTTP ${res.status}（预期 401/403），认证被绕过或异常放行` };
       },
     });
@@ -1081,6 +1367,8 @@ export async function runPhase(ctx, { phase, baseUrl }) {
 
   const loggedIn = await loginAll(ctx, baseUrl);
   await negotiateTrpcInput(ctx, baseUrl, loggedIn);
+  await confirmGraphqlEndpoint(ctx, baseUrl, loggedIn);
+  await negotiateGraphqlCast(ctx, baseUrl, loggedIn);
   const { byUser, anonymousItems, anonTargets } = await discoverResources(ctx, baseUrl, loggedIn);
   const targets = pickTargets(byUser, loggedIn, anonymousItems, anonTargets);
   const cases = buildCases(ctx, targets);
@@ -1128,6 +1416,7 @@ export async function runPhase(ctx, { phase, baseUrl }) {
         path: kase.path,
         identity: kase.identity,
         body: kase.body ?? null,
+        graphql: !!kase.graphql,
       });
     }
     const fresh = await fetchNewDecisions(ctx, baseUrl);

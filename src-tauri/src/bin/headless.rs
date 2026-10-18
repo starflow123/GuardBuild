@@ -193,6 +193,14 @@ fn main() {
     let sidecar_path = std::env::var("GUARDBUILD_SIDECAR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("sidecar/main.mjs"));
+    // host 以 sidecar 所在目录作为子进程 cwd，相对路径会在此基础上被二次拼接
+    let sidecar_path = if sidecar_path.is_relative() {
+        std::env::current_dir()
+            .map(|d| d.join(&sidecar_path))
+            .unwrap_or(sidecar_path)
+    } else {
+        sidecar_path
+    };
     let node_bin = std::env::var("GUARDBUILD_NODE").unwrap_or_else(|_| "node".to_string());
     let auto_consent = !args.gate
         && std::env::var("GUARDBUILD_AUTO_CONSENT")

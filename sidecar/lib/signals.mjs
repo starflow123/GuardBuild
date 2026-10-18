@@ -12,8 +12,10 @@
 //  - 裸 SQL 驱动/helper：dbGet(…) 等单行 helper、db.get(…)/pool.query(…)、
 //    db.prepare(sql).get(…)（better-sqlite3）——vibecoding 项目常见的无 ORM 取数形态；
 //    只收单行读取族（get/query），dbAll/all 等列表族不在此列，避免列表端点误报
+//  - Prisma 原始查询：prisma.$queryRaw`…` / prisma.$queryRawUnsafe(…)
+//  - Knex 单行取数：knex("t").where(…).first()；原始 SQL：db.raw(…)
 export const SINK =
-  /\b(find[A-Za-z]*ById(?:OrThrow)?|findByPk|findOneBy|findOneOrFail|findOne|findUnique(?:OrThrow)?|findFirst(?:OrThrow)?|getById)\s*\(|([A-Za-z_$][\w$]*\.find)\s*\(\s*\{|([A-Za-z_$][\w$]*)\s*\.\s*select\s*\([^)]*\)\s*\.\s*from\s*\([^)]*\)(?:\s*\.\s*[A-Za-z_$][\w$]*\s*\([^)]*\))*\s*\.\s*where\s*\(\s*(?:and\s*\(\s*)?eq\s*\(|((?:db|database|conn|connection|sqlite|pool|client|knex)\s*\.\s*(?:prepare\s*\([^;\n]*\)\s*\.\s*)?(?:get|query))\s*\(|((?:dbGet|dbOne|dbQuery|queryOne|getOne|fetchOne|fetchRow|getRow|selectOne))\s*\(/;
+  /\b(find[A-Za-z]*ById(?:OrThrow)?|findByPk|findOneBy|findOneOrFail|findOne|findUnique(?:OrThrow)?|findFirst(?:OrThrow)?|getById)\s*\(|([A-Za-z_$][\w$]*\.find)\s*\(\s*\{|([A-Za-z_$][\w$]*)\s*\.\s*select\s*\([^)]*\)\s*\.\s*from\s*\([^)]*\)(?:\s*\.\s*[A-Za-z_$][\w$]*\s*\([^)]*\))*\s*\.\s*where\s*\(\s*(?:and\s*\(\s*)?eq\s*\(|((?:db|database|conn|connection|sqlite|pool|client|knex)\s*\.\s*(?:prepare\s*\([^;\n]*\)\s*\.\s*)?(?:get|query))\s*\(|((?:dbGet|dbOne|dbQuery|queryOne|getOne|fetchOne|fetchRow|getRow|selectOne))\s*\(|(\bprisma\s*\.\s*\$queryRaw(?:Unsafe)?\s*[(`])|((?:knex|db|trx|tx)\s*\.\s*raw\s*\()|((?:knex|db|trx|tx)\s*\(\s*[^)]*\s*\)(?:\s*\.\s*[A-Za-z_$][\w$]*\s*\([^)]*\))*\s*\.\s*first\s*\()/;
 
 // 归属校验：出现 userId 与请求者的比较（=== / !== / == / !=）
 export const OWNER_GUARD =
@@ -152,6 +154,191 @@ export function findQueryParamSink(text) {
     // NestJS 装饰器参数绑定：@Query("id") id → sink 实参引用该变量
     const qm = /@Query\s*\(\s*["'`]([^"'`]+)["'`]\s*\)\s*([A-Za-z_$][\w$]*)/.exec(windowText);
     if (qm && new RegExp(`\\b${qm[2]}\\b`).test(argsText)) return { param: qm[1], form: "indirect" };
+  }
+  return null;
+}
+
+// SQL 执行 sink：ORM 原始查询 / 驱动 query / SQLite helper / Python DB-API。
+// 仅当请求输入以拼接或模板方式进入「第一个 SQL 实参」时才作为注入线索（参数化查询不在其列）。
+export const SQL_SINK =
+  /\b(?:dbAll|dbRun|dbGet|dbExec|dbQuery|dbExecute|rawQuery|queryRaw|executeRaw|knexRaw)\s*\(|\b(?:db|database|conn|connection|pool|client|knex|trx|tx|sequelize|prisma|stmt|statement|session|cursor|cur)\s*\.\s*(?:prepare\s*\([^;\n]*\)\s*\.\s*)?(?:all|run|get|each|exec|query|execute|executemany|raw|whereRaw|havingRaw|orderByRaw|\$queryRaw(?:Unsafe)?|\$executeRaw(?:Unsafe)?)\s*\(/;
+
+// 命令执行 sink：Node child_process 与 Python os.system / subprocess 族。
+// 只覆盖会把字符串交给 shell 的入口；execFile/spawn 的数组参数形态在检测时因首参不含输入而自然排除。
+export const CMD_SINK =
+  /\b(?:exec|execSync|execFile|execFileSync|spawn|spawnSync)\s*\(|\bos\s*\.\s*system\s*\(|\bsubprocess\s*\.\s*(?:run|call|check_output|check_call|Popen)\s*\(|\bchild_process\s*\.\s*(?:exec|execSync|spawn|spawnSync|execFile|execFileSync)\s*\(/;
+
+/** 取首个顶层实参文本（跳过字符串/模板与嵌套括号） */
+function firstArgText(argsText) {
+  let depth = 0;
+  let quote = null;
+  for (let i = 0; i < argsText.length; i += 1) {
+    const ch = argsText[i];
+    if (quote) {
+      if (ch === "\\") i += 1;
+      else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") quote = ch;
+    else if (ch === "(" || ch === "[" || ch === "{") depth += 1;
+    else if (ch === ")" || ch === "]" || ch === "}") depth -= 1;
+    else if (ch === "," && depth === 0) return argsText.slice(0, i);
+  }
+  return argsText;
+}
+
+/** 直接请求输入：req.query.x / req.body.x / req.params.x / searchParams.get("x") / Python request.args */
+function directInputIn(expr) {
+  const m = /\breq\s*\.\s*(query|body|params)\s*(?:\.\s*([A-Za-z_$][\w$]*)|\[\s*["'`]([^"'`]+)["'`]\s*\])/.exec(expr);
+  if (m) return { channel: m[1], param: m[2] ?? m[3] ?? null };
+  const sp = /\bsearchParams\s*\.\s*get\s*\(\s*["'`]([^"'`]+)["'`]\s*\)/.exec(expr);
+  if (sp) return { channel: "query", param: sp[1] };
+  const py = /\brequest\s*\.\s*(args|form|json)\s*(?:\.\s*get\s*\(\s*["']([^"']+)["']\s*\)|\[\s*["']([^"']+)["']\s*\])/.exec(expr);
+  if (py) return { channel: py[1] === "json" ? "body" : "query", param: py[2] ?? py[3] ?? null };
+  return null;
+}
+
+/**
+ * 收集请求可控变量并做轻量赋值传播：
+ *  - const { query } = req.query / const host = req.body.host / searchParams.get / Nest @Query / Python request.args
+ *  - const sql = `…${query}…` / const cmd = "ping " + host → 变量继承污点并标记 built（已参与字符串构造）
+ */
+function collectRequestVars(text) {
+  const vars = new Map();
+  const add = (name, channel, param, built = false) => {
+    const n = String(name ?? "").trim();
+    if (!/^[A-Za-z_$][\w$]*$/.test(n)) return;
+    const prev = vars.get(n);
+    if (prev && (prev.built || !built)) return;
+    vars.set(n, { channel, param: param ?? n, built });
+  };
+
+  for (const m of text.matchAll(/(?:const|let|var)\s*\{([^}]+)\}\s*=\s*req\s*\.\s*(query|body|params)\b/g)) {
+    for (const part of m[1].split(",")) {
+      const raw = part.trim();
+      if (!raw || raw.startsWith("...")) continue;
+      const [lhsRaw, rhsRaw] = raw.split(":");
+      const param = lhsRaw.trim().replace(/=.*$/, "").trim();
+      const alias = (rhsRaw ?? lhsRaw).trim().replace(/=.*$/, "").trim();
+      if (param && alias) add(alias, m[2], param);
+    }
+  }
+  for (const m of text.matchAll(
+    /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*req\s*\.\s*(query|body|params)\s*(?:\.\s*([A-Za-z_$][\w$]*)|\[\s*["'`]([^"'`]+)["'`]\s*\])/g
+  )) {
+    add(m[1], m[2], m[3] ?? m[4]);
+  }
+  for (const m of text.matchAll(
+    /(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*[^;\n]{0,160}?searchParams\s*\.\s*get\s*\(\s*["'`]([^"'`]+)["'`]\s*\)/g
+  )) {
+    add(m[1], "query", m[2]);
+  }
+  for (const m of text.matchAll(/@(Query|Body|Param)\s*\(\s*["'`]([^"'`]+)["'`]\s*\)\s*([A-Za-z_$][\w$]*)/g)) {
+    add(m[3], m[1] === "Body" ? "body" : m[1] === "Param" ? "params" : "query", m[2]);
+  }
+  for (const m of text.matchAll(
+    /([A-Za-z_]\w*)\s*=\s*request\s*\.\s*(args|form|json)\s*\.\s*get\s*\(\s*["']([^"']+)["']/g
+  )) {
+    add(m[1], m[2] === "json" ? "body" : "query", m[3]);
+  }
+
+  const propagate = (re) => {
+    for (let pass = 0; pass < 3; pass += 1) {
+      let changed = false;
+      for (const m of text.matchAll(re)) {
+        const name = m[1];
+        if (vars.has(name)) continue;
+        const rhs = m[2];
+        let hit = null;
+        for (const [v, info] of vars) {
+          if (new RegExp(`\\b${escRe(v)}\\b`).test(rhs)) {
+            hit = info;
+            break;
+          }
+        }
+        if (!hit) continue;
+        const built = /`[^`]*\$\{|\+\s*["'`]|["'`]\s*\+|\bf["'][^"']*\{|\.format\s*\(|%\s*\(/.test(rhs);
+        vars.set(name, { ...hit, built: hit.built || built });
+        changed = true;
+      }
+      if (!changed) break;
+    }
+  };
+  propagate(/(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([^;\n]{1,260})/g);
+  propagate(/^[ \t]*([A-Za-z_]\w*)\s*=(?!=)\s*([^\n]{1,260})$/gm);
+  return vars;
+}
+
+/** 首个实参是否由请求输入构造（模板插值 / f-string / 字符串拼接 / 已构造的变量） */
+function constructedTaint(expr, vars) {
+  const direct = directInputIn(expr);
+  if (direct) return { ...direct, form: "direct" };
+  for (const m of expr.matchAll(/\$\{([^{}]*)\}/g)) {
+    for (const [name, info] of vars) {
+      if (new RegExp(`\\b${escRe(name)}\\b`).test(m[1])) return { ...info, form: "interpolation" };
+    }
+  }
+  for (const m of expr.matchAll(/\bf(["'])([^\n]*?)\1/gi)) {
+    for (const im of m[2].matchAll(/\{([^{}]+)\}/g)) {
+      for (const [name, info] of vars) {
+        if (new RegExp(`\\b${escRe(name)}\\b`).test(im[1])) return { ...info, form: "f-string" };
+      }
+    }
+  }
+  for (const m of expr.matchAll(/(?:\+\s*([A-Za-z_$][\w$]*)|([A-Za-z_$][\w$]*)\s*\+)/g)) {
+    const name = m[1] ?? m[2];
+    if (vars.has(name)) return { ...vars.get(name), form: "concat" };
+  }
+  const whole = expr.trim().replace(/[,;]+$/, "");
+  if (/^[A-Za-z_$][\w$]*$/.test(whole) && vars.get(whole)?.built) {
+    return { ...vars.get(whole), form: "variable" };
+  }
+  return null;
+}
+
+function sinkName(raw, fallback) {
+  const m = /([A-Za-z_$][\w$]*)\s*\(/.exec(raw);
+  return m?.[1] ?? fallback;
+}
+
+/** SQL 注入线索：请求输入经模板/拼接进入 SQL sink 的首个实参 */
+export function findSqlInjectionSignal(text) {
+  const vars = collectRequestVars(text);
+  for (const m of text.matchAll(new RegExp(SQL_SINK.source, "g"))) {
+    const openRel = m[0].lastIndexOf("(");
+    if (openRel < 0) continue;
+    const argsText = callArgsSpan(text, m.index + openRel, 800);
+    if (!argsText) continue;
+    const hit = constructedTaint(firstArgText(argsText), vars);
+    if (!hit) continue;
+    return { source: hit.channel, param: hit.param, sink: sinkName(m[0], "sql"), form: hit.form };
+  }
+  // 注意：Prisma 的标签模板 $queryRaw`…${x}…` 会自动参数化，不构成 SQL 注入；
+  // 仅 $queryRawUnsafe(...) 的拼接实参才会由上面的 sink 扫描命中。
+  return null;
+}
+
+/** 命令注入线索：请求输入进入 exec/execSync/os.system/subprocess 的首个实参 */
+export function findCommandInjectionSignal(text) {
+  const vars = collectRequestVars(text);
+  for (const m of text.matchAll(new RegExp(CMD_SINK.source, "g"))) {
+    const raw = m[0];
+    if (/^exec(?:Sync)?\s*\(/.test(raw)) {
+      const before = text.slice(Math.max(0, m.index - 24), m.index);
+      // re.exec / pattern.exec 等正则调用不是命令执行；child_process.exec 与解构后的 exec 保留
+      if (/\.\s*$/.test(before) && !/(?:child_process|cp)\s*\.\s*$/i.test(before)) continue;
+    }
+    const openRel = raw.lastIndexOf("(");
+    const argsText = callArgsSpan(text, m.index + openRel, 800);
+    if (!argsText) continue;
+    const first = firstArgText(argsText);
+    const direct = directInputIn(first);
+    if (direct) return { source: direct.channel, param: direct.param, sink: sinkName(raw, "exec"), form: "direct" };
+    for (const [name, info] of vars) {
+      if (new RegExp(`\\b${escRe(name)}\\b`).test(first)) {
+        return { source: info.channel, param: info.param, sink: sinkName(raw, "exec"), form: "variable" };
+      }
+    }
   }
   return null;
 }

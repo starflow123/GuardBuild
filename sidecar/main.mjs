@@ -576,7 +576,11 @@ async function stageAnalyze(ctx) {
         ? "按对象 ID 取资源且未见认证守卫（无鉴权静态线索）"
         : c.kind === "traversal-suspect"
           ? "文件读取包含请求可控路径片段（路径穿越静态线索）"
-          : "按对象 ID 取资源但未见归属校验（IDOR 静态线索）",
+          : c.kind === "sqli-suspect"
+            ? "请求输入经模板/拼接进入 SQL 查询（SQL 注入静态线索）"
+            : c.kind === "cmdi-suspect"
+              ? "请求输入进入 shell 执行入口（命令注入静态线索）"
+              : "按对象 ID 取资源但未见归属校验（IDOR 静态线索）",
   }));
   if (supa) {
     for (const t of supa.tables ?? []) {
@@ -638,7 +642,7 @@ async function stageAnalyze(ctx) {
     }${d.readFailures > 0 ? `，读取失败 ${d.readFailures} 个` : ""}）`;
     throw new SessionError(`${scanned}，未发现对象级资源接口线索`, {
       code: "no_candidates",
-      hint: `${scanned}。请确认项目包含「按对象 ID 取资源」的 HTTP 接口（如 /api/orders/:id）或「文件读取含请求可控路径」的接口（路径穿越线索），或调整 guardbuild.json 的 scopes 后重试`,
+      hint: `${scanned}。请确认项目包含「按对象 ID 取资源」的 HTTP 接口（如 /api/orders/:id）、「文件读取含请求可控路径」（路径穿越）或「请求输入拼接进 SQL/命令」（注入）的接口，或调整 guardbuild.json 的 scopes 后重试`,
     });
   }
 
@@ -663,12 +667,14 @@ async function stageAnalyze(ctx) {
     !ctx.plan.cancelCandidate &&
     !ctx.plan.unauthReadCandidate &&
     !ctx.plan.traversalCandidate &&
+    !ctx.plan.sqliCandidate &&
+    !ctx.plan.cmdiCandidate &&
     !supaProbeable &&
     !supaStaticLeak
   ) {
-    throw new SessionError("无法构建探测计划：候选端点中缺少可探测的单体资源接口", {
+    throw new SessionError("无法构建探测计划：候选端点中缺少可探测的接口", {
       code: "plan_incomplete",
-      hint: `已发现 ${cands.length} 个候选端点，但均不含「按 ID 取单体资源」的路径（如 GET /api/orders/:id）、文件读取线索，也未定位到可探测的 Supabase 项目（需 URL + anon key + 至少一个表引用）。请确认目标接口形态或在 guardbuild.json 中补充契约/supabase 配置`,
+      hint: `已发现 ${cands.length} 个候选端点，但均不含「按 ID 取单体资源」的路径（如 GET /api/orders/:id）、文件读取线索、SQL/命令注入线索，也未定位到可探测的 Supabase 项目（需 URL + anon key + 至少一个表引用）。请确认目标接口形态或在 guardbuild.json 中补充契约/supabase 配置`,
     });
   }
   ctx.view.plan = {
@@ -678,6 +684,8 @@ async function stageAnalyze(ctx) {
     cancelPath: ctx.plan.cancelCandidate?.fullPath ?? ctx.plan.cancelCandidate?.path ?? null,
     unauthReadPath: ctx.plan.unauthReadCandidate?.fullPath ?? ctx.plan.unauthReadCandidate?.path ?? null,
     traversalPath: ctx.plan.traversalCandidate?.fullPath ?? ctx.plan.traversalCandidate?.path ?? null,
+    sqliPath: ctx.plan.sqliCandidate?.fullPath ?? ctx.plan.sqliCandidate?.path ?? null,
+    cmdiPath: ctx.plan.cmdiCandidate?.fullPath ?? ctx.plan.cmdiCandidate?.path ?? null,
     listPath: ctx.plan.listEndpoint?.path ?? null,
   };
   pushView(ctx);
@@ -690,7 +698,12 @@ async function stageReproduce(ctx) {
 
   const plan = ctx.plan ?? {};
   const hasLocalProbes = !!(
-    plan.readCandidate || plan.cancelCandidate || plan.unauthReadCandidate || plan.traversalCandidate
+    plan.readCandidate ||
+    plan.cancelCandidate ||
+    plan.unauthReadCandidate ||
+    plan.traversalCandidate ||
+    plan.sqliCandidate ||
+    plan.cmdiCandidate
   );
   const supa = plan.supabase ?? null;
 
@@ -711,7 +724,7 @@ async function stageReproduce(ctx) {
     emit(ctx, {
       kind: "probing",
       severity: SEVERITY.INFO,
-      message: "未发现可本地复现的越权/穿越候选，跳过本地目标启动（仅进行 Supabase 探测）",
+      message: "未发现可本地复现的越权/穿越/注入候选，跳过本地目标启动（仅进行 Supabase 探测）",
       phase: STATE.PROBING,
       data: {},
     });

@@ -63,6 +63,21 @@ impl ProcRecord {
     }
 
     pub fn kill(&self) {
+        // npm/.cmd 启动器会经 cmd.exe 再派生孙进程；仅 kill 直接子进程会把
+        // node server.js 留成孤儿（持有工作区句柄，导致 E2E 清理 EBUSY）。
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            use std::process::{Command, Stdio};
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            let _ = Command::new("taskkill")
+                .args(["/PID", &self.pid.to_string(), "/T", "/F"])
+                .creation_flags(CREATE_NO_WINDOW)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+        }
         let mut child = self.child.lock().unwrap();
         let _ = child.kill();
         let _ = child.wait();

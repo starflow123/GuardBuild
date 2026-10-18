@@ -101,12 +101,19 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
   // 路径穿越候选：文件读取端点含请求输入（无自动修复策略，仅复现取证）
   const traversalCandidates = topK((c) => c.kind === "traversal-suspect");
   const traversalCandidate = traversalCandidates[0] ?? null;
+  // 注入类候选：无自动修复模板，仅复现取证
+  const sqliCandidates = topK((c) => c.kind === "sqli-suspect");
+  const cmdiCandidates = topK((c) => c.kind === "cmdi-suspect");
+  const sqliCandidate = sqliCandidates[0] ?? null;
+  const cmdiCandidate = cmdiCandidates[0] ?? null;
 
   const resource =
     readCandidate?.resource ??
     cancelCandidate?.resource ??
     unauthReadCandidate?.resource ??
     traversalCandidate?.resource ??
+    sqliCandidate?.resource ??
+    cmdiCandidate?.resource ??
     "resource";
 
   // 列表/管理端点优先选择与资源名匹配的路径（避免把别的资源列表当作探测目标）
@@ -162,10 +169,14 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
     cancelCandidate,
     unauthReadCandidate,
     traversalCandidate,
+    sqliCandidate,
+    cmdiCandidate,
     readCandidates,
     cancelCandidates,
     unauthReadCandidates,
     traversalCandidates,
+    sqliCandidates,
+    cmdiCandidates,
     listEndpoint: epSlot(list),
     adminListEndpoint: epSlot(adminList),
     adminCancelEndpoint: epSlot(adminCancel),

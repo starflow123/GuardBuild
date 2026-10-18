@@ -17,11 +17,13 @@
 | --- | --- | --- |
 | 1 | 启动目标 | 执行 `guardbuild.json` 的 `prepare` 前置步骤（依赖安装 / 构建）并启动被检服务；契约未声明 `start` 时自动探测启动方式与端口，就绪以输出匹配或主动 HTTP 探活确认 |
 | 2 | 静态线索 | 分析路由与代码产出候选发现（如 IDOR 线索），只作为待实证的线索 |
-| 3 | 动态实证 | 用「身份（普通用户/管理员/匿名）× 对象」用例矩阵真实请求服务：攻击用例证明越权可打穿，业务用例验证授权边界完好 |
+| 3 | 动态实证 | 用「身份（普通用户/管理员/匿名）× 对象」用例矩阵真实请求服务：攻击用例证明越权/注入可打穿，业务用例验证授权边界完好 |
 | 4 | 决策关联 | 目标提供 `/__diag/decisions` 诊断端点时，将每次越权请求归因到具体服务端决策点 |
 | 5 | 隔离修复 | 在临时 git worktree 中生成修复补丁，不触碰原工作区 |
 | 6 | 双重验收 | 修复后：攻击用例必须全部不再复现，且业务用例必须全部保持通过 |
 | 7 | 产物 | `report.json` / `report.md` 报告 + SQLite 证据链（7 张表）；桌面模式可经用户授权写回原工作区 |
+
+**攻击类别**：对象级越权（IDOR）、无鉴权读取、路径穿越、SQL 注入（布尔绕过 / 数据库报错双证据）、命令注入（shell 展开令牌回显，避免输入反射误报）、Supabase 匿名读取与 service_role 暴露。注入与穿越类仅取证，不生成自动修复补丁（按 `vulnerable_unfixed` 阻断并给人工修复指引）。
 
 ## 架构与信任模型
 
@@ -169,6 +171,8 @@ npm run test:rust      # Rust Host
 ## 已知边界
 
 - 静态路由适配已覆盖：Express 风格、Next.js（App/Pages Router）、NestJS、tRPC、GraphQL、Supabase/PostgREST、Python（FastAPI/Flask/Django + DRF）；NestJS / GraphQL / Python 等形态暂不提供自动补丁（证据成立时按 `vulnerable_unfixed` 阻断并给人工修复指引）
+- 取数形态覆盖：`findById`/`findOne`/`findUnique` 等 ORM 单查、Drizzle 链、`dbGet`/`db.get`/`pool.query`、`db.prepare(...).get(...)`、Prisma `$queryRaw`/`$queryRawUnsafe`、Knex `.first()`、`db.raw(...)`；Prisma 标签模板（`$queryRaw` 后接模板字符串）自动参数化，不误报为 SQL 注入
+- 注入静态识别基于「请求输入 → 模板/拼接 → SQL或 shell 首实参」的轻量污点传播；动态复现要求目标返回列表行数变化、数据库报错特征或 shell 展开令牌，无法确证时记为 inconclusive 而非漏洞
 - Flask/Django 的自定义路由注册、异步视图与中间件级鉴权等边缘形态仍可能漏检；动态复现要求项目能按 `guardbuild.json` 启动，并具备可登录的测试身份
 - Windows 全链路已实测；Linux 由 CI 矩阵持续验证（ubuntu-latest + windows-latest），macOS 尚未覆盖
 - 已在 OWASP Juice Shop v20.3.0 上完成全链路 dogfood（Windows，真实依赖与启动链）：静态分析 → email 登录 → 越权复现 → 隔离修复 → 双重验收 `patchStatus=verified`；靶点为注入式 IDOR 样例（非 Juice Shop 自身漏洞），据此修复 10 项真实项目接入失败点

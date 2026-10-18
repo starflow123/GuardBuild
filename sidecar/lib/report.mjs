@@ -34,14 +34,14 @@ function headline(outcome, patchStatus, supabase) {
         ? "发现可利用的对象级越权（IDOR）漏洞；修复补丁未通过双重验收，需人工审查证据"
         : "发现可利用的对象级越权（IDOR）漏洞，已生成双重验收通过的修复补丁（gate 未写回工作区）";
     case "no_candidates":
-      return "静态分析未发现可探测的安全候选端点（对象级越权 / 路径穿越线索）";
+      return "静态分析未发现可探测的安全候选端点（对象级越权 / 注入 / 路径穿越线索）";
     case "vulnerable_unfixed":
       if (supaCritical) {
         return supabase.leaks > 0
           ? `发现 Supabase 数据暴露（${supabase.leaks} 个表匿名可读，RLS 缺失${supabase.serviceRoleLeak ? "；并检出 service_role 密钥客户端暴露" : ""}）——属数据库策略/密钥问题，不在代码层自动修复`
           : "发现 Supabase service_role 密钥客户端暴露（可绕过 RLS 读写全库）——需轮换密钥，不在代码层自动修复";
       }
-      return "发现可复现的越权漏洞证据；但候选中没有可自动修复的对象级越权端点，未生成修复补丁";
+      return "发现可复现的漏洞证据；但候选中没有可自动修复的对象级越权端点，未生成修复补丁";
     case "not_reproducible":
       if (supabase && !supaCritical) {
         return "存在 Supabase 线索，但匿名探测未读出数据（RLS 已生效）且未见 service_role 暴露（可能已有防护）";
@@ -68,7 +68,7 @@ function suggestions(r) {
     lines.push("- 补丁未通过双重验收（存在未阻断攻击或业务回归），请对照 post 证据中的 regressed/inconclusive 用例人工审查。");
     lines.push(`- 补丁保留在隔离 worktree：\`${r.patch?.worktree}\`。`);
   } else if (outcome === "no_candidates") {
-    lines.push("- 当前策略覆盖对象级越权（IDOR）/ 无鉴权读取 / 路径穿越 / Supabase 数据暴露等场景类；如需其它漏洞类别，请扩展策略包与契约。");
+    lines.push("- 当前策略覆盖对象级越权（IDOR）/ 无鉴权读取 / 路径穿越 / SQL 与命令注入 / Supabase 数据暴露等场景类；如需其它漏洞类别，请扩展策略包与契约。");
   } else if (outcome === "vulnerable_unfixed") {
     if (supabase && ((supabase.leaks ?? 0) > 0 || supabase.serviceRoleLeak)) {
       if ((supabase.leaks ?? 0) > 0) {
@@ -87,7 +87,7 @@ function suggestions(r) {
       lines.push("- 加固后重跑 GuardBuild gate，应转为 exit 0（not_reproducible / no_candidates）。");
     } else {
       lines.push("- 漏洞证据已建立（修复前攻击成功），但静态候选中没有可自动修复的对象级越权端点（自动修复仅覆盖带认证的 IDOR 场景）。");
-      lines.push("- 请对照 report.json 中各攻击用例（如纵向越权、无鉴权读取、路径穿越）定位端点并人工加固，再重跑 GuardBuild gate 验证。");
+      lines.push("- 请对照 report.json 中各攻击用例（如纵向越权、无鉴权读取、路径穿越、SQL/命令注入）定位端点并人工加固，再重跑 GuardBuild gate 验证。");
     }
   } else if (outcome === "not_reproducible") {
     if (supabase) {
@@ -114,7 +114,7 @@ function evidenceTable(rows) {
         ? `${e.decision.routeKey ?? "?"}: ${e.decision.decision}${Array.isArray(e.decision.checks) ? ` [${e.decision.checks.join(",")}]` : ""}`
         : "—";
       const grade = e.evidenceGrade ? GRADE_LABELS[e.evidenceGrade] ?? e.evidenceGrade : "—";
-      const actual = e.crossProof ? `${e.actual}（归属证明：${e.crossProof}）` : e.actual;
+      const actual = e.crossProof ? `${e.actual}（交叉证明：${e.crossProof}）` : e.actual;
       return `| ${esc(e.name)} | ${esc(e.category)} | ${esc(e.identity)} | ${esc(e.verdict)} | ${esc(grade)} | ${esc(actual)} | ${esc(decision)} |`;
     })
     .join("\n");

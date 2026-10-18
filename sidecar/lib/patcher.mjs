@@ -28,10 +28,10 @@ export async function createPatch(ctx) {
   const candidates = (ctx.analysis?.candidates ?? []).filter((c) => c.kind === "idor-suspect");
   if (candidates.length === 0) {
     // 到达此处说明攻击已复现（stageReproduce 已通过），但候选中没有可自动修复的
-    // IDOR 端点（如仅无鉴权/纵向越权证据）——不得退化为「无漏洞」放行
+    // IDOR 端点（如仅无鉴权/注入/穿越证据）——不得退化为「无漏洞」放行
     throw new PatchError("攻击证据已建立，但没有可自动修复的对象级越权候选端点", {
       code: "no_patchable_candidates",
-      hint: "自动修复仅覆盖「带认证但缺归属校验」的 IDOR 场景；请对照证据中的攻击用例人工修复该端点后重跑 gate",
+      hint: "自动修复仅覆盖「带认证但缺归属校验」的 IDOR 场景；SQL/命令注入、无鉴权与路径穿越类需按证据中的攻击用例人工修复后重跑 gate",
     });
   }
 
@@ -250,7 +250,7 @@ export async function createPatch(ctx) {
     }
     throw new PatchError("攻击证据已建立，但候选端点均无可自动修复的代码形态", {
       code: "no_patchable_candidates",
-      hint: "自动修复仅覆盖可识别归属校验位的 IDOR 形态；请对照证据人工修复该端点后重跑 gate",
+      hint: "自动修复仅覆盖可识别归属校验位的 IDOR 形态；注入/穿越/无鉴权类需对照证据人工修复后重跑 gate",
       details: { skipped },
     });
   }

@@ -20,6 +20,8 @@ import {
   FS_READ_SINK,
   findTraversalSignal,
   findQueryParamSink,
+  findSqlInjectionSignal,
+  findCommandInjectionSignal,
   callArgsSpan,
   braceSpan,
   findBodyOpen,
@@ -459,13 +461,17 @@ function extractSinks(section) {
   const out = [];
   for (const m of section.text.matchAll(new RegExp(SINK.source, "g"))) {
     const rawReceiver = m[4]?.replace(/\s+/g, "");
+    const knexFirst = m[8]?.replace(/\s+/g, "");
     out.push({
       call:
         m[1] ??
         m[2] ??
         (m[3] ? `${m[3]}.select-where` : null) ??
         (rawReceiver ? rawReceiver.replace(/\.prepare\([^;\n]*\)\./, ".prepare.") : null) ??
-        m[5],
+        m[5] ??
+        (m[6] ? m[6].replace(/[\s(`]+$/, "") : null) ??
+        (m[7] ? m[7].replace(/[\s(`]+$/, "") : null) ??
+        (knexFirst ? `${/^[A-Za-z_$][\w$]*/.exec(knexFirst)?.[0] ?? "knex"}.first` : null),
       index: m.index,
     });
   }
@@ -657,6 +663,28 @@ export async function analyzeProject(ctx) {
         kind: "traversal-suspect",
         resource: traversal.param ?? guessResource(fullPath ?? path, s.text),
         traversal,
+      });
+    }
+
+    // 可疑「SQL 注入」：请求输入经模板/拼接进入 SQL 首参（参数化查询不入选）
+    const sqli = s.graphql ? null : findSqlInjectionSignal(s.text);
+    if (sqli && path) {
+      candidates.push({
+        ...ep,
+        kind: "sqli-suspect",
+        resource: guessResource(fullPath ?? path, s.text),
+        sqli,
+      });
+    }
+
+    // 可疑「命令注入」：请求输入进入 shell 执行入口（exec/os.system/subprocess）
+    const cmdi = s.graphql ? null : findCommandInjectionSignal(s.text);
+    if (cmdi && path) {
+      candidates.push({
+        ...ep,
+        kind: "cmdi-suspect",
+        resource: guessResource(fullPath ?? path, s.text),
+        cmdi,
       });
     }
   }

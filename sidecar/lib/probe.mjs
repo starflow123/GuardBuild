@@ -440,7 +440,11 @@ async function discoverResources(ctx, baseUrl, loggedIn) {
       }
       return { byUser: {}, anonymousItems: anonTargets.map((t) => t.item), anonTargets };
     }
-    if (ctx.plan.traversalCandidate) {
+    if (
+      ctx.plan.traversalCandidate ||
+      planCandidates(ctx, "sqli").length > 0 ||
+      planCandidates(ctx, "cmdi").length > 0
+    ) {
       ctx.emit({
         kind: "discovery",
         severity: SEVERITY.INFO,
@@ -887,6 +891,64 @@ function traversalAttemptPath(routePath, trav, payload, encoded) {
   return `${routePath}${sep}${param}=${value}`;
 }
 
+// —— 注入类用例辅助 ——
+
+const SQLI_PAYLOADS = ["' OR 1=1 -- ", "' OR '1'='1' -- ", '" OR 1=1 -- ', "1 OR 1=1"];
+const SQL_ERROR_RE =
+  /(?:SQLITE_ERROR|SQL syntax|syntax error at or near|SQLSTATE\[\w+\]|ER_PARSE_ERROR|You have an error in your SQL syntax|unrecognized token|SequelizeDatabaseError|PrismaClientKnownRequestError|psycopg2\.errors|sqlalchemy\.exc|near\s+["'][^"']*["']:\s*syntax error)/i;
+
+/** 按注入点通道构造请求：body 平铺字段 / query 追加参数 / params 替换路径段 */
+function injectionReq(cand, inj, payload) {
+  const routePath = candPath(cand);
+  if (!routePath) return null;
+  const method = cand.method ?? (inj.source === "body" ? "POST" : "GET");
+  if (inj.source === "body") {
+    return { method, path: routePath, body: JSON.stringify({ [inj.param ?? "input"]: payload }) };
+  }
+  if (inj.source === "params") {
+    const p = inj.param && routePath.includes(`:${inj.param}`)
+      ? routePath.replace(`:${inj.param}`, encodeURIComponent(payload))
+      : routePath.replace(/:[A-Za-z_]\w*$/, encodeURIComponent(payload));
+    return { method, path: p, body: null };
+  }
+  const param = inj.param ?? "q";
+  const sep = routePath.includes("?") ? "&" : "?";
+  return {
+    method,
+    path: `${routePath}${sep}${encodeURIComponent(param)}=${encodeURIComponent(payload)}`,
+    body: null,
+  };
+}
+
+/** 行数/报错双证据：注入后返回更多行，或仅注入请求触发数据库报错特征 */
+function sqliProof(attack, benign, payload) {
+  const baseArr = extractListItems(benign?.json, null);
+  const attackArr = extractListItems(attack?.json, null);
+  const baseCount = baseArr ? baseArr.length : null;
+  const attackCount = attackArr ? attackArr.length : null;
+  const errorSignature =
+    SQL_ERROR_RE.test(attack?.body ?? "") && !SQL_ERROR_RE.test(benign?.body ?? "");
+  const rowsLeaked =
+    attackCount != null && attackCount > 0 && (baseCount == null || attackCount > baseCount);
+  return { hit: rowsLeaked || errorSignature, baseCount, attackCount, errorSignature, payload };
+}
+
+/** 命令注入回显令牌：由 shell 展开（%OS% / $(id -u)），反射原文不含展开后的值 */
+function cmdiAttempts(token) {
+  if (process.platform === "win32") {
+    return [
+      { payload: `127.0.0.1 & echo GB${token}%OS%`, marker: new RegExp(`GB${token}[A-Za-z0-9_.-]+`) },
+      { payload: `127.0.0.1 && echo GB${token}%OS%`, marker: new RegExp(`GB${token}[A-Za-z0-9_.-]+`) },
+      { payload: `127.0.0.1 & echo GB${token}%USERNAME%`, marker: new RegExp(`GB${token}[A-Za-z0-9_.-]+`) },
+    ];
+  }
+  return [
+    { payload: `127.0.0.1; echo GB${token}$(id -u)`, marker: new RegExp(`GB${token}[A-Za-z0-9_-]+`) },
+    { payload: `127.0.0.1 && echo GB${token}$(id -u)`, marker: new RegExp(`GB${token}[A-Za-z0-9_-]+`) },
+    { payload: `127.0.0.1; echo GB${token}$(whoami)`, marker: new RegExp(`GB${token}[A-Za-z0-9_-]+`) },
+  ];
+}
+
 /** 构建一个阶段内的全部用例（攻击 + 业务），攻击目标对象由发现阶段确定 */
 export function buildCases(ctx, targets) {
   // 每类候选 top-K 逐一构建攻击用例；首个候选保持基名（兼容既有报告/测试/e2e）
@@ -1077,6 +1139,7 @@ export function buildCases(ctx, targets) {
     cases.push({
       id: `attack-path-traversal${suffix}`,
       category: CASE_CATEGORY.ATTACK,
+      unfixable: true,
       name: `路径穿越读取服务器文件（${routePath}${trav.param ? ` · 参数 ${trav.param}` : ""}）`,
       identity: travIdentity,
       method: "GET",
@@ -1142,6 +1205,163 @@ export function buildCases(ctx, targets) {
         traversalLeak(res.body, res._traversalProof?.localName ?? null)
           ? "可通过 ../ 穿越读取服务器任意文件（源码、配置、密钥等敏感信息）"
           : null,
+    });
+  }
+
+  // —— SQL 注入用例：随机基线 vs 布尔/报错载荷（无修复模板，仅取证）——
+  for (const [i, cand] of planCandidates(ctx, "sqli").entries()) {
+    const injection = cand.sqli;
+    const routePath = candPath(cand);
+    if (!routePath || !injection) continue;
+    const suffix = i === 0 ? "" : `-${i + 1}`;
+    const firstReq = injectionReq(cand, injection, SQLI_PAYLOADS[0]);
+    if (!firstReq) continue;
+    const injIdentity = attacker?.name ?? victim?.name ?? null;
+    cases.push({
+      id: `attack-sql-injection${suffix}`,
+      category: CASE_CATEGORY.ATTACK,
+      unfixable: true,
+      name: `SQL 注入（${routePath} · 参数 ${injection.param ?? "?"}）`,
+      identity: injIdentity,
+      method: firstReq.method,
+      path: firstReq.path,
+      body: firstReq.body,
+      routeKey: cand.routeKeys?.[0] ?? null,
+      expect: "注入载荷不得改变查询结果或泄露额外数据（应被参数化/校验拦截）",
+      send: async (c, baseUrl) => {
+        let benign = null;
+        try {
+          const benignReq = injectionReq(cand, injection, shortId("q"));
+          benign = await httpJson(c, { baseUrl, ...benignReq, identity: injIdentity });
+        } catch {
+          /* 基线失败不阻断：以攻击响应的行数差/报错特征为主 */
+        }
+        let last = null;
+        let lastReq = firstReq;
+        let hit = null;
+        let hitReq = null;
+        let proof = null;
+        let firstErr = null;
+        for (const payload of SQLI_PAYLOADS) {
+          const req = injectionReq(cand, injection, payload);
+          try {
+            const res = await httpJson(c, { baseUrl, ...req, identity: injIdentity });
+            last = res;
+            lastReq = req;
+            const p = sqliProof(res, benign, payload);
+            if (p.hit) {
+              hit = res;
+              hitReq = req;
+              proof = p;
+              break;
+            }
+            proof = proof ?? p;
+          } catch (e) {
+            if (!firstErr) firstErr = e;
+          }
+        }
+        if (!last) {
+          throw firstErr ?? new ProbeError(`SQL 注入探测请求全部失败（${routePath}）`, { code: "probe_request_failed" });
+        }
+        const chosen = hit ?? last;
+        chosen._sqliProof = proof ?? { hit: false, payload: SQLI_PAYLOADS[0] };
+        return { res: chosen, path: (hitReq ?? lastReq).path, method: (hitReq ?? lastReq).method };
+      },
+      verify: (res, phase) => {
+        const p = res._sqliProof ?? {};
+        const detail = p.hit
+          ? `证据：${
+              p.errorSignature
+                ? "注入请求触发数据库报错特征"
+                : `注入后返回 ${p.attackCount} 行（正常查询 ${p.baseCount} 行）`
+            }，载荷 ${p.payload}`
+          : "";
+        if (phase === "pre" && p.hit) {
+          return { verdict: VERDICT.VULNERABLE, actual: `HTTP ${res.status}，SQL 注入被放行。${detail}` };
+        }
+        return verifyAttack(res, phase, detail, p.hit);
+      },
+      crossProof: (res) => {
+        const p = res._sqliProof ?? {};
+        if (!p.hit) return null;
+        return {
+          note: p.errorSignature
+            ? `注入请求独有数据库报错特征，确认输入进入 SQL 解析（载荷 ${p.payload}）`
+            : `注入后行数由 ${p.baseCount ?? "未知"} 增至 ${p.attackCount}，确认查询条件被绕过`,
+        };
+      },
+      impact: (res) =>
+        res._sqliProof?.hit ? "可通过 SQL 注入绕过查询条件读取数据库数据或触发数据库错误" : null,
+    });
+  }
+
+  // —— 命令注入用例：shell 展开令牌（%OS% / $(id -u)）作证，避免输入反射误报 ——
+  for (const [i, cand] of planCandidates(ctx, "cmdi").entries()) {
+    const injection = cand.cmdi;
+    const routePath = candPath(cand);
+    if (!routePath || !injection) continue;
+    const suffix = i === 0 ? "" : `-${i + 1}`;
+    const token = shortId("c").replace(/_/g, "");
+    const attempts = cmdiAttempts(token);
+    const firstReq = injectionReq(cand, injection, attempts[0].payload);
+    if (!firstReq) continue;
+    const injIdentity = attacker?.name ?? victim?.name ?? null;
+    cases.push({
+      id: `attack-command-injection${suffix}`,
+      category: CASE_CATEGORY.ATTACK,
+      unfixable: true,
+      name: `命令注入（${routePath} · 参数 ${injection.param ?? "?"}）`,
+      identity: injIdentity,
+      method: firstReq.method,
+      path: firstReq.path,
+      body: firstReq.body,
+      routeKey: cand.routeKeys?.[0] ?? null,
+      expect: "命令注入载荷不得被执行（响应不得出现 shell 展开的令牌）",
+      send: async (c, baseUrl) => {
+        let last = null;
+        let lastReq = firstReq;
+        let hit = null;
+        let hitReq = null;
+        let hitPayload = null;
+        let firstErr = null;
+        for (const attempt of attempts) {
+          const req = injectionReq(cand, injection, attempt.payload);
+          try {
+            const res = await httpJson(c, { baseUrl, ...req, identity: injIdentity });
+            last = res;
+            lastReq = req;
+            if (attempt.marker.test(res.body ?? "")) {
+              hit = res;
+              hitReq = req;
+              hitPayload = attempt.payload;
+              break;
+            }
+          } catch (e) {
+            if (!firstErr) firstErr = e;
+          }
+        }
+        if (!last) {
+          throw firstErr ?? new ProbeError(`命令注入探测请求全部失败（${routePath}）`, { code: "probe_request_failed" });
+        }
+        const chosen = hit ?? last;
+        chosen._cmdiProof = { hit: !!hit, payload: hitPayload ?? attempts[0].payload };
+        return { res: chosen, path: (hitReq ?? lastReq).path, method: (hitReq ?? lastReq).method };
+      },
+      verify: (res, phase) => {
+        const p = res._cmdiProof ?? {};
+        const detail = p.hit ? `证据：响应中出现 shell 展开后的令牌（载荷 ${p.payload}）` : "";
+        if (phase === "pre" && p.hit) {
+          return { verdict: VERDICT.VULNERABLE, actual: `HTTP ${res.status}，命令注入被放行。${detail}` };
+        }
+        return verifyAttack(res, phase, detail, p.hit);
+      },
+      crossProof: (res) => {
+        const p = res._cmdiProof ?? {};
+        if (!p.hit) return null;
+        return { note: `注入令牌由 shell 展开（反射原文不含展开值），确认命令被执行：${p.payload}` };
+      },
+      impact: (res) =>
+        res._cmdiProof?.hit ? "可通过命令注入在服务器执行任意系统命令（RCE）" : null,
     });
   }
 
@@ -1371,7 +1591,20 @@ export async function runPhase(ctx, { phase, baseUrl }) {
   await negotiateGraphqlCast(ctx, baseUrl, loggedIn);
   const { byUser, anonymousItems, anonTargets } = await discoverResources(ctx, baseUrl, loggedIn);
   const targets = pickTargets(byUser, loggedIn, anonymousItems, anonTargets);
-  const cases = buildCases(ctx, targets);
+  const allCases = buildCases(ctx, targets);
+  // 修复后验收只覆盖补丁实际修复的类别：注入/穿越无自动修复模板，
+  // 若与可修复项混在同一目标中，仍按原样复现会误判「补丁无效」
+  const cases = phase === "pre" ? allCases : allCases.filter((c) => !c.unfixable);
+  const skippedUnfixable = phase === "pre" ? [] : allCases.filter((c) => c.unfixable);
+  if (skippedUnfixable.length > 0) {
+    ctx.emit({
+      kind: "phase",
+      severity: SEVERITY.INFO,
+      message: `修复后验收跳过 ${skippedUnfixable.length} 条无自动修复模板的攻击用例（注入/穿越类仅取证）`,
+      phase,
+      data: { skipped: skippedUnfixable.map((c) => c.id) },
+    });
+  }
 
   const attackSlots = cases.filter((c) => c.category === CASE_CATEGORY.ATTACK);
   if (attackSlots.length === 0) {
@@ -1385,9 +1618,11 @@ export async function runPhase(ctx, { phase, baseUrl }) {
     { slot: "cancelCandidate", prefix: "attack-cancel-foreign", count: planCandidates(ctx, "cancel").length },
     { slot: "unauthReadCandidate", prefix: "attack-anonymous-read", count: planCandidates(ctx, "unauthRead").length },
     { slot: "traversalCandidate", prefix: "attack-path-traversal", count: planCandidates(ctx, "traversal").length },
+    { slot: "sqliCandidate", prefix: "attack-sql-injection", count: planCandidates(ctx, "sqli").length },
+    { slot: "cmdiCandidate", prefix: "attack-command-injection", count: planCandidates(ctx, "cmdi").length },
   ].filter((s) => s.count > 0);
   const skipped = plannedSlots.filter(
-    (s) => !cases.some((c) => c.id === s.prefix || c.id.startsWith(`${s.prefix}-`))
+    (s) => !allCases.some((c) => c.id === s.prefix || c.id.startsWith(`${s.prefix}-`))
   );
   if (skipped.length > 0) {
     ctx.emit({

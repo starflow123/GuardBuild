@@ -27,7 +27,13 @@ import {
 } from "../lib/autostart.mjs";
 import { RPC_TO_HOST } from "../../shared/protocol.mjs";
 import { createPatch } from "../lib/patcher.mjs";
-import { SINK, OWNER_FILTER, findQueryParamSink } from "../lib/signals.mjs";
+import {
+  SINK,
+  OWNER_FILTER,
+  findQueryParamSink,
+  findSqlInjectionSignal,
+  findCommandInjectionSignal,
+} from "../lib/signals.mjs";
 
 const fixturePath = fileURLToPath(new URL("../../fixtures/vibeshop/src/app.js", import.meta.url));
 const fixture = readFileSync(fixturePath, "utf8");
@@ -1893,4 +1899,216 @@ test("GENERIC_READY_PATTERN: 匹配主流框架监听行，忽略普通启动日
     assert.ok(!re.test(line), `不应误命中：${line}`);
   }
   assert.equal(parsePortFromLine("Listening on 3000"), 3000, "无 port 字样的监听行也应解析端口");
+});
+
+test("findSqlInjectionSignal: 模板插值/拼接/变量传播命中，参数化与 Prisma 标签模板不误报", () => {
+  const tpl = [
+    "const { query } = req.query;",
+    "const rows = dbAll(`SELECT * FROM products WHERE name LIKE '%${query}%'`);",
+  ].join("\n");
+  assert.deepEqual(findSqlInjectionSignal(tpl), {
+    source: "query",
+    param: "query",
+    sink: "dbAll",
+    form: "interpolation",
+  });
+
+  const concat = `db.query("SELECT * FROM users WHERE id = " + req.query.id);`;
+  assert.deepEqual(findSqlInjectionSignal(concat), {
+    source: "query",
+    param: "id",
+    sink: "query",
+    form: "direct",
+  });
+
+  const viaVar = [
+    "const uid = req.query.id;",
+    'const sql = "SELECT * FROM users WHERE id = " + uid;',
+    "pool.query(sql);",
+  ].join("\n");
+  const varHit = findSqlInjectionSignal(viaVar);
+  assert.equal(varHit?.source, "query");
+  assert.equal(varHit?.param, "id");
+  assert.equal(varHit?.form, "variable");
+
+  const parameterized = "dbAll('SELECT * FROM products WHERE name LIKE ?', [req.query.q]);";
+  assert.equal(findSqlInjectionSignal(parameterized), null, "参数化占位符不应判定为注入");
+
+  const prismaTagged = "prisma.$queryRaw`SELECT * FROM users WHERE id = ${req.params.id}`;";
+  assert.equal(findSqlInjectionSignal(prismaTagged), null, "Prisma 标签模板自动参数化，不应误报");
+
+  const prismaUnsafe = 'prisma.$queryRawUnsafe("SELECT * FROM users WHERE id = " + req.params.id);';
+  assert.equal(findSqlInjectionSignal(prismaUnsafe)?.sink, "$queryRawUnsafe", "$queryRawUnsafe 拼接应命中");
+});
+
+test("findCommandInjectionSignal: 请求输入经变量进入 shell；正则 exec 与 execFile 数组形态不误报", () => {
+  const ping = [
+    "const { host } = req.body;",
+    "let pingCommand = `ping -n 4 ${host}`;",
+    "const out = exec(pingCommand, { timeout: 5000 });",
+  ].join("\n");
+  assert.deepEqual(findCommandInjectionSignal(ping), {
+    source: "body",
+    param: "host",
+    sink: "exec",
+    form: "variable",
+  });
+
+  const direct = 'execSync(`ping -c 1 ${req.query.host}`);';
+  const directHit = findCommandInjectionSignal(direct);
+  assert.equal(directHit?.source, "query");
+  assert.equal(directHit?.param, "host");
+  assert.equal(directHit?.sink, "execSync");
+
+  assert.equal(
+    findCommandInjectionSignal("const m = /(\d+)/.exec(req.query.id);"),
+    null,
+    "正则对象的 .exec 不是命令执行"
+  );
+
+  const arr = [
+    "const host = req.body.host;",
+    'execFile("ping", ["-n", "1", host]);',
+  ].join("\n");
+  assert.equal(findCommandInjectionSignal(arr), null, "execFile 数组参数不经 shell，不应判定");
+});
+
+test("SINK: Prisma 原始查询 / Knex 单行 / db.raw 形态可识别为取数 sink", () => {
+  assert.ok(SINK.test("prisma.$queryRaw`SELECT * FROM users WHERE id = ${id}`"), "Prisma 标签模板应命中原生查询族");
+  assert.ok(SINK.test('prisma.$queryRawUnsafe("SELECT * FROM users WHERE id = ?")'), "$queryRawUnsafe 应命中");
+  assert.ok(SINK.test('knex("users").where({ id }).first()'), "Knex .first() 单行取数应命中");
+  assert.ok(SINK.test('db.raw("SELECT * FROM users WHERE id = ?", [id])'), "db.raw 应命中");
+  assert.ok(SINK.test('db.prepare("SELECT * FROM users WHERE id = ?").get(id)'), "prepare().get() 应命中");
+});
+
+test("analyzeProject: SQL/命令注入候选识别（注入形态独立于越权候选）", async () => {
+  const R = "\\?\D:\p";
+  const content = [
+    'const express = require("express");',
+    'const { execSync } = require("child_process");',
+    "const app = express();",
+    'app.get("/api/products/search", (req, res) => {',
+    "  const { query } = req.query;",
+    "  const rows = dbAll(`SELECT * FROM products WHERE name LIKE '%${query}%'`);",
+    "  res.json({ products: rows });",
+    "});",
+    'app.get("/api/safe-search", (req, res) => {',
+    "  const rows = dbAll('SELECT * FROM products WHERE name LIKE ?', [req.query.q]);",
+    "  res.json({ products: rows });",
+    "});",
+    'app.post("/api/ping", (req, res) => {',
+    "  const { host } = req.body;",
+    "  const pingCommand = `ping -n 4 ${host}`;",
+    "  const out = execSync(pingCommand);",
+    "  res.json({ output: out.toString() });",
+    "});",
+  ].join("\n");
+  const a = await analyzeProject({
+    projectRoot: R,
+    tokens: { project: "tok" },
+    rpc: {
+      request: async (method) => {
+        if (method === "fs.list") return { entries: [{ path: `${R}\src\app.js`, kind: "file", size: 600 }] };
+        if (method === "fs.read") return { content, size: 600, redacted: false, redactions: [] };
+        throw new Error(`不应调用 ${method}`);
+      },
+    },
+  });
+
+  const sqli = a.candidates.find((c) => c.fullPath === "/api/products/search");
+  assert.ok(sqli, "模板拼接进 dbAll 的端点应成为 sqli 候选");
+  assert.equal(sqli.kind, "sqli-suspect");
+  assert.deepEqual(sqli.sqli, { source: "query", param: "query", sink: "dbAll", form: "interpolation" });
+
+  const cmdi = a.candidates.find((c) => c.fullPath === "/api/ping");
+  assert.ok(cmdi, "请求体进入 execSync 的端点应成为 cmdi 候选");
+  assert.equal(cmdi.kind, "cmdi-suspect");
+  assert.equal(cmdi.cmdi?.param, "host");
+
+  assert.ok(
+    !a.candidates.some((c) => c.fullPath === "/api/safe-search"),
+    "参数化查询不应产生注入候选"
+  );
+
+  const plan = buildProbePlan(a);
+  assert.equal(plan.sqliCandidate?.fullPath, "/api/products/search");
+  assert.equal(plan.cmdiCandidate?.fullPath, "/api/ping");
+  assert.equal(plan.sqliCandidates.length, 1);
+  assert.equal(plan.cmdiCandidates.length, 1);
+});
+
+test("buildCases: 注入用例（请求通道构造 + unfixable + 布尔/报错/回显判定）", () => {
+  const sqliCand = {
+    path: "/api/products/search",
+    fullPath: "/api/products/search",
+    method: "GET",
+    sqli: { source: "query", param: "query", sink: "dbAll", form: "interpolation" },
+  };
+  const cmdiCand = {
+    path: "/api/ping",
+    fullPath: "/api/ping",
+    method: "POST",
+    cmdi: { source: "body", param: "host", sink: "execSync", form: "variable" },
+  };
+  const cases = buildCases(
+    { plan: { sqliCandidate: sqliCand, cmdiCandidate: cmdiCand }, targetConfig: null },
+    { attacker: { name: "alice", user: { id: 1 } }, victim: { name: "bob", user: { id: 2 } } }
+  );
+  assert.deepEqual(cases.map((c) => c.id), ["attack-sql-injection", "attack-command-injection"]);
+  assert.ok(cases.every((c) => c.unfixable === true), "注入类无自动修复模板，应标记 unfixable");
+
+  const sqliCase = cases[0];
+  assert.equal(sqliCase.method, "GET");
+  assert.ok(sqliCase.path.startsWith("/api/products/search?query="), "查询参数注入应追加编码后的参数");
+  assert.ok(decodeURIComponent(sqliCase.path.split("?query=")[1]).includes("OR 1=1"));
+
+  const cmdiCase = cases[1];
+  assert.equal(cmdiCase.method, "POST");
+  assert.equal(cmdiCase.path, "/api/ping");
+  assert.match(
+    JSON.parse(cmdiCase.body).host,
+    /^127\.0\.0\.1\s*&&?\s*echo GB/,
+    "命令注入应通过请求体字段投递 shell 载荷"
+  );
+
+  assert.equal(
+    sqliCase.verify(
+      { status: 200, body: "", json: null, _sqliProof: { hit: true, errorSignature: false, attackCount: 3, baseCount: 0, payload: "x" } },
+      "pre"
+    ).verdict,
+    "vulnerable",
+    "布尔绕过导致行数增加应判定可利用"
+  );
+  assert.equal(
+    sqliCase.verify(
+      { status: 500, body: 'SQLITE_ERROR: near "\'": syntax error', json: null, _sqliProof: { hit: true, errorSignature: true, payload: "x" } },
+      "pre"
+    ).verdict,
+    "vulnerable",
+    "500 + 数据库报错特征也应判定可利用"
+  );
+  assert.equal(
+    sqliCase.verify(
+      { status: 200, body: "[]", json: [], _sqliProof: { hit: false, payload: "x" } },
+      "pre"
+    ).verdict,
+    "inconclusive"
+  );
+
+  assert.equal(
+    cmdiCase.verify(
+      { status: 200, body: "GBabcdef", json: {}, _cmdiProof: { hit: true, payload: "127.0.0.1; echo GBabcdef$(id -u)" } },
+      "pre"
+    ).verdict,
+    "vulnerable",
+    "响应出现 shell 展开令牌应判定可利用"
+  );
+  assert.equal(
+    cmdiCase.verify(
+      { status: 200, body: "GBabcdef$(id -u)", json: {}, _cmdiProof: { hit: false, payload: "x" } },
+      "pre"
+    ).verdict,
+    "inconclusive",
+    "未命中的反射原文不得判定为可利用"
+  );
 });

@@ -19,6 +19,13 @@ import { parsePortFromLine, stripAnsi } from "../lib/readyline.mjs";
 import { methodStyleOps, expressStyleOps, findRecordDecisionBlock, buildProbePlan } from "../lib/planner.mjs";
 import { buildLoginBody, classifyLoginFailure, extractListItems, extractEntity, buildCases } from "../lib/probe.mjs";
 import { loadTargetConfig, startUsesPortSlot, renderStart, PORT_SLOT } from "../lib/targetconfig.mjs";
+import {
+  detectStartConfig,
+  diagnoseStartFailure,
+  parseProcfile,
+  GENERIC_READY_PATTERN,
+} from "../lib/autostart.mjs";
+import { RPC_TO_HOST } from "../../shared/protocol.mjs";
 import { createPatch } from "../lib/patcher.mjs";
 import { SINK, OWNER_FILTER, findQueryParamSink } from "../lib/signals.mjs";
 
@@ -227,8 +234,7 @@ const fakeCtx = (content, capture = {}) => ({
   tokens: { project: "tok" },
   rpc: {
     request: async (method, params) => {
-      capture.method = method;
-      capture.params = params;
+      (capture.calls ??= []).push({ method, params });
       return { content };
     },
   },
@@ -243,7 +249,10 @@ test("loadTargetConfig: 契约按原文读取（redact:false），密码不得�
     ],
   };
   const res = await loadTargetConfig(fakeCtx(JSON.stringify(raw), capture));
-  assert.equal(capture.params.redact, false, "契约读取必须关闭脱敏（否则 password 被掩码导致登录 401）");
+  const contractRead = capture.calls.find(
+    (c) => c.method === "fs.read" && String(c.params.path).endsWith("guardbuild.json")
+  );
+  assert.equal(contractRead.params.redact, false, "契约读取必须关闭脱敏（否则 password 被掩码导致登录 401）");
   assert.equal(res.identities[0].password, "secret1");
 });
 
@@ -1648,4 +1657,240 @@ test("N-4: createPatch 链接顶层与子目录 node_modules（含 junction 形�
   const ev = events.find((e) => e.kind === "patch" && /依赖目录链接到隔离工作区/.test(e.message));
   assert.ok(ev && ev.severity === "info", "应有链接成功事件");
   assert.deepEqual(ev.data.linked, ["node_modules", "backend/node_modules"]);
+});
+
+// —— P0 接入自动化：启动方式自动探测 + 启动失败诊断 ——
+
+/** 以 { 相对路径: 内容 } 模拟 Host 的 FS_LIST / FS_READ / FS_STAT（目录用 "dir/" 声明） */
+function virtualCtx(entries, root = "D:/p") {
+  const files = new Map();
+  const dirs = new Set(["."]);
+  for (const [raw, content] of Object.entries(entries)) {
+    const rel = raw.replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/$/, "");
+    if (raw.endsWith("/")) {
+      dirs.add(rel);
+      continue;
+    }
+    files.set(rel, String(content));
+    const parts = rel.split("/");
+    for (let i = 1; i < parts.length; i++) dirs.add(parts.slice(0, i).join("/"));
+  }
+
+  const children = (dirRel) => {
+    const out = [];
+    for (const d of dirs) {
+      if (d === ".") continue;
+      const parent = d.includes("/") ? d.slice(0, d.lastIndexOf("/")) : ".";
+      if (parent === dirRel) out.push({ name: d.split("/").pop(), path: `${root}/${d}`, kind: "dir", size: 0 });
+    }
+    for (const [rel, content] of files) {
+      const parent = rel.includes("/") ? rel.slice(0, rel.lastIndexOf("/")) : ".";
+      if (parent === dirRel) {
+        out.push({ name: rel.split("/").pop(), path: `${root}/${rel}`, kind: "file", size: content.length });
+      }
+    }
+    return out;
+  };
+  const relOf = (abs) =>
+    abs === root ? "." : String(abs).startsWith(`${root}/`) ? String(abs).slice(root.length + 1) : null;
+  const list = (dirRel, depth) => {
+    if (depth <= 0) return [];
+    const out = children(dirRel);
+    if (depth > 1) {
+      for (const e of [...out]) {
+        if (e.kind !== "dir" || /^(node_modules|\.git|\.venv|venv)$/i.test(e.name)) continue;
+        out.push(...list(relOf(e.path), depth - 1));
+      }
+    }
+    return out;
+  };
+
+  return {
+    projectRoot: root,
+    tokens: { project: "tok" },
+    rpc: {
+      request: async (method, params) => {
+        const rel = relOf(params.path);
+        if (method === RPC_TO_HOST.FS_LIST) {
+          if (rel == null) throw new Error("out of root");
+          return { entries: list(rel, params.depth ?? 2) };
+        }
+        if (method === RPC_TO_HOST.FS_READ) {
+          if (!files.has(rel)) throw new Error("not found");
+          return { content: files.get(rel) };
+        }
+        if (method === RPC_TO_HOST.FS_STAT) {
+          if (files.has(rel) || dirs.has(rel)) return { size: 0, kind: files.has(rel) ? "file" : "dir" };
+          throw new Error("not found");
+        }
+        throw new Error("unexpected method");
+      },
+    },
+  };
+}
+
+test("detectStartConfig: package.json start 脚本 → npm run start + PORT 槽位", async () => {
+  const res = await detectStartConfig(
+    virtualCtx({
+      "package.json": JSON.stringify({ scripts: { start: "node server.js" }, dependencies: { express: "^4" } }),
+      "package-lock.json": "{}",
+      "server.js": "require('express')()",
+      "node_modules/": "",
+    })
+  );
+  assert.equal(res.start.cmd, "npm");
+  assert.deepEqual(res.start.args, ["run", "start"]);
+  assert.equal(res.start.env.PORT, PORT_SLOT);
+  assert.equal(res.start.cwd, null);
+  assert.match(res.origin, /scripts\.start/);
+  assert.deepEqual(res.warnings, [], "npm 项目 + 已装依赖时不应有告警");
+});
+
+test("detectStartConfig: 子目录 backend/package.json → start.cwd 定位到子目录", async () => {
+  const res = await detectStartConfig(
+    virtualCtx({
+      "README.md": "# demo",
+      "backend/package.json": JSON.stringify({ scripts: { dev: "node server.js" } }),
+      "backend/server.js": "",
+      "backend/node_modules/": "",
+      "node_modules/": "",
+    })
+  );
+  assert.equal(res.start.cmd, "npm");
+  assert.deepEqual(res.start.args, ["run", "dev"]);
+  assert.equal(res.start.cwd, "backend");
+  assert.match(res.origin, /scripts\.dev/);
+});
+
+test("detectStartConfig: Next.js start 缺构建产物 → 回落 dev 并告警", async () => {
+  const res = await detectStartConfig(
+    virtualCtx({
+      "package.json": JSON.stringify({
+        scripts: { start: "next start", dev: "next dev" },
+        dependencies: { next: "14.0.0" },
+      }),
+      "node_modules/": "",
+    })
+  );
+  assert.deepEqual(res.start.args, ["run", "dev"]);
+  assert.ok(res.warnings.some((w) => /Next\.js/.test(w)), "应提示 start 需要构建");
+});
+
+test("detectStartConfig: FastAPI main.py → uvicorn 模块路径 + 槽位端口", async () => {
+  const res = await detectStartConfig(
+    virtualCtx({
+      "main.py": "from fastapi import FastAPI\napp = FastAPI()\n",
+      "requirements.txt": "fastapi\nuvicorn\n",
+    })
+  );
+  assert.equal(res.start.cmd, "python");
+  assert.deepEqual(res.start.args, [
+    "-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", PORT_SLOT,
+  ]);
+  assert.match(res.origin, /FastAPI/);
+});
+
+test("detectStartConfig: 子目录 manage.py → Django runserver（--noreload + 槽位端口）", async () => {
+  const res = await detectStartConfig(
+    virtualCtx({
+      "backend/manage.py": "#!/usr/bin/env python",
+      "backend/settings.py": "",
+    })
+  );
+  assert.equal(res.start.cwd, "backend");
+  assert.equal(res.start.args[0], "manage.py");
+  assert.equal(res.start.args[1], "runserver");
+  assert.equal(res.start.args[2], `127.0.0.1:${PORT_SLOT}`);
+  assert.ok(res.start.args.includes("--noreload"), "禁用 autoreload，避免子进程泄漏");
+});
+
+test("parseProcfile / detectStartConfig: web 行命令 + $PORT 槽位替换", () => {
+  const parsed = parseProcfile("web: uvicorn app.main:app --host 0.0.0.0 --port $PORT\n");
+  assert.equal(parsed.start.cmd, "uvicorn");
+  assert.deepEqual(parsed.start.args, ["app.main:app", "--host", "0.0.0.0", "--port", PORT_SLOT]);
+  assert.equal(parsed.start.env.PORT, PORT_SLOT);
+  assert.equal(parseProcfile("web: bundle exec puma\n"), null, "白名单外的命令不应被探测采用");
+});
+
+test("loadTargetConfig: 缺失 start 时自动探测，login/identities 保留且部分 start 字段可覆盖", async () => {
+  const identities = [
+    { username: "alice", password: "a", role: "user" },
+    { username: "bob", password: "b", role: "user" },
+  ];
+  const ctx = virtualCtx({
+    "guardbuild.json": JSON.stringify({
+      login: { path: "/api/login" },
+      identities,
+      start: { env: { JWT_SECRET: "s3cr3t" }, readyPattern: "CUSTOM_READY" },
+    }),
+    "package.json": JSON.stringify({ scripts: { start: "node index.js" } }),
+    "index.js": "",
+    "node_modules/": "",
+  });
+  const res = await loadTargetConfig(ctx);
+  assert.equal(res.startSource, "auto");
+  assert.deepEqual(res.start.args, ["run", "start"]);
+  assert.equal(res.start.env.PORT, PORT_SLOT, "自动探测注入端口槽位");
+  assert.equal(res.start.env.JWT_SECRET, "s3cr3t", "契约中的 env 覆盖保留");
+  assert.equal(res.start.readyPattern, "CUSTOM_READY", "契约中的就绪模式覆盖保留");
+  assert.equal(res.login.path, "/api/login");
+  assert.equal(res.identities.length, 2);
+});
+
+test("loadTargetConfig: 显式声明 start 时不自动探测（契约优先）", async () => {
+  const res = await loadTargetConfig(
+    virtualCtx({
+      "guardbuild.json": JSON.stringify({ start: { cmd: "node", args: ["custom.js"] } }),
+      "package.json": JSON.stringify({ scripts: { start: "node server.js" } }),
+      "custom.js": "",
+      "server.js": "",
+      "node_modules/": "",
+    })
+  );
+  assert.equal(res.startSource, "contract");
+  assert.deepEqual(res.start.args, ["custom.js"]);
+});
+
+test("diagnoseStartFailure: 常见启动错误翻译为可操作建议", () => {
+  const dep = diagnoseStartFailure({ output: ["Error: Cannot find module 'express'"], exitCode: 1 });
+  assert.equal(dep.code, "missing_dependency");
+  assert.match(dep.hint, /npm install|prepare/);
+
+  const pyDep = diagnoseStartFailure({ output: ["ModuleNotFoundError: No module named 'fastapi'"] });
+  assert.equal(pyDep.code, "python_missing_dependency");
+
+  const port = diagnoseStartFailure({ output: ["Error: listen EADDRINUSE: address already in use 127.0.0.1:3000"] });
+  assert.equal(port.code, "port_in_use");
+
+  const env = diagnoseStartFailure({ output: ["Error: DATABASE_URL is not set"] });
+  assert.equal(env.code, "missing_env");
+  assert.match(env.hint, /start\.env/);
+
+  const exit = diagnoseStartFailure({ output: ["something"], exitCode: 7 });
+  assert.equal(exit.code, "early_exit");
+  assert.match(exit.hint, /退出码 7/);
+
+  const silent = diagnoseStartFailure({ output: [] });
+  assert.equal(silent.code, "no_ready_output");
+});
+
+test("GENERIC_READY_PATTERN: 匹配主流框架监听行，忽略普通启动日志", () => {
+  // Host 使用 Rust regex（支持内联 (?i)）；JS RegExp 需改用 i 标志
+  const re = new RegExp(GENERIC_READY_PATTERN.replace(/^\(\?i\)/, ""), "i");
+  for (const line of [
+    "Server running on port 3000",
+    "Listening on port 8080",
+    "Listening on 3000",
+    "Uvicorn running on http://127.0.0.1:8000 (Press CTRL+C to quit)",
+    "Local: http://localhost:5173/",
+    "Starting development server at http://127.0.0.1:8000/",
+    "Nest application successfully started",
+    "服务器运行在端口 51234",
+  ]) {
+    assert.ok(re.test(line), `应命中：${line}`);
+  }
+  for (const line of ["Connecting to database...", "Compiling...", "ready in 520 ms"]) {
+    assert.ok(!re.test(line), `不应误命中：${line}`);
+  }
+  assert.equal(parsePortFromLine("Listening on 3000"), 3000, "无 port 字样的监听行也应解析端口");
 });

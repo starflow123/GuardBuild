@@ -34,5 +34,9 @@ export function parsePortFromLine(rawLine) {
   m = line.match(/\bport\b[^\d]{0,12}(\d{2,5})\b/i);
   if (m) return Number(m[1]);
 
+  // "Listening on 3000" / "Server running at 8080"（无 port 字样）
+  m = line.match(/\b(?:listen(?:ing)?|running|serv(?:ing|ed)|started)\b[^\d]{0,24}(\d{2,5})\b/i);
+  if (m) return Number(m[1]);
+
   return null;
 }

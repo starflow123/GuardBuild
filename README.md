@@ -15,7 +15,7 @@
 
 | # | 阶段 | 说明 |
 | --- | --- | --- |
-| 1 | 启动目标 | 按项目根 `guardbuild.json` 契约执行 `prepare` 前置步骤（依赖安装 / 构建）并启动被检服务就绪握手（缺省 `node server.js` + stdout `GB_LISTEN`） |
+| 1 | 启动目标 | 执行 `guardbuild.json` 的 `prepare` 前置步骤（依赖安装 / 构建）并启动被检服务；契约未声明 `start` 时自动探测启动方式与端口，就绪以输出匹配或主动 HTTP 探活确认 |
 | 2 | 静态线索 | 分析路由与代码产出候选发现（如 IDOR 线索），只作为待实证的线索 |
 | 3 | 动态实证 | 用「身份（普通用户/管理员/匿名）× 对象」用例矩阵真实请求服务：攻击用例证明越权可打穿，业务用例验证授权边界完好 |
 | 4 | 决策关联 | 目标提供 `/__diag/decisions` 诊断端点时，将每次越权请求归因到具体服务端决策点 |
@@ -69,7 +69,7 @@ npm run test:rust      # Rust Host
 
 ## guardbuild.json（目标启动契约）
 
-在被检项目根放置 `guardbuild.json` 声明启动方式、准备步骤、登录契约、测试身份与预声明作用域；文件缺失或字段非法时逐项回落到缺省值：
+在被检项目根放置 `guardbuild.json` 声明启动方式、准备步骤、登录契约、测试身份与预声明作用域；文件缺失或字段非法时逐项回落。**`start` 不是必填项**——未声明时引擎自动探测（见下），探测不到才回落缺省 `node server.js`：
 
 ```json
 {
@@ -97,6 +97,10 @@ npm run test:rust      # Rust Host
 }
 ```
 
+- `start` 自动探测（未声明 `start.cmd` 时）：依次检查 `Procfile`（`web:` 行，`$PORT` 自动改写为 `${GB_PORT}`，只接受宿主白名单启动器）、根 `package.json` scripts（`start > dev > serve > preview`；Next.js 缺 `.next/BUILD_ID` 时 `start` 回退到 `dev`；Vite 自动追加 `--port ${GB_PORT} --host 127.0.0.1`）、根 Python 入口（`uvicorn.run` / `FastAPI()` / `Flask()` / `manage.py runserver`）、子目录入口（`backend` / `server` / `api` 等优先，最多 4 个）。契约未声明 `start.cmd` 时仍可用 `start.env` / `readyPattern` 等字段覆盖探测结果；显式 `start.cmd` 始终优先
+- `start.cwd`：启动目录（相对项目根），适配 monorepo 后端位于子目录的项目
+- 就绪判定：先看 `readyPattern` 是否在 stdout 出现（自动探测使用通用模式，覆盖 `http://localhost:3000`、`listening on port 3000`、`server started` 等）；服务静默无输出时，若端口已可连通，主动回环 HTTP 探活兜底，避免误报未就绪
+- 启动失败诊断：识别 `next_no_build` / `port_in_use` / `missing_env` / `dependency_unreachable` / `db_not_initialized` / `django_migrations` / `command_not_found` / `python_missing_dependency` / `missing_dependency` / `script_missing` / `bind_address` / `permission_denied` / `syntax_error` 等常见原因并给出处置建议，附退出码与日志尾部摘录
 - `start`：就绪以 `readyPattern` 在 stdout 出现为准（解析前先剥 ANSI 色码，依次识别行内 JSON `port` → `host:port` → 「端口 NNNN」/ `listening on port NNNN` 文本形状）。端口两种写法任选：`env.PORT=0` 让服务自选端口（要求服务把真实端口打进就绪行）；硬编码端口或打印字面量的服务改用 **`${GB_PORT}` 槽位**——宿主每次 spawn 前分配一个空闲端口注入，`cmd` / `args` / `env` 均可使用（修复阶段会先停止原始实例，验收实例与原始实例不再争用端口）
 - `prepare`：目标启动前按序执行的前置命令（安装依赖 / 构建），`cwd` 相对项目根；在「原始工作区」与「隔离 worktree」各执行一次——修复阶段的验收不依赖原工作区的构建产物
 - `login`：登录契约——`path` 指定登录端点（优先级高于静态分析候选）；`bodyTemplate` 适配非 `username` 的请求体形状，值支持 `{name}` / `{username}` / `{email}` / `{password}` 占位符；`credentialPath` 支持点路径（如 `authentication.token`），`credentialHeader` / `credentialPrefix` 缺省为 `Authorization` / `Bearer `
@@ -106,6 +110,7 @@ npm run test:rust      # Rust Host
 
 **真实项目接入的常见准备**：
 
+- 多数 Node / Python 项目可零启动契约接入（自动探测 `npm run start` / `dev` / `uvicorn` 等）；启动来源与依据见事件流与报告 `start` / `startSource` 字段，接不上时优先看诊断事件里的 `hint`
 - 服务依赖构建产物（`tsc` / 打包）→ 把构建命令放进 `prepare`，gate 与桌面模式都会在启动前执行，无需手工预生成
 - 登录不是 `/api/login`、不是 `{username, password}`、token 不在顶层 → 用 `login` 契约显式声明；引擎先后尝试「契约声明 → 静态分析候选 → `/api/login`」，成功后固化优先级
 - 列表 / 单体不在响应顶层（如 `{ "code": 0, "data": { "items": [] } }`）→ 用 `responses` 契约声明 `list` / `entity` 点路径；不声明时靠自适应探测，形状歧义（多个对象数组）时建议显式声明

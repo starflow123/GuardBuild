@@ -28,6 +28,7 @@
  * scopes 供 CI gate 模式做「预声明授权」使用，由宿主侧读取生效；此处仅透传展示。
  */
 import { RPC_TO_HOST } from "../../shared/protocol.mjs";
+import { detectStartConfig, PORT_SLOT } from "./autostart.mjs";
 
 export const CONFIG_FILENAME = "guardbuild.json";
 
@@ -42,8 +43,9 @@ export const DEFAULT_START = Object.freeze({
 /**
  * 端口槽位占位符：start.cmd/args/env 中出现时，由宿主每次 spawn 分配空闲端口后替换。
  * 用于「双实例并存」与「应用打印字面量端口、PORT=0 无效」的目标项目。
+ * 常量定义在 autostart.mjs（自动探测同样生成槽位），此处转出保持既有导入路径。
  */
-export const PORT_SLOT = "${GB_PORT}";
+export { PORT_SLOT };
 
 export function startUsesPortSlot(start) {
   const s = start ?? DEFAULT_START;
@@ -81,6 +83,7 @@ function normalizeStart(raw) {
       Number.isFinite(s.readyTimeoutMs) && s.readyTimeoutMs >= 1000
         ? Math.floor(s.readyTimeoutMs)
         : DEFAULT_START.readyTimeoutMs,
+    cwd: typeof s.cwd === "string" && s.cwd.trim() ? s.cwd.trim() : null,
   };
 }
 
@@ -189,11 +192,10 @@ function normalizeSupabase(raw) {
   return Object.keys(out).length ? out : null;
 }
 
-function fallback(source, invalid = null) {
+function emptyConfig(source, invalid = null) {
   return {
     source,
     invalid,
-    start: normalizeStart(null),
     identities: null,
     login: null,
     prepare: null,
@@ -201,6 +203,56 @@ function fallback(source, invalid = null) {
     supabase: null,
     scopes: null,
   };
+}
+
+function hasExplicitStart(parsed) {
+  return (
+    parsed?.start &&
+    typeof parsed.start === "object" &&
+    !Array.isArray(parsed.start) &&
+    typeof parsed.start.cmd === "string" &&
+    parsed.start.cmd.trim().length > 0
+  );
+}
+
+/** 自动探测结果 + 契约中的部分 start 覆盖（未声明 cmd 时仍可覆盖 env/readyPattern） */
+function mergeStart(detected, raw) {
+  const out = {
+    ...detected,
+    args: [...(detected.args ?? [])],
+    env: { ...(detected.env ?? {}) },
+  };
+  if (typeof raw.cmd === "string" && raw.cmd.trim()) out.cmd = raw.cmd.trim();
+  if (Array.isArray(raw.args)) out.args = raw.args.map(String);
+  if (raw.env && typeof raw.env === "object" && !Array.isArray(raw.env)) {
+    for (const [k, v] of Object.entries(raw.env)) {
+      if (typeof k === "string" && (typeof v === "string" || typeof v === "number")) out.env[k] = String(v);
+    }
+  }
+  if (typeof raw.cwd === "string" && raw.cwd.trim()) out.cwd = raw.cwd.trim();
+  if (typeof raw.readyPattern === "string" && raw.readyPattern) out.readyPattern = raw.readyPattern;
+  if (Number.isFinite(raw.readyTimeoutMs) && raw.readyTimeoutMs >= 1000) {
+    out.readyTimeoutMs = Math.floor(raw.readyTimeoutMs);
+  }
+  return out;
+}
+
+/** 决定最终启动契约：显式声明 > 自动探测 > 缺省（node server.js） */
+async function resolveStart(ctx, parsed) {
+  if (hasExplicitStart(parsed)) {
+    return { start: normalizeStart(parsed.start), startSource: "contract", autostart: null };
+  }
+  let autostart = null;
+  try {
+    autostart = await detectStartConfig(ctx);
+  } catch (e) {
+    autostart = { start: null, warnings: [`启动方式自动探测失败：${e.message}`], alternatives: [], checked: [] };
+  }
+  const raw = parsed?.start && typeof parsed.start === "object" && !Array.isArray(parsed.start) ? parsed.start : null;
+  const start = autostart?.start
+    ? normalizeStart(raw ? mergeStart(autostart.start, raw) : autostart.start)
+    : normalizeStart(raw);
+  return { start, startSource: autostart?.start ? "auto" : "default", autostart };
 }
 
 /** 读取并归一化目标项目的 guardbuild.json（经 Host 读取，遵循 project.read 作用域） */
@@ -218,21 +270,21 @@ export async function loadTargetConfig(ctx) {
     );
     content = res.content;
   } catch {
-    return fallback("default");
+    return { ...emptyConfig("default"), ...(await resolveStart(ctx, null)) };
   }
   let parsed;
   try {
     parsed = JSON.parse(content);
   } catch (e) {
-    return fallback("invalid", e.message);
+    return { ...emptyConfig("invalid", e.message), ...(await resolveStart(ctx, null)) };
   }
   if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
-    return fallback("invalid", "顶层必须是 JSON 对象");
+    return { ...emptyConfig("invalid", "顶层必须是 JSON 对象"), ...(await resolveStart(ctx, null)) };
   }
   return {
     source: CONFIG_FILENAME,
     invalid: null,
-    start: normalizeStart(parsed.start),
+    ...(await resolveStart(ctx, parsed)),
     identities: normalizeIdentities(parsed.identities),
     login: normalizeLogin(parsed.login),
     prepare: normalizePrepare(parsed.prepare),

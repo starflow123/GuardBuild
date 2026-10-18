@@ -14,7 +14,8 @@ import { EvidenceStore } from "./lib/db.mjs";
 import { StateMachine } from "./lib/statemachine.mjs";
 import { analyzeProject } from "./lib/analyzer.mjs";
 import { buildProbePlan, loadIdentities } from "./lib/planner.mjs";
-import { loadTargetConfig, DEFAULT_START, startUsesPortSlot, renderStart } from "./lib/targetconfig.mjs";
+import { loadTargetConfig, DEFAULT_START, startUsesPortSlot, renderStart, PORT_SLOT } from "./lib/targetconfig.mjs";
+import { diagnoseStartFailure } from "./lib/autostart.mjs";
 import { parsePortFromLine, stripAnsi } from "./lib/readyline.mjs";
 import { runPhase, ProbeError } from "./lib/probe.mjs";
 import { runSupabasePhase, isLoopbackHostname } from "./lib/supabase.mjs";
@@ -269,8 +270,34 @@ async function ensureSupabaseToken(ctx, rawUrl) {
   return ctx.tokens.egress;
 }
 
+/** 回环主动探活：目标不打印监听日志时，用 HTTP 响应替代就绪行 */
+async function canReachLocalHttp(ctx, port, timeoutMs = 2_500) {
+  if (!port || !ctx.tokens?.net) return false;
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    try {
+      await ctx.rpc.request(
+        RPC_TO_HOST.HTTP_REQUEST,
+        {
+          token: ctx.tokens.net,
+          method: "GET",
+          url: `http://127.0.0.1:${port}/`,
+          headers: {},
+          redact: true,
+        },
+        { timeoutMs: 3_000 }
+      );
+      return true;
+    } catch {
+      await new Promise((r) => setTimeout(r, 250));
+    }
+  }
+  return false;
+}
+
 async function spawnTarget(ctx, { cwd, label, role = "target" }) {
   const start = ctx.targetConfig?.start ?? DEFAULT_START;
+  const spawnCwd = start.cwd ? path.resolve(cwd, start.cwd) : cwd;
   // 契约声明了 ${GB_PORT} 槽位时，先分配空闲端口再渲染启动命令（支持多实例并存）
   let allocated = null;
   if (startUsesPortSlot(start)) {
@@ -292,18 +319,28 @@ async function spawnTarget(ctx, { cwd, label, role = "target" }) {
     }
   }
   const { cmd, args, env } = renderStart(start, allocated);
-  const res = await ctx.rpc.request(
-    RPC_TO_HOST.PROC_SPAWN,
-    {
-      token: ctx.tokens.spawn,
-      cmd,
-      args,
-      cwd,
-      env,
-      role,
-    },
-    { timeoutMs: 30_000 }
-  );
+  let res;
+  try {
+    res = await ctx.rpc.request(
+      RPC_TO_HOST.PROC_SPAWN,
+      {
+        token: ctx.tokens.spawn,
+        cmd,
+        args,
+        cwd: spawnCwd,
+        env,
+        role,
+      },
+      { timeoutMs: 30_000 }
+    );
+  } catch (e) {
+    const diag = diagnoseStartFailure({ output: [String(e?.message ?? e)], start });
+    throw new SessionError(`无法启动目标进程「${label}」`, {
+      code: "target_spawn_failed",
+      hint: diag.hint,
+      details: { cwd: spawnCwd, start, diagnosis: diag },
+    });
+  }
   const wait = await ctx.rpc.request(
     RPC_TO_HOST.PROC_WAIT_OUTPUT,
     {
@@ -316,17 +353,46 @@ async function spawnTarget(ctx, { cwd, label, role = "target" }) {
   );
   if (!wait.matched) {
     let lines = [];
+    let exited = false;
+    let exitCode = null;
     try {
       const logs = await ctx.rpc.request(RPC_TO_HOST.PROC_LOGS, { token: ctx.tokens.spawn, pid: res.pid, tail: 40 });
       lines = (logs.lines ?? []).map((l) => l.line);
+      exited = !!logs.exited;
+      exitCode = Number.isInteger(logs.exitCode) ? logs.exitCode : null;
     } catch {
       /* ignore */
     }
+    // 不打印监听日志的服务：端口由宿主分配且进程仍在运行时，用回环 HTTP 主动探活
+    if (!exited && allocated && (await canReachLocalHttp(ctx, allocated))) {
+      emit(ctx, {
+        kind: "process",
+        severity: SEVERITY.WARN,
+        message: `未匹配到就绪输出，但「${label}」已通过 HTTP 探活确认可用（可能未打印监听日志）`,
+        data: { port: allocated, label },
+      });
+      const target = { pid: res.pid, port: allocated, url: `http://127.0.0.1:${allocated}` };
+      emit(ctx, {
+        kind: "process",
+        severity: SEVERITY.SUCCESS,
+        message: `目标实例「${label}」已就绪: ${target.url}（pid ${res.pid}）`,
+        data: target,
+      });
+      return target;
+    }
     await killProc(ctx, res.pid);
+    const diag = diagnoseStartFailure({ output: lines, exitCode, start });
     throw new SessionError(`目标进程「${label}」未在超时内就绪`, {
       code: "target_not_ready",
-      hint: `请确认目标项目可通过启动契约指定的命令在项目目录启动（缺省 \`node server.js\`，可用 guardbuild.json 覆盖），并输出就绪行（缺省 GB_LISTEN）`,
-      details: { cwd, start, output: lines },
+      hint: diag.hint,
+      details: {
+        cwd: spawnCwd,
+        start,
+        exitCode,
+        output: lines,
+        diagnosis: diag,
+        autostart: ctx.targetConfig?.autostart ?? null,
+      },
     });
   }
   // 就绪行解析优先（它是真实绑定端口）；解析不到但契约声明了槽位时回退到分配值
@@ -336,8 +402,8 @@ async function spawnTarget(ctx, { cwd, label, role = "target" }) {
     await killProc(ctx, res.pid);
     throw new SessionError(`无法从就绪输出解析端口（${label}）`, {
       code: "port_parse_failed",
-      hint: "可在 guardbuild.json 的 start.env 中使用 ${PORT: \"${GB_PORT}\"} 由宿主分配端口，无需依赖输出解析",
-      details: { line: stripAnsi(wait.line) },
+      hint: `就绪行中没有可解析的端口：可在 guardbuild.json 的 start.env 中写 PORT: "${PORT_SLOT}" 由宿主分配端口（自动探测已默认这样做），或把 start.readyPattern 指向真正打印端口的日志行`,
+      details: { cwd: spawnCwd, start, line: stripAnsi(wait.line) },
     });
   }
   const target = { pid: res.pid, port, url: `http://127.0.0.1:${port}` };
@@ -864,7 +930,36 @@ async function runFlow(ctx) {
     if (targetConfig.identities) {
       ctx.identities = targetConfig.identities;
     }
-    if (targetConfig.source === "guardbuild.json") {
+    const autostart = targetConfig.autostart ?? null;
+    const startDesc =
+      `${targetConfig.start.cmd} ${targetConfig.start.args.join(" ")}`.trim() +
+      (targetConfig.start.cwd ? `（工作目录 ${targetConfig.start.cwd}）` : "");
+    if (targetConfig.source === "invalid") {
+      emit(ctx, {
+        kind: "session",
+        severity: SEVERITY.WARN,
+        message: `guardbuild.json 解析失败（${targetConfig.invalid}），${
+          targetConfig.startSource === "auto" ? "已自动探测启动方式" : "回落到缺省启动契约（node server.js + GB_LISTEN）"
+        }`,
+        data: { invalid: targetConfig.invalid, startSource: targetConfig.startSource },
+      });
+    }
+    if (targetConfig.startSource === "auto") {
+      emit(ctx, {
+        kind: "session",
+        severity: SEVERITY.INFO,
+        message: `未在契约中声明 start，已自动探测启动方式：${startDesc}（依据 ${autostart?.origin ?? "项目文件"}）`,
+        data: {
+          start: targetConfig.start,
+          startSource: "auto",
+          autostart,
+          login: targetConfig.login,
+          prepare: targetConfig.prepare,
+          identities: targetConfig.identities ? targetConfig.identities.map((i) => i.name) : null,
+          scopes: targetConfig.scopes,
+        },
+      });
+    } else if (targetConfig.source === "guardbuild.json") {
       const extras = [
         targetConfig.login ? `登录端点 ${targetConfig.login.path}` : null,
         targetConfig.prepare?.length ? `准备步骤 ${targetConfig.prepare.length} 个` : null,
@@ -872,22 +967,36 @@ async function runFlow(ctx) {
       emit(ctx, {
         kind: "session",
         severity: SEVERITY.INFO,
-        message: `已加载启动契约 guardbuild.json：${targetConfig.start.cmd} ${targetConfig.start.args.join(" ")}（就绪模式 ${targetConfig.start.readyPattern}${extras.length ? `；${extras.join("，")}` : ""}）`,
+        message: `已加载启动契约 guardbuild.json：${startDesc}（就绪模式 ${targetConfig.start.readyPattern}${extras.length ? `；${extras.join("，")}` : ""}）`,
         data: {
           start: targetConfig.start,
+          startSource: "contract",
           login: targetConfig.login,
           prepare: targetConfig.prepare,
           identities: targetConfig.identities ? targetConfig.identities.map((i) => i.name) : null,
           scopes: targetConfig.scopes,
         },
       });
-    } else if (targetConfig.source === "invalid") {
+    } else if (targetConfig.startSource === "default" && targetConfig.source === "default") {
       emit(ctx, {
         kind: "session",
-        severity: SEVERITY.WARN,
-        message: `guardbuild.json 解析失败（${targetConfig.invalid}），回落到缺省启动契约（node server.js + GB_LISTEN）`,
-        data: { invalid: targetConfig.invalid },
+        severity: SEVERITY.INFO,
+        message: `未发现 guardbuild.json，也未能自动探测启动方式，回落到缺省契约（node server.js + GB_LISTEN）；如项目启动命令不同，请添加 guardbuild.json 的 start`,
+        data: { start: targetConfig.start, startSource: "default", autostart },
       });
+    }
+    if (targetConfig.startSource !== "contract") {
+      for (const w of (autostart?.warnings ?? []).slice(0, 4)) {
+        emit(ctx, { kind: "session", severity: SEVERITY.WARN, message: w, data: { startSource: targetConfig.startSource } });
+      }
+      if (autostart?.alternatives?.length) {
+        emit(ctx, {
+          kind: "session",
+          severity: SEVERITY.INFO,
+          message: `其他可用启动方式：${autostart.alternatives.slice(0, 4).join("；")}`,
+          data: { alternatives: autostart.alternatives },
+        });
+      }
     }
 
     await stageAnalyze(ctx);

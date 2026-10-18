@@ -262,7 +262,10 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
       phases: view.phases ?? {},
       acceptance: view.acceptance ?? null,
       supabase,
-      start: start ? { cmd: start.cmd, args: start.args, readyPattern: start.readyPattern } : null,
+      start: start
+        ? { cmd: start.cmd, args: start.args, cwd: start.cwd ?? null, readyPattern: start.readyPattern }
+        : null,
+      startSource: ctx.targetConfig?.startSource ?? null,
     },
     supabase,
     evidence: { pre: byPhase("pre"), post: byPhase("post"), postWriteback: byPhase("post_writeback") },

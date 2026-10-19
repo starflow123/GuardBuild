@@ -22,11 +22,31 @@ async function httpGet(baseUrl, path, token) {
   }
 }
 
-async function httpPost(baseUrl, path, body) {
+async function httpPost(baseUrl, path, body, token) {
   try {
+    const headers = { "Content-Type": "application/json" };
+    if (token) headers.Authorization = `Bearer ${token}`;
     const res = await fetch(baseUrl + path, {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers,
+      body: JSON.stringify(body),
+    });
+    const text = await res.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch {}
+    return { status: res.status, json, ok: res.status >= 200 && res.status < 300 };
+  } catch (e) {
+    return { status: 0, json: null, ok: false, error: e.message };
+  }
+}
+
+async function httpPut(baseUrl, path, body, token) {
+  try {
+    const headers = { "Content-Type": "application/json" };
+    if (token) headers.Authorization = `Bearer ${token}`;
+    const res = await fetch(baseUrl + path, {
+      method: "PUT",
+      headers,
       body: JSON.stringify(body),
     });
     const text = await res.text();
@@ -191,6 +211,77 @@ export async function detectIdor(ctx, baseUrl, routes, login) {
   return findings;
 }
 
+/** PUT IDOR 探测：alice 修改 bob 的资源 */
+export async function detectPutIdor(ctx, baseUrl, routes, login) {
+  if (!login) return [];
+  const [alice, bob] = login.identities;
+  const findings = [];
+
+  for (const route of routes) {
+    if (!route.path.startsWith("/api/")) continue;
+    const listRes = await httpGet(baseUrl, route.path, bob.token);
+    if (!listRes.ok || !Array.isArray(listRes.json) || listRes.json.length === 0) continue;
+
+    const victimId = listRes.json[0].id;
+    if (!victimId) continue;
+
+    const detailPath = `${route.path}/${victimId}`;
+    const original = listRes.json[0];
+    const testItem = "HACKED_BY_BLACKBOX";
+
+    const putRes = await httpPut(baseUrl, detailPath, { item: testItem }, alice.token);
+    if (putRes.ok && putRes.json && putRes.json.item === testItem) {
+      findings.push({
+        type: "IDOR(PUT)",
+        method: "PUT",
+        path: detailPath,
+        severity: "high",
+        detail: `alice 修改 bob 的资源 #${victimId} → HTTP ${putRes.status}，item 被改成 ${testItem}`,
+        curl: `curl -X PUT -H "Authorization: Bearer <alice_token>" -H "Content-Type: application/json" -d '{"item":"${testItem}"}' ${baseUrl}${detailPath}`,
+      });
+      ctx.emit?.({
+        kind: "evidence",
+        severity: "error",
+        message: `[IDOR-PUT] PUT ${detailPath} → ${putRes.status}（越权修改他人资源）`,
+      });
+      // 恢复原始值
+      await httpPut(baseUrl, detailPath, { item: original.item }, bob.token);
+    }
+  }
+  return findings;
+}
+
+/** 路径穿越探测 */
+export async function detectPathTraversal(ctx, baseUrl, routes, login) {
+  const findings = [];
+  const token = login?.identities?.[0]?.token;
+  const payloads = ["../../etc/passwd", "..%2F..%2Fetc%2Fpasswd", "....//....//etc/passwd"];
+
+  for (const route of routes) {
+    if (!route.path.includes("/files") && !route.path.includes("/download") && !route.path.includes("/static")) continue;
+    for (const payload of payloads) {
+      const res = await httpGet(baseUrl, `${route.path}/${payload}`, token);
+      if (res.ok && (res.json?.includes?.("root:") || res.json?.includes?.("[boot loader]"))) {
+        findings.push({
+          type: "路径穿越",
+          method: "GET",
+          path: `${route.path}/${payload}`,
+          severity: "high",
+          detail: `${route.path}/${payload} → 返回文件内容`,
+          curl: `curl ${baseUrl}${route.path}/${payload}`,
+        });
+        ctx.emit?.({
+          kind: "evidence",
+          severity: "error",
+          message: `[路径穿越] ${route.path}/${payload}`,
+        });
+        break;
+      }
+    }
+  }
+  return findings;
+}
+
 /** 无鉴权访问检测：不登录直接访问路由，200 = 暴露 */
 export async function detectUnauthenticated(ctx, baseUrl, routes) {
   const findings = [];
@@ -234,12 +325,14 @@ export async function runBlackbox(ctx, baseUrl) {
   }
   routes.push(...brute);
 
-  // 自动登录 + IDOR 探测
+  // 自动登录 + 攻击探测
   const login = await detectLogin(ctx, baseUrl);
   const idorFindings = login ? await detectIdor(ctx, baseUrl, routes, login) : [];
+  const putIdorFindings = login ? await detectPutIdor(ctx, baseUrl, routes, login) : [];
+  const traversalFindings = login ? await detectPathTraversal(ctx, baseUrl, routes, login) : [];
   const unauthFindings = await detectUnauthenticated(ctx, baseUrl, routes);
 
-  const allFindings = [...idorFindings, ...unauthFindings];
+  const allFindings = [...idorFindings, ...putIdorFindings, ...traversalFindings, ...unauthFindings];
 
   ctx.emit?.({
     kind: "discovery",

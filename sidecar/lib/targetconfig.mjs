@@ -142,6 +142,15 @@ export function normalizeLogin(raw) {
       typeof l.credentialPath === "string" && l.credentialPath ? l.credentialPath : "token",
     credentialPrefix: typeof l.credentialPrefix === "string" ? l.credentialPrefix : "Bearer ",
     userPath: typeof l.userPath === "string" && l.userPath ? l.userPath : null,
+    // 登录后每个请求都带的额外固定 header（如 X-Tenant-Id / X-Api-Version）
+    extraHeaders:
+      l.extraHeaders && typeof l.extraHeaders === "object" && !Array.isArray(l.extraHeaders)
+        ? Object.fromEntries(
+            Object.entries(l.extraHeaders).filter(([k, v]) => typeof k === "string" && k && typeof v === "string")
+          )
+        : {},
+    // 是否使用 Cookie 鉴权（登录后从响应 Set-Cookie 提取，后续请求带 Cookie 头）
+    cookieAuth: l.cookieAuth === true,
   };
 }
 

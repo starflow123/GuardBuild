@@ -125,6 +125,7 @@ async function httpJson(ctx, opts) {
     credentialPath = null,
     credentialPrefix = null,
     credentialHeader = null,
+    extraHeaders = null,
     redact = true,
     graphql = false,
   } = opts;
@@ -141,6 +142,10 @@ async function httpJson(ctx, opts) {
     params.credentialPath = credentialPath;
     params.credentialPrefix = credentialPrefix;
     if (credentialHeader) params.credentialHeader = credentialHeader;
+  }
+  // 合并全局额外 header（如 X-Tenant-Id）
+  if (extraHeaders && typeof extraHeaders === "object") {
+    Object.assign(params.headers, extraHeaders);
   }
   params.redact = redact;
 

@@ -502,10 +502,13 @@ function pickTargets(byUser, loggedIn, anonymousItems = [], anonTargets = []) {
   const victimItems = victim ? byUser[victim.name] ?? [] : [];
   const victimPaid = victimItems.filter((o) => o.status === "paid");
   const attackerPaid = attackerItems.filter((o) => o.status === "paid");
+  // attacker 自己列表里已有的资源 id：这些资源不属于"他人"，请求成功不算越权
+  const attackerOwnIds = new Set(attackerItems.map((o) => String(resourceIdOf(o))).filter(Boolean));
   return {
     attacker,
     victim,
     admin,
+    attackerOwnIds,
     readTarget: victimItems[0] ?? anonymousItems[0] ?? null,
     attackCancelTarget: victimPaid[0] ?? victimItems[1] ?? victimItems[0] ?? null,
     adminCancelTarget: victimPaid[1] ?? victimPaid[0] ?? victimItems[0] ?? null,
@@ -1007,9 +1010,15 @@ export function buildCases(ctx, targets) {
       verify: (res, phase) => {
         const o = extractEntity(res.json, entityPathFor(ctx, cand.graphql));
         const leaked = o && String(resourceIdOf(o)) === String(readTarget.id);
+        // 跨端点 id 串号防护：如果 attacker 自己列表里就有这个 id，说明是自己的资源，不是越权
+        const isOwnResource = leaked && targets.attackerOwnIds?.has(String(readTarget.id));
         const detail = leaked
-          ? `证据：返回${candLabel} #${resourceIdOf(o)}（归属 ${ownerOf(o)}，金额 ${o.amount}，状态 ${o.status}）`
+          ? `证据：返回${candLabel} #${resourceIdOf(o)}（归属 ${ownerOf(o)}，金额 ${o.amount}，状态 ${o.status}）${isOwnResource ? "（但该 id 在 attacker 自己列表中，疑似串号）" : ""}`
           : "";
+        if (isOwnResource) {
+          // 不算越权：attacker 本来就能访问自己的资源
+          return { verdict: "inconclusive", detail: `目标 #${readTarget.id} 在 attacker 自己的资源列表中，疑似跨端点 id 串号，不计为越权` };
+        }
         return verifyAttack(res, phase, detail, leaked);
       },
       crossProof: (res) => {

@@ -312,6 +312,42 @@ export async function detectUnauthenticated(ctx, baseUrl, routes) {
   return findings;
 }
 
+/** SQL 注入探测：对带参数的路由发 payload，看数据库错误 */
+export async function detectSqli(ctx, baseUrl, routes, login) {
+  const findings = [];
+  const token = login?.identities?.[0]?.token;
+  const payloads = ["' OR 1=1--", "' OR '1'='1", "1; DROP TABLE--", "' UNION SELECT NULL--"];
+  const errorSignatures = ["SQL syntax", "MySQL server", "SQLite3::query", "ORA-", "PostgreSQL", "Microsoft SQL Server", "Unclosed quotation mark"];
+
+  for (const route of routes) {
+    // 对列表路由的查询参数发 payload
+    for (const payload of payloads) {
+      const testUrl = `${route.path}?id=${encodeURIComponent(payload)}&q=${encodeURIComponent(payload)}`;
+      const res = await httpGet(baseUrl, testUrl, token);
+      const body = typeof res.json === "string" ? res.json : JSON.stringify(res.json ?? "");
+      for (const sig of errorSignatures) {
+        if (body.includes(sig)) {
+          findings.push({
+            type: "SQL 注入",
+            method: "GET",
+            path: testUrl,
+            severity: "high",
+            detail: `${testUrl} → 返回数据库错误（${sig}）`,
+            curl: `curl ${baseUrl}${testUrl}`,
+          });
+          ctx.emit?.({
+            kind: "evidence",
+            severity: "error",
+            message: `[SQLi] ${testUrl}`,
+          });
+          break;
+        }
+      }
+    }
+  }
+  return findings;
+}
+
 /** 黑盒扫描主入口 */
 export async function runBlackbox(ctx, baseUrl) {
   ctx.emit?.({ kind: "phase", severity: "info", message: `开始纯黑盒扫描：${baseUrl}` });
@@ -336,9 +372,10 @@ export async function runBlackbox(ctx, baseUrl) {
   const idorFindings = login ? await detectIdor(ctx, baseUrl, routes, login) : [];
   const putIdorFindings = login ? await detectPutIdor(ctx, baseUrl, routes, login) : [];
   const traversalFindings = login ? await detectPathTraversal(ctx, baseUrl, routes, login) : [];
+  const sqliFindings = login ? await detectSqli(ctx, baseUrl, routes, login) : [];
   const unauthFindings = await detectUnauthenticated(ctx, baseUrl, routes);
 
-  const allFindings = [...idorFindings, ...putIdorFindings, ...traversalFindings, ...unauthFindings];
+  const allFindings = [...idorFindings, ...putIdorFindings, ...traversalFindings, ...sqliFindings, ...unauthFindings];
 
   ctx.emit?.({
     kind: "discovery",

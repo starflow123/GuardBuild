@@ -154,6 +154,16 @@ export function normalizeLogin(raw) {
   };
 }
 
+/** Docker 容器隔离配置：目标服务跑在容器里，不直接跑宿主机。 */
+function normalizeDocker(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  return {
+    enabled: raw.enabled === true,
+    composeFile: typeof raw.composeFile === "string" ? raw.composeFile : "docker-compose.yml",
+    service: typeof raw.service === "string" ? raw.service : null,
+  };
+}
+
 /** prepare 步骤：spawn 目标前的顺序执行命令（安装依赖/构建等）。 */
 function normalizePrepare(raw) {
   if (!Array.isArray(raw) || raw.length === 0) return null;
@@ -357,6 +367,7 @@ export async function loadTargetConfig(ctx) {
     login: normalizeLogin(parsed.login),
     prepare: normalizePrepare(parsed.prepare),
     responses: normalizeResponses(parsed.responses),
+    docker: normalizeDocker(parsed.docker),
     supabase: normalizeSupabase(parsed.supabase),
     routes: normalizeRoutes(parsed.routes),
     openapi: normalizeOpenapi(parsed.openapi),

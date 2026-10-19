@@ -9,9 +9,26 @@
  *  5. 输出发现的路由列表
  */
 
-async function httpGet(baseUrl, path) {
+async function httpGet(baseUrl, path, token) {
   try {
-    const res = await fetch(baseUrl + path);
+    const headers = token ? { Authorization: `Bearer ${token}` } : {};
+    const res = await fetch(baseUrl + path, { headers });
+    const text = await res.text();
+    let json = null;
+    try { json = JSON.parse(text); } catch {}
+    return { status: res.status, json, ok: res.status >= 200 && res.status < 300 };
+  } catch (e) {
+    return { status: 0, json: null, ok: false, error: e.message };
+  }
+}
+
+async function httpPost(baseUrl, path, body) {
+  try {
+    const res = await fetch(baseUrl + path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
     const text = await res.text();
     let json = null;
     try { json = JSON.parse(text); } catch {}
@@ -55,12 +72,13 @@ export async function discoverOpenapi(ctx, baseUrl) {
   return null;
 }
 
-/** 目录爆破常见 API 路径 */
+/** 目录爆破常见 API 路径（401/403 也算路由存在） */
 export async function bruteRoutes(ctx, baseUrl) {
   const found = [];
   for (const p of COMMON_API_PATHS) {
     const res = await httpGet(baseUrl, p);
-    if (res.ok) {
+    // 200 = 公开可访问，401/403 = 需要登录但路由存在
+    if (res.ok || res.status === 401 || res.status === 403) {
       found.push({ method: "GET", path: p });
       ctx.emit?.({
         kind: "discovery",
@@ -103,6 +121,76 @@ export async function checkRateLimit(ctx, baseUrl) {
   }
 }
 
+/** 自动探测登录方式并登录两个测试账号 */
+async function detectLogin(ctx, baseUrl) {
+  const loginPaths = ["/api/login", "/login", "/auth", "/api/auth"];
+  const creds = [
+    { name: "alice", email: "alice@test.com", password: "alice123" },
+    { name: "bob", email: "bob@test.com", password: "bob123" },
+  ];
+  for (const p of loginPaths) {
+    const results = [];
+    let allOk = true;
+    for (const c of creds) {
+      const res = await httpPost(baseUrl, p, { email: c.email, password: c.password });
+      if (res.ok && res.json?.token) {
+        results.push({ ...c, token: res.json.token });
+      } else {
+        allOk = false;
+        break;
+      }
+    }
+    if (allOk && results.length === 2) {
+      ctx.emit?.({ kind: "discovery", severity: "info", message: `登录成功：POST ${p}（alice + bob）` });
+      return { path: p, identities: results };
+    }
+  }
+  ctx.emit?.({ kind: "discovery", severity: "warn", message: "未发现可用的登录接口" });
+  return null;
+}
+
+/** IDOR 探测：双账号发请求，验证越权 */
+export async function detectIdor(ctx, baseUrl, routes, login) {
+  if (!login) return [];
+  const [alice, bob] = login.identities;
+  const findings = [];
+
+  for (const route of routes) {
+    // 从列表接口推断详情接口：/api/orders → /api/orders/101
+    const listRes = await httpGet(baseUrl, route.path, bob.token);
+    if (!listRes.ok || !Array.isArray(listRes.json) || listRes.json.length === 0) continue;
+
+    const victimItem = listRes.json[0];
+    const victimId = victimItem.id;
+    if (!victimId) continue;
+
+    // alice 访问 bob 的资源
+    const detailPath = `${route.path}/${victimId}`;
+    const attackRes = await httpGet(baseUrl, detailPath, alice.token);
+
+    if (attackRes.ok && attackRes.json) {
+      const ownerId = attackRes.json.userId ?? attackRes.json.ownerId ?? attackRes.json.user_id;
+      // bob 的 userId 是 2（lab-idor 数据），alice 是 1
+      if (ownerId && String(ownerId) !== "1") {
+        findings.push({
+          type: "IDOR",
+          method: "GET",
+          path: detailPath,
+          severity: "high",
+          detail: `alice 访问 bob 的资源 #${victimId} → HTTP ${attackRes.status}，归属 userId=${ownerId}`,
+          curl: `curl -H "Authorization: Bearer <alice_token>" ${baseUrl}${detailPath}`,
+        });
+        ctx.emit?.({
+          kind: "evidence",
+          severity: "error",
+          message: `[IDOR] GET ${detailPath} → ${attackRes.status}（越权访问他人资源）`,
+        });
+      }
+    }
+  }
+  return findings;
+}
+
 /** 黑盒扫描主入口 */
 export async function runBlackbox(ctx, baseUrl) {
   ctx.emit?.({ kind: "phase", severity: "info", message: `开始纯黑盒扫描：${baseUrl}` });
@@ -122,12 +210,16 @@ export async function runBlackbox(ctx, baseUrl) {
   }
   routes.push(...brute);
 
+  // 自动登录 + IDOR 探测
+  const login = await detectLogin(ctx, baseUrl);
+  const idorFindings = login ? await detectIdor(ctx, baseUrl, routes, login) : [];
+
   ctx.emit?.({
     kind: "discovery",
     severity: "info",
-    message: `黑盒扫描完成：发现 ${routes.length} 条路由`,
-    data: { routes, openapiFound: !!openapi },
+    message: `黑盒扫描完成：${routes.length} 条路由，${idorFindings.length} 个 IDOR 漏洞`,
+    data: { routes, openapiFound: !!openapi, idorFindings },
   });
 
-  return { routes, openapi };
+  return { routes, openapi, findings: idorFindings };
 }

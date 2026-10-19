@@ -1013,6 +1013,28 @@ export async function scanAttackSurface(ctx, baseUrl, loggedIn) {
   }
 }
 
+/**
+ * 速率限制检测：对一个 GET 端点连续发 10 次请求，看是否返回 429。
+ */
+export async function rateLimitCheck(ctx, baseUrl, loggedIn) {
+  const probePath = "/";
+  let got429 = false;
+  for (let i = 0; i < 10; i++) {
+    try {
+      const res = await httpJson(ctx, { baseUrl, method: "GET", path: probePath });
+      if (res.status === 429) { got429 = true; break; }
+    } catch { break; }
+  }
+  if (!got429) {
+    ctx.emit({
+      kind: "evidence",
+      severity: SEVERITY.WARN,
+      message: `[攻击面] ${probePath} 连续 10 次请求无 429，可能缺少速率限制`,
+      data: { path: probePath, requests: 10, limited: false },
+    });
+  }
+}
+
 /** 构建一个阶段内的全部用例（攻击 + 业务），攻击目标对象由发现阶段确定 */
 export function buildCases(ctx, targets) {
   // 每类候选 top-K 逐一构建攻击用例；首个候选保持基名（兼容既有报告/测试/e2e）
@@ -1686,6 +1708,7 @@ export async function runPhase(ctx, { phase, baseUrl }) {
   // 外部攻击面扫描：发常见管理路径/敏感文件，记录暴露面（pre 阶段才跑）
   if (phase === "pre") {
     await scanAttackSurface(ctx, baseUrl, loggedIn);
+    await rateLimitCheck(ctx, baseUrl, loggedIn);
   }
   // 修复后验收只覆盖补丁实际修复的类别：注入/穿越无自动修复模板，
   // 若与可修复项混在同一目标中，仍按原样复现会误判「补丁无效」

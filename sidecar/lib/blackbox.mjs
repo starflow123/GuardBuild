@@ -191,6 +191,30 @@ export async function detectIdor(ctx, baseUrl, routes, login) {
   return findings;
 }
 
+/** 无鉴权访问检测：不登录直接访问路由，200 = 暴露 */
+export async function detectUnauthenticated(ctx, baseUrl, routes) {
+  const findings = [];
+  for (const route of routes) {
+    const res = await httpGet(baseUrl, route.path);
+    if (res.ok) {
+      findings.push({
+        type: "未授权访问",
+        method: route.method,
+        path: route.path,
+        severity: "medium",
+        detail: `无需登录即可访问 ${route.path} → HTTP ${res.status}`,
+        curl: `curl ${baseUrl}${route.path}`,
+      });
+      ctx.emit?.({
+        kind: "evidence",
+        severity: "warn",
+        message: `[无鉴权] ${route.method} ${route.path} → ${res.status}（无需登录）`,
+      });
+    }
+  }
+  return findings;
+}
+
 /** 黑盒扫描主入口 */
 export async function runBlackbox(ctx, baseUrl) {
   ctx.emit?.({ kind: "phase", severity: "info", message: `开始纯黑盒扫描：${baseUrl}` });
@@ -213,13 +237,16 @@ export async function runBlackbox(ctx, baseUrl) {
   // 自动登录 + IDOR 探测
   const login = await detectLogin(ctx, baseUrl);
   const idorFindings = login ? await detectIdor(ctx, baseUrl, routes, login) : [];
+  const unauthFindings = await detectUnauthenticated(ctx, baseUrl, routes);
+
+  const allFindings = [...idorFindings, ...unauthFindings];
 
   ctx.emit?.({
     kind: "discovery",
     severity: "info",
-    message: `黑盒扫描完成：${routes.length} 条路由，${idorFindings.length} 个 IDOR 漏洞`,
-    data: { routes, openapiFound: !!openapi, idorFindings },
+    message: `黑盒扫描完成：${routes.length} 条路由，${allFindings.length} 个漏洞`,
+    data: { routes, openapiFound: !!openapi, findings: allFindings },
   });
 
-  return { routes, openapi, findings: idorFindings };
+  return { routes, openapi, findings: allFindings };
 }

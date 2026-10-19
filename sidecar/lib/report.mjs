@@ -122,6 +122,44 @@ function evidenceTable(rows) {
   return `${head}\n${body}\n${rest}`;
 }
 
+function renderLlmSection(llm) {
+  const applied = [
+    llm.applied?.start ? "启动契约" : null,
+    llm.applied?.login ? "登录契约" : null,
+    llm.applied?.routes ? `路由 ${llm.applied.routes} 条` : null,
+  ].filter(Boolean);
+  const cache = llm.cached
+    ? `${llm.cacheSource === "disk" ? "磁盘" : "内存"}缓存${llm.cachedAt ? `（${fmtTime(llm.cachedAt)}）` : ""}`
+    : "本次调用";
+  const lines = [
+    "## LLM 接入侦察\n",
+    "| 项目 | 值 |",
+    "| --- | --- |",
+    `| 模型 | ${esc(llm.model ?? "—")} |`,
+    `| 应用 | ${esc(applied.join("、") || "无")} |`,
+    `| 启动验证 | ${llm.verified?.start ? "已通过实际启动验证" : "未通过/未验证"} |`,
+    `| 登录验证 | ${llm.verified?.login ? "已通过实际登录验证" : "未通过/未验证"} |`,
+    `| 路由线索 | ${llm.routeCount ?? 0} 条（仅用于定位动态探测目标，不参与自动改码） |`,
+    `| 来源 | ${esc(cache)} |`,
+    `| Token | ${llm.usage?.total_tokens ?? "—"} |`,
+    `| 证据 | ${llm.evidenceFiles?.length ?? 0} 个文件 / ${llm.evidenceChars ?? 0} 字符 |`,
+    "",
+  ];
+  if (llm.rejectedStart) {
+    const rejected = llm.rejectedStart;
+    lines.push(
+      `- 启动回退：LLM 启动契约未通过实际启动验证（\`${esc(rejected.cmd ?? "?")} ${esc((rejected.args ?? []).join(" "))}\`）。`
+    );
+  }
+  if (llm.warnings?.length) {
+    lines.push("\n**侦察警告**\n", ...llm.warnings.slice(0, 10).map((w) => `- ${esc(w)}`), "");
+  }
+  if (llm.notes?.length) {
+    lines.push("\n**侦察备注**\n", ...llm.notes.slice(0, 5).map((n) => `- ${esc(n)}`), "");
+  }
+  return lines.join("\n");
+}
+
 function renderMarkdown(r) {
   const acc = r.acceptance;
   const pre = r.evidence.pre ?? [];
@@ -169,8 +207,20 @@ function renderMarkdown(r) {
     summaryLines.push(`- Supabase：${bits.join("，")}`);
   }
   if (r.summary.start) summaryLines.push(`- 启动契约：\`${esc(r.summary.start.cmd)} ${esc((r.summary.start.args ?? []).join(" "))}\`（就绪模式 ${esc(r.summary.start.readyPattern)}）`);
+  if (r.llm?.used) {
+    const applied = [
+      r.llm.applied?.start ? "启动" : null,
+      r.llm.applied?.login ? "登录" : null,
+      r.llm.applied?.routes ? `路由 ${r.llm.applied.routes} 条` : null,
+    ].filter(Boolean);
+    summaryLines.push(
+      `- LLM 接入侦察：${esc(r.llm.model ?? "未知模型")}，应用 ${esc(applied.join("、") || "无")}；启动 ${r.llm.verified?.start ? "已验证" : "未验证"}，登录 ${r.llm.verified?.login ? "已验证" : "未验证"}${r.llm.cached ? `（${r.llm.cacheSource === "disk" ? "磁盘" : "内存"}缓存）` : ""}`
+    );
+  }
   if (r.error) summaryLines.push(`- 错误：\`${esc(r.error.code)}\` — ${esc(r.error.message)}`);
   parts.push(summaryLines.join("\n") + "\n");
+
+  if (r.llm?.used) parts.push(renderLlmSection(r.llm));
 
   if (r.summary.findings.length) {
     parts.push(`## 静态发现（${r.summary.findings.length}）\n`);
@@ -267,6 +317,26 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
         : null,
       startSource: ctx.targetConfig?.startSource ?? null,
     },
+    llm: view.llm
+      ? {
+          used: !!view.llm.used,
+          model: view.llm.model ?? null,
+          source: view.llm.source ?? null,
+          cached: !!view.llm.cached,
+          cacheSource: view.llm.cacheSource ?? null,
+          cachedAt: view.llm.cachedAt ?? null,
+          durationMs: view.llm.durationMs ?? null,
+          routeCount: view.llm.routes ?? 0,
+          applied: view.llm.applied ?? { start: false, login: false, routes: 0 },
+          verified: view.llm.verified ?? { start: false, login: false },
+          rejectedStart: view.llm.rejectedStart ?? null,
+          evidenceFiles: view.llm.evidenceFiles ?? [],
+          evidenceChars: view.llm.evidenceChars ?? 0,
+          usage: view.llm.usage ?? null,
+          notes: view.llm.notes ?? [],
+          warnings: view.llm.warnings ?? [],
+        }
+      : null,
     supabase,
     evidence: { pre: byPhase("pre"), post: byPhase("post"), postWriteback: byPhase("post_writeback") },
     patch: view.patch

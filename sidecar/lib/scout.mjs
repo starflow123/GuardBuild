@@ -11,6 +11,8 @@
  * 无 key / 超时 / 非法输出时返回 null，主流程继续走确定性逻辑。
  */
 import { createHash } from "node:crypto";
+import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { RPC_TO_HOST } from "../../shared/protocol.mjs";
 import { ALLOWED_LAUNCHERS, GENERIC_READY_PATTERN, PORT_SLOT } from "./autostart.mjs";
 import { normalizeStart, normalizeLogin } from "./targetconfig.mjs";
@@ -19,6 +21,8 @@ import { isEnabled, chat, parseJson } from "./llm.mjs";
 export const SCOUT_VERSION = "scout-v1";
 const CACHE_TTL_MS = 30 * 60 * 1000;
 const CACHE_MAX = 20;
+const DISK_CACHE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const DISK_CACHE_MAX = 20;
 const SCOUT_CACHE = new Map();
 
 const MAX_TREE_ENTRIES = 300;
@@ -490,6 +494,178 @@ function cacheKeyFor(model, evidence) {
 }
 
 /**
+ * 落盘位置由宿主传入的 GUARDBUILD_DATA_DIR 决定（与证据库同目录），
+ * 绝不写入被检项目。缓存键包含证据树与证据文件内容：源码/契约变化会自动失效。
+ */
+function scoutDataDir() {
+  const dir = process.env.GUARDBUILD_DATA_DIR;
+  return typeof dir === "string" && dir.trim() ? dir : null;
+}
+
+function projectCacheId(root) {
+  let p = normPath(root).replace(/\/+$/, "");
+  if (process.platform === "win32") p = p.toLowerCase();
+  return createHash("sha256").update(p).digest("hex").slice(0, 16);
+}
+
+function diskCacheFile(ctx, key) {
+  const base = scoutDataDir();
+  if (!base) return null;
+  return join(base, "scout", projectCacheId(ctx.projectRoot), `${key}.json`);
+}
+
+function writeJsonAtomic(file, data) {
+  const tmp = `${file}.${process.pid}.tmp`;
+  try {
+    writeFileSync(tmp, JSON.stringify(data), "utf8");
+    renameSync(tmp, file);
+  } catch (e) {
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      /* ignore */
+    }
+    throw e;
+  }
+}
+
+function pruneDiskCache(dir) {
+  try {
+    const files = readdirSync(dir)
+      .filter((n) => n.endsWith(".json"))
+      .map((n) => ({ name: n, mtime: statSync(join(dir, n)).mtimeMs }))
+      .sort((a, b) => b.mtime - a.mtime);
+    for (const f of files.slice(DISK_CACHE_MAX)) rmSync(join(dir, f.name), { force: true });
+  } catch {
+    /* 缓存清理失败不影响主流程 */
+  }
+}
+
+function writeDiskCache(ctx, key, result) {
+  const file = diskCacheFile(ctx, key);
+  if (!file) return null;
+  const savedAt = Date.now();
+  const payload = {
+    version: SCOUT_VERSION,
+    savedAt,
+    model: result.model ?? null,
+    usage: result.usage ?? null,
+    durationMs: result.durationMs ?? null,
+    evidenceFiles: result.evidenceFiles ?? [],
+    evidenceChars: result.evidenceChars ?? 0,
+    start: result.start ?? null,
+    login: result.login ?? null,
+    routes: result.routes ?? [],
+    notes: result.notes ?? [],
+    warnings: result.warnings ?? [],
+    verified: { start: null, login: null },
+  };
+  try {
+    mkdirSync(dirname(file), { recursive: true });
+    writeJsonAtomic(file, payload);
+    pruneDiskCache(dirname(file));
+    return { file, savedAt };
+  } catch {
+    return null;
+  }
+}
+
+async function readDiskCache(ctx, key, evidence) {
+  const file = diskCacheFile(ctx, key);
+  if (!file || !existsSync(file)) return null;
+  let data = null;
+  try {
+    data = JSON.parse(readFileSync(file, "utf8"));
+  } catch {
+    data = null;
+  }
+  if (
+    !data ||
+    data.version !== SCOUT_VERSION ||
+    !Number.isFinite(data.savedAt) ||
+    Date.now() - data.savedAt > DISK_CACHE_TTL_MS
+  ) {
+    try {
+      rmSync(file, { force: true });
+    } catch {
+      /* ignore */
+    }
+    return null;
+  }
+
+  const warnings = Array.isArray(data.warnings) ? [...data.warnings] : [];
+  warnings.push(`使用磁盘缓存的侦察契约（保存于 ${new Date(data.savedAt).toISOString()}）`);
+  let checked;
+  try {
+    checked = await validateScoutResult(
+      { start: data.start, login: data.login, routes: data.routes, notes: data.notes },
+      {
+        evidence: { dirs: evidence?.dirs ?? null, files: evidence?.files ?? [] },
+        readFile: (rel) => readProjectText(ctx, rel),
+      },
+      warnings
+    );
+  } catch {
+    return null;
+  }
+
+  let start = checked.start;
+  if (data.verified?.start === false) {
+    start = null;
+    warnings.push("缓存中的启动方式在上次运行未通过实际启动验证，已忽略并改用确定性自动探测/缺省契约");
+  }
+
+  return {
+    start,
+    login: checked.login,
+    routes: checked.routes,
+    notes: checked.notes,
+    warnings,
+    _source: "llm-scout",
+    _unverified: true,
+    _cacheFile: file,
+    model: data.model ?? null,
+    usage: data.usage ?? null,
+    evidenceFiles: Array.isArray(data.evidenceFiles) ? data.evidenceFiles : [],
+    evidenceChars: Number(data.evidenceChars) || 0,
+    cached: true,
+    cacheSource: "disk",
+    savedAt: data.savedAt,
+    verified: {
+      start: typeof data.verified?.start === "boolean" ? data.verified.start : null,
+      login: typeof data.verified?.login === "boolean" ? data.verified.login : null,
+    },
+  };
+}
+
+/** 把本次运行的实际验证结果写回缓存（仅本地数据目录，不影响目标项目）。 */
+export function recordScoutVerification(ctx, patch = {}) {
+  const file = ctx?.scoutCacheFile;
+  if (!file || !existsSync(file)) return false;
+  const applied = {};
+  if (typeof patch.start === "boolean") applied.start = patch.start;
+  if (typeof patch.login === "boolean") applied.login = patch.login;
+  try {
+    const data = JSON.parse(readFileSync(file, "utf8"));
+    if (!data || data.version !== SCOUT_VERSION) return false;
+    const verified = data.verified && typeof data.verified === "object" ? data.verified : { start: null, login: null };
+    Object.assign(verified, applied);
+    data.verified = verified;
+    data.verifiedAt = Date.now();
+    if (patch.rejectedStart !== undefined) data.rejectedStart = patch.rejectedStart;
+    writeJsonAtomic(file, data);
+    for (const entry of SCOUT_CACHE.values()) {
+      if (entry.result?._cacheFile !== file) continue;
+      entry.result.verified = { ...(entry.result.verified ?? {}), ...applied };
+      if (patch.rejectedStart !== undefined) entry.result.rejectedStart = patch.rejectedStart;
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * 运行接入侦察；失败返回 null（调用方继续确定性流程）。
  * @param {object} ctx
  * @param {object} opts { getToken, model, maxFiles, chatImpl }
@@ -498,8 +674,6 @@ export async function runScout(
   ctx,
   { getToken, model = null, maxFiles = MAX_FILES, chatImpl = chat } = {}
 ) {
-  if (!isEnabled()) return null;
-  if (typeof getToken !== "function") throw new Error("缺少网络作用域令牌提供方");
   const started = Date.now();
   const evidence = await collectEvidence(ctx, { maxFiles });
   if (evidence.files.length === 0) {
@@ -515,6 +689,9 @@ export async function runScout(
       evidenceFiles: [],
       evidenceChars: 0,
       cached: false,
+      cacheSource: null,
+      savedAt: null,
+      verified: { start: null, login: null },
       durationMs: Date.now() - started,
     };
   }
@@ -522,8 +699,24 @@ export async function runScout(
   const key = cacheKeyFor(model, evidence);
   const cached = SCOUT_CACHE.get(key);
   if (cached && Date.now() - cached.at < CACHE_TTL_MS) {
-    return { ...cached.result, cached: true, durationMs: Date.now() - started };
+    return {
+      ...cached.result,
+      cached: true,
+      cacheSource: cached.result.cacheSource ?? "memory",
+      durationMs: Date.now() - started,
+    };
   }
+
+  const disk = await readDiskCache(ctx, key, evidence);
+  if (disk) {
+    disk.durationMs = Date.now() - started;
+    SCOUT_CACHE.set(key, { at: Date.now(), result: disk });
+    trimScoutCache();
+    return disk;
+  }
+
+  if (!isEnabled()) return null;
+  if (typeof getToken !== "function") throw new Error("缺少网络作用域令牌提供方");
 
   const userPrompt = buildPrompt(evidence);
   const res = await chatImpl(ctx, {
@@ -551,13 +744,25 @@ export async function runScout(
     evidenceFiles: evidence.files.map((f) => f.rel),
     evidenceChars: evidence.totalChars,
     cached: false,
+    cacheSource: null,
+    savedAt: null,
+    verified: { start: null, login: null },
     durationMs: Date.now() - started,
   };
+  const stored = writeDiskCache(ctx, key, result);
+  if (stored) {
+    result._cacheFile = stored.file;
+    result.savedAt = stored.savedAt;
+  }
   SCOUT_CACHE.set(key, { at: Date.now(), result });
+  trimScoutCache();
+  return result;
+}
+
+function trimScoutCache() {
   while (SCOUT_CACHE.size > CACHE_MAX) {
     SCOUT_CACHE.delete(SCOUT_CACHE.keys().next().value);
   }
-  return result;
 }
 
 /**

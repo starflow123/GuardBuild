@@ -82,6 +82,29 @@ export interface SessionError {
   details?: unknown;
 }
 
+export interface LlmView {
+  used: boolean;
+  model?: string | null;
+  source?: string | null;
+  routes?: number;
+  applied?: { start: boolean; login: boolean; routes: number };
+  notes?: string[];
+  warnings?: string[];
+  cached?: boolean;
+  cacheSource?: "memory" | "disk" | null;
+  cachedAt?: number | null;
+  durationMs?: number | null;
+  evidenceFiles?: string[];
+  evidenceChars?: number;
+  usage?: {
+    prompt_tokens?: number;
+    completion_tokens?: number;
+    total_tokens?: number;
+  } | null;
+  verified?: { start: boolean; login: boolean };
+  rejectedStart?: { cmd?: string; args?: string[] } | null;
+}
+
 export interface View {
   sessionId?: string;
   projectRoot?: string;
@@ -105,6 +128,7 @@ export interface View {
   targets?: Record<string, { pid: number; port: number; url: string; role?: string }>;
   patch?: ViewPatch | null;
   acceptance?: AcceptanceView | null;
+  llm?: LlmView | null;
   error?: SessionError | null;
   tokens?: TokenItem[];
   pendingConsent?: ConsentRequest | null;
@@ -319,7 +343,26 @@ function createMockBridge(): Bridge {
             reason: "按对象 ID 取资源但未见归属校验（IDOR 静态线索）",
           },
         ];
+        view.llm = {
+          used: true,
+          model: "deepseek-chat",
+          source: "llm-scout",
+          routes: 3,
+          applied: { start: true, login: true, routes: 3 },
+          notes: ["浏览器模拟：DeepSeek 从自定义路由表推断接入契约"],
+          warnings: [],
+          cached: true,
+          cacheSource: "disk",
+          cachedAt: Date.now() - 60_000,
+          durationMs: 12,
+          evidenceFiles: ["lib/app.mjs", "boot.mjs"],
+          evidenceChars: 3412,
+          usage: { prompt_tokens: 1200, completion_tokens: 240, total_tokens: 1440 },
+          verified: { start: true, login: true },
+          rejectedStart: null,
+        };
         ev({ kind: "analyze", phase: st, severity: "warn", message: "发现 2 个对象级越权候选" });
+        ev({ kind: "scout", phase: st, severity: "success", message: "LLM 接入侦察：启动/登录契约已验证（磁盘缓存复用）" });
       }
       if (st === "evidenced") {
         view.evidence = [...(view.evidence ?? []), ...sampleEvidence("pre")];

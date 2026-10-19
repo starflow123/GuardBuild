@@ -4,6 +4,7 @@ import { bridge, isTauri, type UiEvent, type View } from "./bridge";
 import { WorkflowStepper } from "./components/WorkflowStepper";
 import { ConsentDialog } from "./components/ConsentDialog";
 import { TokenPanel } from "./components/TokenPanel";
+import { ScoutPanel } from "./components/ScoutPanel";
 import { FindingsList } from "./components/FindingsList";
 import { EventLog } from "./components/EventLog";
 import { EvidenceViewer } from "./components/EvidenceViewer";
@@ -196,6 +197,7 @@ export function App() {
             </div>
           </div>
           <TokenPanel view={view} />
+          <ScoutPanel view={view} />
           <div className="panel">
             <div className="panel-title">隔离与留痕</div>
             <div className="panel-body small muted" style={{ padding: "8px 13px" }}>

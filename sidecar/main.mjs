@@ -19,7 +19,7 @@ import { diagnoseStartFailure } from "./lib/autostart.mjs";
 import { parsePortFromLine, stripAnsi } from "./lib/readyline.mjs";
 import { runPhase, ProbeError } from "./lib/probe.mjs";
 import { runSupabasePhase, isLoopbackHostname } from "./lib/supabase.mjs";
-import { runScout, applyScoutResult } from "./lib/scout.mjs";
+import { runScout, applyScoutResult, recordScoutVerification } from "./lib/scout.mjs";
 import { isEnabled as llmEnabled } from "./lib/llm.mjs";
 import { createPatch, writebackPatch, rollbackWorkspace, PatchError } from "./lib/patcher.mjs";
 import { emitReport } from "./lib/report.mjs";
@@ -281,15 +281,6 @@ async function ensureSupabaseToken(ctx, rawUrl) {
 async function stageScout(ctx, targetConfig) {
   const optIn = targetConfig.llm?.enabled === true || process.env.GUARDBUILD_LLM_SCOUT === "1";
   if (!optIn) return;
-  if (!llmEnabled()) {
-    emit(ctx, {
-      kind: "scout",
-      severity: SEVERITY.WARN,
-      message: "已启用 LLM 接入侦察，但未设置 DEEPSEEK_API_KEY；跳过侦察，继续确定性流程",
-      data: {},
-    });
-    return;
-  }
 
   const needsStart = targetConfig.startSource !== "contract" && targetConfig.startSource !== "auto";
   const needsLogin = !targetConfig.login;
@@ -343,13 +334,24 @@ async function stageScout(ctx, targetConfig) {
     });
     return;
   }
-  if (!scout) return;
+  if (!scout) {
+    emit(ctx, {
+      kind: "scout",
+      severity: SEVERITY.WARN,
+      message: llmEnabled()
+        ? "LLM 接入侦察未返回可用结果；继续确定性流程"
+        : "已启用 LLM 接入侦察，但未设置 DEEPSEEK_API_KEY 且没有可用的磁盘缓存；跳过侦察，继续确定性流程",
+      data: {},
+    });
+    return;
+  }
 
   const fallbackStart = { start: targetConfig.start, startSource: targetConfig.startSource };
   const applied = applyScoutResult(targetConfig, scout);
   if (applied.login) ctx.loginConfig = targetConfig.login;
   ctx.scoutApplied = applied;
   ctx.scoutFallbackStart = applied.start ? fallbackStart : null;
+  ctx.scoutCacheFile = scout._cacheFile ?? null;
 
   const appliedDesc = [
     applied.start ? `启动 ${scout.start.cmd} ${scout.start.args.join(" ")}`.trim() : null,
@@ -365,13 +367,26 @@ async function stageScout(ctx, targetConfig) {
     notes: scout.notes ?? [],
     warnings: scout.warnings ?? [],
     cached: !!scout.cached,
+    cacheSource: scout.cacheSource ?? null,
+    cachedAt: scout.savedAt ?? null,
     durationMs: scout.durationMs ?? null,
     evidenceFiles: scout.evidenceFiles ?? [],
     evidenceChars: scout.evidenceChars ?? 0,
     usage: scout.usage ?? null,
     verified: { start: false, login: false },
+    rejectedStart: scout.rejectedStart ?? null,
   };
   pushView(ctx);
+  if (scout.cached) {
+    emit(ctx, {
+      kind: "scout",
+      severity: SEVERITY.INFO,
+      message: `命中${scout.cacheSource === "disk" ? "磁盘" : "内存"}侦察缓存（${
+        scout.savedAt ? new Date(scout.savedAt).toISOString() : "保存时间未知"
+      }），复用后仍会实际启动/登录验证`,
+      data: { cacheSource: scout.cacheSource ?? null, savedAt: scout.savedAt ?? null },
+    });
+  }
   emit(ctx, {
     kind: "scout",
     severity: appliedDesc.length ? SEVERITY.SUCCESS : SEVERITY.INFO,
@@ -833,6 +848,7 @@ async function stageReproduce(ctx) {
   let pre = null;
   if (hasLocalProbes) {
     await runPrepare(ctx, { cwd: ctx.projectRoot, label: "原始工作区" });
+    if (ctx.scoutApplied?.start) recordScoutVerification(ctx, { start: false });
     let target;
     try {
       target = await spawnTarget(ctx, { cwd: ctx.projectRoot, label: "原始工作区（修复前）", role: "target-pre" });
@@ -852,6 +868,7 @@ async function stageReproduce(ctx) {
       ctx.targetConfig.startSource = ctx.scoutFallbackStart.startSource;
       ctx.scoutApplied.start = false;
       ctx.scoutFallbackStart = null;
+      recordScoutVerification(ctx, { start: false, rejectedStart: attempted });
       if (ctx.view.llm) {
         ctx.view.llm.rejectedStart = attempted;
         pushView(ctx);
@@ -862,6 +879,7 @@ async function stageReproduce(ctx) {
     ctx.view.targets.original = { ...target, role: "原始工作区（修复前）" };
     pushView(ctx);
     if (ctx.scoutApplied?.start) {
+      recordScoutVerification(ctx, { start: true });
       ctx.view.llm.verified.start = true;
       pushView(ctx);
       emit(ctx, {
@@ -873,10 +891,19 @@ async function stageReproduce(ctx) {
       });
     }
 
-    pre = await runPhase(ctx, { phase: "pre", baseUrl: target.url });
+    if (ctx.scoutApplied?.login) recordScoutVerification(ctx, { login: false });
+    try {
+      pre = await runPhase(ctx, { phase: "pre", baseUrl: target.url });
+    } catch (e) {
+      if (ctx.scoutApplied?.login) recordScoutVerification(ctx, { login: !!ctx._loginVerified });
+      throw e;
+    }
     ctx.pushEvidence(pre.evidence);
     ctx.view.phases.pre = pre.summary;
     ctx.view.baseline = acceptanceVerdict(pre.summary);
+    if (ctx.scoutApplied?.login) {
+      recordScoutVerification(ctx, { login: !!ctx._loginVerified });
+    }
     if (ctx.scoutApplied?.login && ctx._loginVerified) {
       ctx.view.llm.verified.login = true;
       pushView(ctx);

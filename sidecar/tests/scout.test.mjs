@@ -1,11 +1,15 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   sanitizeStart,
   sanitizeLogin,
   validateScoutResult,
   runScout,
   applyScoutResult,
+  recordScoutVerification,
   clearScoutCache,
 } from "../lib/scout.mjs";
 import { analyzeProject } from "../lib/analyzer.mjs";
@@ -58,6 +62,20 @@ const FILES = {
     "app.get('/api/items', (req, res) => res.json({ items: [] }));",
   ].join("\n"),
 };
+
+function tempDataDir() {
+  const dir = mkdtempSync(join(tmpdir(), "gb-scout-"));
+  const saved = process.env.GUARDBUILD_DATA_DIR;
+  process.env.GUARDBUILD_DATA_DIR = dir;
+  return {
+    dir,
+    restore() {
+      if (saved == null) delete process.env.GUARDBUILD_DATA_DIR;
+      else process.env.GUARDBUILD_DATA_DIR = saved;
+      rmSync(dir, { recursive: true, force: true });
+    },
+  };
+}
 
 const LLM_JSON = JSON.stringify({
   start: { cmd: "node", args: ["server.js"], env: { PORT: "${GB_PORT}" }, readyPattern: "listening" },
@@ -139,6 +157,7 @@ test("validateScoutResult：丢弃无法定位的路由，保留查询参数路�
 
 test("runScout：无 key 返回 null；有 chat 注入时校验、缓存且只调用一次", async () => {
   clearScoutCache();
+  const temp = tempDataDir();
   const saved = process.env.DEEPSEEK_API_KEY;
   try {
     delete process.env.DEEPSEEK_API_KEY;
@@ -172,6 +191,125 @@ test("runScout：无 key 返回 null；有 chat 注入时校验、缓存且只�
     assert.equal(chatCalls, 1);
   } finally {
     clearScoutCache();
+    temp.restore();
+    if (saved == null) delete process.env.DEEPSEEK_API_KEY;
+    else process.env.DEEPSEEK_API_KEY = saved;
+  }
+});
+
+test("runScout：侦察结果落盘，无密钥时仍可跨会话复用", async () => {
+  clearScoutCache();
+  const temp = tempDataDir();
+  const saved = process.env.DEEPSEEK_API_KEY;
+  try {
+    process.env.DEEPSEEK_API_KEY = "test-key";
+    let chatCalls = 0;
+    const chatImpl = async () => {
+      chatCalls++;
+      return { content: LLM_JSON, model: "deepseek-chat", usage: { prompt_tokens: 1, total_tokens: 2 } };
+    };
+    const first = await runScout(makeRpcCtx({ files: FILES }).ctx, {
+      getToken: async () => "t",
+      chatImpl,
+      model: "deepseek-chat",
+    });
+    assert.equal(first.cached, false);
+    assert.ok(first._cacheFile && existsSync(first._cacheFile));
+    const cachedJson = readFileSync(first._cacheFile, "utf8");
+    assert.ok(!cachedJson.includes("test-key"));
+    assert.ok(!cachedJson.includes("alice"));
+    const cachedData = JSON.parse(cachedJson);
+    assert.equal(cachedData.identities, undefined);
+    assert.equal(cachedData.version, "scout-v1");
+    assert.equal(cachedData.start.cmd, "node");
+    assert.equal(cachedData.login.path, "/api/login");
+    assert.equal(cachedData.verified.start, null);
+    assert.equal(cachedData.verified.login, null);
+
+    clearScoutCache();
+    delete process.env.DEEPSEEK_API_KEY;
+    const second = await runScout(makeRpcCtx({ files: FILES }).ctx, {
+      getToken: async () => "t",
+      chatImpl,
+      model: "deepseek-chat",
+    });
+    assert.equal(second.cached, true);
+    assert.equal(second.cacheSource, "disk");
+    assert.equal(second.start.cmd, "node");
+    assert.equal(second.login.path, "/api/login");
+    assert.equal(chatCalls, 1);
+  } finally {
+    clearScoutCache();
+    temp.restore();
+    if (saved == null) delete process.env.DEEPSEEK_API_KEY;
+    else process.env.DEEPSEEK_API_KEY = saved;
+  }
+});
+
+test("recordScoutVerification：启动验证失败写回缓存，下次忽略该启动方式", async () => {
+  clearScoutCache();
+  const temp = tempDataDir();
+  const saved = process.env.DEEPSEEK_API_KEY;
+  try {
+    process.env.DEEPSEEK_API_KEY = "test-key";
+    const { ctx } = makeRpcCtx({ files: FILES });
+    const first = await runScout(ctx, {
+      getToken: async () => "t",
+      chatImpl: async () => ({ content: LLM_JSON, model: "deepseek-chat" }),
+      model: "deepseek-chat",
+    });
+    ctx.scoutCacheFile = first._cacheFile;
+    assert.equal(recordScoutVerification(ctx, { start: false, login: true }), true);
+    const savedData = JSON.parse(readFileSync(first._cacheFile, "utf8"));
+    assert.equal(savedData.verified.start, false);
+    assert.equal(savedData.verified.login, true);
+
+    clearScoutCache();
+    delete process.env.DEEPSEEK_API_KEY;
+    const second = await runScout(makeRpcCtx({ files: FILES }).ctx, {
+      getToken: async () => "t",
+      model: "deepseek-chat",
+    });
+    assert.equal(second.cached, true);
+    assert.equal(second.start, null);
+    assert.equal(second.login.path, "/api/login");
+    assert.ok(second.warnings.some((w) => w.includes("启动验证") && w.includes("已忽略")));
+  } finally {
+    clearScoutCache();
+    temp.restore();
+    if (saved == null) delete process.env.DEEPSEEK_API_KEY;
+    else process.env.DEEPSEEK_API_KEY = saved;
+  }
+});
+
+test("runScout：证据变化使磁盘缓存失效", async () => {
+  clearScoutCache();
+  const temp = tempDataDir();
+  const saved = process.env.DEEPSEEK_API_KEY;
+  try {
+    process.env.DEEPSEEK_API_KEY = "test-key";
+    let chatCalls = 0;
+    const chatImpl = async () => {
+      chatCalls++;
+      return { content: LLM_JSON, model: "deepseek-chat" };
+    };
+    await runScout(makeRpcCtx({ files: FILES }).ctx, {
+      getToken: async () => "t",
+      chatImpl,
+      model: "deepseek-chat",
+    });
+    clearScoutCache();
+    const changed = { ...FILES, "server.js": `${FILES["server.js"]}\n// changed` };
+    const second = await runScout(makeRpcCtx({ files: changed }).ctx, {
+      getToken: async () => "t",
+      chatImpl,
+      model: "deepseek-chat",
+    });
+    assert.equal(second.cached, false);
+    assert.equal(chatCalls, 2);
+  } finally {
+    clearScoutCache();
+    temp.restore();
     if (saved == null) delete process.env.DEEPSEEK_API_KEY;
     else process.env.DEEPSEEK_API_KEY = saved;
   }

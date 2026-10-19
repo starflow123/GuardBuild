@@ -62,7 +62,7 @@ npm run app:build      # 构建（--no-bundle）
 npm run host:headless  # 构建无头宿主（--no-default-features）
 npm run e2e            # 主工作流 E2E（31 断言，自动生成 .demo 演示目标）
 npm run e2e:gate       # CI gate 演练（51 断言，7 轮裁决 + 报告产物）
-npm run e2e:llm        # LLM 接入侦察演练（27 断言，本机 mock DeepSeek，无需真实密钥）
+npm run e2e:llm        # LLM 接入侦察演练（40 断言，本机 mock DeepSeek，含无密钥磁盘缓存复用轮）
 npm run seed-demo      # 单独生成演示工作区 .demo/vibeshop（供桌面端手动演练）
 
 # 单元测试
@@ -143,7 +143,9 @@ npm run e2e:llm                # 本机 mock DeepSeek 演练，无需真实密�
 - 四道验证关：结构白名单 → 路由文件可定位 → 实际启动成功 → 实际登录成功；任一失败都会回退到确定性流程，不中止会话
 - 安全边界：只发送目录树与脱敏源码片段，**不发送 `guardbuild.json`（含测试身份）、`.env`、密钥/锁文件**；出站统一走 Host 的 `net.egress`（仅预声明主机 + https）；密钥不写入契约、日志、证据与报告
 - 裁决边界：LLM 不判定漏洞、不生成身份、不参与补丁；其路由线索只用于定位动态探测目标，修复阶段跳过（攻击复现后裁决为 `vulnerable_unfixed`，需人工修复）
-- 可观测：事件流与视图 `llm` 字段记录 model / 证据文件 / 路由数 / 应用与验证结果 / token 用量；侦察结果按内容哈希缓存 30 分钟
+- 可观测：事件流与视图 `llm` 字段记录 model / 证据文件 / 路由数 / 应用与验证结果 / token 用量；报告 `report.json` 与 `report.md` 的「LLM 接入侦察」段同步记录缓存来源、实际启动/登录验证与被拒绝的启动方式；GUI 增加「LLM 接入侦察」面板
+- 侦察缓存：结果写入 `GUARDBUILD_DATA_DIR/scout/<项目哈希>/<证据哈希>.json`，**不写入被检项目**；有效期 7 天、每个项目最多 20 份；缓存键包含模型与证据树/文件内容，源码或契约变化会自动失效；载入时重新跑结构白名单与路由可定位校验，并再次实际启动/登录验证；上次启动验证失败的启动方式会被忽略；缓存只含脱敏契约，不含密钥、提示词或身份凭证
+- 无密钥复用：同一项目命中磁盘缓存时，即使未设置 `DEEPSEEK_API_KEY` 也能复用侦察契约并完成实际验证，事件流与视图标记 `cacheSource=disk`
 - 环境变量：`DEEPSEEK_API_KEY`（必需）、`DEEPSEEK_BASE_URL`（测试/代理端点）、`DEEPSEEK_MODEL`（缺省 `deepseek-chat`）；Host 启动 Sidecar 时只透传这三个与 `GUARDBUILD_LLM_SCOUT`，不会进入目标进程环境
 
 ## CI 门禁接入（GitHub Actions）

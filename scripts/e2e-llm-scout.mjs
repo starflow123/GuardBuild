@@ -10,17 +10,20 @@
  *   —— 攻击（越权读 + 越权取消）已复现，但 LLM 路由线索只用于定位探测目标，
  *      不参与自动改码，必须人工修复。
  *
+ * 第二轮 r2 关闭 mock 且不提供密钥：验证侦察契约从磁盘缓存复用，
+ * 仍会实际启动/登录验证，报告与视图标记 cacheSource=disk。
+ *
  * 同时校验安全边界：
  *   - 侦察请求经 Host 出站，带 Bearer 鉴权；密钥只从环境变量读取；
  *   - 发送给 LLM 的证据不含 identities / 密码 / 任何密钥；
- *   - 密钥真实值不出现在报告、事件流与 stderr。
+ *   - 密钥真实值不出现在报告、事件流、stderr 与缓存文件。
  *
  * 用法: node scripts/e2e-llm-scout.mjs
  */
 import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { createServer } from "node:http";
-import { cpSync, existsSync, mkdirSync, readFileSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -218,8 +221,21 @@ function readReport(round) {
   try { return JSON.parse(readFileSync(p, "utf8")); } catch { return null; }
 }
 
+function findScoutCacheFiles() {
+  const root = path.join(dataDir, "scout");
+  if (!existsSync(root)) return [];
+  const out = [];
+  for (const proj of readdirSync(root)) {
+    const dir = path.join(root, proj);
+    for (const f of readdirSync(dir)) {
+      if (f.endsWith(".json")) out.push(path.join(dir, f));
+    }
+  }
+  return out;
+}
+
 async function main() {
-  console.log("[LLM] 0/1 准备演示目录…");
+  console.log("[LLM] 0/2 准备演示目录…");
   rmSync(demoDir, { recursive: true, force: true });
   mkdirSync(dataDir, { recursive: true });
   if (!existsSync(exe)) throw new Error(`未找到无头宿主: ${exe}（先 cargo build --no-default-features --bin guardbuild-headless）`);
@@ -228,7 +244,7 @@ async function main() {
   const { server, port: mockPort, state } = await startMockLlm();
   let r1;
   try {
-    console.log("\n[LLM] 1/1 未知框架 + mock DeepSeek：期望 exit 1（漏洞复现但无自动补丁）…");
+    console.log("\n[LLM] 1/2 未知框架 + mock DeepSeek：期望 exit 1（漏洞复现但无自动补丁）…");
     r1 = await runGate(ws, "r1", {
       DEEPSEEK_API_KEY: MOCK_KEY,
       DEEPSEEK_BASE_URL: `http://127.0.0.1:${mockPort}/v1`,
@@ -236,6 +252,12 @@ async function main() {
   } finally {
     await new Promise((r) => server.close(r));
   }
+
+  console.log("\n[LLM] 2/2 关闭 mock 且不提供密钥：期望命中磁盘缓存并仍实际验证…");
+  const r2 = await runGate(ws, "r2", {
+    DEEPSEEK_API_KEY: "",
+    DEEPSEEK_BASE_URL: "",
+  });
 
   const g1 = r1.gate ?? {};
   check("退出码 = 1（漏洞证据成立）", r1.code === 1, `code=${r1.code}`);
@@ -320,6 +342,17 @@ async function main() {
     `outcome=${rep?.verdict?.outcome} patch=${rep?.patch ? "有" : "无"}`
   );
   check(
+    "报告写入 LLM 侦察字段（本次调用、已验证、证据/用量）",
+    rep?.llm?.used === true &&
+      rep.llm.source === "llm-scout" &&
+      rep.llm.cached === false &&
+      rep.llm.verified?.start === true &&
+      rep.llm.verified?.login === true &&
+      (rep.llm.evidenceFiles ?? []).includes("lib/app.mjs") &&
+      Number(rep.llm.usage?.total_tokens ?? 0) > 0,
+    `used=${rep?.llm?.used} cached=${rep?.llm?.cached} verified=${JSON.stringify(rep?.llm?.verified)}`
+  );
+  check(
     "报告记录 LLM 推断的启动契约（startSource=llm-scout）",
     rep?.summary?.startSource === "llm-scout" &&
       rep?.summary?.start?.cmd === "node" &&
@@ -353,8 +386,74 @@ async function main() {
   check("DB：未写入补丁记录", patchN === 0, `patches=${patchN}`);
   check("DB：pre 攻击证据入库（≥ 2）", preVulnN >= 2, `pre vulnerable=${preVulnN}`);
 
+  // ---------- 第二轮：无密钥 / 无 mock 的磁盘缓存复用 ----------
+  const g2 = r2.gate ?? {};
+  check("r2 无密钥仍 exit 1（缓存契约 + 实际复现）", r2.code === 1, `code=${r2.code}`);
+  check(
+    "r2 verdict=vulnerable_unfixed",
+    g2.verdict === "vulnerable_unfixed" && g2.error?.code === "no_patchable_candidates",
+    `verdict=${g2.verdict} code=${g2.error?.code}`
+  );
+  check("r2 未再调用 LLM（mock 请求数仍为 1）", state.calls === 1, `calls=${state.calls}`);
+  check("r2 事件流提示命中磁盘侦察缓存", r2.stdout.includes("命中磁盘侦察缓存"), "");
+  const view2 = lastView(r2.stdout) ?? {};
+  const llm2 = view2.llm ?? {};
+  check(
+    "r2 视图标记磁盘缓存与保存时间",
+    llm2.used === true && llm2.cached === true && llm2.cacheSource === "disk" && Number(llm2.cachedAt) > 0,
+    `cached=${llm2.cached} source=${llm2.cacheSource} at=${llm2.cachedAt}`
+  );
+  check(
+    "r2 缓存契约仍经实际启动+登录验证",
+    llm2.verified?.start === true && llm2.verified?.login === true,
+    `verified=${JSON.stringify(llm2.verified)}`
+  );
+  check(
+    "r2 侦察事件确认实际启动/登录验证",
+    r2.stdout.includes("LLM 启动契约已验证") && r2.stdout.includes("LLM 登录契约已验证"),
+    ""
+  );
+  const rep2 = readReport("r2");
+  check(
+    "r2 报告记录缓存来源与验证结果",
+    rep2?.llm?.used === true &&
+      rep2.llm.cached === true &&
+      rep2.llm.cacheSource === "disk" &&
+      Number(rep2.llm.cachedAt) > 0 &&
+      rep2.llm.verified?.start === true &&
+      rep2.llm.verified?.login === true &&
+      rep2.summary?.startSource === "llm-scout",
+    `cached=${rep2?.llm?.cached} source=${rep2?.llm?.cacheSource} verified=${JSON.stringify(rep2?.llm?.verified)}`
+  );
+  const rep2Vuln = (rep2?.evidence?.pre ?? []).filter((e) => e.verdict === "vulnerable");
+  check("r2 报告仍复现越权证据（≥ 2）", rep2Vuln.length >= 2, `vulnerable=${rep2Vuln.length}`);
+
+  const cacheFiles = findScoutCacheFiles();
+  const cacheBlob = cacheFiles.map((f) => readFileSync(f, "utf8")).join("\n");
+  check("侦察缓存落盘到数据目录（非目标项目）", cacheFiles.length >= 1, cacheFiles.join(" | "));
+  check(
+    "缓存不含密钥/身份凭证",
+    !cacheBlob.includes(MOCK_KEY) &&
+      !cacheBlob.includes("alice@llm.shop") &&
+      !cacheBlob.includes("alice123") &&
+      !cacheBlob.includes("bob123"),
+    ""
+  );
+  check(
+    "缓存写回实际验证结果（start + login）",
+    cacheFiles.some((f) => {
+      try {
+        const d = JSON.parse(readFileSync(f, "utf8"));
+        return d.verified?.start === true && d.verified?.login === true;
+      } catch {
+        return false;
+      }
+    }),
+    ""
+  );
+
   // ---------- 密钥不泄漏 ----------
-  const blob = [JSON.stringify(rep ?? {}), md, r1.stdout, r1.stderr].join("\n");
+  const blob = [JSON.stringify(rep ?? {}), md, r1.stdout, r1.stderr, JSON.stringify(rep2 ?? {}), r2.stdout, r2.stderr].join("\n");
   check("mock 密钥不进入报告/事件流/stderr", !blob.includes(MOCK_KEY), "");
 
   const passed = checks.filter((c) => c.pass).length;

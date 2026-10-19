@@ -1,13 +1,26 @@
 /**
  * 报告渲染器：把会话视图渲染为 report.json + report.md，经 report.emit 交由
  * Host 校验（会话一致性、大小上限）并写入 report_dir。
- *
- * 时序约定：调用方必须在 setState(终态) 之前 await emitReport——
- * report.emit 是「请求-应答」调用，Host 响应返回即代表文件已落盘，
- * 因此 gate 观察到终态时报告必然已经存在（不受通知并行处理影响）。
- *
- * 渲染失败不影响工作流裁决：内部捕获并降级为 warn 事件。
  */
+
+/** 为每条 vulnerable 证据生成可直接复制的 curl 复现命令 */
+function buildPocList(preEvidence, baseUrl) {
+  return preEvidence
+    .filter((e) => e.verdict === "vulnerable")
+    .map((e) => {
+      const method = (e.method ?? "GET").toUpperCase();
+      const url = `${baseUrl ?? ""}${e.endpoint ?? ""}`;
+      const headers = e.identity ? `-H "Authorization: Bearer <${e.identity}_token>"` : "";
+      const body = e.body ? `-H "Content-Type: application/json" -d '${typeof e.body === "string" ? e.body : JSON.stringify(e.body)}'` : "";
+      return {
+        id: e.caseId ?? null,
+        name: e.name ?? "",
+        severity: "high",
+        curl: `curl -X ${method} ${url} ${headers} ${body}`.replace(/\s+/g, " ").trim(),
+      };
+    });
+}
+
 import { PROTOCOL_VERSION, RPC_TO_HOST, SEVERITY, STATE_LABELS } from "../../shared/protocol.mjs";
 
 const MD_EVIDENCE_CAP = 20;
@@ -339,6 +352,7 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
       : null,
     supabase,
     evidence: { pre: byPhase("pre"), post: byPhase("post"), postWriteback: byPhase("post_writeback") },
+    poc: buildPocList(byPhase("pre"), view.targets?.original?.url),
     patch: view.patch
       ? {
           hash: view.patch.hash,

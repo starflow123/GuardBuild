@@ -1,0 +1,16 @@
+{
+  "_note": "SENTINEL_GUARDBUILD_CONTRACT_MUST_NOT_BE_SENT_TO_LLM",
+  "responses": { "list": "data.items", "entity": "data" },
+  "identities": [
+    { "name": "alice", "email": "alice@llm.shop", "password": "alice123", "role": "user" },
+    { "name": "bob", "email": "bob@llm.shop", "password": "bob123", "role": "user" }
+  ],
+  "llm": { "enabled": true },
+  "scopes": [
+    "project.read",
+    "worktree.write",
+    "proc.spawn",
+    "net.probe",
+    "net.egress:api.deepseek.com"
+  ]
+}

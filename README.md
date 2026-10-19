@@ -61,7 +61,8 @@ npm run app:build      # 构建（--no-bundle）
 # 无头验收（零 npm 依赖：构建宿主后即可运行）
 npm run host:headless  # 构建无头宿主（--no-default-features）
 npm run e2e            # 主工作流 E2E（31 断言，自动生成 .demo 演示目标）
-npm run e2e:gate       # CI gate 演练（34 断言，5 轮裁决 + 报告产物）
+npm run e2e:gate       # CI gate 演练（51 断言，7 轮裁决 + 报告产物）
+npm run e2e:llm        # LLM 接入侦察演练（27 断言，本机 mock DeepSeek，无需真实密钥）
 npm run seed-demo      # 单独生成演示工作区 .demo/vibeshop（供桌面端手动演练）
 
 # 单元测试
@@ -109,6 +110,7 @@ npm run test:rust      # Rust Host
 - `responses`：声明列表 / 单体资源在响应 JSON 中的位置（点路径，如 `data.items`）；不声明时自适应——列表找「顶层数组 → 首个含 `id` 的对象数组」，单体找「首个对象值字段 → 响应自身」；资源名参与用例文案（`order` 显示为「订单」）
 - `identities`：支持 `username` / `email` / 自定义 `fields` 三种形状；至少 2 个，否则回退到内置演示身份；`role: "admin"` 的身份用于管理端用例
 - `scopes`：仅 CI gate 模式读取，作为「预声明授权」白名单；桌面模式不生效（仍逐次征求用户授权）
+- `llm`：可选接入侦察开关（`enabled` / `model` / `maxFiles`），默认关闭；启用与安全边界见下节
 
 **真实项目接入的常见准备**：
 
@@ -120,6 +122,29 @@ npm run test:rust      # Rust Host
 - Windows 上 `npm` / `npx` 等 `.cmd` shim 自动解析（沿 `PATH` × `PATHEXT` 查找），契约里直接写 `npm` / `npx` 即可
 - 服务硬编码端口、启动脚本不支持 `PORT=0`、或就绪行只打印字面量端口 → 契约改用 `${GB_PORT}` 槽位（宿主分配空闲端口注入，解析不到就绪端口时直接回退到分配值）
 - 目标项目不是 git 仓库 / 尚无提交基线 → 修复阶段会在创建隔离 worktree 前预检并给出明确指引（`git init && git add -A && git commit -m baseline`）
+
+### 可选：LLM 接入侦察（未知框架兜底）
+
+静态适配器认不出的自定义路由表 / 启动方式，可让 DeepSeek 只做「接入侦察」：读取脱敏后的目录树与少量源码片段，推断启动命令、登录请求形态与可寻址路由。默认关闭，必须显式开启：
+
+```json
+{
+  "llm": { "enabled": true, "model": "deepseek-chat", "maxFiles": 8 },
+  "scopes": ["project.read", "worktree.write", "proc.spawn", "net.probe", "net.egress:api.deepseek.com"]
+}
+```
+
+```bash
+export DEEPSEEK_API_KEY=...    # 只放环境变量；也可用 GUARDBUILD_LLM_SCOUT=1 临时开启
+npm run e2e:llm                # 本机 mock DeepSeek 演练，无需真实密钥
+```
+
+- 优先级：显式契约（`start` / `login` / `routes`）> 确定性自动探测 > LLM 侦察；LLM 只补缺，不覆盖已有声明
+- 四道验证关：结构白名单 → 路由文件可定位 → 实际启动成功 → 实际登录成功；任一失败都会回退到确定性流程，不中止会话
+- 安全边界：只发送目录树与脱敏源码片段，**不发送 `guardbuild.json`（含测试身份）、`.env`、密钥/锁文件**；出站统一走 Host 的 `net.egress`（仅预声明主机 + https）；密钥不写入契约、日志、证据与报告
+- 裁决边界：LLM 不判定漏洞、不生成身份、不参与补丁；其路由线索只用于定位动态探测目标，修复阶段跳过（攻击复现后裁决为 `vulnerable_unfixed`，需人工修复）
+- 可观测：事件流与视图 `llm` 字段记录 model / 证据文件 / 路由数 / 应用与验证结果 / token 用量；侦察结果按内容哈希缓存 30 分钟
+- 环境变量：`DEEPSEEK_API_KEY`（必需）、`DEEPSEEK_BASE_URL`（测试/代理端点）、`DEEPSEEK_MODEL`（缺省 `deepseek-chat`）；Host 启动 Sidecar 时只透传这三个与 `GUARDBUILD_LLM_SCOUT`，不会进入目标进程环境
 
 ## CI 门禁接入（GitHub Actions）
 
@@ -145,7 +170,7 @@ npm run test:rust      # Rust Host
 
 ## 安全模型
 
-- **作用域令牌**：`project.read`（限定根目录）/ `worktree.write`（仅临时工作树）/ `proc.spawn`（可执行与参数白名单）/ `net.probe`（仅回环）/ `workspace.write`（绑定补丁哈希，仅 UI 批准后签发）/ `workspace.rollback`（绑定备份 ID，仅 UI 触发）
+- **作用域令牌**：`project.read`（限定根目录）/ `worktree.write`（仅临时工作树）/ `proc.spawn`（可执行与参数白名单）/ `net.probe`（仅回环）/ `net.egress`（仅预声明的 HTTPS 主机，LLM 接入侦察用）/ `workspace.write`（绑定补丁哈希，仅 UI 批准后签发）/ `workspace.rollback`（绑定备份 ID，仅 UI 触发）
 - **写回保护**：写回前自动备份原文件；回滚按备份恢复，冲突文件不覆盖；gate 模式在 Host 层直接拒绝写回
 - **凭证保护**：目标身份凭证直接存入 Host 保险库，不流经 Sidecar；日志全量脱敏
 - **全程留痕**：授权与审批写入 SQLite（`approvals.via` 区分 `user-consent` / `auto-consent` / `policy` / `gate-policy`）

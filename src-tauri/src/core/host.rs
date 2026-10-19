@@ -291,12 +291,21 @@ impl Host {
         if let Some(parent) = cfg.sidecar_path.parent() {
             cmd.current_dir(parent);
         }
-        let extra = vec![
+        let mut extra = vec![
             ("GUARDBUILD_PROTOCOL_VERSION".to_string(), PROTOCOL_VERSION.to_string()),
             ("GUARDBUILD_APP_VERSION".to_string(), cfg.app_version.clone()),
             ("GUARDBUILD_DATA_DIR".to_string(), cfg.data_dir.to_string_lossy().to_string()),
             ("GUARDBUILD_AUTO_CONSENT".to_string(), if cfg.auto_consent { "1".into() } else { "0".into() }),
         ];
+        // 接入侦察的可选配置：密钥只从宿主进程环境透传给 Sidecar（侧车再经 net.egress
+        // 请求 Host 出站），绝不写入 cfg / 日志 / 报告，也不进入目标进程环境。
+        for key in ["DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL", "GUARDBUILD_LLM_SCOUT"] {
+            if let Ok(v) = std::env::var(key) {
+                if !v.trim().is_empty() {
+                    extra.push((key.to_string(), v));
+                }
+            }
+        }
         for (k, v) in procops::sanitized_env(&extra) {
             cmd.env(k, v);
         }
@@ -1274,6 +1283,8 @@ impl Host {
             credential_prefix: Option<String>,
             #[serde(default)]
             redact: Option<bool>,
+            #[serde(default, rename = "timeoutMs")]
+            timeout_ms: Option<u64>,
         }
         let p: P = jget(&params)?;
         let _ = self.session_of_token(&p.token)?;
@@ -1318,7 +1329,7 @@ impl Host {
             &p.method.to_uppercase(),
             &headers,
             p.body.as_deref(),
-            Duration::from_secs(15),
+            Duration::from_millis(p.timeout_ms.unwrap_or(15_000).clamp(1_000, 120_000)),
         )?;
 
         // 提取并入库身份凭证（响应中的凭证不会流出 Host）

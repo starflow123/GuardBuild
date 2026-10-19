@@ -1,0 +1,7 @@
+{
+  "name": "llm-scout-shop",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "未知框架靶场：无 package scripts/main、无框架装饰器，启动/登录/路由只能靠 LLM 接入侦察或人工契约"
+}

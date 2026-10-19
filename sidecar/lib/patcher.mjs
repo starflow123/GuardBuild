@@ -134,12 +134,41 @@ export async function createPatch(ctx) {
     });
   }
 
-  // 2. 按文件分组候选，逐一生成定向替换
+  // 2. 按文件分组候选，逐一生成定向替换。
+  //    外部线索（OpenAPI / guardbuild.json routes）来源的候选没有代码文件位置，
+  //    无法生成定向补丁——证据已在 probe 阶段固化，此处只记录跳过原因。
   const byFile = new Map();
+  const externalSkipped = [];
   for (const c of candidates) {
+    if (!c.file || c.source === "openapi" || c.source === "routes" || c.source === "llm-scout") {
+      externalSkipped.push({
+        method: c.method,
+        path: c.fullPath ?? c.path,
+        source: c.source ?? "unknown",
+        reason:
+          c.source === "llm-scout"
+            ? "候选来自 LLM 接入侦察（仅用于定位动态探测目标），不参与自动改码"
+            : "候选来自外部路由线索（OpenAPI/手工声明），无代码文件位置，跳过自动补丁",
+      });
+      continue;
+    }
     const arr = byFile.get(c.file) ?? [];
     arr.push(c);
     byFile.set(c.file, arr);
+  }
+  if (externalSkipped.length > 0) {
+    ctx.emit({
+      kind: "patch",
+      severity: SEVERITY.WARN,
+      message: `${externalSkipped.length} 个候选来自外部/LLM 路由线索，无法生成自动补丁（需人工修复）`,
+      data: { skipped: externalSkipped },
+    });
+  }
+  if (byFile.size === 0) {
+    throw new PatchError("攻击证据已建立，但候选均无代码位置可定位（全部来自 OpenAPI/手工路由线索）", {
+      code: "no_patchable_candidates",
+      hint: "自动补丁需要静态分析定位到具体文件行号；请在目标项目里找到对应 handler 手动加归属校验，或提供带代码路径的 routes 线索（LLM 侦察线索只用于定位探测目标，不参与自动改码）",
+    });
   }
 
   const filePatches = [];

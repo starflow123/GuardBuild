@@ -34,7 +34,7 @@ function headline(outcome, patchStatus, supabase) {
         ? "发现可利用的对象级越权（IDOR）漏洞；修复补丁未通过双重验收，需人工审查证据"
         : "发现可利用的对象级越权（IDOR）漏洞，已生成双重验收通过的修复补丁（gate 未写回工作区）";
     case "no_candidates":
-      return "静态分析未发现可探测的安全候选端点（对象级越权 / 注入 / 路径穿越线索）";
+      return "静态分析未发现可探测的安全候选端点（对象级越权 / 注入 / 路径穿越线索）。若项目是未识别框架，可在 guardbuild.json 提供 openapi.file 或 routes 字段声明路由后重试";
     case "vulnerable_unfixed":
       if (supaCritical) {
         return supabase.leaks > 0

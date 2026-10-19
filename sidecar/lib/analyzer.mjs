@@ -18,6 +18,8 @@ import {
   PUBLIC_PATH,
   OWNER_FILTER,
   FS_READ_SINK,
+  XSS_REFLECTION,
+  SSRF_SINK,
   findTraversalSignal,
   findQueryParamSink,
   findSqlInjectionSignal,
@@ -33,7 +35,7 @@ export { braceSpan, findQueryParamSink } from "./signals.mjs";
 
 // `.graphql/.gql` 为 SDL schema 文件：GraphQL 适配器的主要分析对象
 const SOURCE_EXT = [".js", ".mjs", ".cjs", ".ts", ".tsx", ".jsx", ".py", ".graphql", ".gql"];
-const MAX_FILES = 64;
+const MAX_FILES = 200;
 const MAX_FILE_BYTES = 128 * 1024;
 
 // 编译/生成产物目录：同分时让位于真实源码
@@ -687,6 +689,18 @@ export async function analyzeProject(ctx) {
         cmdi,
       });
     }
+
+    // 可疑「反射型 XSS」：响应输出直接拼接请求输入（未转义）
+    // 暂时禁用：动态 oracle 未实现，产出候选会误导。待 probe 加 XSS 反射验证后再开。
+    // if (!s.graphql && XSS_REFLECTION.test(s.text)) {
+    //   candidates.push({ ...ep, kind: "xss-suspect", resource: guessResource(fullPath ?? path, s.text) });
+    // }
+
+    // 可疑「SSRF」：HTTP 客户端参数直接来自请求输入
+    // 暂时禁用：动态 oracle 未实现（需要 net.egress + 外部回调检测）。待实现后再开。
+    // if (!s.graphql && SSRF_SINK.test(s.text)) {
+    //   candidates.push({ ...ep, kind: "ssrf-suspect", resource: guessResource(fullPath ?? path, s.text) });
+    // }
   }
 
   // Supabase / PostgREST 适配器：静态检测（失败不阻塞主流程，密钥值不进入返回值以外展示面）
@@ -747,13 +761,109 @@ export async function analyzeProject(ctx) {
     supabaseServiceRoleLeak: !!supabase?.serviceRoleLeak,
   };
 
+  // 标记适配器来源
+  for (const ep of endpoints) ep.source = ep.source ?? "adapter";
+  for (const c of candidates) c.source = c.source ?? "adapter";
+
+  // ---- 合并外部路由线索：OpenAPI 文件 + guardbuild.json routes 手工声明 ----
+  const externalWarnings = [];
+  const externalEndpoints = [];
+
+  if (ctx.targetConfig?.openapi) {
+    try {
+      const { loadOpenapiEndpoints } = await import("./openapi.mjs");
+      const r = await loadOpenapiEndpoints(ctx, ctx.targetConfig.openapi);
+      externalEndpoints.push(...r.endpoints);
+      externalWarnings.push(...r.warnings);
+    } catch (e) {
+      externalWarnings.push(`OpenAPI 解析失败：${e.message}`);
+    }
+  }
+
+  if (Array.isArray(ctx.targetConfig?.routes)) {
+    for (const r of ctx.targetConfig.routes) {
+      externalEndpoints.push({
+        file: null,
+        startLine: null,
+        method: r.method,
+        style: "routes",
+        path: r.path,
+        mountPrefix: null,
+        fullPath: r.path,
+        routeKeys: [r.path],
+        matchVars: [],
+        hasAuth: r.hasAuth,
+        authSource: r.hasAuth ? "routes-declared" : null,
+        hasOwnerGuard: false,
+        hasRoleGuard: false,
+        hasOwnerFilter: false,
+        sinkCalls: [],
+        trpc: null,
+        graphql: null,
+        source: "routes",
+        resource: r.resource ?? guessResource(r.path, ""),
+        ...(r.query ? { queryParam: { param: r.query, in: "query" } } : {}),
+      });
+    }
+  }
+
+  // LLM 侦察线索：只提供可寻址路由 + 可定位文件，作为动态探测目标；
+  // 归属/鉴权判断仍由 probe 实际发请求验证，不因 LLM 断言而直接定罪。
+  if (Array.isArray(ctx.targetConfig?.llmRoutes)) {
+    for (const r of ctx.targetConfig.llmRoutes) {
+      externalEndpoints.push({
+        file: r.file ?? null,
+        startLine: r.line ?? null,
+        method: r.method,
+        style: "llm-scout",
+        path: r.path,
+        mountPrefix: null,
+        fullPath: r.path,
+        routeKeys: [r.path],
+        matchVars: [],
+        hasAuth: r.hasAuth !== false,
+        authSource: r.hasAuth !== false ? "llm-inferred" : null,
+        hasOwnerGuard: false,
+        hasRoleGuard: false,
+        // 列表路由仅用于动态资源发现；归属过滤由实际响应验证，不据此判定漏洞
+        hasOwnerFilter: r.list === true && r.hasOwnerFilter === true,
+        sinkCalls: [],
+        trpc: null,
+        graphql: null,
+        source: "llm-scout",
+        resource: r.resource ?? guessResource(r.path, ""),
+        ...(r.query ? { queryParam: { param: r.query, in: "query" } } : {}),
+      });
+    }
+  }
+
+  // 去重：按 method + fullPath，已有适配器结果优先
+  const seen = new Set(endpoints.map((e) => `${e.method} ${e.fullPath}`));
+  for (const ep of externalEndpoints) {
+    const key = `${ep.method} ${ep.fullPath}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    endpoints.push(ep);
+    // 外部线索没有代码 sink，直接按"带认证但未见归属校验"报候选；动态 probe 会实际验证
+    const addressable = /:[A-Za-z_]\w*/.test(ep.path) || !!ep.queryParam;
+    if (addressable) {
+      candidates.push({ ...ep, kind: ep.hasAuth ? "idor-suspect" : "no-auth-suspect" });
+    }
+  }
+
   return {
     fileCount: files.length,
     readFiles,
     sections,
     endpoints,
     candidates,
-    diagnostics,
+    diagnostics: {
+      ...diagnostics,
+      endpointsFromOpenapi: ctx.targetConfig?.openapi ? externalEndpoints.filter((e) => e.source === "openapi").length : 0,
+      endpointsFromRoutes: Array.isArray(ctx.targetConfig?.routes) ? externalEndpoints.filter((e) => e.source === "routes").length : 0,
+      endpointsFromLlm: Array.isArray(ctx.targetConfig?.llmRoutes) ? externalEndpoints.filter((e) => e.source === "llm-scout").length : 0,
+      externalWarnings,
+    },
     supabase,
     graphql: graphqlScan.endpoint ? { endpoint: graphqlScan.endpoint, login: graphqlScan.login } : null,
   };

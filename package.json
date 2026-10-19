@@ -24,7 +24,8 @@
     "e2e:nest": "node scripts/e2e-nest.mjs",
     "e2e:trpc": "node scripts/e2e-trpc.mjs",
     "e2e:graphql": "node scripts/e2e-graphql.mjs",
-    "e2e:python": "node scripts/e2e-python.mjs"
+    "e2e:python": "node scripts/e2e-python.mjs",
+    "e2e:llm": "node scripts/e2e-llm-scout.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.9.0",

@@ -16,6 +16,7 @@ guardbuild-data/
 .demo-trpc/
 .demo-graphql/
 .demo-python/
+.demo-llm/
 guardbuild.db*
 *.tsbuildinfo
 

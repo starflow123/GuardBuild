@@ -48,6 +48,16 @@ export const FS_READ_SINK =
 // 请求输入引用：req.query.x / req.params.x / req.body.x / 数组或字面量下标形态
 export const REQ_INPUT = /\breq\s*\.\s*(query|params|body)\b(?:\s*\.\s*([A-Za-z_$][\w$]*)|\[\s*["'`]([^"'`]+)["'`]\s*\])?/;
 
+// —— XSS 反射线索：响应输出 sink 与请求输入在同段代码内合流，且未经转义 ——
+// res.send / res.end / res.json / ctx.body / res.write 直接拼接 req 变量
+export const XSS_REFLECTION =
+  /\b(?:res|response|ctx)\s*\.\s*(?:send|end|write|json)\s*\(\s*[`'"][^`'"]*\$\{\s*req\s*\.\s*(?:query|params|body)|res\s*\.\s*(?:send|end)\s*\(\s*req\s*\.\s*(?:query|params|body)/;
+
+// —— SSRF 线索：HTTP 客户端 sink 的参数直接来自请求输入 ——
+// fetch(url) / axios.get(req.query.url) / http.get(req.params.url)
+export const SSRF_SINK =
+  /\b(?:fetch|axios\s*\.\s*get|axios\s*\.\s*post|http\s*\.\s*get|https\s*\.\s*get|request)\s*\(\s*[^)]*req\s*\.\s*(?:query|params|body)/;
+
 // 现代框架的查询串读取：searchParams.get("x")（Next.js req.nextUrl / URL 解析形态）
 export const SP_GET = /\bsearchParams\s*\.\s*get\s*\(\s*["'`]([^"'`]+)["'`]\s*\)/;
 

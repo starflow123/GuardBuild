@@ -108,6 +108,11 @@ function ownerOf(obj) {
   return obj?.userId ?? obj?.user_id ?? obj?.ownerId ?? obj?.owner_id ?? obj?.uid ?? null;
 }
 
+/** 资源主键读取：兼容 id / userId / user_id / resourceId 命名（响应体字段名不统一） */
+function resourceIdOf(obj) {
+  return obj?.id ?? obj?.resourceId ?? obj?.userId ?? obj?.user_id ?? null;
+}
+
 /** 经 Host 发起一次 HTTP 请求（可携带保险库身份） */
 async function httpJson(ctx, opts) {
   const {
@@ -347,6 +352,8 @@ export async function loginAll(ctx, baseUrl) {
     if (!failed) {
       ctx.plan.loginPath = path;
       ctx.plan.loginCandidates = [path, ...candidates.filter((c) => c !== path)];
+      ctx._loginVerified = true;
+      ctx._loginEndpoint = path;
       return loggedIn;
     }
   }
@@ -816,9 +823,16 @@ function verifyAttack(res, phase, detail, leaked = true) {
         }）`,
       };
     }
+    // pre 阶段：401/403/404 是服务端权限校验生效的硬证据 → 已有防护（静态误报）
+    if (DENIED_STATUS.has(res.status)) {
+      return {
+        verdict: VERDICT.BLOCKED,
+        actual: `HTTP ${res.status}，该端点在修复前即已有访问控制（静态分析误报，无需修复）`,
+      };
+    }
     return {
       verdict: VERDICT.INCONCLUSIVE,
-      actual: `HTTP ${res.status}，攻击在修复前即无法复现（该端点可能已有防护）`,
+      actual: `HTTP ${res.status}，攻击在修复前即无法复现（非权限类错误，原因待查）`,
     };
   }
   if (DENIED_STATUS.has(res.status) || res.graphqlDenied) {
@@ -992,19 +1006,19 @@ export function buildCases(ctx, targets) {
       expect: `越权读取他人${candLabel}应被拒绝（401/403/404）`,
       verify: (res, phase) => {
         const o = extractEntity(res.json, entityPathFor(ctx, cand.graphql));
-        const leaked = o && String(o.id) === String(readTarget.id);
+        const leaked = o && String(resourceIdOf(o)) === String(readTarget.id);
         const detail = leaked
-          ? `证据：返回${candLabel} #${o.id}（归属 ${ownerOf(o)}，金额 ${o.amount}，状态 ${o.status}）`
+          ? `证据：返回${candLabel} #${resourceIdOf(o)}（归属 ${ownerOf(o)}，金额 ${o.amount}，状态 ${o.status}）`
           : "";
         return verifyAttack(res, phase, detail, leaked);
       },
       crossProof: (res) => {
         const o = extractEntity(res.json, entityPathFor(ctx, cand.graphql));
-        if (!o || o.id !== readTarget.id) return null;
+        if (!o || String(resourceIdOf(o)) !== String(readTarget.id)) return null;
         const ownerOk = !victim.user?.id || ownerOf(o) === victim.user.id;
         if (!ownerOk) return null;
         return {
-          note: `响应对象 #${o.id} 与请求目标一致，归属 ${ownerOf(o)}${victim.user?.id ? "（与受害人身份一致）" : ""}`,
+          note: `响应对象 #${resourceIdOf(o)} 与请求目标一致，归属 ${ownerOf(o)}${victim.user?.id ? "（与受害人身份一致）" : ""}`,
         };
       },
       impact: (res) => (okStatus(res.status) ? `可读取他人${candLabel}详情及字段（id/userId/amount/address 等）` : null),
@@ -1591,6 +1605,27 @@ export async function runPhase(ctx, { phase, baseUrl }) {
   await negotiateGraphqlCast(ctx, baseUrl, loggedIn);
   const { byUser, anonymousItems, anonTargets } = await discoverResources(ctx, baseUrl, loggedIn);
   const targets = pickTargets(byUser, loggedIn, anonymousItems, anonTargets);
+  // 身份交叉校验：attacker 与 victim 必须是两个不同用户，否则"越权读他人"用例退化为"读自己"
+  if (targets.attacker && targets.victim) {
+    const aId = targets.attacker.user?.id;
+    const vId = targets.victim.user?.id;
+    if (aId != null && vId != null && String(aId) === String(vId)) {
+      ctx.emit({
+        kind: "discovery",
+        severity: SEVERITY.WARN,
+        message: `attacker(${targets.attacker.name}) 与 victim(${targets.victim.name}) 登录后解析出的用户 id 相同（${aId}），越权用例可能退化为"读自己"。请检查 guardbuild.json 的 identities 是否配置了两个真实不同的账号`,
+        data: { attackerId: aId, victimId: vId },
+      });
+    }
+    const victimItems = byUser[targets.victim.name] ?? [];
+    if (victimItems.length === 0) {
+      ctx.emit({
+        kind: "discovery",
+        severity: SEVERITY.WARN,
+        message: `victim(${targets.victim.name}) 名下未发现任何资源（列表接口返回空），越权读用例将依赖匿名探测兜底；若结果全为 inconclusive，请确认 victim 账号下有可访问数据`,
+      });
+    }
+  }
   const allCases = buildCases(ctx, targets);
   // 修复后验收只覆盖补丁实际修复的类别：注入/穿越无自动修复模板，
   // 若与可修复项混在同一目标中，仍按原样复现会误判「补丁无效」

@@ -19,6 +19,8 @@ import { diagnoseStartFailure } from "./lib/autostart.mjs";
 import { parsePortFromLine, stripAnsi } from "./lib/readyline.mjs";
 import { runPhase, ProbeError } from "./lib/probe.mjs";
 import { runSupabasePhase, isLoopbackHostname } from "./lib/supabase.mjs";
+import { runScout, applyScoutResult } from "./lib/scout.mjs";
+import { isEnabled as llmEnabled } from "./lib/llm.mjs";
 import { createPatch, writebackPatch, rollbackWorkspace, PatchError } from "./lib/patcher.mjs";
 import { emitReport } from "./lib/report.mjs";
 import {
@@ -110,6 +112,7 @@ function createCtx(params) {
       targets: {},
       patch: null,
       supabase: null,
+      llm: null,
       acceptance: null,
       error: null,
     },
@@ -268,6 +271,126 @@ async function ensureSupabaseToken(ctx, rawUrl) {
   );
   ctx.tokens.egressHost = host;
   return ctx.tokens.egress;
+}
+
+/**
+ * LLM 接入侦察（可选）：只在 guardbuild.json 的 llm.enabled=true 或环境变量
+ * GUARDBUILD_LLM_SCOUT=1 时运行。无 key / 无授权 / 超时 / 非法输出一律警告并
+ * 回落到确定性流程，绝不中止会话。
+ */
+async function stageScout(ctx, targetConfig) {
+  const optIn = targetConfig.llm?.enabled === true || process.env.GUARDBUILD_LLM_SCOUT === "1";
+  if (!optIn) return;
+  if (!llmEnabled()) {
+    emit(ctx, {
+      kind: "scout",
+      severity: SEVERITY.WARN,
+      message: "已启用 LLM 接入侦察，但未设置 DEEPSEEK_API_KEY；跳过侦察，继续确定性流程",
+      data: {},
+    });
+    return;
+  }
+
+  const needsStart = targetConfig.startSource !== "contract" && targetConfig.startSource !== "auto";
+  const needsLogin = !targetConfig.login;
+  const needsRoutes = !targetConfig.routes && !targetConfig.openapi;
+  if (!needsStart && !needsLogin && !needsRoutes) {
+    emit(ctx, {
+      kind: "scout",
+      severity: SEVERITY.INFO,
+      message: "显式契约已覆盖启动、登录与路由线索，跳过 LLM 接入侦察",
+      data: {},
+    });
+    return;
+  }
+
+  const model = targetConfig.llm?.model ?? null;
+  emit(ctx, {
+    kind: "scout",
+    severity: SEVERITY.INFO,
+    message: `开始 LLM 接入侦察${model ? `（${model}）` : ""}：只推断启动/登录/路由，不参与漏洞判定`,
+    data: { model, needsStart, needsLogin, needsRoutes },
+  });
+
+  let scout;
+  try {
+    scout = await runScout(ctx, {
+      model,
+      maxFiles: targetConfig.llm?.maxFiles ?? 8,
+      getToken: async (url, reason) => {
+        const { host, scheme } = urlHostAndScheme(url);
+        if (!host) throw new Error(`无法解析 LLM 端点主机：${url}`);
+        if (isLoopbackHostname(host)) {
+          if (!ctx.tokens.net) {
+            ctx.tokens.net = await requestScope(ctx, SCOPE_KINDS.NET_PROBE, "向本机回环的 LLM 测试服务发送请求");
+          }
+          return ctx.tokens.net;
+        }
+        if (scheme !== "https") throw new Error("LLM 端点必须是 https（仅回环测试允许明文 http）");
+        if (ctx.tokens.egress && ctx.tokens.egressHost === host) return ctx.tokens.egress;
+        const token = await requestScope(ctx, SCOPE_KINDS.NET_EGRESS, reason, host);
+        ctx.tokens.egress = token;
+        ctx.tokens.egressHost = host;
+        return token;
+      },
+    });
+  } catch (e) {
+    emit(ctx, {
+      kind: "scout",
+      severity: SEVERITY.WARN,
+      message: `LLM 接入侦察失败，继续确定性流程：${e.message}`,
+      data: { code: e.code ?? null },
+    });
+    return;
+  }
+  if (!scout) return;
+
+  const fallbackStart = { start: targetConfig.start, startSource: targetConfig.startSource };
+  const applied = applyScoutResult(targetConfig, scout);
+  if (applied.login) ctx.loginConfig = targetConfig.login;
+  ctx.scoutApplied = applied;
+  ctx.scoutFallbackStart = applied.start ? fallbackStart : null;
+
+  const appliedDesc = [
+    applied.start ? `启动 ${scout.start.cmd} ${scout.start.args.join(" ")}`.trim() : null,
+    applied.login ? `登录 ${scout.login.path}` : null,
+    applied.routes ? `路由 ${applied.routes} 条` : null,
+  ].filter(Boolean);
+  ctx.view.llm = {
+    used: true,
+    model: scout.model ?? model,
+    source: scout._source,
+    routes: scout.routes?.length ?? 0,
+    applied,
+    notes: scout.notes ?? [],
+    warnings: scout.warnings ?? [],
+    cached: !!scout.cached,
+    durationMs: scout.durationMs ?? null,
+    evidenceFiles: scout.evidenceFiles ?? [],
+    evidenceChars: scout.evidenceChars ?? 0,
+    usage: scout.usage ?? null,
+    verified: { start: false, login: false },
+  };
+  pushView(ctx);
+  emit(ctx, {
+    kind: "scout",
+    severity: appliedDesc.length ? SEVERITY.SUCCESS : SEVERITY.INFO,
+    message: appliedDesc.length
+      ? `LLM 接入侦察返回候选契约（待实际启动/登录验证）：${appliedDesc.join("，")}`
+      : "LLM 接入侦察未采纳新线索（已有更可信契约或输出不可定位）",
+    data: { model: scout.model ?? model, applied, cached: !!scout.cached },
+  });
+  for (const w of (scout.warnings ?? []).slice(0, 8)) {
+    emit(ctx, { kind: "scout", severity: SEVERITY.WARN, message: w, data: {} });
+  }
+  if (scout.notes?.length) {
+    emit(ctx, {
+      kind: "scout",
+      severity: SEVERITY.INFO,
+      message: `LLM 侦察备注：${scout.notes.join("；")}`,
+      data: { notes: scout.notes },
+    });
+  }
 }
 
 /** 回环主动探活：目标不打印监听日志时，用 HTTP 响应替代就绪行 */
@@ -710,16 +833,63 @@ async function stageReproduce(ctx) {
   let pre = null;
   if (hasLocalProbes) {
     await runPrepare(ctx, { cwd: ctx.projectRoot, label: "原始工作区" });
-    const target = await spawnTarget(ctx, { cwd: ctx.projectRoot, label: "原始工作区（修复前）", role: "target-pre" });
+    let target;
+    try {
+      target = await spawnTarget(ctx, { cwd: ctx.projectRoot, label: "原始工作区（修复前）", role: "target-pre" });
+    } catch (e) {
+      const retryable = ["target_spawn_failed", "target_not_ready", "port_parse_failed"].includes(e.code);
+      if (!ctx.scoutApplied?.start || !ctx.scoutFallbackStart || !retryable) throw e;
+      // 第一道实际验证未通过：LLM 启动契约不可用，回退到自动探测/缺省启动契约
+      emit(ctx, {
+        kind: "scout",
+        severity: SEVERITY.WARN,
+        message: `LLM 启动契约未通过实际启动验证（${e.message}），回退到${ctx.scoutFallbackStart.startSource === "auto" ? "自动探测" : "缺省"}启动契约重试`,
+        phase: STATE.PROBING,
+        data: { error: e.message, code: e.code ?? null },
+      });
+      const attempted = ctx.targetConfig.start;
+      ctx.targetConfig.start = ctx.scoutFallbackStart.start;
+      ctx.targetConfig.startSource = ctx.scoutFallbackStart.startSource;
+      ctx.scoutApplied.start = false;
+      ctx.scoutFallbackStart = null;
+      if (ctx.view.llm) {
+        ctx.view.llm.rejectedStart = attempted;
+        pushView(ctx);
+      }
+      target = await spawnTarget(ctx, { cwd: ctx.projectRoot, label: "原始工作区（修复前）", role: "target-pre" });
+    }
     ctx.procs.original = target;
     ctx.view.targets.original = { ...target, role: "原始工作区（修复前）" };
     pushView(ctx);
+    if (ctx.scoutApplied?.start) {
+      ctx.view.llm.verified.start = true;
+      pushView(ctx);
+      emit(ctx, {
+        kind: "scout",
+        severity: SEVERITY.SUCCESS,
+        message: `LLM 启动契约已验证：目标进程按「${ctx.targetConfig.start.cmd} ${ctx.targetConfig.start.args.join(" ")}」成功就绪（${target.url}）`,
+        phase: STATE.PROBING,
+        data: { start: ctx.targetConfig.start, url: target.url },
+      });
+    }
 
     pre = await runPhase(ctx, { phase: "pre", baseUrl: target.url });
     ctx.pushEvidence(pre.evidence);
     ctx.view.phases.pre = pre.summary;
     ctx.view.baseline = acceptanceVerdict(pre.summary);
-    pushView(ctx);
+    if (ctx.scoutApplied?.login && ctx._loginVerified) {
+      ctx.view.llm.verified.login = true;
+      pushView(ctx);
+      emit(ctx, {
+        kind: "scout",
+        severity: SEVERITY.SUCCESS,
+        message: `LLM 登录契约已验证：使用 guardbuild.json 提供的身份成功登录（${ctx.loginConfig.path}）`,
+        phase: STATE.PROBING,
+        data: { login: { ...ctx.loginConfig, path: ctx.loginConfig.path } },
+      });
+    } else {
+      pushView(ctx);
+    }
   } else {
     emit(ctx, {
       kind: "probing",
@@ -1012,6 +1182,7 @@ async function runFlow(ctx) {
       }
     }
 
+    await stageScout(ctx, targetConfig);
     await stageAnalyze(ctx);
     await stageReproduce(ctx);
     await stagePatch(ctx);

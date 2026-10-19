@@ -12,6 +12,7 @@
  *   "responses": { "list": "orders", "entity": "order" },
  *   "identities": [{ "name": "alice", "email": "alice@example.com", "password": "alice123", "role": "user" }],
  *   "supabase": { "envFile": ".env", "url": "https://xyz.supabase.co", "anonKey": "eyJ…", "tables": ["profiles"] },
+ *   "llm": { "enabled": true, "model": "deepseek-chat" },
  *   "scopes": ["project.read", "worktree.write", "proc.spawn", "net.probe"]
  * }
  *
@@ -65,7 +66,7 @@ export function renderStart(start, port) {
   };
 }
 
-function normalizeStart(raw) {
+export function normalizeStart(raw) {
   const s = raw && typeof raw === "object" ? raw : {};
   const env = { ...DEFAULT_START.env };
   if (s.env && typeof s.env === "object") {
@@ -118,7 +119,7 @@ function normalizeIdentities(raw) {
 }
 
 /** 登录契约：路径 / 请求体模板 / 凭据在响应中的位置与请求头写法。 */
-function normalizeLogin(raw) {
+export function normalizeLogin(raw) {
   const l = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : null;
   if (!l) return null;
   if (typeof l.path !== "string" || !l.path.trim()) return null;
@@ -174,6 +175,61 @@ function normalizeResponses(raw) {
   return { list, entity };
 }
 
+/** 手工路由线索：用户在 guardbuild.json 里直接声明的端点（未知框架用）。 */
+const ROUTE_METHODS = new Set(["GET", "POST", "PUT", "PATCH", "DELETE"]);
+const MAX_ROUTES = 200;
+
+function normalizeRoutes(raw) {
+  if (!Array.isArray(raw)) return null;
+  const out = [];
+  for (const it of raw) {
+    if (!it || typeof it !== "object") continue;
+    const method = String(it.method ?? "").toUpperCase();
+    if (!ROUTE_METHODS.has(method)) continue;
+    const path = typeof it.path === "string" ? it.path.trim() : "";
+    if (!path.startsWith("/")) continue;
+    // 必须可寻址：有 :param 或显式 query 参数，否则动态探测无法构造请求
+    if (!/:[A-Za-z_]\w*/.test(path) && !(typeof it.query === "string" && it.query.trim())) continue;
+    out.push({
+      method,
+      path,
+      resource: typeof it.resource === "string" && it.resource.trim() ? it.resource.trim() : null,
+      hasAuth: typeof it.hasAuth === "boolean" ? it.hasAuth : true,
+      ownerField: typeof it.ownerField === "string" && it.ownerField.trim() ? it.ownerField.trim() : null,
+      query: typeof it.query === "string" && it.query.trim() ? it.query.trim() : null,
+      source: "routes",
+    });
+    if (out.length >= MAX_ROUTES) break;
+  }
+  return out.length ? out : null;
+}
+
+/** OpenAPI 文件线索：指向项目内的 openapi.json / swagger.json。 */
+function normalizeOpenapi(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const file = typeof raw.file === "string" ? raw.file.trim() : "";
+  if (!file) return null;
+  // 拒绝绝对路径与越出根目录的 ../
+  if (/^[a-zA-Z]:[\\/]/.test(file) || file.startsWith("/") || file.includes("..")) return null;
+  const out = { file };
+  if (typeof raw.basePath === "string" && raw.basePath.trim().startsWith("/")) {
+    out.basePath = raw.basePath.trim();
+  }
+  return out;
+}
+
+/** LLM 接入侦察开关：默认关闭；密钥只从进程环境读取，不写入契约。 */
+function normalizeLlm(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const maxFiles = Number.isFinite(raw.maxFiles) ? Math.floor(raw.maxFiles) : 8;
+  return {
+    enabled: raw.enabled === true,
+    model:
+      typeof raw.model === "string" && raw.model.trim() ? raw.model.trim() : null,
+    maxFiles: Math.min(12, Math.max(1, maxFiles)),
+  };
+}
+
 /** Supabase 覆盖项：显式指定环境文件 / 项目 URL / anon key / 表名（缺省由静态检测自动发现） */
 function normalizeSupabase(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
@@ -201,6 +257,9 @@ function emptyConfig(source, invalid = null) {
     prepare: null,
     responses: null,
     supabase: null,
+    routes: null,
+    openapi: null,
+    llm: null,
     scopes: null,
   };
 }
@@ -290,6 +349,9 @@ export async function loadTargetConfig(ctx) {
     prepare: normalizePrepare(parsed.prepare),
     responses: normalizeResponses(parsed.responses),
     supabase: normalizeSupabase(parsed.supabase),
+    routes: normalizeRoutes(parsed.routes),
+    openapi: normalizeOpenapi(parsed.openapi),
+    llm: normalizeLlm(parsed.llm),
     scopes: Array.isArray(parsed.scopes)
       ? parsed.scopes.filter((x) => typeof x === "string" && x)
       : null,

@@ -457,16 +457,43 @@ async function spawnTarget(ctx, { cwd, label, role = "target" }) {
     }
   }
   const { cmd, args, env } = renderStart(start, allocated);
+
+  // Docker 容器隔离：docker.enabled=true 时，用 docker run 替代直接 spawn
+  const docker = ctx.targetConfig?.docker;
+  let finalCmd = cmd;
+  let finalArgs = args;
+  let finalEnv = env;
+  if (docker?.enabled) {
+    const port = allocated ?? 3000;
+    const containerName = `guardbuild-${ctx.sessionId.slice(0, 8)}`;
+    const image = docker.image ?? "node:20-alpine";
+    finalCmd = "docker";
+    finalArgs = [
+      "run", "--rm", "-d",
+      "--name", containerName,
+      "-p", `${port}:3000`,
+      "-e", "NODE_ENV=test",
+      image,
+      "sh", "-c", `cd /app && npm install --no-audit --no-fund && npm start`,
+    ];
+    finalEnv = {};
+    emit(ctx, {
+      kind: "process",
+      severity: SEVERITY.INFO,
+      message: `[Docker] 启动容器 ${containerName}（${image}，端口 ${port}:3000）`,
+      data: { containerName, image, port },
+    });
+  }
   let res;
   try {
     res = await ctx.rpc.request(
       RPC_TO_HOST.PROC_SPAWN,
       {
         token: ctx.tokens.spawn,
-        cmd,
-        args,
+        cmd: finalCmd,
+        args: finalArgs,
         cwd: spawnCwd,
-        env,
+        env: finalEnv,
         role,
       },
       { timeoutMs: 30_000 }

@@ -971,6 +971,48 @@ function cmdiAttempts(token) {
   ];
 }
 
+/**
+ * 外部攻击面扫描：发常见管理路径/敏感文件，记录未授权暴露面。
+ * 只做 GET，不破坏数据；发现 200 就记录为暴露端点。
+ */
+export async function scanAttackSurface(ctx, baseUrl, loggedIn) {
+  const paths = [
+    "/admin", "/admin/", "/admin/login",
+    "/actuator", "/actuator/health", "/actuator/env", "/actuator/heapdump",
+    "/debug/pprof", "/metrics",
+    "/.env", "/.git/config", "/.git/HEAD",
+    "/api/swagger", "/api/docs", "/swagger", "/swagger-ui.html", "/v2/api-docs", "/v3/api-docs",
+    "/graphql",
+    "/server-status",
+    "/wp-admin",
+  ];
+  const findings = [];
+  for (const p of paths) {
+    try {
+      const res = await httpJson(ctx, { baseUrl, method: "GET", path: p });
+      if (okStatus(res.status) && res.json != null) {
+        findings.push({ path: p, status: res.status, contentType: res.headers?.["content-type"] ?? "" });
+        ctx.emit({
+          kind: "evidence",
+          severity: SEVERITY.WARN,
+          message: `[攻击面] ${p} 返回 HTTP ${res.status}（未授权可访问）`,
+          data: { path: p, status: res.status },
+        });
+      }
+    } catch {
+      // 忽略单个路径失败
+    }
+  }
+  if (findings.length > 0) {
+    ctx.emit({
+      kind: "discovery",
+      severity: SEVERITY.INFO,
+      message: `外部攻击面扫描：发现 ${findings.length} 个未授权可访问路径`,
+      data: { findings },
+    });
+  }
+}
+
 /** 构建一个阶段内的全部用例（攻击 + 业务），攻击目标对象由发现阶段确定 */
 export function buildCases(ctx, targets) {
   // 每类候选 top-K 逐一构建攻击用例；首个候选保持基名（兼容既有报告/测试/e2e）
@@ -1641,6 +1683,10 @@ export async function runPhase(ctx, { phase, baseUrl }) {
     }
   }
   const allCases = buildCases(ctx, targets);
+  // 外部攻击面扫描：发常见管理路径/敏感文件，记录暴露面（pre 阶段才跑）
+  if (phase === "pre") {
+    await scanAttackSurface(ctx, baseUrl, loggedIn);
+  }
   // 修复后验收只覆盖补丁实际修复的类别：注入/穿越无自动修复模板，
   // 若与可修复项混在同一目标中，仍按原样复现会误判「补丁无效」
   const cases = phase === "pre" ? allCases : allCases.filter((c) => !c.unfixable);

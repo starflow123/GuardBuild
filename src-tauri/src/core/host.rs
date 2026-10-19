@@ -299,7 +299,7 @@ impl Host {
         ];
         // 接入侦察的可选配置：密钥只从宿主进程环境透传给 Sidecar（侧车再经 net.egress
         // 请求 Host 出站），绝不写入 cfg / 日志 / 报告，也不进入目标进程环境。
-        for key in ["DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL", "GUARDBUILD_LLM_SCOUT"] {
+        for key in ["DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL", "GUARDBUILD_LLM_SCOUT", "GUARDBUILD_BLACKBOX_URL"] {
             if let Ok(v) = std::env::var(key) {
                 if !v.trim().is_empty() {
                     extra.push((key.to_string(), v));

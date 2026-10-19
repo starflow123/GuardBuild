@@ -27,17 +27,19 @@ use guardbuild_lib::core::host::{Host, HostConfig, GATE_DEFAULT_SCOPES};
 
 struct Args {
     project: Option<String>,
+    url: Option<String>,
     gate: bool,
     report_dir: Option<PathBuf>,
 }
 
 fn parse_args() -> Args {
-    let mut args = Args { project: None, gate: false, report_dir: None };
+    let mut args = Args { project: None, url: None, gate: false, report_dir: None };
     let mut it = std::env::args().skip(1);
     while let Some(a) = it.next() {
         match a.as_str() {
             "--gate" => args.gate = true,
             "--project" => args.project = it.next(),
+            "--url" => args.url = it.next(),
             "--report" => args.report_dir = it.next().map(PathBuf::from),
             other => eprintln!("[gate] 忽略未知参数: {other}"),
         }
@@ -186,6 +188,11 @@ fn finish_gate(host: &Arc<Host>, exit_code: i32, mut payload: Value) -> ! {
 
 fn main() {
     let args = parse_args();
+
+    // 纯黑盒模式：把 --url 透传给 sidecar
+    if let Some(ref url) = args.url {
+        std::env::set_var("GUARDBUILD_BLACKBOX_URL", url);
+    }
 
     let data_dir = std::env::var("GUARDBUILD_DATA_DIR")
         .map(PathBuf::from)

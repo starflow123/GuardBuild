@@ -1127,6 +1127,27 @@ async function runFlow(ctx) {
     ctx.db.ensureProject(ctx.projectRoot, ctx.projectRoot, ctx.projectName);
     ctx.db.ensureSession(sessionId, ctx.projectRoot, ctx.projectRoot);
     pushView(ctx);
+
+    // 纯黑盒模式：传入 URL，不读源码、不启动本地服务、不生成补丁
+    const blackboxUrl = process.env.GUARDBUILD_BLACKBOX_URL;
+    if (blackboxUrl) {
+      emit(ctx, {
+        kind: "session",
+        severity: SEVERITY.INFO,
+        message: `纯黑盒模式：目标 ${blackboxUrl}（不读源码、不生成本地补丁）`,
+        data: { sessionId, blackbox: true },
+      });
+      const { runBlackbox } = await import("./lib/blackbox.mjs");
+      const result = await runBlackbox(ctx, blackboxUrl);
+      ctx.view.blackbox = { url: blackboxUrl, routes: result.routes, openapiFound: !!result.openapi };
+      emit(ctx, {
+        kind: "session",
+        severity: SEVERITY.INFO,
+        message: `黑盒扫描完成：${result.routes.length} 条路由${result.openapi ? "（含 OpenAPI）" : ""}`,
+      });
+      return;
+    }
+
     emit(ctx, {
       kind: "session",
       severity: SEVERITY.INFO,

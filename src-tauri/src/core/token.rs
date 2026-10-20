@@ -259,7 +259,7 @@ impl Token {
     }
 
     /// 校验：在允许的根目录内、用允许的命令启动进程。
-    pub fn require_spawn(&self, cwd: &Path, cmd: &str, node_bin: &str) -> HostResult<()> {
+    pub fn require_spawn(&self, cwd: &Path, cmd: &str, args: &[String], node_bin: &str) -> HostResult<()> {
         let base = Path::new(cmd)
             .file_stem()
             .map(|s| s.to_string_lossy().to_lowercase())
@@ -269,10 +269,12 @@ impl Token {
             "node", "npm", "npx", "python", "python3", "py", "uvicorn", "gunicorn", "hypercorn",
             "flask", "fastapi", "uv",
         ];
-        let allowed_cmd = LAUNCHERS.contains(&base.as_str()) || cmd == node_bin;
-        if !allowed_cmd {
+        if base == "docker" {
+            // docker 可以挂载宿主目录、暴露端口，必须逐参数白名单校验（见 validate_docker_*）
+            validate_docker_invocation(cwd, args)?;
+        } else if !(LAUNCHERS.contains(&base.as_str()) || cmd == node_bin) {
             return Err(HostError::ScopeDenied(format!(
-                "命令 `{cmd}` 不在允许列表（node/npm/npx 或 Python 启动器 python/uvicorn/flask 等）内"
+                "命令 `{cmd}` 不在允许列表（node/npm/npx、Python 启动器或受限的 docker run/rm）内"
             )));
         }
         if any_scope(self, |s| match s {
@@ -347,6 +349,314 @@ impl Token {
             ))
         }
     }
+}
+
+// ---------- docker 参数白名单 ----------
+//
+// 容器隔离让目标跑在 docker 里，但 docker CLI 本身能力极强（挂载任意宿主目录、
+// --privileged、host 网络等）。Host 不能只校验可执行名，必须逐参数收紧到
+// sidecar 实际会生成的那一种调用形状。
+
+fn docker_denied(reason: impl Into<String>) -> HostError {
+    HostError::ScopeDenied(format!("docker 调用被拒绝：{}", reason.into()))
+}
+
+fn is_guardbuild_container_name(s: &str) -> bool {
+    s.len() > "guardbuild-".len()
+        && s.len() <= 80
+        && s.starts_with("guardbuild-")
+        && s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+}
+
+fn is_safe_image_ref(s: &str) -> bool {
+    !s.is_empty()
+        && s.len() <= 200
+        && !s.starts_with('-')
+        && s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '/' | ':' | '@' | '-'))
+}
+
+/// 容器内绝对路径：不允许 .、..、空段与尾部斜杠（Docker 的 --mount 语义也要求绝对路径）。
+fn is_safe_container_path(p: &str) -> bool {
+    if !p.starts_with('/') || p == "/" || p.len() > 200 || p.contains('\0') {
+        return false;
+    }
+    p[1..].split('/').all(|seg| !seg.is_empty() && seg != "." && seg != "..")
+}
+
+fn is_safe_env_key(k: &str) -> bool {
+    !k.is_empty()
+        && k.len() <= 100
+        && k.chars().next().map(|c| c.is_ascii_alphabetic() || c == '_').unwrap_or(false)
+        && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+fn parse_publish_spec(v: &str) -> Option<(u16, u16)> {
+    let mut parts = v.split(':');
+    let ip = parts.next()?;
+    let host = parts.next()?.parse::<u16>().ok()?;
+    let container = parts.next()?.parse::<u16>().ok()?;
+    if parts.next().is_some() || ip != "127.0.0.1" || host == 0 || container == 0 {
+        return None;
+    }
+    Some((host, container))
+}
+
+/// `-v <src>:<dst>[:ro|rw]`：src 必须是本次 spawn 的 cwd（防止挂载任意宿主目录）。
+fn parse_volume_spec(cwd: &Path, spec: &str) -> HostResult<String> {
+    let (rest, _mode) = match spec.rsplit_once(':') {
+        Some((r, m)) if m == "ro" || m == "rw" => (r, Some(m)),
+        _ => (spec, None),
+    };
+    // Windows 盘符本身带冒号，用「最后一个冒号」切分 source/target
+    let (src, target) = rest
+        .rsplit_once(':')
+        .ok_or_else(|| docker_denied(format!("-v 需要 <宿主目录>:<容器目录>，收到 `{spec}`")))?;
+    if !is_safe_container_path(target) {
+        return Err(docker_denied(format!("-v 容器目录非法：`{target}`")));
+    }
+    let src_path = Path::new(src)
+        .canonicalize()
+        .map_err(|e| docker_denied(format!("-v 宿主目录不可访问：`{src}` ({e})")))?;
+    if normalize_for_compare(&src_path) != normalize_for_compare(cwd) {
+        return Err(docker_denied(format!(
+            "-v 宿主目录必须是当前目标目录 {:?}，拒绝 `{src}`",
+            cwd
+        )));
+    }
+    Ok(target.to_string())
+}
+
+fn validate_docker_remove(sub: &str, rest: &[String]) -> HostResult<()> {
+    let mut names = 0usize;
+    for a in rest {
+        if a == "--force" || (sub == "rm" && a == "-f") {
+            continue;
+        }
+        if a.starts_with('-') {
+            return Err(docker_denied(format!("`docker {sub}` 不允许参数 `{a}`")));
+        }
+        if !is_guardbuild_container_name(a) {
+            return Err(docker_denied(format!(
+                "`docker {sub}` 只能操作 guardbuild-* 容器，收到 `{a}`"
+            )));
+        }
+        names += 1;
+        if names > 8 {
+            return Err(docker_denied("一次最多操作 8 个容器"));
+        }
+    }
+    if names == 0 {
+        return Err(docker_denied(format!("`docker {sub}` 缺少容器名")));
+    }
+    Ok(())
+}
+
+fn validate_docker_run(cwd: &Path, args: &[String]) -> HostResult<()> {
+    let mut name: Option<String> = None;
+    let mut publish: Option<(u16, u16)> = None;
+    let mut mount_target: Option<String> = None;
+    let mut workdir: Option<String> = None;
+    let mut env_count = 0usize;
+    let mut image: Option<String> = None;
+
+    let mut i = 0usize;
+    while i < args.len() {
+        let a = args[i].as_str();
+        if a == "--" {
+            return Err(docker_denied("不接受 `--` 分隔符"));
+        }
+        if !a.starts_with('-') {
+            image = Some(a.to_string());
+            break;
+        }
+        match a {
+            "--rm" | "--init" => {
+                i += 1;
+            }
+            "--name" | "-p" | "--publish" | "-v" | "--volume" | "-w" | "--workdir" | "-e" | "--env" => {
+                let v = args
+                    .get(i + 1)
+                    .ok_or_else(|| docker_denied(format!("`{a}` 缺少参数")))?;
+                match a {
+                    "--name" => {
+                        if name.is_some() {
+                            return Err(docker_denied("--name 只能出现一次"));
+                        }
+                        if !is_guardbuild_container_name(v) {
+                            return Err(docker_denied(format!("容器名必须形如 guardbuild-*，收到 `{v}`")));
+                        }
+                        name = Some(v.clone());
+                    }
+                    "-p" | "--publish" => {
+                        if publish.is_some() {
+                            return Err(docker_denied("端口映射只能声明一次"));
+                        }
+                        publish = Some(parse_publish_spec(v).ok_or_else(|| {
+                            docker_denied(format!(
+                                "端口映射必须是 127.0.0.1:<宿主端口>:<容器端口>，收到 `{v}`"
+                            ))
+                        })?);
+                    }
+                    "-v" | "--volume" => {
+                        if mount_target.is_some() {
+                            return Err(docker_denied("只允许一个项目目录挂载"));
+                        }
+                        mount_target = Some(parse_volume_spec(cwd, v)?);
+                    }
+                    "-w" | "--workdir" => {
+                        if workdir.is_some() {
+                            return Err(docker_denied("-w 只能出现一次"));
+                        }
+                        if !is_safe_container_path(v) {
+                            return Err(docker_denied(format!("-w 容器目录非法：`{v}`")));
+                        }
+                        workdir = Some(v.clone());
+                    }
+                    "-e" | "--env" => {
+                        let (k, val) = v
+                            .split_once('=')
+                            .ok_or_else(|| docker_denied(format!("-e 需要 KEY=VALUE，收到 `{v}`")))?;
+                        if !is_safe_env_key(k) {
+                            return Err(docker_denied(format!("-e 变量名非法：`{k}`")));
+                        }
+                        if val.len() > 4096 || val.contains('\0') {
+                            return Err(docker_denied(format!("-e {k} 的值过长或含非法字符")));
+                        }
+                        env_count += 1;
+                        if env_count > 32 {
+                            return Err(docker_denied("环境变量最多 32 个"));
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+                i += 2;
+            }
+            _ if a.starts_with("--name=") => {
+                let v = &a["--name=".len()..];
+                if name.is_some() || !is_guardbuild_container_name(v) {
+                    return Err(docker_denied(format!("容器名必须形如 guardbuild-*，收到 `{v}`")));
+                }
+                name = Some(v.to_string());
+                i += 1;
+            }
+            _ if a.starts_with("--publish=") => {
+                let v = &a["--publish=".len()..];
+                if publish.is_some() {
+                    return Err(docker_denied("端口映射只能声明一次"));
+                }
+                publish = Some(parse_publish_spec(v).ok_or_else(|| {
+                    docker_denied(format!("端口映射必须是 127.0.0.1:<宿主端口>:<容器端口>，收到 `{v}`"))
+                })?);
+                i += 1;
+            }
+            _ if a.starts_with("--volume=") => {
+                if mount_target.is_some() {
+                    return Err(docker_denied("只允许一个项目目录挂载"));
+                }
+                mount_target = Some(parse_volume_spec(cwd, &a["--volume=".len()..])?);
+                i += 1;
+            }
+            _ if a.starts_with("--workdir=") => {
+                if workdir.is_some() {
+                    return Err(docker_denied("-w 只能出现一次"));
+                }
+                let v = &a["--workdir=".len()..];
+                if !is_safe_container_path(v) {
+                    return Err(docker_denied(format!("-w 容器目录非法：`{v}`")));
+                }
+                workdir = Some(v.to_string());
+                i += 1;
+            }
+            _ if a.starts_with("--env=") => {
+                let v = &a["--env=".len()..];
+                let (k, val) = v
+                    .split_once('=')
+                    .ok_or_else(|| docker_denied(format!("-e 需要 KEY=VALUE，收到 `{v}`")))?;
+                if !is_safe_env_key(k) || val.len() > 4096 || val.contains('\0') {
+                    return Err(docker_denied(format!("-e 参数非法：`{v}`")));
+                }
+                env_count += 1;
+                if env_count > 32 {
+                    return Err(docker_denied("环境变量最多 32 个"));
+                }
+                i += 1;
+            }
+            _ => {
+                return Err(docker_denied(format!(
+                    "不允许的 docker run 参数 `{a}`（容器隔离仅支持 --rm/--init/--name/-p/-v/-w/-e）"
+                )))
+            }
+        }
+    }
+
+    let image = image.ok_or_else(|| docker_denied("缺少镜像名"))?;
+    if !is_safe_image_ref(&image) {
+        return Err(docker_denied(format!("镜像名非法：`{image}`")));
+    }
+    let name = name.ok_or_else(|| docker_denied("缺少 --name guardbuild-*（用于清理容器）"))?;
+    let (host_port, container_port) =
+        publish.ok_or_else(|| docker_denied("缺少 127.0.0.1:<宿主端口>:<容器端口> 映射"))?;
+    let target = mount_target.ok_or_else(|| docker_denied("缺少项目目录挂载（-v <cwd>:<容器目录>）"))?;
+    let wd = workdir.ok_or_else(|| docker_denied("缺少容器工作目录（-w）"))?;
+    if wd != target {
+        return Err(docker_denied(format!(
+            "-w `{wd}` 必须与挂载目标 `{target}` 一致"
+        )));
+    }
+    let _ = (host_port, container_port, name);
+    if args.len() > 96 {
+        return Err(docker_denied("参数过多"));
+    }
+    Ok(())
+}
+
+/// 校验 docker 调用形状（仅 run/rm/stop/version，且 run 必须挂载当前项目目录、
+/// 只映射回环端口、不启用 privileged/host 网络等危险能力）。
+pub fn validate_docker_invocation(cwd: &Path, args: &[String]) -> HostResult<()> {
+    let sub = args.first().map(String::as_str).unwrap_or("");
+    match sub {
+        "run" => validate_docker_run(cwd, &args[1..]),
+        "rm" | "stop" => validate_docker_remove(sub, &args[1..]),
+        "version" if args.len() == 1 => Ok(()),
+        _ => Err(docker_denied(format!(
+            "仅允许 docker run/rm/stop/version，收到 `{sub}`"
+        ))),
+    }
+}
+
+/// 事件/进程列表中的 docker 参数脱敏：`-e KEY=VALUE` 的 VALUE 可能是契约里的凭据。
+pub fn redact_docker_env_args(cmd: &str, args: &[String]) -> Vec<String> {
+    let is_docker = Path::new(cmd)
+        .file_stem()
+        .map(|s| s.to_string_lossy().eq_ignore_ascii_case("docker"))
+        .unwrap_or(false);
+    if !is_docker {
+        return args.to_vec();
+    }
+    let mask = |kv: &str| match kv.split_once('=') {
+        Some((k, _)) => format!("{k}=***"),
+        None => "***".to_string(),
+    };
+    let mut out = Vec::with_capacity(args.len());
+    let mut next_is_env = false;
+    for a in args {
+        if next_is_env {
+            out.push(mask(a));
+            next_is_env = false;
+        } else if a == "-e" || a == "--env" {
+            out.push(a.clone());
+            next_is_env = true;
+        } else if let Some(v) = a.strip_prefix("--env=") {
+            out.push(format!("--env={}", mask(v)));
+        } else {
+            out.push(a.clone());
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -429,5 +739,110 @@ mod tests {
             via: "test".into(),
         });
         assert!(store.require("t").is_err());
+    }
+
+    fn docker_cwd() -> PathBuf {
+        std::env::temp_dir().canonicalize().unwrap()
+    }
+
+    fn docker_args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    fn valid_run_args() -> Vec<String> {
+        let mount = format!("{}:/app", docker_cwd().to_string_lossy());
+        docker_args(&[
+            "run",
+            "--rm",
+            "--init",
+            "--name",
+            "guardbuild-s1-target-1",
+            "-p",
+            "127.0.0.1:48123:3000",
+            "-v",
+            &mount,
+            "-w",
+            "/app",
+            "-e",
+            "PORT=3000",
+            "-e",
+            "NODE_ENV=test",
+            "node:20-alpine",
+            "node",
+            "server.js",
+        ])
+    }
+
+    #[test]
+    fn docker_run_accepts_sidecar_shape() {
+        assert!(validate_docker_invocation(&docker_cwd(), &valid_run_args()).is_ok());
+    }
+
+    #[test]
+    fn docker_run_rejects_dangerous_or_malformed_args() {
+        let cwd = docker_cwd();
+        let cases: Vec<Vec<String>> = vec![
+            docker_args(&["run", "--privileged", "alpine", "sh"]),
+            docker_args(&["run", "--network", "host", "alpine", "sh"]),
+            docker_args(&["run", "-d", "alpine", "sh"]),
+            docker_args(&["run", "--name", "other", "alpine", "sh"]),
+            docker_args(&["run", "-p", "0.0.0.0:8080:80", "alpine", "sh"]),
+            docker_args(&["run", "-p", "127.0.0.1:0:80", "alpine", "sh"]),
+            docker_args(&["run", "-v", "/:/app", "alpine", "sh"]),
+            docker_args(&["run", "--volume", "/etc:/app", "alpine", "sh"]),
+            docker_args(&["run", "-e", "BAD-KEY=1", "alpine", "sh"]),
+            docker_args(&["create", "alpine"]),
+            docker_args(&["pull", "alpine"]),
+            docker_args(&[]),
+        ];
+        for args in cases {
+            assert!(
+                validate_docker_invocation(&cwd, &args).is_err(),
+                "应拒绝: {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn docker_run_requires_mount_pointing_at_cwd() {
+        let cwd = docker_cwd();
+        let outside = if cfg!(windows) { Path::new(r"D:\") } else { Path::new("/") };
+        let mount = format!("{}:/app", outside.to_string_lossy());
+        let args = docker_args(&[
+            "run",
+            "--name",
+            "guardbuild-s1-target-1",
+            "-p",
+            "127.0.0.1:48123:3000",
+            "-v",
+            &mount,
+            "-w",
+            "/app",
+            "alpine",
+            "sh",
+        ]);
+        assert!(validate_docker_invocation(&cwd, &args).is_err());
+    }
+
+    #[test]
+    fn docker_remove_only_touches_guardbuild_containers() {
+        let cwd = docker_cwd();
+        assert!(validate_docker_invocation(&cwd, &docker_args(&["rm", "-f", "guardbuild-abc-1"])).is_ok());
+        assert!(validate_docker_invocation(&cwd, &docker_args(&["stop", "guardbuild-abc-1"])).is_ok());
+        assert!(validate_docker_invocation(&cwd, &docker_args(&["rm", "-f", "mysql"])).is_err());
+        assert!(validate_docker_invocation(&cwd, &docker_args(&["rm", "-f"])).is_err());
+        assert!(validate_docker_invocation(&cwd, &docker_args(&["rm", "-v", "x"])).is_err());
+    }
+
+    #[test]
+    fn docker_env_values_are_redacted_in_logs() {
+        let args = docker_args(&["run", "-e", "API_KEY=secret", "--env", "PORT=3000", "--env=TOKEN=abc", "img"]);
+        let out = redact_docker_env_args("docker", &args);
+        assert!(out.iter().all(|a| !a.contains("secret") && !a.contains("abc")));
+        assert!(out.contains(&"API_KEY=***".to_string()));
+        assert!(out.contains(&"--env=TOKEN=***".to_string()));
+        // 非 docker 命令原样返回
+        let node = docker_args(&["-e", "X=1"]);
+        assert_eq!(redact_docker_env_args("node", &node), node);
     }
 }

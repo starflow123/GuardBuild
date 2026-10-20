@@ -51,6 +51,39 @@ export interface FindingItem {
   reason: string;
 }
 
+export interface BlackboxFinding {
+  type: string;
+  method: string;
+  path: string;
+  severity: string;
+  detail: string;
+  evidenceId: string;
+  evidenceGrade: string;
+  curl: string;
+}
+
+export interface BlackboxView {
+  mode: string;
+  url: string;
+  routeCount: number;
+  routes?: { method: string; path: string; source?: string | null }[];
+  openapiFound?: boolean;
+  openapiRouteCount?: number;
+  findings: BlackboxFinding[];
+  evidenceCount?: number;
+  login?: {
+    attempted: boolean;
+    ok: boolean;
+    path?: string | null;
+    identities?: { name: string; role?: string; id?: string | null }[];
+  } | null;
+  rateLimited?: boolean;
+  allowMutation?: boolean;
+  reachable?: boolean | null;
+  outcome?: string | null;
+  exitCode?: number | null;
+}
+
 export interface ViewPatch {
   hash: string;
   diff: string;
@@ -125,7 +158,10 @@ export interface View {
   };
   evidence?: EvidenceItem[];
   phases?: Record<string, unknown>;
-  targets?: Record<string, { pid: number; port: number; url: string; role?: string }>;
+  targets?: Record<string, { pid: number; port: number; url: string; role?: string }> & {
+    docker?: { enabled: boolean; image: string | null; containerPort: number; workdir: string };
+  };
+  blackbox?: BlackboxView | null;
   patch?: ViewPatch | null;
   acceptance?: AcceptanceView | null;
   llm?: LlmView | null;

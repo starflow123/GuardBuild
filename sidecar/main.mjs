@@ -14,13 +14,21 @@ import { EvidenceStore } from "./lib/db.mjs";
 import { StateMachine } from "./lib/statemachine.mjs";
 import { analyzeProject } from "./lib/analyzer.mjs";
 import { buildProbePlan, loadIdentities } from "./lib/planner.mjs";
-import { loadTargetConfig, DEFAULT_START, startUsesPortSlot, renderStart, PORT_SLOT } from "./lib/targetconfig.mjs";
+import {
+  loadTargetConfig,
+  loadBlackboxConfig,
+  DEFAULT_START,
+  startUsesPortSlot,
+  renderStart,
+  PORT_SLOT,
+} from "./lib/targetconfig.mjs";
 import { diagnoseStartFailure } from "./lib/autostart.mjs";
 import { parsePortFromLine, stripAnsi } from "./lib/readyline.mjs";
 import { runPhase, ProbeError } from "./lib/probe.mjs";
 import { runSupabasePhase, isLoopbackHostname } from "./lib/supabase.mjs";
 import { runScout, applyScoutResult, recordScoutVerification } from "./lib/scout.mjs";
 import { isEnabled as llmEnabled } from "./lib/llm.mjs";
+import { runBlackbox } from "./lib/blackbox.mjs";
 import { createPatch, writebackPatch, rollbackWorkspace, PatchError } from "./lib/patcher.mjs";
 import { emitReport } from "./lib/report.mjs";
 import {
@@ -67,6 +75,7 @@ const TERMINAL_STATES = new Set([
   STATE.APPLIED,
   STATE.ROLLED_BACK,
   STATE.VERIFY_FAILED,
+  STATE.COMPLETED,
   STATE.ABORTED,
   STATE.ERROR,
 ]);
@@ -117,6 +126,8 @@ function createCtx(params) {
       error: null,
     },
     procs: {},
+    // Docker 沙箱：本会话创建的容器名，用于失败/结束时 docker rm -f
+    docker: { containers: [], seq: 0 },
     cancelled: false,
     gate: params.gate === true,
     _lastDecisionSeq: 0,
@@ -433,55 +444,139 @@ async function canReachLocalHttp(ctx, port, timeoutMs = 2_500) {
   return false;
 }
 
+/** Docker 容器名：guardbuild-<session8>-<role>-<seq>，Host 只允许操作此前缀。 */
+function nextDockerContainerName(ctx, role) {
+  const seq = ++ctx.docker.seq;
+  const safeRole =
+    String(role)
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 24) || "target";
+  return `guardbuild-${ctx.sessionId.slice(0, 8)}-${safeRole}-${seq}`;
+}
+
+/** Docker Desktop 接受 Windows 盘符路径，但统一用正斜杠并去掉 \\?\ 扩展前缀（否则 -v 会被解析成非法 mode）。 */
+function dockerMountPath(p) {
+  let s = path.resolve(p).replace(/\\/g, "/");
+  if (s.startsWith("//?/UNC/")) s = `//${s.slice("//?/UNC/".length)}`;
+  else if (s.startsWith("//?/")) s = s.slice(4);
+  return s;
+}
+
+/**
+ * Docker 就绪判定：以映射后的宿主端口 HTTP 探活为准（容器日志不一定打印监听行）。
+ * 同时检查 docker CLI 是否已退出，镜像/命令错误时尽快失败而不是干等超时。
+ */
+async function waitForDockerReady(ctx, pid, port, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (ctx.cancelled) throw new CancelledError();
+    if (await canReachLocalHttp(ctx, port, 600)) return { ok: true };
+    try {
+      const logs = await ctx.rpc.request(
+        RPC_TO_HOST.PROC_LOGS,
+        { token: ctx.tokens.spawn, pid, tail: 5 },
+        { timeoutMs: 5_000 }
+      );
+      if (logs.exited) {
+        return {
+          ok: false,
+          exited: true,
+          exitCode: Number.isInteger(logs.exitCode) ? logs.exitCode : null,
+        };
+      }
+    } catch {
+      /* 进程表查询失败不阻断就绪轮询 */
+    }
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return { ok: false, exited: false, exitCode: null };
+}
+
 async function spawnTarget(ctx, { cwd, label, role = "target" }) {
   const start = ctx.targetConfig?.start ?? DEFAULT_START;
   const spawnCwd = start.cwd ? path.resolve(cwd, start.cwd) : cwd;
-  // 契约声明了 ${GB_PORT} 槽位时，先分配空闲端口再渲染启动命令（支持多实例并存）
+  const docker = ctx.targetConfig?.docker;
+  const dockerEnabled = docker?.enabled === true;
+  if (dockerEnabled && docker.invalid) {
+    throw new SessionError(`Docker 沙箱配置不合法：${docker.invalid}`, {
+      code: "docker_config_invalid",
+      hint: "请在 guardbuild.json 的 docker 中补全 image/containerPort/workdir；配置错误时 GuardBuild 不会回退到宿主机直接运行目标",
+      details: { docker },
+    });
+  }
+  // 契约声明了 ${GB_PORT} 槽位、或启用 Docker（需要宿主端口做映射）时，先分配空闲端口
   let allocated = null;
-  if (startUsesPortSlot(start)) {
+  if (startUsesPortSlot(start) || dockerEnabled) {
     try {
       const res = await ctx.rpc.request(RPC_TO_HOST.PROC_ALLOC_PORT, { token: ctx.tokens.spawn }, { timeoutMs: 15_000 });
       allocated = res.port;
       emit(ctx, {
         kind: "process",
         severity: SEVERITY.INFO,
-        message: `已分配空闲端口 ${allocated}（注入 ${label} 的 \${GB_PORT} 槽位）`,
+        message: dockerEnabled
+          ? `已分配宿主端口 ${allocated}（映射到容器 :${docker.containerPort}）`
+          : `已分配空闲端口 ${allocated}（注入 ${label} 的 \${GB_PORT} 槽位）`,
         data: { port: allocated, label },
       });
     } catch (e) {
-      throw new SessionError("无法分配空闲端口（启动契约使用了 ${GB_PORT} 槽位）", {
+      throw new SessionError("无法分配空闲端口", {
         code: "port_alloc_failed",
         hint: e.message,
         details: { cwd, label },
       });
     }
   }
-  const { cmd, args, env } = renderStart(start, allocated);
+  // Docker 内应用固定监听 containerPort（宿主端口只做映射，注入进去反而会让映射失效）
+  const { cmd, args, env } = renderStart(start, dockerEnabled ? docker.containerPort : allocated);
 
-  // Docker 容器隔离：docker.enabled=true 时，用 docker run 替代直接 spawn
-  const docker = ctx.targetConfig?.docker;
   let finalCmd = cmd;
   let finalArgs = args;
   let finalEnv = env;
-  if (docker?.enabled) {
-    const port = allocated ?? 3000;
-    const containerName = `guardbuild-${ctx.sessionId.slice(0, 8)}`;
-    const image = docker.image ?? "node:20-alpine";
+  let containerName = null;
+  if (dockerEnabled) {
+    const mergedEnv = { ...env, ...docker.env, PORT: String(docker.containerPort) };
+    if (mergedEnv.NODE_ENV == null) mergedEnv.NODE_ENV = "test";
+    if (Object.keys(mergedEnv).length > 32) {
+      throw new SessionError("Docker 沙箱环境变量过多（最多 32 个）", {
+        code: "docker_config_invalid",
+        hint: "请精简 guardbuild.json 的 start.env / docker.env",
+      });
+    }
+    const innerCmd = docker.command ?? [cmd, ...args];
+    containerName = nextDockerContainerName(ctx, role);
     finalCmd = "docker";
     finalArgs = [
-      "run", "--rm", "-d",
-      "--name", containerName,
-      "-p", `${port}:3000`,
-      "-e", "NODE_ENV=test",
-      image,
-      "sh", "-c", `cd /app && npm install --no-audit --no-fund && npm start`,
+      "run",
+      "--rm",
+      "--init",
+      "--name",
+      containerName,
+      "-p",
+      `127.0.0.1:${allocated}:${docker.containerPort}`,
+      "-v",
+      `${dockerMountPath(spawnCwd)}:${docker.workdir}`,
+      "-w",
+      docker.workdir,
+      ...Object.entries(mergedEnv).flatMap(([k, v]) => ["-e", `${k}=${v}`]),
+      docker.image,
+      ...innerCmd,
     ];
     finalEnv = {};
+    ctx.docker.containers.push(containerName);
     emit(ctx, {
       kind: "process",
       severity: SEVERITY.INFO,
-      message: `[Docker] 启动容器 ${containerName}（${image}，端口 ${port}:3000）`,
-      data: { containerName, image, port },
+      message: `[Docker] 启动容器 ${containerName}：${docker.image}；${spawnCwd} → ${docker.workdir}；127.0.0.1:${allocated} → 容器 :${docker.containerPort}`,
+      data: {
+        containerName,
+        image: docker.image,
+        workdir: docker.workdir,
+        hostPort: allocated,
+        containerPort: docker.containerPort,
+        envKeys: Object.keys(mergedEnv),
+      },
     });
   }
   let res;
@@ -503,8 +598,58 @@ async function spawnTarget(ctx, { cwd, label, role = "target" }) {
     throw new SessionError(`无法启动目标进程「${label}」`, {
       code: "target_spawn_failed",
       hint: diag.hint,
-      details: { cwd: spawnCwd, start, diagnosis: diag },
+      details: { cwd: spawnCwd, start, docker: dockerEnabled ? docker : null, diagnosis: diag },
     });
+  }
+  if (dockerEnabled) {
+    // 容器日志可能不打印监听行：直接对映射后的宿主端口做 HTTP 探活
+    const ready = await waitForDockerReady(ctx, res.pid, allocated, docker.readyTimeoutMs);
+    if (!ready.ok) {
+      const lines = [];
+      let exitCode = ready.exitCode;
+      try {
+        const logs = await ctx.rpc.request(RPC_TO_HOST.PROC_LOGS, {
+          token: ctx.tokens.spawn,
+          pid: res.pid,
+          tail: 60,
+        });
+        lines.push(...(logs.lines ?? []).map((l) => l.line));
+        if (Number.isInteger(logs.exitCode)) exitCode = logs.exitCode;
+      } catch {
+        /* ignore */
+      }
+      await killProc(ctx, res.pid);
+      const diag = diagnoseStartFailure({ output: lines, exitCode, start });
+      throw new SessionError(`Docker 容器「${label}」未在超时内就绪`, {
+        code: "target_not_ready",
+        hint: `容器 ${containerName} 已启动，但宿主端口 ${allocated} 无 HTTP 响应。请确认容器内服务监听 0.0.0.0:${docker.containerPort}（而非 127.0.0.1），必要时调整 guardbuild.json 的 docker.containerPort/image/workdir。${
+          diag.hint ? ` ${diag.hint}` : ""
+        }`,
+        details: {
+          cwd: spawnCwd,
+          start,
+          docker,
+          containerName,
+          hostPort: allocated,
+          exitCode,
+          output: lines,
+          diagnosis: diag,
+        },
+      });
+    }
+    const target = {
+      pid: res.pid,
+      port: allocated,
+      url: `http://127.0.0.1:${allocated}`,
+      container: containerName,
+    };
+    emit(ctx, {
+      kind: "process",
+      severity: SEVERITY.SUCCESS,
+      message: `目标容器「${label}」已就绪: ${target.url} → 容器 :${docker.containerPort}（${containerName}）`,
+      data: target,
+    });
+    return target;
   }
   const wait = await ctx.rpc.request(
     RPC_TO_HOST.PROC_WAIT_OUTPUT,
@@ -590,7 +735,37 @@ async function killProc(ctx, pid) {
   }
 }
 
+/** 清理本会话创建的容器：先 docker rm -f，再回收 docker CLI 进程。 */
+async function cleanupDockerContainers(ctx) {
+  const names = ctx.docker?.containers ?? [];
+  ctx.docker.containers = [];
+  if (!names.length || !ctx.tokens?.spawn) return;
+  for (const name of names) {
+    try {
+      const res = await ctx.rpc.request(
+        RPC_TO_HOST.PROC_SPAWN,
+        {
+          token: ctx.tokens.spawn,
+          cmd: "docker",
+          args: ["rm", "-f", name],
+          cwd: ctx.projectRoot,
+          role: "docker-cleanup",
+        },
+        { timeoutMs: 20_000 }
+      );
+      await ctx.rpc.request(
+        RPC_TO_HOST.PROC_WAIT_EXIT,
+        { token: ctx.tokens.spawn, pid: res.pid, timeoutMs: 15_000 },
+        { timeoutMs: 20_000 }
+      );
+    } catch {
+      /* --rm 可能已自动删除，或会话已中止 */
+    }
+  }
+}
+
 async function shutdownProcs(ctx) {
+  await cleanupDockerContainers(ctx);
   const entries = Object.values(ctx.procs).filter(Boolean);
   for (const p of entries) await killProc(ctx, p.pid);
   ctx.procs = {};
@@ -1146,6 +1321,153 @@ async function recheckAfterWriteback(ctx) {
   }
 }
 
+// ---------- 纯黑盒外部模式 ----------
+
+/**
+ * 纯黑盒模式：只对已运行目标发起外部 HTTP 攻击，不读源码、不启动目标、不生成补丁。
+ * guardbuild.json 仅用于读取 login/identities/blackbox 配置；证据全部来自外部请求。
+ */
+async function runBlackboxFlow(ctx, rawUrl) {
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    throw new SessionError(`黑盒目标 URL 非法：${rawUrl}`, {
+      code: "blackbox_bad_url",
+      hint: "请传入完整 URL（如 https://example.com 或 http://127.0.0.1:3000）",
+    });
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new SessionError(`黑盒模式仅支持 http/https：${parsed.protocol}`, {
+      code: "blackbox_bad_url",
+      hint: "请使用 http(s) URL 指向已运行的目标服务",
+    });
+  }
+  if (parsed.username || parsed.password) {
+    throw new SessionError("黑盒目标 URL 不能内嵌账号密码", {
+      code: "blackbox_bad_url",
+      hint: "请在 guardbuild.json 的 identities 中提供测试身份，由 Host 保险库注入凭据",
+    });
+  }
+  const baseUrl = `${parsed.origin}${parsed.pathname === "/" ? "" : parsed.pathname.replace(/\/+$/, "")}`;
+  const host = parsed.hostname.toLowerCase();
+
+  setState(ctx, STATE.PROBING);
+  emit(ctx, {
+    kind: "session",
+    severity: SEVERITY.INFO,
+    message: `纯黑盒外部模式：目标 ${baseUrl}（不读源码、不启动本地服务、不生成补丁）`,
+    data: { sessionId: ctx.sessionId, blackbox: true, host },
+  });
+
+  if (isLoopbackHostname(host)) {
+    ctx.tokens.http = await requestScope(ctx, SCOPE_KINDS.NET_PROBE, `向本机回环目标 ${host} 发起黑盒攻击探测`);
+  } else {
+    if (parsed.protocol !== "https:") {
+      throw new SessionError("远程黑盒目标仅支持 https（明文 http 仅限本机回环）", {
+        code: "blackbox_insecure_url",
+        hint: "请使用 https URL；本机调试可用 http://127.0.0.1:<port>",
+      });
+    }
+    ctx.tokens.http = await requestScope(
+      ctx,
+      SCOPE_KINDS.NET_EGRESS,
+      `向 ${host} 发起黑盒攻击探测`,
+      host
+    );
+  }
+
+  const cfg = await loadBlackboxConfig(ctx);
+  if (cfg.source === "invalid") {
+    emit(ctx, {
+      kind: "session",
+      severity: SEVERITY.WARN,
+      message: `guardbuild.json 解析失败（${cfg.invalid}）：黑盒模式将使用内建演示身份尝试登录`,
+      data: { invalid: cfg.invalid },
+    });
+  } else if (cfg.source === "none") {
+    emit(ctx, {
+      kind: "session",
+      severity: SEVERITY.INFO,
+      message: "项目目录未提供 guardbuild.json：仅做未认证攻击面探测，并使用内建演示身份尝试登录",
+      data: {},
+    });
+  }
+  if (cfg.login) ctx.loginConfig = cfg.login;
+  if (cfg.identities) ctx.identities = cfg.identities;
+
+  const allowMutation =
+    process.env.GUARDBUILD_BLACKBOX_MUTATE === "1" || cfg.blackbox?.allowMutation === true;
+  // 先落一份最小视图：扫描（含不可达）失败时报告仍能按黑盒模式渲染。
+  ctx.view.blackbox = {
+    mode: "blackbox",
+    url: baseUrl,
+    routeCount: 0,
+    routes: [],
+    openapiFound: false,
+    openapiRouteCount: 0,
+    findings: [],
+    evidenceCount: 0,
+    login: null,
+    rateLimited: false,
+    allowMutation,
+    reachable: null,
+    outcome: null,
+    exitCode: null,
+  };
+  const result = await runBlackbox(ctx, baseUrl, { config: cfg, allowMutation });
+
+  if (!result.reachable) {
+    ctx.view.blackbox.reachable = false;
+    ctx.view.blackbox.outcome = "failed";
+    ctx.view.blackbox.exitCode = 2;
+    pushView(ctx);
+    throw new SessionError(`黑盒目标不可达：${baseUrl}`, {
+      code: "blackbox_unreachable",
+      hint: "请确认目标服务已启动、URL/端口正确；远程目标需 https 且 Host 已授予 net.egress:<host> 作用域",
+    });
+  }
+
+  const outcome = result.findings.length > 0 ? "vulnerable_unfixed" : "no_findings";
+  const exitCode = result.findings.length > 0 ? 1 : 0;
+  ctx.view.targets.blackbox = { url: baseUrl, role: "外部黑盒目标" };
+  ctx.view.phases.blackbox = result.summary;
+  ctx.view.blackbox = {
+    mode: "blackbox",
+    url: baseUrl,
+    routeCount: result.routes.length,
+    routes: result.routes.map((r) => ({ method: r.method, path: r.path, source: r.source ?? null })),
+    openapiFound: result.openapiFound,
+    openapiRouteCount: result.openapiRouteCount,
+    findings: result.findings,
+    evidenceCount: result.evidence.length,
+    login: result.login,
+    rateLimited: result.rateLimited,
+    allowMutation: result.configuredMutation,
+    reachable: true,
+    outcome,
+    exitCode,
+  };
+  ctx.pushEvidence(result.evidence);
+  pushView(ctx);
+
+  emit(ctx, {
+    kind: "session",
+    severity: result.findings.length > 0 ? SEVERITY.ERROR : SEVERITY.SUCCESS,
+    message:
+      result.findings.length > 0
+        ? `黑盒扫描完成：${result.routes.length} 条路由，发现 ${result.findings.length} 个可复现漏洞`
+        : `黑盒扫描完成：${result.routes.length} 条路由，未发现可复现漏洞（仅覆盖本次探测面）`,
+    data: { ...result.summary, outcome, exitCode },
+  });
+
+  setState(ctx, STATE.EVIDENCED);
+  await emitReport(ctx, { outcome, exitCode, state: STATE.COMPLETED });
+  setState(ctx, STATE.COMPLETED);
+  await shutdownProcs(ctx);
+  endSession(ctx);
+}
+
 // ---------- 会话主流程 ----------
 
 async function runFlow(ctx) {
@@ -1155,23 +1477,9 @@ async function runFlow(ctx) {
     ctx.db.ensureSession(sessionId, ctx.projectRoot, ctx.projectRoot);
     pushView(ctx);
 
-    // 纯黑盒模式：传入 URL，不读源码、不启动本地服务、不生成补丁
     const blackboxUrl = process.env.GUARDBUILD_BLACKBOX_URL;
     if (blackboxUrl) {
-      emit(ctx, {
-        kind: "session",
-        severity: SEVERITY.INFO,
-        message: `纯黑盒模式：目标 ${blackboxUrl}（不读源码、不生成本地补丁）`,
-        data: { sessionId, blackbox: true },
-      });
-      const { runBlackbox } = await import("./lib/blackbox.mjs");
-      const result = await runBlackbox(ctx, blackboxUrl);
-      ctx.view.blackbox = { url: blackboxUrl, routes: result.routes, openapiFound: !!result.openapi };
-      emit(ctx, {
-        kind: "session",
-        severity: SEVERITY.INFO,
-        message: `黑盒扫描完成：${result.routes.length} 条路由${result.openapi ? "（含 OpenAPI）" : ""}`,
-      });
+      await runBlackboxFlow(ctx, blackboxUrl);
       return;
     }
 
@@ -1184,6 +1492,20 @@ async function runFlow(ctx) {
 
     const targetConfig = await loadTargetConfig(ctx);
     ctx.targetConfig = targetConfig;
+    if (targetConfig.docker?.enabled) {
+      ctx.view.targets.docker = {
+        enabled: true,
+        image: targetConfig.docker.image,
+        containerPort: targetConfig.docker.containerPort,
+        workdir: targetConfig.docker.workdir,
+      };
+      emit(ctx, {
+        kind: "session",
+        severity: SEVERITY.INFO,
+        message: `[Docker] 沙箱已启用：${targetConfig.docker.image}；项目挂载到 ${targetConfig.docker.workdir}；容器监听 ${targetConfig.docker.containerPort}（宿主端口动态分配）；就绪判定为 HTTP 探活`,
+        data: { docker: ctx.view.targets.docker },
+      });
+    }
     ctx.loginConfig = targetConfig.login ?? null;
     if (targetConfig.identities) {
       ctx.identities = targetConfig.identities;

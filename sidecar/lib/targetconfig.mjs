@@ -154,13 +154,137 @@ export function normalizeLogin(raw) {
   };
 }
 
-/** Docker 容器隔离配置：目标服务跑在容器里，不直接跑宿主机。 */
+/**
+ * Docker 容器隔离配置：目标服务跑在容器里，不直接跑宿主机。
+ * Host 只接受受限的 `docker run`（挂载当前项目目录、仅回环端口映射、无特权/宿主网络），
+ * 因此这里的归一化必须生成与 Host 白名单一致的形状；非法配置在启动时显式报错，
+ * 绝不静默回落到宿主机直接启动。
+ */
 function normalizeDocker(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const enabled = raw.enabled === true;
+  const problems = [];
+
+  const image = typeof raw.image === "string" ? raw.image.trim() : "";
+  if (!image || image.length > 200 || !/^[A-Za-z0-9_][A-Za-z0-9._/:@-]*$/.test(image)) {
+    problems.push("docker.image 缺失或非法（如 node:20-alpine）");
+  }
+
+  let containerPort = 3000;
+  if (raw.containerPort != null) {
+    if (Number.isInteger(raw.containerPort) && raw.containerPort >= 1 && raw.containerPort <= 65535) {
+      containerPort = raw.containerPort;
+    } else {
+      problems.push("docker.containerPort 必须是 1-65535 的整数");
+    }
+  }
+
+  let workdir = "/app";
+  if (raw.workdir != null) {
+    const ok =
+      typeof raw.workdir === "string" &&
+      raw.workdir.startsWith("/") &&
+      raw.workdir.length > 1 &&
+      raw.workdir.length <= 200 &&
+      raw.workdir
+        .slice(1)
+        .split("/")
+        .every((seg) => seg && seg !== "." && seg !== ".." && /^[A-Za-z0-9._-]+$/.test(seg));
+    if (ok) workdir = raw.workdir;
+    else problems.push("docker.workdir 必须是容器内绝对路径（如 /app）");
+  }
+
+  const env = {};
+  if (raw.env && typeof raw.env === "object" && !Array.isArray(raw.env)) {
+    for (const [k, v] of Object.entries(raw.env)) {
+      if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(k)) {
+        problems.push(`docker.env 变量名非法：${k}`);
+        continue;
+      }
+      if (typeof v === "string" || typeof v === "number") env[k] = String(v);
+    }
+  }
+
+  let command = null;
+  if (raw.command != null) {
+    if (
+      Array.isArray(raw.command) &&
+      raw.command.length > 0 &&
+      raw.command.length <= 64 &&
+      raw.command.every((a) => typeof a === "string" && a.length <= 4096)
+    ) {
+      command = raw.command.map(String);
+    } else {
+      problems.push("docker.command 必须是非空字符串数组");
+    }
+  }
+
+  const readyTimeoutMs =
+    Number.isFinite(raw.readyTimeoutMs) && raw.readyTimeoutMs >= 1000
+      ? Math.min(600_000, Math.floor(raw.readyTimeoutMs))
+      : 60_000;
+
   return {
-    enabled: raw.enabled === true,
-    composeFile: typeof raw.composeFile === "string" ? raw.composeFile : "docker-compose.yml",
-    service: typeof raw.service === "string" ? raw.service : null,
+    enabled,
+    image: image || null,
+    containerPort,
+    workdir,
+    env,
+    command,
+    readyTimeoutMs,
+    invalid: problems.length ? problems.join("；") : null,
+  };
+}
+
+/**
+ * 黑盒模式配置：只读取登录/身份/黑盒开关，不触发启动探测（不读源码）。
+ * allowMutation 默认 false：写操作类探测（PUT/POST）需显式开启。
+ */
+function normalizeBlackbox(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const loginPaths = Array.isArray(raw.loginPaths)
+    ? raw.loginPaths
+        .filter((p) => typeof p === "string" && p.trim())
+        .map((p) => (p.trim().startsWith("/") ? p.trim() : `/${p.trim()}`))
+        .slice(0, 8)
+    : null;
+  return {
+    allowMutation: raw.allowMutation === true,
+    loginPaths: loginPaths?.length ? loginPaths : null,
+    maxRoutes: Number.isFinite(raw.maxRoutes) ? Math.min(200, Math.max(10, Math.floor(raw.maxRoutes))) : null,
+  };
+}
+
+/** 纯黑盒模式：仅加载契约中的登录/身份信息（KB 级读取，不做源码分析/自动探测）。 */
+export async function loadBlackboxConfig(ctx) {
+  const base = String(ctx.projectRoot).replace(/[\\/]+$/, "");
+  const path = `${base}/${CONFIG_FILENAME}`;
+  let content;
+  try {
+    const res = await ctx.rpc.request(
+      RPC_TO_HOST.FS_READ,
+      { token: ctx.tokens.project, path, redact: false },
+      { timeoutMs: 15_000 }
+    );
+    content = res.content;
+  } catch {
+    return { source: "none", invalid: null, login: null, identities: null, blackbox: null };
+  }
+  let parsed;
+  try {
+    parsed = JSON.parse(content);
+  } catch (e) {
+    return { source: "invalid", invalid: e.message, login: null, identities: null, blackbox: null };
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { source: "invalid", invalid: "顶层必须是 JSON 对象", login: null, identities: null, blackbox: null };
+  }
+  return {
+    source: CONFIG_FILENAME,
+    invalid: null,
+    login: normalizeLogin(parsed.login),
+    identities: normalizeIdentities(parsed.identities),
+    blackbox: normalizeBlackbox(parsed.blackbox),
   };
 }
 

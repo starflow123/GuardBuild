@@ -39,7 +39,17 @@ function esc(v) {
   return String(v ?? "").replace(/\|/g, "\\|").replace(/\n/g, " ");
 }
 
-function headline(outcome, patchStatus, supabase) {
+function headline(outcome, patchStatus, supabase, blackbox = null) {
+  if (blackbox) {
+    if (outcome === "vulnerable_unfixed") {
+      return `黑盒外部扫描发现 ${blackbox.findings?.length ?? 0} 个可利用漏洞（证据来自对运行实例的外部请求）`;
+    }
+    if (outcome === "no_findings") {
+      return `黑盒外部扫描未发现可复现漏洞（${blackbox.routeCount ?? 0} 条路由；仅代表本次已探测攻击面）`;
+    }
+    if (outcome === "failed") return "黑盒扫描执行失败，未能完成外部验证闭环";
+    if (outcome === "aborted") return "黑盒扫描被中止，报告不完整";
+  }
   const supaCritical = supabase && ((supabase.leaks ?? 0) > 0 || supabase.serviceRoleLeak);
   switch (outcome) {
     case "vulnerable":
@@ -73,6 +83,26 @@ function suggestions(r) {
   const { outcome, patchStatus } = r.verdict;
   const supabase = r.supabase ?? null;
   const lines = [];
+  if (r.blackbox) {
+    const bb = r.blackbox;
+    if (outcome === "vulnerable_unfixed") {
+      for (const f of (bb.findings ?? []).slice(0, 8)) {
+        lines.push(`- 已复现：${f.type}（${f.method} ${f.path}）—— ${f.detail}`);
+      }
+      lines.push("- 黑盒模式只取证、不改码：请在源码/配置/数据库策略中修复上述端点，再重跑同一 URL 验证。");
+      if (!bb.allowMutation) {
+        lines.push("- 写操作类越权（PUT/POST）默认未执行（避免修改目标数据）；如需覆盖，设置 blackbox.allowMutation=true 或 GUARDBUILD_BLACKBOX_MUTATE=1 后重跑。");
+      }
+    } else if (outcome === "no_findings") {
+      lines.push("- 本次覆盖：未认证读取、跨用户读取（IDOR）、路径穿越、SQL 注入（错误/布尔盲注）、敏感文件/调试端点暴露；可选写操作越权默认关闭。");
+      lines.push("- 未发现不代表无漏洞：黑盒结果受路由发现、测试身份、资源可发现性与攻击面启发式限制；建议补充 guardbuild.json 的 login/identities/blackbox.loginPaths 或 OpenAPI 文档后重跑。");
+    } else if (outcome === "failed") {
+      lines.push(`- 执行失败（${r.error?.code}）：${r.error?.message ?? ""}${r.error?.hint ? `；建议：${r.error.hint}` : ""}`);
+    } else {
+      lines.push("- 黑盒扫描未完成裁决；可重新运行。");
+    }
+    return lines.join("\n");
+  }
   if (outcome === "vulnerable" && patchStatus === "verified") {
     lines.push(`- 隔离 worktree 中已存在通过双重验收的修复补丁（\`${r.patch?.hash?.slice(0, 12)}…\`），gate 未写回原工作区。`);
     lines.push(`- 补丁位置：\`${r.patch?.worktree}\`；可将修改应用到工作区后提交。`);
@@ -175,12 +205,14 @@ function renderLlmSection(llm) {
 
 function renderMarkdown(r) {
   const acc = r.acceptance;
+  const bb = r.blackbox ?? null;
+  const bbEvidence = r.evidence.blackbox ?? [];
   const pre = r.evidence.pre ?? [];
   const post = r.evidence.post ?? [];
   const preVuln = pre.filter((e) => e.verdict === "vulnerable").length;
   const parts = [];
 
-  parts.push(`# GuardBuild 安全诊断报告\n`);
+  parts.push(`# ${bb ? "GuardBuild 黑盒安全扫描报告" : "GuardBuild 安全诊断报告"}\n`);
   parts.push(`> **结论：${r.verdict.headline}**\n`);
   parts.push(
     [
@@ -188,23 +220,48 @@ function renderMarkdown(r) {
       "| --- | --- |",
       `| 生成时间 | ${fmtTime(r.generatedAt)} |`,
       `| 目标项目 | ${esc(r.session.projectName)}（\`${esc(r.session.projectRoot)}\`） |`,
+      ...(bb ? [`| 扫描目标 | \`${esc(bb.url)}\` |`] : []),
       `| 会话 | ${esc(r.session.id)} |`,
       `| 终态 | ${esc(r.session.stateLabel)}（${esc(r.session.state)}） |`,
       `| 退出码 | ${r.verdict.exitCode}（0=无漏洞证据 / 1=漏洞证据成立 / 2=执行失败） |`,
-      `| 模式 | ${r.tool.gate ? "CI gate（策略授权，禁止写回）" : "交互会话"} |`,
+      `| 模式 | ${bb ? "纯黑盒外部扫描（不读源码 / 不启动目标 / 不生成补丁）" : r.tool.gate ? "CI gate（策略授权，禁止写回）" : "交互会话"} |`,
+      ...(r.targets?.docker?.enabled
+        ? [
+            `| Docker 沙箱 | \`${esc(r.targets.docker.image)}\`；项目 → \`${esc(r.targets.docker.workdir)}\`；容器端口 ${r.targets.docker.containerPort}（仅供运行时隔离，不构成对恶意代码的安全边界） |`,
+          ]
+        : []),
       `| 协议 | ${r.tool.protocolVersion} |`,
       "",
     ].join("\n")
   );
 
   parts.push(`## 摘要\n`);
-  const summaryLines = [`- 静态发现：${r.summary.findingCount} 个安全候选端点`];
-  summaryLines.push(`- 修复前证据（pre）：${pre.length} 条，其中 vulnerable ${preVuln} 条`);
-  const preGrades = r.summary.phases?.pre?.grades;
-  if (preGrades) {
-    summaryLines.push(
-      `- 证据级别（pre）：决策轨迹 ${preGrades.strong ?? 0} 条 / 内容归属 ${preGrades["cross-proven"] ?? 0} 条 / 仅 HTTP ${preGrades["http-only"] ?? 0} 条`
-    );
+  const summaryLines = bb
+    ? [
+        `- 扫描目标：\`${esc(bb.url)}\``,
+        `- 路由发现：${bb.routeCount ?? 0} 条${bb.openapiFound ? `（含 OpenAPI ${bb.openapiRouteCount ?? 0} 条模板路径）` : "（目录探测）"}`,
+        `- 黑盒证据：${bbEvidence.length} 条，其中 vulnerable ${bbEvidence.filter((e) => e.verdict === "vulnerable").length} 条`,
+        `- 登录：${
+          bb.login?.ok
+            ? `成功（${esc(bb.login.path)}；身份 ${esc((bb.login.identities ?? []).map((i) => i.name).join("、") || "—")}）`
+            : "失败或未配置（跨用户越权用例已跳过）"
+        }`,
+        `- 写操作探测：${bb.allowMutation ? "已开启（会修改目标数据并尽力恢复）" : "关闭（默认只读探测）"}`,
+        `- 目标可达：${
+          bb.reachable === false
+            ? "否（连接失败，未执行探测）"
+            : `是${bb.rateLimited ? "；命中速率限制（429）" : "；未观察到 429"}`
+        }`,
+      ]
+    : [`- 静态发现：${r.summary.findingCount} 个安全候选端点`];
+  if (!bb) {
+    summaryLines.push(`- 修复前证据（pre）：${pre.length} 条，其中 vulnerable ${preVuln} 条`);
+    const preGrades = r.summary.phases?.pre?.grades;
+    if (preGrades) {
+      summaryLines.push(
+        `- 证据级别（pre）：决策轨迹 ${preGrades.strong ?? 0} 条 / 内容归属 ${preGrades["cross-proven"] ?? 0} 条 / 仅 HTTP ${preGrades["http-only"] ?? 0} 条`
+      );
+    }
   }
   if (acc) {
     summaryLines.push(
@@ -213,14 +270,14 @@ function renderMarkdown(r) {
   }
   if (r.patch) summaryLines.push(`- 补丁：\`${r.patch.hash?.slice(0, 12)}…\`（${r.patch.files?.length ?? 0} 个文件，${esc(r.patch.status)}）`);
   const sb = r.summary.supabase;
-  if (sb?.detected) {
+  if (!bb && sb?.detected) {
     const bits = [`URL \`${esc(sb.url ?? "—")}\``, `表引用 ${sb.tables?.length ?? 0} 个`];
     if (sb.serviceRoleLeak) bits.push(`service_role 暴露（${esc(sb.serviceRoleLeak.source)}）`);
     if (sb.leaks) bits.push(`匿名可读 ${sb.leaks} 个表`);
     summaryLines.push(`- Supabase：${bits.join("，")}`);
   }
-  if (r.summary.start) summaryLines.push(`- 启动契约：\`${esc(r.summary.start.cmd)} ${esc((r.summary.start.args ?? []).join(" "))}\`（就绪模式 ${esc(r.summary.start.readyPattern)}）`);
-  if (r.llm?.used) {
+  if (!bb && r.summary.start) summaryLines.push(`- 启动契约：\`${esc(r.summary.start.cmd)} ${esc((r.summary.start.args ?? []).join(" "))}\`（就绪模式 ${esc(r.summary.start.readyPattern)}）`);
+  if (!bb && r.llm?.used) {
     const applied = [
       r.llm.applied?.start ? "启动" : null,
       r.llm.applied?.login ? "登录" : null,
@@ -233,9 +290,9 @@ function renderMarkdown(r) {
   if (r.error) summaryLines.push(`- 错误：\`${esc(r.error.code)}\` — ${esc(r.error.message)}`);
   parts.push(summaryLines.join("\n") + "\n");
 
-  if (r.llm?.used) parts.push(renderLlmSection(r.llm));
+  if (!bb && r.llm?.used) parts.push(renderLlmSection(r.llm));
 
-  if (r.summary.findings.length) {
+  if (!bb && r.summary.findings.length) {
     parts.push(`## 静态发现（${r.summary.findings.length}）\n`);
     parts.push(
       [
@@ -249,8 +306,29 @@ function renderMarkdown(r) {
     );
   }
 
-  parts.push(`## 修复前证据（pre，${pre.length} 条）\n`);
-  parts.push(evidenceTable(pre));
+  if (bb) {
+    parts.push(`## 黑盒发现（${bb.findings?.length ?? 0}）\n`);
+    if (bb.findings?.length) {
+      parts.push(
+        [
+          "| 类型 | 方法 | 路径 | 证据级别 | 详情 |",
+          "| --- | --- | --- | --- | --- |",
+          ...bb.findings.map(
+            (f) =>
+              `| ${esc(f.type)} | ${esc(f.method)} | ${esc(f.path)} | ${esc(GRADE_LABELS[f.evidenceGrade] ?? f.evidenceGrade ?? "—")} | ${esc(f.detail)} |`
+          ),
+          "",
+        ].join("\n")
+      );
+    } else {
+      parts.push("_未发现可复现漏洞。_\n");
+    }
+    parts.push(`## 黑盒探测证据（${bbEvidence.length} 条）\n`);
+    parts.push(evidenceTable(bbEvidence));
+  } else {
+    parts.push(`## 修复前证据（pre，${pre.length} 条）\n`);
+    parts.push(evidenceTable(pre));
+  }
 
   if (r.patch) {
     parts.push(`## 修复补丁\n`);
@@ -299,6 +377,7 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
   const finalState = state ?? view.state;
   const start = ctx.targetConfig?.start ?? null;
   const supabase = view.supabase ?? null;
+  const blackbox = view.blackbox ?? null;
   const r = {
     schema: "guardbuild.report/1",
     generatedAt: Date.now(),
@@ -316,15 +395,32 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
       outcome,
       exitCode,
       patchStatus,
-      headline: headline(outcome, patchStatus, supabase),
+      headline: headline(outcome, patchStatus, supabase, blackbox),
     },
     summary: {
       findingCount: (view.findings ?? []).length,
       findings: view.findings ?? [],
-      evidence: { pre: byPhase("pre").length, post: byPhase("post").length, postWriteback: byPhase("post_writeback").length },
+      evidence: {
+        blackbox: byPhase("blackbox").length,
+        pre: byPhase("pre").length,
+        post: byPhase("post").length,
+        postWriteback: byPhase("post_writeback").length,
+      },
       phases: view.phases ?? {},
       acceptance: view.acceptance ?? null,
       supabase,
+      blackbox: blackbox
+        ? {
+            url: blackbox.url,
+            routeCount: blackbox.routeCount ?? 0,
+            openapiFound: !!blackbox.openapiFound,
+            openapiRouteCount: blackbox.openapiRouteCount ?? 0,
+            findingCount: (blackbox.findings ?? []).length,
+            login: blackbox.login ?? null,
+            rateLimited: !!blackbox.rateLimited,
+            allowMutation: !!blackbox.allowMutation,
+          }
+        : null,
       start: start
         ? { cmd: start.cmd, args: start.args, cwd: start.cwd ?? null, readyPattern: start.readyPattern }
         : null,
@@ -351,8 +447,16 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
         }
       : null,
     supabase,
-    evidence: { pre: byPhase("pre"), post: byPhase("post"), postWriteback: byPhase("post_writeback") },
-    poc: buildPocList(byPhase("pre"), view.targets?.original?.url),
+    blackbox,
+    evidence: {
+      blackbox: byPhase("blackbox"),
+      pre: byPhase("pre"),
+      post: byPhase("post"),
+      postWriteback: byPhase("post_writeback"),
+    },
+    poc: blackbox
+      ? buildPocList(byPhase("blackbox"), blackbox.url)
+      : buildPocList(byPhase("pre"), view.targets?.original?.url),
     patch: view.patch
       ? {
           hash: view.patch.hash,

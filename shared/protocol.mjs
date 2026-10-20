@@ -114,6 +114,7 @@ export const STATE = {
   APPLIED: "applied",
   ROLLED_BACK: "rolled_back",
   VERIFY_FAILED: "verify_failed",
+  COMPLETED: "completed",
   ABORTED: "aborted",
   ERROR: "error",
 };
@@ -132,6 +133,7 @@ export const STATE_LABELS = {
   applied: "已修复并写回",
   rolled_back: "已回滚",
   verify_failed: "验收未通过",
+  completed: "扫描完成",
   aborted: "已中止",
   error: "执行出错",
 };
@@ -139,10 +141,10 @@ export const STATE_LABELS = {
 /** 状态机合法迁移表（Sidecar 与 Host/UI 共同遵守） */
 export const TRANSITIONS = {
   idle: ["starting"],
-  starting: ["analyzing", "error", "aborted"],
+  starting: ["analyzing", "probing", "error", "aborted"],
   analyzing: ["probing", "error", "aborted"],
   probing: ["evidenced", "error", "aborted"],
-  evidenced: ["patching", "error", "aborted"],
+  evidenced: ["patching", "completed", "error", "aborted"],
   patching: ["patch_review", "error", "aborted"],
   patch_review: ["verifying", "aborted", "error"],
   verifying: ["writeback_pending", "verify_failed", "aborted", "error"],
@@ -151,6 +153,7 @@ export const TRANSITIONS = {
   applying: ["applied", "error"],
   applied: ["rolled_back", "error"],
   rolled_back: [],
+  completed: [],
   error: [],
   aborted: [],
 };

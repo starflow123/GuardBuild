@@ -130,7 +130,8 @@ async function httpJson(ctx, opts) {
     graphql = false,
   } = opts;
   const params = {
-    token: ctx.tokens.net,
+    // 黑盒模式把目标主机令牌放在 http 槽位（远程 net.egress）；常规流程仍用 net。
+    token: ctx.tokens.http ?? ctx.tokens.net,
     method,
     url: `${baseUrl.replace(/\/+$/, "")}${path}`,
     headers: body ? { "Content-Type": "application/json" } : {},

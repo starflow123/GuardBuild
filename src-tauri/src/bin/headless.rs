@@ -163,6 +163,33 @@ fn spawn_gate_watcher(host: Arc<Host>) {
                     p["error"] = view.get("error").cloned().unwrap_or(Value::Null);
                     finish_gate(&host, exit_code, p);
                 }
+                "completed" => {
+                    // 纯黑盒终态：结果在 view.blackbox 中（不生成补丁）
+                    let bb = view.get("blackbox");
+                    let outcome = bb
+                        .and_then(|b| b.get("outcome"))
+                        .and_then(|o| o.as_str())
+                        .unwrap_or("no_findings");
+                    let exit_code = bb
+                        .and_then(|b| b.get("exitCode"))
+                        .and_then(|e| e.as_i64())
+                        .unwrap_or(0) as i32;
+                    let verdict = match outcome {
+                        "vulnerable_unfixed" => "vulnerable_unfixed",
+                        _ => "no_findings",
+                    };
+                    let mut p = base(verdict);
+                    if let Some(b) = bb {
+                        p["blackbox"] = json!({
+                            "url": b.get("url").cloned().unwrap_or(Value::Null),
+                            "routeCount": b.get("routeCount").cloned().unwrap_or(Value::Null),
+                            "findingCount": b.get("findings").and_then(|f| f.as_array()).map(|a| a.len()).unwrap_or(0),
+                            "openapiFound": b.get("openapiFound").cloned().unwrap_or(Value::Null),
+                            "login": b.get("login").cloned().unwrap_or(Value::Null),
+                        });
+                    }
+                    finish_gate(&host, exit_code, p);
+                }
                 "aborted" => finish_gate(&host, 2, base("aborted")),
                 "applied" => {
                     let mut p = base("vulnerable");
@@ -187,7 +214,7 @@ fn finish_gate(host: &Arc<Host>, exit_code: i32, mut payload: Value) -> ! {
 }
 
 fn main() {
-    let args = parse_args();
+    let mut args = parse_args();
 
     // 纯黑盒模式：把 --url 透传给 sidecar
     if let Some(ref url) = args.url {
@@ -214,8 +241,13 @@ fn main() {
             .map(|v| v != "0")
             .unwrap_or(true);
 
+    // 纯黑盒 --url 模式不需要本地项目：缺省以当前目录作为会话根（仅用于 report/作用域，不做源码分析）
+    if args.url.is_some() && args.project.is_none() {
+        args.project = std::env::current_dir().ok().map(|p| p.to_string_lossy().to_string());
+    }
+
     if args.gate && args.project.is_none() {
-        println!("GB_ERROR {}", json!({ "stage": "gate", "error": "--gate 需要 --project <dir>（或 GUARDBUILD_E2E_PROJECT）" }));
+        println!("GB_ERROR {}", json!({ "stage": "gate", "error": "--gate 需要 --project <dir>（或 GUARDBUILD_E2E_PROJECT/--url）" }));
         std::process::exit(2);
     }
 

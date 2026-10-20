@@ -262,6 +262,53 @@ test("loadTargetConfig: 契约按原文读取（redact:false），密码不得�
   assert.equal(res.identities[0].password, "secret1");
 });
 
+test("loadTargetConfig: docker 契约归一化（镜像/端口/工作目录/env/命令）", async () => {
+  const raw = {
+    start: { cmd: "node", args: ["server.js"] },
+    docker: {
+      enabled: true,
+      image: "node:20-alpine",
+      containerPort: 8080,
+      workdir: "/srv/app",
+      env: { NODE_ENV: "test", BAD_KEY: "x" },
+      command: ["sh", "-c", "node server.js"],
+      readyTimeoutMs: 90000,
+    },
+  };
+  const res = await loadTargetConfig(fakeCtx(JSON.stringify(raw)));
+  assert.equal(res.docker.enabled, true);
+  assert.equal(res.docker.image, "node:20-alpine");
+  assert.equal(res.docker.containerPort, 8080);
+  assert.equal(res.docker.workdir, "/srv/app");
+  assert.equal(res.docker.env.NODE_ENV, "test");
+  assert.equal(res.docker.env.BAD_KEY, "x");
+  assert.deepEqual(res.docker.command, ["sh", "-c", "node server.js"]);
+  assert.equal(res.docker.readyTimeoutMs, 90000);
+  assert.equal(res.docker.invalid, null);
+});
+
+test("loadTargetConfig: docker 启用但镜像缺失 → 标记 invalid（启动时显式失败，不回退宿主机）", async () => {
+  const res = await loadTargetConfig(fakeCtx(JSON.stringify({ docker: { enabled: true } })));
+  assert.equal(res.docker.enabled, true);
+  assert.ok(res.docker.invalid && res.docker.invalid.includes("docker.image"), res.docker.invalid);
+
+  const badPath = await loadTargetConfig(
+    fakeCtx(JSON.stringify({ docker: { enabled: true, image: "alpine", workdir: "/app/../etc" } }))
+  );
+  assert.ok(badPath.docker.invalid && badPath.docker.invalid.includes("docker.workdir"), badPath.docker.invalid);
+
+  const badEnv = await loadTargetConfig(
+    fakeCtx(JSON.stringify({ docker: { enabled: true, image: "alpine", env: { "bad-key": "x" } } }))
+  );
+  assert.ok(badEnv.docker.invalid && badEnv.docker.invalid.includes("docker.env"), badEnv.docker.invalid);
+});
+
+test("loadTargetConfig: docker 未启用时不产生副作用配置", async () => {
+  const res = await loadTargetConfig(fakeCtx(JSON.stringify({ docker: { image: 42 } })));
+  assert.equal(res.docker.enabled, false);
+  assert.equal(res.docker.image, null);
+});
+
 test("loadTargetConfig: email 身份 + login 契约归一化（前导斜杠自动补齐、默认值）", async () => {
   const raw = {
     start: { cmd: "node", args: ["x.js"] },

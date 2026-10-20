@@ -19,7 +19,9 @@ use super::httpclient;
 use super::procops::{self, ProcTable};
 use super::redact::Redactor;
 use super::rpc::{RpcConnection, RpcError};
-use super::token::{now_ms, resolve_in_root_allow_missing, Scope, Token, TokenStore};
+use super::token::{
+    now_ms, redact_docker_env_args, resolve_in_root_allow_missing, Scope, Token, TokenStore,
+};
 use super::vault::Vault;
 
 pub const PROTOCOL_VERSION: &str = "guardbuild.rpc/1";
@@ -299,7 +301,14 @@ impl Host {
         ];
         // 接入侦察的可选配置：密钥只从宿主进程环境透传给 Sidecar（侧车再经 net.egress
         // 请求 Host 出站），绝不写入 cfg / 日志 / 报告，也不进入目标进程环境。
-        for key in ["DEEPSEEK_API_KEY", "DEEPSEEK_BASE_URL", "DEEPSEEK_MODEL", "GUARDBUILD_LLM_SCOUT", "GUARDBUILD_BLACKBOX_URL"] {
+        for key in [
+            "DEEPSEEK_API_KEY",
+            "DEEPSEEK_BASE_URL",
+            "DEEPSEEK_MODEL",
+            "GUARDBUILD_LLM_SCOUT",
+            "GUARDBUILD_BLACKBOX_URL",
+            "GUARDBUILD_BLACKBOX_MUTATE",
+        ] {
             if let Ok(v) = std::env::var(key) {
                 if !v.trim().is_empty() {
                     extra.push((key.to_string(), v));
@@ -1097,7 +1106,7 @@ impl Host {
         {
             let tokens = self.tokens.read().unwrap();
             let token = tokens.require(&p.token)?;
-            token.require_spawn(&cwd, &p.cmd, &self.cfg.node_bin)?;
+            token.require_spawn(&cwd, &p.cmd, &p.args, &self.cfg.node_bin)?;
         }
         let env_pairs: Vec<(String, String)> = p.env.into_iter().collect();
         let redactor = self.redactor.clone();
@@ -1132,7 +1141,12 @@ impl Host {
             "probing",
             "info",
             &format!("已启动目标进程 (pid {}) 于 {}", rec.pid, cwd.to_string_lossy()),
-            json!({ "pid": rec.pid, "cmd": p.cmd, "args": rec.args, "cwd": rec.cwd.to_string_lossy() }),
+            json!({
+                "pid": rec.pid,
+                "cmd": p.cmd,
+                "args": redact_docker_env_args(&p.cmd, &rec.args),
+                "cwd": rec.cwd.to_string_lossy()
+            }),
         );
         Ok(json!({ "pid": rec.pid, "cmd": rec.cmd, "cwd": rec.cwd.to_string_lossy() }))
     }
@@ -1251,7 +1265,7 @@ impl Host {
                     "pid": r.pid,
                     "role": r.role,
                     "cmd": r.cmd,
-                    "args": r.args,
+                    "args": redact_docker_env_args(&r.cmd, &r.args),
                     "cwd": r.cwd.to_string_lossy(),
                     "startedAt": r.started_at,
                     "exited": r.is_exited(),

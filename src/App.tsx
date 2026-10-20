@@ -6,6 +6,7 @@ import { ConsentDialog } from "./components/ConsentDialog";
 import { TokenPanel } from "./components/TokenPanel";
 import { ScoutPanel } from "./components/ScoutPanel";
 import { FindingsList } from "./components/FindingsList";
+import { BlackboxPanel } from "./components/BlackboxPanel";
 import { EventLog } from "./components/EventLog";
 import { EvidenceViewer } from "./components/EvidenceViewer";
 import { DiffViewer } from "./components/DiffViewer";
@@ -21,11 +22,11 @@ const ACTIVE_STATES = new Set([
   "applying",
 ]);
 const WAIT_STATES = new Set(["patch_review", "writeback_pending"]);
-const TERMINAL_STATES = new Set(["idle", "applied", "rolled_back", "error", "aborted", "verify_failed"]);
+const TERMINAL_STATES = new Set(["idle", "applied", "rolled_back", "error", "aborted", "verify_failed", "completed"]);
 
 function stateChipClass(state: string): string {
   if (ACTIVE_STATES.has(state)) return "state-running";
-  if (state === "applied") return "state-ok";
+  if (state === "applied" || state === "completed") return "state-ok";
   if (state === "patch_review" || state === "writeback_pending" || state === "verify_failed" || state === "rolled_back")
     return "state-warn";
   if (state === "error" || state === "aborted") return "state-err";
@@ -103,6 +104,7 @@ export function App() {
   useEffect(() => {
     if (!view) return;
     if (view.state === "evidenced") setTab("evidence");
+    else if (view.state === "completed" && view.blackbox) setTab("findings");
     else if (view.state === "patch_review") setTab("patch");
     else if (view.state === "verifying" || view.state === "writeback_pending") setTab("acceptance");
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -141,7 +143,8 @@ export function App() {
     await run(() => bridge.resolveConsent(c.consentId, approved), "授权回应失败");
   };
 
-  const findingsCount = view?.findings?.length ?? 0;
+  const blackbox = view?.blackbox ?? null;
+  const findingsCount = blackbox ? (blackbox.findings?.length ?? 0) : (view?.findings?.length ?? 0);
   const evidenceCount = view?.evidence?.length ?? 0;
   const patchBadge = view?.patch ? (view.patch.status === "written_back" ? "已写回" : "待审查") : "";
   const acceptanceBadge = view?.acceptance ? (view.acceptance.pass ? "通过" : "未通过") : "";
@@ -199,10 +202,25 @@ export function App() {
           <TokenPanel view={view} />
           <ScoutPanel view={view} />
           <div className="panel">
-            <div className="panel-title">隔离与留痕</div>
+            <div className="panel-title">{blackbox ? "黑盒边界" : "隔离与留痕"}</div>
             <div className="panel-body small muted" style={{ padding: "8px 13px" }}>
-              <div>修复在独立 Git worktree 中生成，经 Diff 审查与用户授权后才写回。</div>
-              <div>请求、响应与服务端权限判断三方关联，证据与事件留存于 SQLite。</div>
+              {blackbox ? (
+                <>
+                  <div>仅对运行中的目标发起外部 HTTP 请求，不读源码、不启动本地服务、不生成补丁。</div>
+                  <div>登录令牌由 Host 保险库注入，Sidecar 不接触凭据明文；请求与响应留存于 SQLite。</div>
+                </>
+              ) : (
+                <>
+                  <div>修复在独立 Git worktree 中生成，经 Diff 审查与用户授权后才写回。</div>
+                  <div>请求、响应与服务端权限判断三方关联，证据与事件留存于 SQLite。</div>
+                </>
+              )}
+              {view?.targets?.docker?.enabled && (
+                <div style={{ marginTop: 5 }}>
+                  Docker 沙箱：{view.targets.docker.image} · 容器端口 {view.targets.docker.containerPort} · 项目挂载至{" "}
+                  {view.targets.docker.workdir}
+                </div>
+              )}
               {view?.rollback?.available && (
                 <div style={{ color: "var(--warn)", marginTop: 5 }}>
                   可回滚：写回前已备份 {view.rollback.files?.length ?? 0} 个原文件
@@ -241,11 +259,15 @@ export function App() {
           {tab === "findings" && (
             <div className="panel" style={{ flex: 1, minHeight: 0 }}>
               <div className="panel-title">
-                对象级越权候选（静态线索，需动态证据确认）
+                {blackbox ? "黑盒扫描发现（外部请求证据）" : "对象级越权候选（静态线索，需动态证据确认）"}
                 <span className="count">{findingsCount}</span>
               </div>
               <div className="panel-body">
-                <FindingsList findings={view?.findings ?? []} />
+                {blackbox ? (
+                  <BlackboxPanel blackbox={blackbox} />
+                ) : (
+                  <FindingsList findings={view?.findings ?? []} />
+                )}
               </div>
             </div>
           )}
@@ -260,24 +282,40 @@ export function App() {
               </div>
             </div>
           )}
-          {tab === "patch" && (
-            <DiffViewer
-              patch={view?.patch ?? null}
-              canApprove={canApprovePatch}
-              onApprove={() => run(() => bridge.approvePatch(view?.patch?.hash), "批准补丁失败")}
-            />
-          )}
-          {tab === "acceptance" && (
-            <div className="panel" style={{ flex: 1, minHeight: 0 }}>
-              <div className="panel-body" style={{ padding: 0 }}>
-                <AcceptancePanel
-                  view={view}
-                  canWriteback={canWriteback}
-                  onWriteback={() => run(() => bridge.approveWriteback(view?.patch?.hash ?? ""), "写回失败")}
-                />
+          {tab === "patch" &&
+            (blackbox ? (
+              <div className="panel" style={{ flex: 1, minHeight: 0 }}>
+                <div className="panel-body" style={{ padding: "12px 16px" }}>
+                  <div className="empty">黑盒模式只做外部取证，不读取源码，也不会生成修复补丁。</div>
+                </div>
               </div>
-            </div>
-          )}
+            ) : (
+              <DiffViewer
+                patch={view?.patch ?? null}
+                canApprove={canApprovePatch}
+                onApprove={() => run(() => bridge.approvePatch(view?.patch?.hash), "批准补丁失败")}
+              />
+            ))}
+          {tab === "acceptance" &&
+            (blackbox ? (
+              <div className="panel" style={{ flex: 1, minHeight: 0 }}>
+                <div className="panel-body" style={{ padding: "12px 16px" }}>
+                  <div className="empty">
+                    黑盒模式没有攻击阻断/业务保持的双重验收；请修复目标后重跑同一 URL 复测。
+                  </div>
+                </div>
+              </div>
+            ) : (
+              <div className="panel" style={{ flex: 1, minHeight: 0 }}>
+                <div className="panel-body" style={{ padding: 0 }}>
+                  <AcceptancePanel
+                    view={view}
+                    canWriteback={canWriteback}
+                    onWriteback={() => run(() => bridge.approveWriteback(view?.patch?.hash ?? ""), "写回失败")}
+                  />
+                </div>
+              </div>
+            ))}
         </div>
 
         <div className="col">

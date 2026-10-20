@@ -63,6 +63,11 @@ impl ProcRecord {
     }
 
     pub fn kill(&self) {
+        // Host 托管的 docker run 与该容器同生命周期：先删容器，再回收 CLI，
+        // 避免 UI 终止目标 / 阶段切换 / 宿主退出时留下仍在运行的容器。
+        if let Some(name) = docker_container_name(&self.cmd, &self.args) {
+            remove_docker_container(&name);
+        }
         // npm/.cmd 启动器会经 cmd.exe 再派生孙进程；仅 kill 直接子进程会把
         // node server.js 留成孤儿（持有工作区句柄，导致 E2E 清理 EBUSY）。
         #[cfg(windows)]
@@ -82,6 +87,49 @@ impl ProcRecord {
         let _ = child.kill();
         let _ = child.wait();
     }
+}
+
+/// 从 `docker run` 参数中提取容器名（仅接受 guardbuild-* 前缀，防御性双重校验）。
+pub fn docker_container_name(program: &str, args: &[String]) -> Option<String> {
+    let base = Path::new(program)
+        .file_stem()?
+        .to_string_lossy()
+        .to_lowercase();
+    if base != "docker" || args.first().map(String::as_str) != Some("run") {
+        return None;
+    }
+    let mut it = args.iter().skip(1);
+    while let Some(a) = it.next() {
+        if a == "--name" {
+            return it.next().filter(|n| n.starts_with("guardbuild-")).cloned();
+        }
+        if let Some(n) = a.strip_prefix("--name=") {
+            return n.starts_with("guardbuild-").then(|| n.to_string());
+        }
+        // 跳过带值参数，避免把它们的值误判为 --name
+        if matches!(
+            a.as_str(),
+            "-e" | "--env" | "-p" | "--publish" | "-v" | "--volume" | "-w" | "--workdir"
+        ) {
+            it.next();
+        }
+    }
+    None
+}
+
+fn remove_docker_container(name: &str) {
+    let mut cmd = Command::new("docker");
+    cmd.args(["rm", "-f", name])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let _ = cmd.status();
 }
 
 /// 进程表：托管所有由 Host 启动的子进程。
@@ -460,5 +508,28 @@ pub fn wait_exit(rec: &ProcRecord, timeout_ms: u64) -> Option<i64> {
             return None;
         }
         std::thread::sleep(Duration::from_millis(80));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn docker_container_name_extracts_only_guardbuild_run_names() {
+        let a = args(&[
+            "run", "--rm", "--name", "guardbuild-s1-target-1", "-e", "PORT=3000", "-p",
+            "127.0.0.1:1:3000", "-v", "D:/p:/app", "alpine", "sh",
+        ]);
+        assert_eq!(docker_container_name("docker", &a).as_deref(), Some("guardbuild-s1-target-1"));
+        let b = args(&["run", "--name=guardbuild-x-2", "alpine"]);
+        assert_eq!(docker_container_name(r"C:\bin\docker.exe", &b).as_deref(), Some("guardbuild-x-2"));
+        assert_eq!(docker_container_name("docker", &args(&["rm", "-f", "guardbuild-x-2"])), None);
+        assert_eq!(docker_container_name("docker", &args(&["run", "--name", "other", "alpine"])), None);
+        assert_eq!(docker_container_name("node", &a), None);
     }
 }

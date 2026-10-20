@@ -62,6 +62,7 @@ npm run app:build      # 构建（--no-bundle）
 npm run host:headless  # 构建无头宿主（--no-default-features）
 npm run e2e            # 主工作流 E2E（31 断言，自动生成 .demo 演示目标）
 npm run e2e:gate       # CI gate 演练（51 断言，7 轮裁决 + 报告产物）
+npm run e2e:blackbox   # 纯黑盒外部扫描演练（18 断言：漏洞/已修复/不可达三种目标）
 npm run e2e:llm        # LLM 接入侦察演练（40 断言，本机 mock DeepSeek，含无密钥磁盘缓存复用轮）
 npm run seed-demo      # 单独生成演示工作区 .demo/vibeshop（供桌面端手动演练）
 
@@ -111,6 +112,7 @@ npm run test:rust      # Rust Host
 - `identities`：支持 `username` / `email` / 自定义 `fields` 三种形状；至少 2 个，否则回退到内置演示身份；`role: "admin"` 的身份用于管理端用例
 - `scopes`：仅 CI gate 模式读取，作为「预声明授权」白名单；桌面模式不生效（仍逐次征求用户授权）
 - `llm`：可选接入侦察开关（`enabled` / `model` / `maxFiles`），默认关闭；启用与安全边界见下节
+- `docker`：可选容器沙箱（`enabled` / `image` / `containerPort` / `workdir` / `env` / `command` / `readyTimeoutMs`）；启用后目标只经受限 `docker run` 在容器内启动，见下节「Docker 容器沙箱」
 
 **真实项目接入的常见准备**：
 
@@ -147,6 +149,57 @@ npm run e2e:llm                # 本机 mock DeepSeek 演练，无需真实密�
 - 侦察缓存：结果写入 `GUARDBUILD_DATA_DIR/scout/<项目哈希>/<证据哈希>.json`，**不写入被检项目**；有效期 7 天、每个项目最多 20 份；缓存键包含模型与证据树/文件内容，源码或契约变化会自动失效；载入时重新跑结构白名单与路由可定位校验，并再次实际启动/登录验证；上次启动验证失败的启动方式会被忽略；缓存只含脱敏契约，不含密钥、提示词或身份凭证
 - 无密钥复用：同一项目命中磁盘缓存时，即使未设置 `DEEPSEEK_API_KEY` 也能复用侦察契约并完成实际验证，事件流与视图标记 `cacheSource=disk`
 - 环境变量：`DEEPSEEK_API_KEY`（必需）、`DEEPSEEK_BASE_URL`（测试/代理端点）、`DEEPSEEK_MODEL`（缺省 `deepseek-chat`）；Host 启动 Sidecar 时只透传这三个与 `GUARDBUILD_LLM_SCOUT`，不会进入目标进程环境
+
+## 纯黑盒外部扫描（已运行 / 沙箱中的目标）
+
+不读源码、不启动本地服务、不生成补丁：只对**已运行**的目标发起外部 HTTP 请求并取证。所有请求仍经 Host（回环走 `net.probe`，远程仅 HTTPS 走 `net.egress`），登录令牌由 Host 保险库注入，Sidecar 不见明文。
+
+```bash
+# 本机回环目标（项目目录只用于读取 guardbuild.json 的 login/identities 与报告元信息）
+guardbuild-headless --url http://127.0.0.1:3000 \
+  --project ./my-project --gate --report ./guardbuild-report
+
+# 远程目标：必须 https，且 gate 需在 guardbuild.json 预声明具体主机
+#   "scopes": ["net.egress:staging.example.com"]
+guardbuild-headless --url https://staging.example.com --project ./my-project --gate
+```
+
+- 探测面：OpenAPI 发现 + 常见路由目录探测；未认证读取、跨用户读取（IDOR，需 ≥2 个普通测试身份）、SQL 注入（错误回显 / 稳定基线布尔盲注）、路径穿越、敏感文件与 actuator 暴露、限流观察。
+- 写操作越权（PUT IDOR）默认关闭，避免修改目标数据；显式开启：`guardbuild.json` 的 `blackbox.allowMutation: true` 或环境变量 `GUARDBUILD_BLACKBOX_MUTATE=1`（修改后尽力恢复原值）。
+- 登录/身份来自 `guardbuild.json` 的 `login` / `identities`；可加 `blackbox.loginPaths` 补充登录端点候选。
+- 裁决：发现可复现漏洞 → `completed` + `vulnerable_unfixed`，exit 1；无可复现漏洞 → `completed` + `no_findings`，exit 0；目标不可达/执行错误 → `failed`，exit 2（不可达会在一次短超时预检后立即失败，不做整轮探测）。
+- 报告：`report.json` / `report.md` 为黑盒版式，含路由发现、登录结果、证据级别与复现 curl；证据中令牌一律为 `***vault:<identity>***` 占位。
+- 回归：`npm run e2e:blackbox`（18 断言：漏洞目标 exit 1、已修复目标 exit 0、不可达 exit 2 + 快速短路、报告一致性与令牌不泄露）。
+
+## Docker 容器沙箱（目标进程隔离）
+
+在 `guardbuild.json` 中声明 `docker`，目标服务会通过受限的 `docker run` 在 Linux 容器内启动；攻击仍只针对映射到宿主回环端口的 HTTP 接口，Sidecar 不进入容器、不读取容器内文件。
+
+```json
+{
+  "start": {
+    "cmd": "node",
+    "args": ["server.js"],
+    "env": { "PORT": "${GB_PORT}", "HOST": "0.0.0.0" }
+  },
+  "docker": {
+    "enabled": true,
+    "image": "node:20-alpine",
+    "containerPort": 3000,
+    "workdir": "/app",
+    "env": { "NODE_ENV": "test" },
+    "readyTimeoutMs": 60000
+  }
+}
+```
+
+- 实际启动形状：`docker run --rm --init --name guardbuild-<session>-<role>-<n> -p 127.0.0.1:<宿主端口>:<containerPort> -v <项目目录>:<workdir> -w <workdir> -e ... <image> <start.cmd/start.args>`；`command` 可整体覆盖容器内命令。
+- 端口：容器内固定监听 `containerPort`（`start.env.PORT` 会被强制覆盖为该值），宿主端口每次动态分配且只绑定 `127.0.0.1`；就绪判定为对宿主端口的 HTTP 探活（容器日志仅用于失败诊断）。
+- 挂载：只允许把本次启动目录（项目根或隔离 worktree）挂载到容器 `workdir`，且 `-w` 必须与挂载点一致；镜像需自带运行时与依赖（`prepare` 仍在宿主机执行）。
+- Host 白名单：只接受 `docker run/rm/stop/version`；`run` 仅允许 `--rm`、`--init`、`--name guardbuild-*`、`-p 127.0.0.1:<宿主>:<容器>`、`-v <cwd>:<path>[:ro|rw]`、`-w`、`-e KEY=VALUE`，并拒绝 `--privileged`、host 网络、`--mount`、`--env-file`、`--volumes-from`、任意宿主目录挂载与后台 `-d`。
+- 清理：会话结束、失败或中止时对每个容器执行 `docker rm -f`；`docker.enabled=true` 但配置非法时直接报 `docker_config_invalid`，绝不回退到宿主机直接运行。
+- 边界：容器用于**运行时隔离**（独立依赖/进程环境，目标不会碰宿主全局环境），项目目录仍以读写方式挂载、可能被目标进程写入；它不构成对恶意项目代码的安全边界，不要用它运行不信任仓库。
+- 回归：`npm run e2e:docker`（需要本机 Docker 与 `node:20-alpine`；未检测到 Docker 时自动跳过）。
 
 ## CI 门禁接入（GitHub Actions）
 

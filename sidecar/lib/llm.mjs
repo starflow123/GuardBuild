@@ -68,6 +68,7 @@ export async function chat(
     model = null,
     timeoutMs = DEFAULT_TIMEOUT_MS,
     maxTokens = 1500,
+    purpose = "发送 LLM 请求",
   } = {}
 ) {
   const key = apiKey();
@@ -91,7 +92,7 @@ export async function chat(
   if (url.protocol !== "https:" && !isLoopback(url.hostname)) {
     throw new LlmError("DeepSeek 端点必须是 https（或本机回环测试服务）", { code: "llm_insecure_endpoint" });
   }
-  const token = await getToken(url.toString(), "向 DeepSeek 发送接入侦察请求");
+  const token = await getToken(url.toString(), `向 DeepSeek ${purpose}`);
   const body = JSON.stringify({
     model: model || defaultModel(),
     messages: [

@@ -343,6 +343,7 @@ export async function requestPatchIntent(
       model,
       timeoutMs: PATCH_TIMEOUT_MS,
       maxTokens: 1200,
+      purpose: "发送补丁意图（编码代理）",
     });
   } catch (e) {
     return { ...empty, failure: `LLM 请求失败：${e?.message ?? e}` };

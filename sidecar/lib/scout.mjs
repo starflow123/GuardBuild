@@ -726,6 +726,7 @@ export async function runScout(
     model,
     timeoutMs: SCOUT_TIMEOUT_MS,
     maxTokens: 1600,
+    purpose: "做接入侦察",
   });
   const raw = parseJson(res.content);
   const warnings = [];

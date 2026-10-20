@@ -64,7 +64,7 @@ npm run e2e            # 主工作流 E2E（31 断言，自动生成 .demo 演�
 npm run e2e:gate       # CI gate 演练（53 断言，7 轮裁决 + 报告产物）
 npm run e2e:blackbox   # 纯黑盒外部扫描演练（22 断言：漏洞/已修复/Cookie 会话/不可达）
 npm run e2e:llm        # LLM 接入侦察演练（40 断言，本机 mock DeepSeek，含无密钥磁盘缓存复用轮）
-npm run e2e:llm-patch  # LLM 编码代理补丁演练（49 断言，本机 mock：守规矩 / 不守规矩 / 无密钥三轮）
+npm run e2e:llm-patch  # LLM 编码代理补丁演练（53 断言，本机 mock：守规矩 / 不守规矩 / 无密钥三轮）
 npm run seed-demo      # 单独生成演示工作区 .demo/vibeshop（供桌面端手动演练）
 
 # 单元测试
@@ -175,7 +175,7 @@ npm run e2e:llm-patch          # 本机 mock DeepSeek 三轮演练，无需真�
 - 裁决边界不变：LLM 不判定漏洞、不生成身份，也不参与验收裁决——是否放行只由实测证据（攻击阻断 / 业务回归）决定
 - 可观测：视图与报告的补丁对象新增 `strategy: "llm-coding-agent"`、`autoVerify`、`llm`（模型 / token 用量 / 采纳与拒绝统计 / 涉及文件与补丁数）；`report.md` 新增「LLM 编码代理（补丁意图）」章节，逐条列出被拒绝的意图与原因；GUI 在补丁面板展示同一份统计
 - 无密钥 / 未开启：编码代理整体关闭，行为回落到「模板能补就补，补不动就 `vulnerable_unfixed` + exit 1 交人工」，零模型调用、零外发
-- 回归：`npm run e2e:llm-patch`（49 断言，三轮：守规矩模型 → 自动验收通过 exit 1 且全程不进 `patch_review`；不守规矩模型 → 越界与歧义锚点被拒、双重验收拦下 `verify_failed`；无密钥 → 零外发 + `vulnerable_unfixed`），靶场为 `fixtures/llm-patch-shop`（其取数形态经静态校验确认两条确定性模板都补不动）
+- 回归：`npm run e2e:llm-patch`（53 断言，三轮：守规矩模型 → 自动验收通过 exit 1 且全程不进 `patch_review`；不守规矩模型 → 越界与歧义锚点被拒、双重验收拦下 `verify_failed`；无密钥 → 零外发 + `vulnerable_unfixed`），靶场为 `fixtures/llm-patch-shop`（其取数形态经静态校验确认两条确定性模板都补不动）
 
 ## 纯黑盒外部扫描（已运行 / 沙箱中的目标）
 

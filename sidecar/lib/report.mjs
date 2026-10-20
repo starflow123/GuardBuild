@@ -210,6 +210,7 @@ function summarizeLlmPatch(llm) {
     requestedFiles: (llm.requestedFiles ?? []).length,
     appliedFiles: (llm.appliedFiles ?? []).map((f) => ({ file: f.file, ops: f.ops })),
     appliedOps: llm.appliedOps ?? 0,
+    usage: (llm.usage ?? []).slice(0, 8),
     rejected: (llm.rejected ?? []).slice(0, 12),
     failures: (llm.failures ?? []).slice(0, 8),
   };
@@ -223,6 +224,13 @@ function renderLlmPatchSection(llm) {
     `| 模型 | ${esc(llm.model ?? "—")} |`,
     `| 请求文件 | ${llm.requestedFiles} 个 |`,
     `| 采纳补丁 | ${llm.appliedOps} 处（${llm.appliedFiles.map((f) => `${f.file}×${f.ops}`).join("、") || "无"}） |`,
+    ...(llm.usage?.length
+      ? [
+          `| Token 用量 | ${llm.usage
+            .map((u) => `${u.file}: prompt ${u.prompt_tokens ?? "?"} / completion ${u.completion_tokens ?? "?"}`)
+            .join("；")} |`,
+        ]
+      : []),
     `| 校验拒绝 | ${(llm.rejected ?? []).length} 条 |`,
     "",
   ];
@@ -385,6 +393,16 @@ function renderMarkdown(r) {
       [
         `- 哈希：\`${r.patch.hash}\``,
         `- 策略：${esc(r.patch.strategy ?? "—")}${r.patch.autoVerify ? "（LLM 编码代理补丁已自动执行双重验收，通过后才进入人工审查）" : ""}`,
+        ...(r.patch.fixes?.length
+          ? [
+              `- 逐候选：${r.patch.fixes
+                  .flatMap((f) => (f.candidates ?? []).map((c) => `\`${c.candidate}\`→${esc(c.strategy)}（${f.file}）`))
+                  .join("；")}`,
+            ]
+          : []),
+        ...(r.patch.skipped?.length
+          ? [`- 未产出补丁的候选：${r.patch.skipped.length} 个（原因见 report.json 的 patch.skipped）`]
+          : []),
         `- 文件：${fileDesc || "—"}`,
         `- 隔离位置：\`${esc(r.patch.worktree)}\``,
         `- 状态：${esc(r.patch.status)}（${r.patch.lineCount ?? 0} 行改动）`,
@@ -515,6 +533,16 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
           diff: view.patch.diff,
           strategy: view.patch.strategy ?? null,
           autoVerify: !!view.patch.autoVerify,
+          fixes: (view.patch.fixes ?? []).map((f) => ({
+            file: f.file,
+            appliedOps: f.appliedOps ?? (f.fixes ?? []).length,
+            candidates: (f.fixes ?? []).map((x) => ({ candidate: x.candidate, strategy: x.strategy })),
+          })),
+          skipped: (view.patch.skipped ?? []).slice(0, 12).map((s) => ({
+            candidate: s.candidate ?? null,
+            file: s.file ?? null,
+            reason: s.reason ?? null,
+          })),
           llm: summarizeLlmPatch(view.patch.llm),
         }
       : null,

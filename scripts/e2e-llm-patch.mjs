@@ -443,6 +443,22 @@ async function main() {
     `strategy=${rep1?.patch?.strategy} appliedOps=${rep1?.patch?.llm?.appliedOps}`
   );
   check("报告 markdown 含「LLM 编码代理（补丁意图）」章节", md1.includes("LLM 编码代理（补丁意图）") && md1.includes("双重验收"), "");
+  check(
+    "报告 patch.fixes 逐候选可审计（候选→策略→文件）",
+    (rep1?.patch?.fixes ?? []).some(
+      (f) =>
+        f.file === "src/app.js" &&
+        (f.candidates ?? []).length === 2 &&
+        f.candidates.every((c) => c.strategy === "llm-coding-agent")
+    ),
+    JSON.stringify(rep1?.patch?.fixes ?? null)
+  );
+  check(
+    "报告 patch.llm 记录 token 用量",
+    Number(rep1?.patch?.llm?.usage?.[0]?.total_tokens ?? 0) > 0,
+    JSON.stringify(rep1?.patch?.llm?.usage ?? null)
+  );
+  check("报告 markdown 含逐候选补丁行", /逐候选：.*GET \/api\/orders\/:id.*llm-coding-agent/.test(md1), "");
 
   const db = new DatabaseSync(path.join(dataDir, "guardbuild.db"), { readOnly: true });
   const patchRow1 = db.prepare("SELECT strategy, status FROM patches WHERE session_id = ?").get(g1.sessionId);
@@ -492,6 +508,12 @@ async function main() {
     "r2 报告 patch.llm 记录采纳 1 处 / 拒绝 ≥ 2 条",
     rep2?.patch?.llm?.appliedOps === 1 && (rep2?.patch?.llm?.rejected ?? []).length >= 2,
     `appliedOps=${rep2?.patch?.llm?.appliedOps} rejected=${(rep2?.patch?.llm?.rejected ?? []).length}`
+  );
+  check(
+    "r2 报告逐候选只标已落地的取消候选，且记下未产出补丁的候选",
+    (rep2?.patch?.fixes ?? []).flatMap((f) => f.candidates ?? []).some((c) => /POST \/api\/orders\/:id\/cancel/i.test(c.candidate ?? "")) &&
+      (rep2?.patch?.skipped ?? []).length >= 1,
+    `fixes=${JSON.stringify(rep2?.patch?.fixes ?? null)} skipped=${(rep2?.patch?.skipped ?? []).length}`
   );
   check(
     "r2 报告裁决为 verify_failed",

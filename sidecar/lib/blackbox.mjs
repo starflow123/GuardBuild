@@ -66,6 +66,7 @@ const COMMON_API_PATHS = [
   "/users", "/orders", "/products", "/posts",
   "/api/profile", "/api/me",
   "/api/files", "/api/download", "/api/static",
+  "/api/orders/search", "/api/users/search", "/api/search", "/api/query",
 ];
 const ATTACK_SURFACE_PATHS = [
   "/admin", "/admin/", "/admin/login",
@@ -190,7 +191,13 @@ export async function detectIdor(ctx, baseUrl, routes, login) {
     const attackRes = await httpGet(baseUrl, detailPath, alice.token);
 
     if (attackRes.ok && attackRes.json) {
-      const ownerId = attackRes.json.userId ?? attackRes.json.ownerId ?? attackRes.json.user_id;
+      // 自适应：尝试多种归属字段名
+      const ownerFields = ["userId", "ownerId", "user_id", "createdBy", "authorId", "accountId"];
+      let ownerId = null;
+      let foundField = null;
+      for (const f of ownerFields) {
+        if (attackRes.json[f] != null) { ownerId = attackRes.json[f]; foundField = f; break; }
+      }
       // bob 的 userId 是 2（lab-idor 数据），alice 是 1
       if (ownerId && String(ownerId) !== "1") {
         findings.push({
@@ -198,7 +205,7 @@ export async function detectIdor(ctx, baseUrl, routes, login) {
           method: "GET",
           path: detailPath,
           severity: "high",
-          detail: `alice 访问 bob 的资源 #${victimId} → HTTP ${attackRes.status}，归属 userId=${ownerId}`,
+          detail: `alice 访问 bob 的资源 #${victimId} → HTTP ${attackRes.status}，归属 ${foundField}=${ownerId}`,
           curl: `curl -H "Authorization: Bearer <alice_token>" ${baseUrl}${detailPath}`,
         });
         ctx.emit?.({
@@ -316,33 +323,52 @@ export async function detectUnauthenticated(ctx, baseUrl, routes) {
 export async function detectSqli(ctx, baseUrl, routes, login) {
   const findings = [];
   const token = login?.identities?.[0]?.token;
-  const payloads = ["' OR 1=1--", "' OR '1'='1", "1; DROP TABLE--", "' UNION SELECT NULL--"];
   const errorSignatures = ["SQL syntax", "MySQL server", "SQLite3::query", "ORA-", "PostgreSQL", "Microsoft SQL Server", "Unclosed quotation mark"];
 
   for (const route of routes) {
-    // 对列表路由的查询参数发 payload
-    for (const payload of payloads) {
-      const testUrl = `${route.path}?id=${encodeURIComponent(payload)}&q=${encodeURIComponent(payload)}`;
-      const res = await httpGet(baseUrl, testUrl, token);
-      const body = typeof res.json === "string" ? res.json : JSON.stringify(res.json ?? "");
-      for (const sig of errorSignatures) {
-        if (body.includes(sig)) {
-          findings.push({
-            type: "SQL 注入",
-            method: "GET",
-            path: testUrl,
-            severity: "high",
-            detail: `${testUrl} → 返回数据库错误（${sig}）`,
-            curl: `curl ${baseUrl}${testUrl}`,
-          });
-          ctx.emit?.({
-            kind: "evidence",
-            severity: "error",
-            message: `[SQLi] ${testUrl}`,
-          });
-          break;
-        }
+    // 1. 先取正常响应基线
+    const baseline = await httpGet(baseUrl, `${route.path}?q=test`, token);
+    const baselineLen = JSON.stringify(baseline.json ?? "").length;
+
+    // 2. 错误检测
+    const errRes = await httpGet(baseUrl, `${route.path}?q=${encodeURIComponent("' OR 1=1--")}`, token);
+    const errBody = typeof errRes.json === "string" ? errRes.json : JSON.stringify(errRes.json ?? "");
+    for (const sig of errorSignatures) {
+      if (errBody.includes(sig)) {
+        findings.push({
+          type: "SQL 注入（错误回显）",
+          method: "GET",
+          path: `${route.path}?q=' OR 1=1--`,
+          severity: "high",
+          detail: `返回数据库错误：${sig}`,
+          curl: `curl -H "Authorization: Bearer <token>" "${baseUrl}${route.path}?q=' OR 1=1--"`,
+        });
+        ctx.emit?.({ kind: "evidence", severity: "error", message: `[SQLi-错误] ${route.path}` });
+        break;
       }
+    }
+
+    // 3. 盲注检测（boolean-based）：对比真/假条件响应差异
+    const trueRes = await httpGet(baseUrl, `${route.path}?q=${encodeURIComponent("test' AND 1=1--")}`, token);
+    const falseRes = await httpGet(baseUrl, `${route.path}?q=${encodeURIComponent("test' AND 1=2--")}`, token);
+    const trueLen = JSON.stringify(trueRes.json ?? "").length;
+    const falseLen = JSON.stringify(falseRes.json ?? "").length;
+
+    // 真条件响应 ≈ 基线，假条件响应 ≠ 基线 → 盲注存在
+    if (
+      baselineLen > 0 &&
+      Math.abs(trueLen - baselineLen) < baselineLen * 0.2 &&
+      Math.abs(falseLen - baselineLen) > baselineLen * 0.3
+    ) {
+      findings.push({
+        type: "SQL 注入（盲注）",
+        method: "GET",
+        path: `${route.path}?q=test' AND 1=1--`,
+        severity: "high",
+        detail: `boolean-based 盲注：真条件响应 ${trueLen}B ≈ 基线 ${baselineLen}B，假条件 ${falseLen}B 差异显著`,
+        curl: `curl -H "Authorization: Bearer <token>" "${baseUrl}${route.path}?q=test' AND 1=1--"`,
+      });
+      ctx.emit?.({ kind: "evidence", severity: "error", message: `[SQLi-盲注] ${route.path}` });
     }
   }
   return findings;

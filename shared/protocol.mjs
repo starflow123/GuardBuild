@@ -145,7 +145,8 @@ export const TRANSITIONS = {
   analyzing: ["probing", "error", "aborted"],
   probing: ["evidenced", "error", "aborted"],
   evidenced: ["patching", "completed", "error", "aborted"],
-  patching: ["patch_review", "error", "aborted"],
+  // patching -> verifying：LLM 编码代理产出的补丁先自动双重验收，通过后才进人工审查
+  patching: ["patch_review", "verifying", "error", "aborted"],
   patch_review: ["verifying", "aborted", "error"],
   verifying: ["writeback_pending", "verify_failed", "aborted", "error"],
   verify_failed: ["patching", "aborted", "error"],

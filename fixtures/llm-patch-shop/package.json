@@ -1,0 +1,10 @@
+{
+  "name": "llm-patch-shop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "LLMPatchShop - 示例订单服务（GuardBuild 诊断靶场：IDOR 形态规避确定性模板，用于 LLM 编码代理补丁链路）",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

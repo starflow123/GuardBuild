@@ -306,6 +306,7 @@ impl Host {
             "DEEPSEEK_BASE_URL",
             "DEEPSEEK_MODEL",
             "GUARDBUILD_LLM_SCOUT",
+            "GUARDBUILD_LLM_PATCH",
             "GUARDBUILD_BLACKBOX_URL",
             "GUARDBUILD_BLACKBOX_MUTATE",
         ] {

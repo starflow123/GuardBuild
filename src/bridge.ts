@@ -84,6 +84,17 @@ export interface BlackboxView {
   exitCode?: number | null;
 }
 
+export interface ViewLlmPatch {
+  enabled: boolean;
+  model?: string | null;
+  requestedFiles?: { file: string; candidates: string[] }[];
+  appliedFiles?: { file: string; ops: number }[];
+  appliedOps?: number;
+  rejected?: { file: string; candidate?: string | null; reason: string }[];
+  failures?: { file: string; reason: string }[];
+  usage?: { file: string; prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }[];
+}
+
 export interface ViewPatch {
   hash: string;
   diff: string;
@@ -92,8 +103,10 @@ export interface ViewPatch {
   status: string;
   lineCount: number;
   strategy?: string;
-  fixes?: { file: string; appliedOps: number; fixes: { candidate: string; strategy: string }[] }[];
-  skipped?: { file: string; candidate?: string; reason: string }[];
+  autoVerify?: boolean;
+  llm?: ViewLlmPatch | null;
+  fixes?: { file: string; appliedOps: number; fixes: { candidate: string; strategy: string; reason?: string | null }[] }[];
+  skipped?: { file: string; candidate?: string; reason: string; llm?: string }[];
 }
 
 export interface AcceptanceView {

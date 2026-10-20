@@ -285,6 +285,24 @@ async function ensureSupabaseToken(ctx, rawUrl) {
   return ctx.tokens.egress;
 }
 
+/** LLM 出站令牌：回环复用 net.probe（本地 mock 服务）；远程仅 https 且需 net.egress @ host */
+async function ensureLlmToken(ctx, url, reason) {
+  const { host, scheme } = urlHostAndScheme(url);
+  if (!host) throw new Error(`无法解析 LLM 端点主机：${url}`);
+  if (isLoopbackHostname(host)) {
+    if (!ctx.tokens.net) {
+      ctx.tokens.net = await requestScope(ctx, SCOPE_KINDS.NET_PROBE, "向本机回环的 LLM 服务发送请求");
+    }
+    return ctx.tokens.net;
+  }
+  if (scheme !== "https") throw new Error("LLM 端点必须是 https（仅回环测试允许明文 http）");
+  if (ctx.tokens.egress && ctx.tokens.egressHost === host) return ctx.tokens.egress;
+  const token = await requestScope(ctx, SCOPE_KINDS.NET_EGRESS, reason, host);
+  ctx.tokens.egress = token;
+  ctx.tokens.egressHost = host;
+  return token;
+}
+
 /**
  * LLM 接入侦察（可选）：只在 guardbuild.json 的 llm.enabled=true 或环境变量
  * GUARDBUILD_LLM_SCOUT=1 时运行。无 key / 无授权 / 超时 / 非法输出一律警告并
@@ -320,22 +338,7 @@ async function stageScout(ctx, targetConfig) {
     scout = await runScout(ctx, {
       model,
       maxFiles: targetConfig.llm?.maxFiles ?? 8,
-      getToken: async (url, reason) => {
-        const { host, scheme } = urlHostAndScheme(url);
-        if (!host) throw new Error(`无法解析 LLM 端点主机：${url}`);
-        if (isLoopbackHostname(host)) {
-          if (!ctx.tokens.net) {
-            ctx.tokens.net = await requestScope(ctx, SCOPE_KINDS.NET_PROBE, "向本机回环的 LLM 测试服务发送请求");
-          }
-          return ctx.tokens.net;
-        }
-        if (scheme !== "https") throw new Error("LLM 端点必须是 https（仅回环测试允许明文 http）");
-        if (ctx.tokens.egress && ctx.tokens.egressHost === host) return ctx.tokens.egress;
-        const token = await requestScope(ctx, SCOPE_KINDS.NET_EGRESS, reason, host);
-        ctx.tokens.egress = token;
-        ctx.tokens.egressHost = host;
-        return token;
-      },
+      getToken: (url, reason) => ensureLlmToken(ctx, url, reason),
     });
   } catch (e) {
     emit(ctx, {
@@ -1243,6 +1246,8 @@ async function stagePatch(ctx) {
 
   const result = await createPatch(ctx);
   const lineCount = result.patch.diff.split("\n").filter((l) => l.startsWith("+") || l.startsWith("-")).length;
+  const usedLlm = !!result.usedLlm;
+  const autoVerify = usedLlm && ctx.llmConfig?.autoVerify !== false;
   ctx.view.patch = {
     hash: result.patch.hash,
     diff: result.patch.diff,
@@ -1252,6 +1257,9 @@ async function stagePatch(ctx) {
     lineCount,
     fixes: result.filePatches,
     skipped: result.skipped,
+    strategy: result.filePatches.flatMap((f) => f.fixes.map((x) => x.strategy)).join(",") || "none",
+    llm: result.llm?.enabled ? result.llm : null,
+    autoVerify,
   };
   pushView(ctx);
 
@@ -1261,6 +1269,19 @@ async function stagePatch(ctx) {
   ctx.view.targets.worktree = { ...wt, role: "隔离工作区（修复候选）" };
   pushView(ctx);
 
+  // LLM 编码代理产出的补丁：先自动跑双重验收（攻击失效 + 业务不回归），通过后才进人工审查。
+  // 确定性模板补丁保持原样（人工批准后再验收），避免改变既有 gate/交互流程语义。
+  if (autoVerify) {
+    emit(ctx, {
+      kind: "patch",
+      severity: SEVERITY.INFO,
+      message: `补丁含 LLM 编码代理产出的意图（patch_hash ${result.patch.hash.slice(0, 12)}…），自动执行双重验收；通过后再交您审查 Diff 与写回`,
+      phase: STATE.PATCHING,
+      data: { patchHash: result.patch.hash, lineCount, strategy: ctx.view.patch.strategy, llm: result.llm },
+    });
+    return { ...result, autoVerify: true };
+  }
+
   setState(ctx, STATE.PATCH_REVIEW);
   emit(ctx, {
     kind: "patch",
@@ -1269,7 +1290,7 @@ async function stagePatch(ctx) {
     phase: STATE.PATCH_REVIEW,
     data: { patchHash: result.patch.hash, lineCount },
   });
-  return result;
+  return { ...result, autoVerify: false };
 }
 
 async function stageVerify(ctx) {
@@ -1553,6 +1574,8 @@ async function runFlow(ctx) {
       });
     }
     ctx.loginConfig = targetConfig.login ?? null;
+    ctx.llmConfig = targetConfig.llm ?? null;
+    ctx.llmGetToken = (url, reason) => ensureLlmToken(ctx, url, reason);
     if (targetConfig.identities) {
       ctx.identities = targetConfig.identities;
     }
@@ -1628,12 +1651,20 @@ async function runFlow(ctx) {
     await stageScout(ctx, targetConfig);
     await stageAnalyze(ctx);
     await stageReproduce(ctx);
-    await stagePatch(ctx);
-    // 进入 patch_review 后等待用户的 patch.approved 指令（见上方 handler）
+    const patchResult = await stagePatch(ctx);
+    // 未走自动验收时，进入 patch_review 后等待用户的 patch.approved 指令（见上方 handler）
+    if (patchResult?.autoVerify) await stageVerify(ctx);
   } catch (e) {
     // 用户已请求中止时，吊销令牌/结束进程导致的在途 RPC 失败也归为中止
     if (ctx.cancelled || e instanceof CancelledError) {
       abortSession(ctx);
+      return;
+    }
+    // 自动双重验收未通过：报告与终态（verify_failed）已在 stageVerify 内落定，
+    // 不能再改写为「执行失败」——否则报告丢漏洞裁决，gate 还可能因状态竞态退成 2
+    if (e.code === "verify_failed") {
+      shutdownProcs(ctx).catch(() => {});
+      endSession(ctx);
       return;
     }
     failSession(ctx, e);

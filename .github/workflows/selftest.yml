@@ -80,6 +80,9 @@ jobs:
       - name: LLM 侦察 E2E（本机 mock DeepSeek + 磁盘缓存复用，无需真实密钥）
         run: node scripts/e2e-llm-scout.mjs
 
+      - name: LLM 编码代理补丁 E2E（本机 mock：意图校验 + 自动双重验收 + 无密钥回落）
+        run: node scripts/e2e-llm-patch.mjs
+
       - name: Docker 沙箱 E2E（无可用 Docker 时自动跳过）
         run: node scripts/e2e-docker.mjs
 
@@ -115,5 +118,7 @@ jobs:
             .demo-blackbox-e2e/data/guardbuild.db
             .demo-llm/reports
             .demo-llm/data/guardbuild.db
+            .demo-llm-patch/reports
+            .demo-llm-patch/data/guardbuild.db
             .demo-docker-e2e/reports
             .demo-docker-e2e/data/guardbuild.db

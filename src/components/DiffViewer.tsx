@@ -60,6 +60,21 @@ export function DiffViewer({
           </span>
         </div>
       )}
+      {patch.llm?.enabled && (
+        <div className="patch-meta" style={{ borderBottom: "1px solid var(--line-soft)" }}>
+          <span className="muted small">
+            LLM 编码代理（{patch.llm.model ?? "未知模型"}）：请求 {patch.llm.requestedFiles?.length ?? 0} 个文件 · 采纳
+            {patch.llm.appliedOps ?? 0} 处补丁意图 · 校验拒绝 {patch.llm.rejected?.length ?? 0} 条
+            {patch.autoVerify ? " · 已自动执行双重验收，通过后再由您审查写回" : ""}
+          </span>
+          {(patch.llm.rejected?.length ?? 0) > 0 && (
+            <span className="muted small" style={{ display: "block" }}>
+              拒绝原因：
+              {patch.llm.rejected!.slice(0, 4).map((r) => `${r.file}（${r.reason}）`).join("；")}
+            </span>
+          )}
+        </div>
+      )}
       {patch.skipped && patch.skipped.length > 0 && (
         <div className="patch-meta" style={{ borderBottom: "1px solid var(--line-soft)" }}>
           <span className="small" style={{ color: "#f7dc9b" }}>

@@ -17,6 +17,10 @@ guardbuild-data/
 .demo-graphql/
 .demo-python/
 .demo-llm/
+.demo-llm-patch/
+.demo-blackbox/
+.demo-blackbox-e2e/
+.demo-docker-e2e/
 guardbuild.db*
 *.tsbuildinfo
 

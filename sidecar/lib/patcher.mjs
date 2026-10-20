@@ -5,11 +5,19 @@
  *  1. worktree 由 Host 从 HEAD 创建（--detach），不触碰原工作区未提交改动；
  *  2. 模型/编排层只产出「定向替换意图」（find/replace 锚点），由 Host 在真实字节上执行；
  *     锚点未匹配时 Host 返回 Conflict，补丁生成诚实失败，不猜测内容；
- *  3. 补丁以 git diff 捕获并计算 patch_hash，后续写回与该哈希绑定。
+ *  3. 补丁以 git diff 捕获并计算 patch_hash，后续写回与该哈希绑定；
+ *  4. LLM 编码代理（可选）同样只产出 file+search+replace 意图，且先经严格校验
+ *     （锚点唯一、目标文件受限、改动规模受限），写入后仍须双重验收。
  */
 import { relative, sep } from "node:path";
 import { RPC_TO_HOST, SEVERITY, shortId } from "../../shared/protocol.mjs";
 import { FIX_STRATEGIES } from "./planner.mjs";
+import { patchEnabled, requestPatchIntent } from "./llm-patcher.mjs";
+
+/** 确定性模板策略覆盖的候选（仅 IDOR：有明确的归属校验插入位） */
+const TEMPLATE_KINDS = new Set(["idor-suspect"]);
+/** LLM 编码代理额外覆盖的候选类别 */
+const LLM_KINDS = new Set(["idor-suspect", "no-auth-suspect", "traversal-suspect", "sqli-suspect", "cmdi-suspect"]);
 
 export class PatchError extends Error {
   constructor(message, { code = "patch_failed", hint = null, details = null } = {}) {
@@ -22,16 +30,21 @@ export class PatchError extends Error {
 
 /**
  * 为静态分析得到的候选端点生成修复补丁。
- * 返回 { worktree, patch: {id, hash, diff, files, strategies}, filePatches, skipped }
+ * 返回 { worktree, patch: {id, hash, diff, files, strategies}, filePatches, skipped, llm }
  */
 export async function createPatch(ctx) {
-  const candidates = (ctx.analysis?.candidates ?? []).filter((c) => c.kind === "idor-suspect");
+  const useLlm = patchEnabled(ctx);
+  const allCandidates = ctx.analysis?.candidates ?? [];
+  const patchableKinds = useLlm ? LLM_KINDS : TEMPLATE_KINDS;
+  const candidates = allCandidates.filter((c) => patchableKinds.has(c.kind));
   if (candidates.length === 0) {
     // 到达此处说明攻击已复现（stageReproduce 已通过），但候选中没有可自动修复的
     // IDOR 端点（如仅无鉴权/注入/穿越证据）——不得退化为「无漏洞」放行
-    throw new PatchError("攻击证据已建立，但没有可自动修复的对象级越权候选端点", {
+    throw new PatchError("攻击证据已建立，但没有可自动修复的候选端点", {
       code: "no_patchable_candidates",
-      hint: "自动修复仅覆盖「带认证但缺归属校验」的 IDOR 场景；SQL/命令注入、无鉴权与路径穿越类需按证据中的攻击用例人工修复后重跑 gate",
+      hint: useLlm
+        ? "确定性模板覆盖「带认证但缺归属校验」的 IDOR；编码代理可尝试注入/穿越/无鉴权类，但候选需定位到源码文件（外部路由线索与 Supabase 数据策略不在代码层修复范围）"
+        : "自动修复仅覆盖「带认证但缺归属校验」的 IDOR 场景；SQL/命令注入、无鉴权与路径穿越类需按证据中的攻击用例人工修复后重跑 gate",
     });
   }
 
@@ -175,6 +188,16 @@ export async function createPatch(ctx) {
 
   const filePatches = [];
   const skipped = [];
+  const llmStats = {
+    enabled: useLlm,
+    requestedFiles: [],
+    appliedFiles: [],
+    appliedOps: 0,
+    rejected: [],
+    failures: [],
+    model: null,
+    usage: [],
+  };
   for (const [file, cands] of byFile) {
     const rel = relative(ctx.projectRoot, file).split(sep).join("/");
     const wtPath = `${wtRoot}/${rel}`;
@@ -212,9 +235,16 @@ export async function createPatch(ctx) {
     }
     const content = read.content;
 
-    const ops = [];
+    // 1) 确定性模板补丁（仅覆盖有明确归属校验插入位的 IDOR 形态）
+    const templateOps = [];
     const used = [];
+    const unapplied = [];
     for (const cand of cands) {
+      const key = `${cand.method} ${cand.path}`;
+      if (!TEMPLATE_KINDS.has(cand.kind)) {
+        unapplied.push(cand);
+        continue;
+      }
       let applied = false;
       let lastErr = null;
       for (const strat of FIX_STRATEGIES) {
@@ -223,44 +253,148 @@ export async function createPatch(ctx) {
         if (cand.style && !strat.styles.includes(cand.style)) continue;
         try {
           const candOps = strat.builder(content, cand);
-          ops.push(...candOps);
-          used.push({ candidate: `${cand.method} ${cand.path}`, strategy: strat.name });
+          templateOps.push(...candOps);
+          used.push({ candidate: key, strategy: strat.name });
           applied = true;
           break;
         } catch (e) {
           lastErr = e;
         }
       }
-      if (!applied) {
-        skipped.push({ file, candidate: `${cand.method} ${cand.path}`, reason: lastErr?.message ?? "无匹配策略" });
+      if (applied) continue;
+      unapplied.push(cand);
+      skipped.push({ file, candidate: key, reason: lastErr?.message ?? "无匹配策略" });
+    }
+
+    const writeSum = { appliedOps: 0, beforeSha256: null, sha256: null, wrote: false };
+    const flushWrite = async (patchOps, reason) => {
+      if (patchOps.length === 0) return;
+      let write;
+      try {
+        write = await ctx.rpc.request(
+          RPC_TO_HOST.FS_WRITE,
+          { token: ctx.tokens.worktree, path: wtPath, ops: patchOps, reason },
+          { timeoutMs: 30_000 }
+        );
+      } catch (e) {
+        throw new PatchError(`锚点替换在隔离副本中执行失败：${e.message}`, {
+          code: "anchor_conflict",
+          hint: "源文件与提交版本存在差异（可能含未提交改动），锚点无法匹配",
+          details: { file, worktreePath: wtPath },
+        });
+      }
+      writeSum.appliedOps += write.appliedOps ?? 0;
+      writeSum.beforeSha256 = writeSum.beforeSha256 ?? write.beforeSha256;
+      writeSum.sha256 = write.sha256;
+      writeSum.wrote = true;
+    };
+
+    await flushWrite(templateOps, `修复越权：${cands.map((c) => `${c.method} ${c.path}`).join("、")}`);
+
+    // 2) LLM 编码代理回落：模板覆盖不到的候选。锚点在「隔离副本当前字节」上校验，
+    //    既避免与已写入的模板补丁错位，也比工作区字节更贴近 Host 实际修改的对象。
+    if (useLlm && unapplied.length > 0 && typeof ctx.llmGetToken === "function") {
+      const keyOf = (c) => `${c.method} ${c.fullPath ?? c.path}`.toLowerCase();
+      const attempted = unapplied.map((c) => `${c.method} ${c.path}`);
+      llmStats.requestedFiles.push({ file: rel, candidates: attempted });
+
+      let wtBytes = null;
+      try {
+        // redact:false：校验锚点必须用真实字节
+        const cur = await ctx.rpc.request(
+          RPC_TO_HOST.FS_READ,
+          { token: ctx.tokens.worktree, path: wtPath, redact: false },
+          { timeoutMs: 30_000 }
+        );
+        wtBytes = cur.content;
+      } catch (e) {
+        llmStats.failures.push({ file: rel, reason: `读取隔离副本失败：${e.message}` });
+      }
+
+      if (wtBytes != null) {
+        const llmRes = await requestPatchIntent(ctx, {
+          file,
+          rel,
+          content: wtBytes,
+          candidates: unapplied,
+          evidence: ctx.view?.evidence ?? [],
+          model: ctx.llmConfig?.model ?? null,
+          getToken: ctx.llmGetToken,
+          maxFiles: ctx.llmConfig?.patchMaxFiles,
+          // 提示词只喂脱敏后的源码，真实锚点校验走上面的 wtBytes
+          readRedacted: async () => {
+            const r = await ctx.rpc.request(
+              RPC_TO_HOST.FS_READ,
+              { token: ctx.tokens.worktree, path: wtPath },
+              { timeoutMs: 30_000 }
+            );
+            return r.content;
+          },
+        });
+        if (llmRes.model) llmStats.model = llmRes.model;
+        if (llmRes.usage) llmStats.usage.push({ file: rel, ...llmRes.usage });
+        for (const r of llmRes.rejected) llmStats.rejected.push({ file: rel, ...r });
+
+        const covered = new Set(llmRes.accepted.map((a) => String(a.candidate ?? "").toLowerCase()));
+        if (llmRes.ops.length > 0) {
+          await flushWrite(
+            llmRes.ops,
+            `LLM 编码代理修复：${llmRes.accepted.map((a) => a.candidate ?? "-").join("、")}`
+          );
+          llmStats.appliedOps += llmRes.ops.length;
+          llmStats.appliedFiles.push({ file: rel, ops: llmRes.ops.length });
+          for (const a of llmRes.accepted) {
+            used.push({
+              candidate: a.candidate ?? attempted[0],
+              strategy: "llm-coding-agent",
+              reason: a.reason ?? null,
+              addedLines: a.addedLines ?? null,
+            });
+          }
+          ctx.emit({
+            kind: "patch",
+            severity: SEVERITY.INFO,
+            message: `LLM 编码代理为 ${rel} 产出 ${llmRes.ops.length} 个补丁意图（锚点校验通过，已写入隔离副本）`,
+            data: {
+              file: rel,
+              candidates: llmRes.accepted.map((a) => a.candidate),
+              reasons: llmRes.accepted.map((a) => a.reason),
+              rejected: llmRes.rejected.length,
+              model: llmRes.model,
+            },
+          });
+        }
+
+        for (const c of unapplied) {
+          const key = `${c.method} ${c.path}`;
+          if (covered.has(key.toLowerCase()) || covered.has(keyOf(c))) continue;
+          const reason =
+            llmRes.failure ?? llmRes.rejected[0]?.reason ?? "编码代理未对该端点产出经校验的补丁";
+          const existing = skipped.find((s) => s.file === file && s.candidate === key);
+          if (existing) existing.llm = reason;
+          else skipped.push({ file, candidate: key, reason });
+        }
+
+        if (llmRes.ops.length === 0) {
+          const reason = llmRes.failure ?? llmRes.rejected[0]?.reason ?? "编码代理未产出可用补丁";
+          llmStats.failures.push({ file: rel, reason });
+          ctx.emit({
+            kind: "patch",
+            severity: SEVERITY.WARN,
+            message: `LLM 编码代理未产出 ${rel} 的可用补丁：${reason}（这些端点转人工修复）`,
+            data: { file: rel, candidates: attempted, rejected: llmRes.rejected },
+          });
+        }
       }
     }
-    if (ops.length === 0) continue;
 
-    let write;
-    try {
-      write = await ctx.rpc.request(
-        RPC_TO_HOST.FS_WRITE,
-        {
-          token: ctx.tokens.worktree,
-          path: wtPath,
-          ops,
-          reason: `修复对象级越权：${cands.map((c) => `${c.method} ${c.path}`).join("、")}`,
-        },
-        { timeoutMs: 30_000 }
-      );
-    } catch (e) {
-      throw new PatchError(`锚点替换在隔离副本中执行失败：${e.message}`, {
-        code: "anchor_conflict",
-        hint: "源文件与提交版本存在差异（可能含未提交改动），锚点无法匹配",
-        details: { file, worktreePath: wtPath },
-      });
-    }
+    if (!writeSum.wrote) continue;
+
     filePatches.push({
       file: rel,
-      appliedOps: write.appliedOps,
-      beforeSha256: write.beforeSha256,
-      sha256: write.sha256,
+      appliedOps: writeSum.appliedOps,
+      beforeSha256: writeSum.beforeSha256,
+      sha256: writeSum.sha256,
       fixes: used,
     });
   }
@@ -281,8 +415,10 @@ export async function createPatch(ctx) {
     }
     throw new PatchError("攻击证据已建立，但候选端点均无可自动修复的代码形态", {
       code: "no_patchable_candidates",
-      hint: "自动修复仅覆盖可识别归属校验位的 IDOR 形态；注入/穿越/无鉴权类需对照证据人工修复后重跑 gate",
-      details: { skipped },
+      hint: useLlm
+        ? `确定性模板与 LLM 编码代理（已启用）都未能产出经校验的补丁；编码代理只在锚点唯一、目标为源码文件且改动规模受限时才提交补丁意图，拒绝原因见 details.skipped 与报告中的 llmPatch`
+        : "自动修复仅覆盖可识别归属校验位的 IDOR 形态；注入/穿越/无鉴权类需对照证据人工修复后重跑 gate（或在 guardbuild.json 开启 llm.enabled/llm.patch 让编码代理尝试）",
+      details: { skipped, llmPatch: useLlm ? llmStats : null },
     });
   }
 
@@ -296,11 +432,13 @@ export async function createPatch(ctx) {
     throw new PatchError("补丁生成后 diff 为空，请检查替换是否实际生效", { code: "empty_diff" });
   }
 
+  const strategies = [...new Set(filePatches.flatMap((f) => f.fixes.map((x) => x.strategy)))];
+  const usedLlm = strategies.includes("llm-coding-agent");
   const patch = {
     id: shortId("patch"),
     sessionId: ctx.sessionId,
     worktree,
-    strategy: filePatches.flatMap((f) => f.fixes.map((x) => x.strategy)).join(",") || "none",
+    strategy: strategies.join(",") || "none",
     diff: diffRes.diff,
     files: diffRes.files,
     patchHash: diffRes.patchHash,
@@ -313,12 +451,14 @@ export async function createPatch(ctx) {
   ctx.emit({
     kind: "patch",
     severity: SEVERITY.SUCCESS,
-    message: `已在隔离 worktree 生成最小补丁（${filePatches.length} 个文件 / ${lineCount} 行变更），等待 Diff 审查与授权`,
+    message: `已在隔离 worktree 生成最小补丁（${filePatches.length} 个文件 / ${lineCount} 行变更；策略 ${patch.strategy}）${usedLlm ? "，含 LLM 编码代理产出的补丁意图，等待双重验收" : "，等待 Diff 审查与授权"}`,
     data: {
       patchHash: patch.patchHash,
       worktree,
       files: filePatches.map((f) => f.file),
       skipped,
+      strategy: patch.strategy,
+      llmApplied: llmStats.appliedOps,
     },
   });
 
@@ -327,6 +467,8 @@ export async function createPatch(ctx) {
     patch: { id: patch.id, hash: patch.patchHash, diff: patch.diff, files: patch.files, status: patch.status },
     filePatches,
     skipped,
+    usedLlm,
+    llm: llmStats,
   };
 }
 

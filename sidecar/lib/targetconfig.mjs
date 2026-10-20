@@ -366,16 +366,25 @@ function normalizeOpenapi(raw) {
   return out;
 }
 
-/** LLM 接入侦察开关：默认关闭；密钥只从进程环境读取，不写入契约。 */
-function normalizeLlm(raw) {
+/** LLM 接入开关：默认关闭；密钥只从进程环境读取，不写入契约。 */
+export function normalizeLlm(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
   const maxFiles = Number.isFinite(raw.maxFiles) ? Math.floor(raw.maxFiles) : 8;
-  return {
-    enabled: raw.enabled === true,
+  const enabled = raw.enabled === true;
+  const out = {
+    enabled,
     model:
       typeof raw.model === "string" && raw.model.trim() ? raw.model.trim() : null,
     maxFiles: Math.min(12, Math.max(1, maxFiles)),
+    // 编码代理（改代码）：跟随 enabled，可用 patch:false 单独关掉
+    patch: raw.patch === true || (raw.patch !== false && enabled),
+    // LLM 产出的补丁先自动跑双重验收，通过后才进人工审查
+    autoVerify: raw.autoVerify !== false,
   };
+  if (Number.isFinite(raw.patchMaxFiles)) {
+    out.patchMaxFiles = Math.min(10, Math.max(1, Math.floor(raw.patchMaxFiles)));
+  }
+  return out;
 }
 
 /** Supabase 覆盖项：显式指定环境文件 / 项目 URL / anon key / 表名（缺省由静态检测自动发现） */

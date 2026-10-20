@@ -203,6 +203,45 @@ function renderLlmSection(llm) {
   return lines.join("\n");
 }
 
+function summarizeLlmPatch(llm) {
+  if (!llm || !llm.enabled) return null;
+  return {
+    model: llm.model ?? null,
+    requestedFiles: (llm.requestedFiles ?? []).length,
+    appliedFiles: (llm.appliedFiles ?? []).map((f) => ({ file: f.file, ops: f.ops })),
+    appliedOps: llm.appliedOps ?? 0,
+    rejected: (llm.rejected ?? []).slice(0, 12),
+    failures: (llm.failures ?? []).slice(0, 8),
+  };
+}
+
+function renderLlmPatchSection(llm) {
+  const lines = [
+    "## LLM 编码代理（补丁意图）\n",
+    "| 项目 | 值 |",
+    "| --- | --- |",
+    `| 模型 | ${esc(llm.model ?? "—")} |`,
+    `| 请求文件 | ${llm.requestedFiles} 个 |`,
+    `| 采纳补丁 | ${llm.appliedOps} 处（${llm.appliedFiles.map((f) => `${f.file}×${f.ops}`).join("、") || "无"}） |`,
+    `| 校验拒绝 | ${(llm.rejected ?? []).length} 条 |`,
+    "",
+  ];
+  if (llm.appliedFiles?.length) {
+    lines.push(
+      "- 工作方式：模型只提交 `file + search + replace` 的补丁意图，Sidecar 在隔离副本的真实字节上校验锚点唯一、目标为源码文件、改动规模受限，再由 Host 写入隔离 worktree；补丁仍须通过「攻击阻断 + 业务不回归」双重验收。",
+      ""
+    );
+  }
+  const rejects = (llm.rejected ?? []).slice(0, 8);
+  if (rejects.length) {
+    lines.push("**被拒绝的补丁意图**\n", ...rejects.map((r) => `- ${esc(r.file)}：${esc(r.reason)}`), "");
+  }
+  if (llm.failures?.length) {
+    lines.push("**未产出补丁的文件**\n", ...llm.failures.slice(0, 6).map((f) => `- ${esc(f.file)}：${esc(f.reason)}`), "");
+  }
+  return lines.join("\n");
+}
+
 function renderMarkdown(r) {
   const acc = r.acceptance;
   const bb = r.blackbox ?? null;
@@ -268,7 +307,14 @@ function renderMarkdown(r) {
       `- 双重验收：攻击阻断 ${acc.attackBlocked}/${acc.attackTotal}，业务保持 ${acc.businessPassed}/${acc.businessTotal} → ${acc.pass ? "通过" : "未通过"}`
     );
   }
-  if (r.patch) summaryLines.push(`- 补丁：\`${r.patch.hash?.slice(0, 12)}…\`（${r.patch.files?.length ?? 0} 个文件，${esc(r.patch.status)}）`);
+  if (r.patch) {
+    const llmBits = r.patch.llm
+      ? `；LLM 编码代理采纳 ${r.patch.llm.appliedOps} 处、拒绝 ${r.patch.llm.rejected?.length ?? 0} 条`
+      : "";
+    summaryLines.push(
+      `- 补丁：\`${r.patch.hash?.slice(0, 12)}…\`（${r.patch.files?.length ?? 0} 个文件，${esc(r.patch.status)}；策略 ${esc(r.patch.strategy ?? "—")}${llmBits}）`
+    );
+  }
   const sb = r.summary.supabase;
   if (!bb && sb?.detected) {
     const bits = [`URL \`${esc(sb.url ?? "—")}\``, `表引用 ${sb.tables?.length ?? 0} 个`];
@@ -338,6 +384,7 @@ function renderMarkdown(r) {
     parts.push(
       [
         `- 哈希：\`${r.patch.hash}\``,
+        `- 策略：${esc(r.patch.strategy ?? "—")}${r.patch.autoVerify ? "（LLM 编码代理补丁已自动执行双重验收，通过后才进入人工审查）" : ""}`,
         `- 文件：${fileDesc || "—"}`,
         `- 隔离位置：\`${esc(r.patch.worktree)}\``,
         `- 状态：${esc(r.patch.status)}（${r.patch.lineCount ?? 0} 行改动）`,
@@ -352,6 +399,7 @@ function renderMarkdown(r) {
         "",
       ].join("\n")
     );
+    if (r.patch.llm) parts.push(renderLlmPatchSection(r.patch.llm), "");
   }
 
   if (acc) {
@@ -465,6 +513,9 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
           status: view.patch.status,
           lineCount: view.patch.lineCount,
           diff: view.patch.diff,
+          strategy: view.patch.strategy ?? null,
+          autoVerify: !!view.patch.autoVerify,
+          llm: summarizeLlmPatch(view.patch.llm),
         }
       : null,
     acceptance: view.acceptance ?? null,

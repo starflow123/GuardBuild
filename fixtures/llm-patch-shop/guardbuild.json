@@ -1,0 +1,28 @@
+{
+  "_note": "本靶场的处理器形态（normalizeId + store 取数）刻意规避确定性归属校验模板：自动修复只能由 LLM 编码代理产出补丁意图，再经双重验收。",
+  "start": {
+    "cmd": "node",
+    "args": ["server.js"],
+    "env": { "PORT": "0" },
+    "readyPattern": "已就绪",
+    "readyTimeoutMs": 20000
+  },
+  "login": {
+    "path": "/api/login",
+    "bodyTemplate": { "username": "{username}", "password": "{password}" },
+    "credentialPath": "token"
+  },
+  "responses": { "list": "orders", "entity": "order" },
+  "identities": [
+    { "name": "alice", "username": "alice", "password": "alice123", "role": "user" },
+    { "name": "bob", "username": "bob", "password": "bob123", "role": "user" },
+    { "name": "admin", "username": "admin", "password": "admin123", "role": "admin" }
+  ],
+  "llm": { "enabled": false, "patch": true, "autoVerify": true },
+  "scopes": [
+    "project.read",
+    "worktree.write",
+    "proc.spawn",
+    "net.probe"
+  ]
+}

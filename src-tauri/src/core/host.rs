@@ -961,8 +961,20 @@ impl Host {
             .map(|m| m.root.clone())
             .ok_or(HostError::TokenInvalid)?;
         let dir = PathBuf::from(&p.path);
-        if !super::token::path_within(&self.cfg.worktrees_root(), &dir) {
-            return Err(HostError::PathOutOfScope(p.path));
+        // 仅允许删除本会话目录下的 worktree，且令牌需具备 worktree.write 作用域
+        let wt_root = self.cfg.worktrees_root().join(&session_id);
+        {
+            let tokens = self.tokens.read().unwrap();
+            let token = tokens.require(&p.token)?;
+            if !token
+                .scopes
+                .iter()
+                .any(|s| matches!(s, Scope::WorktreeWrite { .. }))
+                || dir == wt_root
+                || !super::token::path_within(&wt_root, &dir)
+            {
+                return Err(HostError::PathOutOfScope(p.path));
+            }
         }
         gitops::worktree_remove(&root, &dir)?;
         Ok(json!({ "ok": true }))
@@ -1289,6 +1301,8 @@ impl Host {
             identity_ref: Option<String>,
             #[serde(default, rename = "storeCredentialAs")]
             store_credential_as: Option<String>,
+            #[serde(default, rename = "storeCookieAs")]
+            store_cookie_as: Option<String>,
             #[serde(default, rename = "credentialPath")]
             credential_path: Option<String>,
             #[serde(default, rename = "credentialHeader")]
@@ -1348,7 +1362,25 @@ impl Host {
 
         // 提取并入库身份凭证（响应中的凭证不会流出 Host）
         let mut stored_identity: Option<String> = None;
-        if let Some(identity) = &p.store_credential_as {
+        let mut credential_kind: Option<&str> = None;
+        if let Some(identity) = &p.store_cookie_as {
+            // Cookie 会话：从 Set-Cookie 提取 name=value（丢弃 Path/HttpOnly 等属性）
+            if let Some(cookie) = collect_cookie_header(&resp.headers) {
+                self.vault
+                    .lock()
+                    .unwrap()
+                    .store(identity, "Cookie", &cookie, &url.to_string());
+                stored_identity = Some(identity.clone());
+                credential_kind = Some("cookie");
+                self.push_event(
+                    "credential",
+                    "probing",
+                    "info",
+                    &format!("已获取身份会话 Cookie [{identity}] 并存入保险库（密文不离开 Host）"),
+                    json!({ "identity": identity, "header": "Cookie" }),
+                );
+            }
+        } else if let Some(identity) = &p.store_credential_as {
             if let Some(path) = &p.credential_path {
                 if let Some(value) = json_path(&resp.body, path) {
                     let header = p.credential_header.clone().unwrap_or_else(|| "Authorization".into());
@@ -1356,6 +1388,7 @@ impl Host {
                     let full = format!("{prefix}{value}");
                     self.vault.lock().unwrap().store(identity, &header, &full, &url.to_string());
                     stored_identity = Some(identity.clone());
+                    credential_kind = Some("token");
                     self.push_event(
                         "credential",
                         "probing",
@@ -1375,16 +1408,24 @@ impl Host {
             (resp.body.clone(), Vec::new())
         };
 
+        // Set-Cookie 只能在 Host 内入库，绝不回传给 Sidecar
+        let headers_out: HashMap<String, String> = resp
+            .headers
+            .into_iter()
+            .filter(|(k, _)| !k.eq_ignore_ascii_case("set-cookie"))
+            .collect();
+
         Ok(json!({
             "status": resp.status,
             "statusText": resp.status_text,
-            "headers": resp.headers.into_iter().collect::<HashMap<String, String>>(),
+            "headers": headers_out,
             "body": body_out,
             "redacted": !reports.is_empty(),
             "redactions": reports,
             "durationMs": resp.duration_ms,
             "truncated": resp.truncated,
             "storedIdentity": stored_identity,
+            "credentialKind": credential_kind,
         }))
     }
 
@@ -1535,11 +1576,12 @@ impl Host {
         self.emit_view();
     }
 
-    pub fn start_session(self: &Arc<Self>, root: &str) -> HostResult<Value> {
+    pub fn start_session(self: &Arc<Self>, root: &str, blackbox_url: Option<&str>) -> HostResult<Value> {
         let root_path = PathBuf::from(root);
         if !root_path.is_dir() {
             return Err(HostError::NotFound(format!("目录不存在: {root}")));
         }
+        let blackbox_url = normalize_blackbox_url(blackbox_url)?;
         let canon = root_path
             .canonicalize()
             .map_err(|e| HostError::NotFound(format!("目录不可访问: {e}")))?;
@@ -1591,13 +1633,21 @@ impl Host {
             "target": null,
             "patch": null,
             "acceptance": null,
+            "blackboxUrl": blackbox_url.clone(),
         });
         self.push_event(
             "session",
             "starting",
             "info",
-            &format!("已创建诊断会话，目标: {}", canon.to_string_lossy()),
-            json!({ "sessionId": session_id }),
+            &match &blackbox_url {
+                Some(url) => format!(
+                    "已创建黑盒扫描会话，外部目标: {}（项目目录: {}，仅用于契约与报告）",
+                    url,
+                    canon.to_string_lossy()
+                ),
+                None => format!("已创建诊断会话，目标: {}", canon.to_string_lossy()),
+            },
+            json!({ "sessionId": session_id, "blackboxUrl": blackbox_url.clone() }),
         );
         self.push_event(
             "security",
@@ -1613,11 +1663,18 @@ impl Host {
         let root_str = canon.to_string_lossy().to_string();
         let token_id = token.id.clone();
         let gate = self.cfg.gate;
+        let blackbox_target = blackbox_url.clone();
         let me = self.clone();
         thread::spawn(move || {
             match conn.call(
                 "session.start",
-                json!({ "sessionId": sid, "projectRoot": root_str, "token": token_id, "gate": gate }),
+                json!({
+                    "sessionId": sid,
+                    "projectRoot": root_str,
+                    "token": token_id,
+                    "gate": gate,
+                    "blackboxUrl": blackbox_target,
+                }),
                 Duration::from_secs(30),
             ) {
                 Ok(res) if res.get("ok").and_then(|v| v.as_bool()) == Some(false) => {
@@ -1875,9 +1932,116 @@ fn unwrap_wire_envelope<'a>(v: &'a Value) -> &'a Value {
     }
 }
 
+/// 从 Set-Cookie 响应头提取 `name=value; name2=value2` 形式的 Cookie 头值。
+/// 同名 Cookie 以后出现的为准；`Max-Age=0` 视为清除。
+fn collect_cookie_header(headers: &[(String, String)]) -> Option<String> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    for (name, value) in headers {
+        if !name.eq_ignore_ascii_case("set-cookie") {
+            continue;
+        }
+        let mut parts = value.split(';');
+        let pair = parts.next().unwrap_or("").trim();
+        let Some((key, val)) = pair.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() {
+            continue;
+        }
+        let cleared = parts.any(|attr| attr.trim().eq_ignore_ascii_case("max-age=0"));
+        if cleared {
+            pairs.retain(|(k, _)| k != key);
+            continue;
+        }
+        if let Some(existing) = pairs.iter_mut().find(|(k, _)| k == key) {
+            existing.1 = val.trim().to_string();
+        } else {
+            pairs.push((key.to_string(), val.trim().to_string()));
+        }
+    }
+    if pairs.is_empty() {
+        return None;
+    }
+    Some(
+        pairs
+            .into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect::<Vec<_>>()
+            .join("; "),
+    )
+}
+
+/// 黑盒目标只接受回环 http 或任意 https；返回归一化 URL。
+fn normalize_blackbox_url(raw: Option<&str>) -> HostResult<Option<String>> {
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok(None);
+    };
+    let parsed = Url::parse(raw)
+        .map_err(|e| HostError::InvalidParams(format!("黑盒目标 URL 非法: {e}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(HostError::InvalidParams("黑盒目标仅支持 http/https".into()));
+    }
+    let host = parsed.host_str().unwrap_or("");
+    if host.is_empty() {
+        return Err(HostError::InvalidParams("黑盒目标缺少主机名".into()));
+    }
+    if parsed.scheme() == "http" && !matches!(host, "127.0.0.1" | "localhost" | "::1" | "[::1]") {
+        return Err(HostError::InvalidParams(
+            "远程目标必须使用 https（明文 http 仅限本机回环）".into(),
+        ));
+    }
+    Ok(Some(parsed.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn blackbox_url_accepts_loopback_http_and_https_remote() {
+        assert_eq!(
+            normalize_blackbox_url(Some("http://127.0.0.1:3000")).unwrap().as_deref(),
+            Some("http://127.0.0.1:3000/")
+        );
+        assert_eq!(
+            normalize_blackbox_url(Some(" https://staging.example.com/api ")).unwrap().as_deref(),
+            Some("https://staging.example.com/api")
+        );
+        assert_eq!(normalize_blackbox_url(Some("   ")).unwrap(), None);
+        assert_eq!(normalize_blackbox_url(None).unwrap(), None);
+    }
+
+    #[test]
+    fn blackbox_url_rejects_remote_http_and_bad_scheme() {
+        assert!(normalize_blackbox_url(Some("http://example.com")).is_err());
+        assert!(normalize_blackbox_url(Some("ftp://example.com")).is_err());
+        assert!(normalize_blackbox_url(Some("not a url")).is_err());
+    }
+
+    #[test]
+    fn cookie_header_collects_pairs_and_dedupes() {
+        let h = |name: &str, v: &str| (name.to_string(), v.to_string());
+        let out = collect_cookie_header(&[
+            h("Content-Type", "text/html"),
+            h("Set-Cookie", "session=abc123; Path=/; HttpOnly"),
+            h("Set-Cookie", "theme=dark; SameSite=Lax"),
+            h("Set-Cookie", "session=fresh456; Path=/"),
+        ]);
+        assert_eq!(out.as_deref(), Some("session=fresh456; theme=dark"));
+        assert_eq!(collect_cookie_header(&[h("X-Test", "1")]), None);
+        assert_eq!(collect_cookie_header(&[h("Set-Cookie", "broken")]), None);
+    }
+
+    #[test]
+    fn cookie_header_drops_cleared_cookies() {
+        let h = |v: &str| ("Set-Cookie".to_string(), v.to_string());
+        assert_eq!(
+            collect_cookie_header(&[h("session=gone; Max-Age=0"), h("theme=dark")]).as_deref(),
+            Some("theme=dark")
+        );
+        assert_eq!(collect_cookie_header(&[h("session=x; max-age=0")]), None);
+    }
 
     #[test]
     fn json_path_reads_plain_and_nested_paths() {

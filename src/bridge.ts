@@ -162,6 +162,7 @@ export interface View {
     docker?: { enabled: boolean; image: string | null; containerPort: number; workdir: string };
   };
   blackbox?: BlackboxView | null;
+  blackboxUrl?: string | null;
   patch?: ViewPatch | null;
   acceptance?: AcceptanceView | null;
   llm?: LlmView | null;
@@ -193,7 +194,7 @@ interface Bridge {
   getEvents(limit?: number): Promise<UiEvent[]>;
   getHostInfo(): Promise<{ protocolVersion: string; appVersion: string; dataDir: string; sidecarReady: boolean }>;
   pickProjectDir(): Promise<string | null>;
-  startSession(projectRoot: string): Promise<{ sessionId: string }>;
+  startSession(projectRoot: string, targetUrl?: string | null): Promise<{ sessionId: string }>;
   resolveConsent(consentId: string, approved: boolean): Promise<unknown>;
   approvePatch(patchHash?: string): Promise<unknown>;
   approveWriteback(patchHash: string): Promise<unknown>;
@@ -225,9 +226,9 @@ const tauriBridge: Bridge = {
     const { invoke } = await import("@tauri-apps/api/core");
     return invoke<string | null>("pick_project_dir");
   },
-  async startSession(projectRoot) {
+  async startSession(projectRoot, targetUrl) {
     const { invoke } = await import("@tauri-apps/api/core");
-    return invoke("start_session", { projectRoot });
+    return invoke("start_session", { projectRoot, targetUrl: targetUrl ?? null });
   },
   async resolveConsent(consentId, approved) {
     const { invoke } = await import("@tauri-apps/api/core");

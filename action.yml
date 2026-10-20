@@ -22,6 +22,10 @@ inputs:
     description: 'Node.js 版本（需 ≥ 22.5，node:sqlite 依赖）'
     required: false
     default: '24'
+  url:
+    description: '黑盒目标 URL（已运行的 http(s) 服务）。提供后仅对运行中实例做外部扫描，不读源码、不创建 worktree、不写回'
+    required: false
+    default: ''
 
 outputs:
   verdict:
@@ -65,12 +69,15 @@ runs:
         GB_BIN: ${{ github.action_path }}/src-tauri/target/release/guardbuild-headless
         GB_PROJECT: ${{ inputs.project }}
         GB_REPORT: ${{ github.workspace }}/${{ inputs.report-dir }}
+        GB_URL: ${{ inputs.url }}
       run: |
         set +e
         mkdir -p "$GB_REPORT"
         BIN="$GB_BIN"
         [ -f "$BIN" ] || BIN="$GB_BIN.exe"
-        "$BIN" --gate --project "$GB_PROJECT" --report "$GB_REPORT" 2>&1 | tee "$GB_REPORT/gate.log"
+        ARGS=(--gate --project "$GB_PROJECT" --report "$GB_REPORT")
+        [ -n "$GB_URL" ] && ARGS+=(--url "$GB_URL")
+        "$BIN" "${ARGS[@]}" 2>&1 | tee "$GB_REPORT/gate.log"
         code=${PIPESTATUS[0]}
         echo "exit-code=$code" >> "$GITHUB_OUTPUT"
         grep '^GB_GATE ' "$GB_REPORT/gate.log" | tail -n 1 | sed 's/^GB_GATE //' > "$GB_REPORT/gate.json" || true

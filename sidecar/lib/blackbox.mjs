@@ -31,6 +31,18 @@ const DENIED_STATUS = new Set([401, 403, 404]);
 const MAX_ROUTES = 60;
 const MAX_PROBE_ROUTES = 14;
 
+/** blackbox.maxRoutes 只收紧/放宽发现上限；未配置时保持内建默认。 */
+function resolveRouteCap(options) {
+  const raw = options?.config?.blackbox?.maxRoutes;
+  if (!Number.isFinite(raw)) return MAX_ROUTES;
+  return Math.min(200, Math.max(10, Math.floor(raw)));
+}
+
+/** 每类攻击的候选上限：默认 14，调低 maxRoutes 时同步收紧（不会超过路由上限）。 */
+function resolveProbeCap(routeCap) {
+  return Math.max(1, Math.min(routeCap, MAX_PROBE_ROUTES));
+}
+
 const OWNER_FIELDS = ["userId", "user_id", "ownerId", "owner_id", "createdBy", "authorId", "accountId", "uid", "customerId"];
 const SENSITIVE_KEYS = new Set([
   "email", "phone", "address", "userId", "user_id", "ownerId", "owner_id",
@@ -172,7 +184,7 @@ export async function discoverOpenapi(ctx, baseUrl) {
 }
 
 /** OpenAPI 路径 → 路由列表；带 {param} 的模板单独标记（黑盒无法凭空构造有效 ID）。 */
-export function openapiRoutes(found) {
+export function openapiRoutes(found, limit = MAX_ROUTES) {
   const doc = found?.doc ?? null;
   if (!doc?.paths) return [];
   let base = "";
@@ -194,7 +206,7 @@ export function openapiRoutes(found) {
         templated: /\{[^}]+\}|:[A-Za-z_]\w*/.test(path),
         source: "openapi",
       });
-      if (out.length >= MAX_ROUTES) return out;
+      if (out.length >= limit) return out;
     }
   }
   return out;
@@ -220,7 +232,7 @@ export async function bruteRoutes(ctx, baseUrl) {
   return found;
 }
 
-function mergeRoutes(...lists) {
+function mergeRoutes(limit, ...lists) {
   const seen = new Set();
   const out = [];
   for (const list of lists) {
@@ -230,7 +242,7 @@ function mergeRoutes(...lists) {
       if (seen.has(key)) continue;
       seen.add(key);
       out.push(r);
-      if (out.length >= MAX_ROUTES) return out;
+      if (out.length >= limit) return out;
     }
   }
   return out;
@@ -401,9 +413,9 @@ async function checkRateLimit(ctx, baseUrl) {
   return { limited, reachable };
 }
 
-async function probeUnauthRead(ctx, baseUrl, routes) {
+async function probeUnauthRead(ctx, baseUrl, routes, limit = MAX_PROBE_ROUTES) {
   const records = [];
-  for (const route of routes.filter((r) => r.method === "GET").slice(0, MAX_PROBE_ROUTES)) {
+  for (const route of routes.filter((r) => r.method === "GET").slice(0, limit)) {
     const res = await httpJson(ctx, { baseUrl, method: "GET", path: route.path });
     if (!res.ok) continue;
     const sensitivePath = looksSensitivePath(route.path);
@@ -430,9 +442,9 @@ async function probeUnauthRead(ctx, baseUrl, routes) {
   return records;
 }
 
-async function probeIdor(ctx, baseUrl, routes, { attacker, victim }) {
+async function probeIdor(ctx, baseUrl, routes, { attacker, victim }, limit = MAX_PROBE_ROUTES) {
   const records = [];
-  const candidates = routes.filter((r) => r.method === "GET").slice(0, MAX_PROBE_ROUTES);
+  const candidates = routes.filter((r) => r.method === "GET").slice(0, limit);
   for (const route of candidates) {
     const list = await httpJson(ctx, { baseUrl, method: "GET", path: route.path, identity: victim.name });
     if (!list.ok) continue;
@@ -514,9 +526,9 @@ async function probeIdor(ctx, baseUrl, routes, { attacker, victim }) {
 }
 
 /** 写操作 IDOR 会修改目标数据：仅在 blackbox.allowMutation=true 时执行，并尽力恢复。 */
-async function probePutIdor(ctx, baseUrl, routes, { attacker, victim }) {
+async function probePutIdor(ctx, baseUrl, routes, { attacker, victim }, limit = MAX_PROBE_ROUTES) {
   const records = [];
-  for (const route of routes.filter((r) => r.method === "GET").slice(0, MAX_PROBE_ROUTES)) {
+  for (const route of routes.filter((r) => r.method === "GET").slice(0, limit)) {
     const list = await httpJson(ctx, { baseUrl, method: "GET", path: route.path, identity: victim.name });
     if (!list.ok) continue;
     const items = extractItems(list.json);
@@ -566,9 +578,9 @@ const SQL_ERROR_SIGNATURES = [
   "Microsoft SQL Server", "Unclosed quotation mark", "near \"", "syntax error",
 ];
 
-async function probeSqli(ctx, baseUrl, routes, identity) {
+async function probeSqli(ctx, baseUrl, routes, identity, limit = MAX_PROBE_ROUTES) {
   const records = [];
-  for (const route of routes.filter((r) => r.method === "GET").slice(0, MAX_PROBE_ROUTES)) {
+  for (const route of routes.filter((r) => r.method === "GET").slice(0, limit)) {
     const basePath = route.path;
     const sep = basePath.includes("?") ? "&" : "?";
     const baseline1 = await httpJson(ctx, { baseUrl, method: "GET", path: `${basePath}${sep}q=test`, identity });
@@ -700,7 +712,15 @@ function summarize(records, routes, login) {
 
 /** 黑盒扫描主入口：所有请求均经 Host，返回证据记录（已落库）+ 漏洞清单。 */
 export async function runBlackbox(ctx, baseUrl, options = {}) {
-  ctx.emit({ kind: "phase", severity: SEVERITY.INFO, message: `开始黑盒外部扫描：${baseUrl}`, phase: "blackbox" });
+  const routeCap = resolveRouteCap(options);
+  const probeCap = resolveProbeCap(routeCap);
+  ctx.emit({
+    kind: "phase",
+    severity: SEVERITY.INFO,
+    message: `开始黑盒外部扫描：${baseUrl}（路由上限 ${routeCap}，每类探测最多 ${probeCap} 条）`,
+    phase: "blackbox",
+    data: { routeCap, probeCap, configured: options?.config?.blackbox?.maxRoutes ?? null },
+  });
 
   // 可达性预检：不可达时每条探测都会等连接超时，必须先短路，避免整轮扫描拖成分钟级。
   const health = await httpJson(ctx, { baseUrl, method: "GET", path: "/", timeoutMs: 4_000 });
@@ -714,6 +734,7 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
     });
     return {
       routes: [],
+      maxRoutes: routeCap,
       openapiFound: false,
       openapiRouteCount: 0,
       findings: [],
@@ -727,9 +748,9 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
   }
 
   const openapiFound = await discoverOpenapi(ctx, baseUrl);
-  const openapi = openapiRoutes(openapiFound);
+  const openapi = openapiRoutes(openapiFound, routeCap);
   const brute = await bruteRoutes(ctx, baseUrl);
-  const routes = mergeRoutes(openapi, brute);
+  const routes = mergeRoutes(routeCap, openapi, brute);
   const surface = await probeAttackSurface(ctx, baseUrl);
   const rate = await checkRateLimit(ctx, baseUrl);
   const rateLimited = rate.limited;
@@ -748,12 +769,12 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
 
   const who = pair ? pair.attacker.name : users[0]?.name ?? null;
   const probes = [];
-  probes.push(...(await probeUnauthRead(ctx, baseUrl, routes)));
-  if (pair) probes.push(...(await probeIdor(ctx, baseUrl, routes, pair)));
-  if (who) probes.push(...(await probeSqli(ctx, baseUrl, routes, who)));
+  probes.push(...(await probeUnauthRead(ctx, baseUrl, routes, probeCap)));
+  if (pair) probes.push(...(await probeIdor(ctx, baseUrl, routes, pair, probeCap)));
+  if (who) probes.push(...(await probeSqli(ctx, baseUrl, routes, who, probeCap)));
   probes.push(...(await probeTraversal(ctx, baseUrl, who)));
   if (pair && options.allowMutation) {
-    probes.push(...(await probePutIdor(ctx, baseUrl, routes, pair)));
+    probes.push(...(await probePutIdor(ctx, baseUrl, routes, pair, probeCap)));
   } else if (pair) {
     ctx.emit({
       kind: "discovery",
@@ -797,6 +818,7 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
   });
   return {
     routes,
+    maxRoutes: routeCap,
     openapiFound: !!openapiFound,
     openapiRouteCount: openapi.length,
     findings,

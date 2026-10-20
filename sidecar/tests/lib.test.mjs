@@ -17,7 +17,15 @@ import {
 } from "../lib/analyzer.mjs";
 import { parsePortFromLine, stripAnsi } from "../lib/readyline.mjs";
 import { methodStyleOps, expressStyleOps, findRecordDecisionBlock, buildProbePlan } from "../lib/planner.mjs";
-import { buildLoginBody, classifyLoginFailure, extractListItems, extractEntity, buildCases } from "../lib/probe.mjs";
+import {
+  buildLoginBody,
+  encodeLoginBody,
+  classifyLoginFailure,
+  extractListItems,
+  extractEntity,
+  buildCases,
+  loginAll,
+} from "../lib/probe.mjs";
 import { loadTargetConfig, startUsesPortSlot, renderStart, PORT_SLOT } from "../lib/targetconfig.mjs";
 import {
   detectStartConfig,
@@ -331,6 +339,96 @@ test("loadTargetConfig: email 身份 + login 契约归一化（前导斜杠自�
   assert.equal(res.identities[0].email, "jim@juice.sh");
   assert.equal(res.identities[0].username, null);
   assert.equal(res.prepare, null, "无 prepare 时应为 null");
+});
+
+test("loadTargetConfig: cookieAuth 与 form 编码归一化（默认 json）", async () => {
+  const raw = {
+    login: { path: "/session/login", cookieAuth: true, encoding: "urlencoded" },
+    identities: [
+      { username: "a", password: "p1" },
+      { username: "b", password: "p2" },
+    ],
+  };
+  const res = await loadTargetConfig(fakeCtx(JSON.stringify(raw)));
+  assert.equal(res.login.cookieAuth, true);
+  assert.equal(res.login.encoding, "form");
+
+  const jsonRes = await loadTargetConfig(fakeCtx(JSON.stringify({ login: { path: "/login" } })));
+  assert.equal(jsonRes.login.cookieAuth, false);
+  assert.equal(jsonRes.login.encoding, "json");
+});
+
+test("encodeLoginBody: form-urlencoded 与 JSON 两种编码", () => {
+  assert.deepEqual(encodeLoginBody({ email: "a@x.io", password: "p 1" }, true), {
+    body: "email=a%40x.io&password=p+1",
+    contentType: "application/x-www-form-urlencoded",
+  });
+  assert.deepEqual(encodeLoginBody({ email: "a@x.io" }, false), {
+    body: '{"email":"a@x.io"}',
+    contentType: "application/json",
+  });
+});
+
+test("loginAll: Cookie 登录（form + 302 Set-Cookie）经 Host 入库后视为成功", async () => {
+  const calls = [];
+  const ctx = {
+    plan: { loginCandidates: ["/session/login"], loginPath: "/session/login" },
+    identities: [
+      { name: "alice", username: "alice", password: "a1", role: "user" },
+      { name: "bob", username: "bob", password: "b2", role: "user" },
+    ],
+    loginConfig: {
+      path: "/session/login",
+      bodyTemplate: { user: "{username}", pass: "{password}" },
+      credentialHeader: "Authorization",
+      credentialPath: "token",
+      credentialPrefix: "Bearer ",
+      extraHeaders: { "X-Tenant": "t1" },
+      cookieAuth: true,
+      encoding: "form",
+      userPath: null,
+    },
+    tokens: { net: "tok_net" },
+    emit: () => {},
+    rpc: {
+      request: async (method, params) => {
+        calls.push({ method, params });
+        return {
+          status: 302,
+          body: "",
+          headers: { Location: "/" },
+          storedIdentity: params.storeCookieAs,
+          credentialKind: "cookie",
+        };
+      },
+    },
+  };
+  const logged = await loginAll(ctx, "http://127.0.0.1:3000");
+  assert.equal(logged.length, 2);
+  assert.equal(calls.length, 2);
+  const p = calls[0].params;
+  assert.equal(p.storeCookieAs, "alice");
+  assert.equal(p.storeCredentialAs, undefined, "Cookie 模式不应同时写入 token 槽位");
+  assert.equal(p.body, "user=alice&pass=a1");
+  assert.equal(p.headers["Content-Type"], "application/x-www-form-urlencoded");
+  assert.equal(p.headers["X-Tenant"], "t1", "login.extraHeaders 应随请求发送");
+});
+
+test("loginAll: Cookie 模式 302 但无 Set-Cookie 时给出 cookie_missing 诊断", async () => {
+  const ctx = {
+    plan: { loginCandidates: ["/session/login"], loginPath: "/session/login" },
+    identities: [{ name: "alice", username: "alice", password: "a1", role: "user" }],
+    loginConfig: { path: "/session/login", cookieAuth: true, extraHeaders: {}, bodyTemplate: null, userPath: null },
+    tokens: { net: "tok_net" },
+    emit: () => {},
+    rpc: {
+      request: async () => ({ status: 302, body: "", headers: {}, storedIdentity: null }),
+    },
+  };
+  await assert.rejects(
+    () => loginAll(ctx, "http://127.0.0.1:3000"),
+    (e) => e.code === "cookie_missing"
+  );
 });
 
 test("loadTargetConfig: fields 自定义身份 + prepare 归一化（cwd/timeoutMs 默认值）", async () => {

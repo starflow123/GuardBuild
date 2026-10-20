@@ -50,7 +50,7 @@ jobs:
       - name: Sidecar 单元测试
         run: node --test "sidecar/tests/**/*.test.mjs"
 
-      - name: gate 演练（4 轮裁决 + 报告产物）
+      - name: gate 演练（7 轮裁决 + 报告产物）
         run: node scripts/e2e-gate.mjs
 
       - name: 主工作流 E2E（31 断言）
@@ -73,6 +73,20 @@ jobs:
 
       - name: Python 适配器 E2E（FastAPI 真实 uvicorn + 越权/匿名/修复三分支）
         run: node scripts/e2e-python.mjs
+
+      - name: 黑盒外部模式 E2E（真实 HTTP 目标 + Cookie 会话鉴权，本机回环）
+        run: node scripts/e2e-blackbox.mjs
+
+      - name: LLM 侦察 E2E（本机 mock DeepSeek + 磁盘缓存复用，无需真实密钥）
+        run: node scripts/e2e-llm-scout.mjs
+
+      - name: Docker 沙箱 E2E（无可用 Docker 时自动跳过）
+        run: node scripts/e2e-docker.mjs
+
+      - name: 前端依赖安装与构建（tsc + vite）
+        run: |
+          npm ci
+          npm run build
 
       - name: 上传报告与证据库
         if: always()
@@ -97,3 +111,9 @@ jobs:
             .demo-graphql/data/guardbuild.db
             .demo-python/reports
             .demo-python/data/guardbuild.db
+            .demo-blackbox-e2e/reports
+            .demo-blackbox-e2e/data/guardbuild.db
+            .demo-llm/reports
+            .demo-llm/data/guardbuild.db
+            .demo-docker-e2e/reports
+            .demo-docker-e2e/data/guardbuild.db

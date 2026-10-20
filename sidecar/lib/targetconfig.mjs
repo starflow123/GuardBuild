@@ -151,6 +151,11 @@ export function normalizeLogin(raw) {
         : {},
     // 是否使用 Cookie 鉴权（登录后从响应 Set-Cookie 提取，后续请求带 Cookie 头）
     cookieAuth: l.cookieAuth === true,
+    // 登录请求体编码：json（默认）或 form（application/x-www-form-urlencoded）
+    encoding:
+      l.encoding === "form" || l.encoding === "urlencoded" || l.encoding === "x-www-form-urlencoded"
+        ? "form"
+        : "json",
   };
 }
 

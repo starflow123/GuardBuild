@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { runBlackbox, extractItems, extractEntityById, extractOwner } from "../lib/blackbox.mjs";
+import { runBlackbox, openapiRoutes, extractItems, extractEntityById, extractOwner } from "../lib/blackbox.mjs";
 
 function jsonPath(obj, path) {
   return String(path)
@@ -205,6 +205,67 @@ test("runBlackbox: 有归属校验时标记 blocked，且无漏洞结论", async
     assert.ok(idor);
     assert.equal(idor.verdict, "blocked");
     assert.equal(result.summary.attackBlocked, 1);
+  } finally {
+    await target.close();
+  }
+});
+
+function openapiServer(count) {
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, "http://127.0.0.1");
+    if (url.pathname === "/openapi.json") {
+      const paths = {};
+      for (let i = 0; i < count; i++) {
+        paths[`/api/items${i}`] = { get: { responses: { 200: { description: "ok" } } } };
+      }
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ openapi: "3.0.0", paths }));
+      return;
+    }
+    res.writeHead(404, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ error: "not found" }));
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        url: `http://127.0.0.1:${server.address().port}`,
+        close: () => new Promise((r) => server.close(r)),
+      });
+    });
+  });
+}
+
+test("openapiRoutes: limit 截断路由数量", () => {
+  const paths = {};
+  for (let i = 0; i < 25; i++) paths[`/api/r${i}`] = { get: {} };
+  const found = { doc: { openapi: "3.0.0", paths } };
+  assert.equal(openapiRoutes(found, 10).length, 10);
+  assert.equal(openapiRoutes(found, 200).length, 25);
+  assert.equal(openapiRoutes(found).length, 25);
+});
+
+test("runBlackbox: blackbox.maxRoutes 控制发现与探测上限", async () => {
+  const target = await openapiServer(30);
+  const ctx = makeCtx(new Map());
+  try {
+    const capped = await runBlackbox(ctx, target.url, {
+      config: { login: ctx.loginConfig, identities: ctx.identities, blackbox: { maxRoutes: 10 } },
+      allowMutation: false,
+    });
+    assert.equal(capped.maxRoutes, 10);
+    assert.equal(capped.routes.length, 10);
+    assert.ok(capped.routes.every((r) => r.path.startsWith("/api/items")));
+    const start = ctx.events.find((e) => e.kind === "phase" && e.message.startsWith("开始黑盒"));
+    assert.equal(start.data.routeCap, 10);
+    assert.equal(start.data.probeCap, 10);
+
+    const dflt = await runBlackbox(ctx, target.url, {
+      config: { login: ctx.loginConfig, identities: ctx.identities, blackbox: null },
+      allowMutation: false,
+    });
+    assert.equal(dflt.maxRoutes, 60);
+    assert.equal(dflt.openapiRouteCount, 30);
+    assert.equal(dflt.routes.length, 53, "30 条 OpenAPI + 23 条目录探测（404 亦视为路由存在）");
   } finally {
     await target.close();
   }

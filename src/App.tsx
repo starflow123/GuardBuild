@@ -43,6 +43,8 @@ export function App() {
   const [evFilter, setEvFilter] = useState("all");
   const [busy, setBusy] = useState(false);
   const [toast, setToast] = useState<string | null>(null);
+  const [bbUrl, setBbUrl] = useState("");
+  const [bbProject, setBbProject] = useState<string | null>(null);
   const [hostInfo, setHostInfo] = useState<{
     protocolVersion: string;
     appVersion: string;
@@ -131,10 +133,42 @@ export function App() {
     run(async () => {
       const dir = await bridge.pickProjectDir();
       if (!dir) return;
+      setBbProject(dir);
       setTab("findings");
       setEvFilter("all");
       await bridge.startSession(dir);
     }, "启动失败");
+
+  const pickBlackboxProject = () =>
+    run(async () => {
+      const dir = await bridge.pickProjectDir();
+      if (dir) setBbProject(dir);
+    }, "选择目录失败");
+
+  const startBlackbox = () =>
+    run(async () => {
+      const url = bbUrl.trim();
+      let parsed: URL;
+      try {
+        parsed = new URL(url);
+      } catch {
+        showToast("黑盒目标 URL 非法：请填写完整的 http(s) 地址");
+        return;
+      }
+      if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+        showToast("黑盒目标仅支持 http/https");
+        return;
+      }
+      let dir = bbProject;
+      if (!dir) {
+        dir = await bridge.pickProjectDir();
+        if (!dir) return;
+        setBbProject(dir);
+      }
+      setTab("findings");
+      setEvFilter("all");
+      await bridge.startSession(dir, url);
+    }, "黑盒扫描启动失败");
 
   const resolveConsent = async (approved: boolean) => {
     const c = activeConsent;
@@ -193,6 +227,38 @@ export function App() {
 
       <div className="app-main">
         <div className="col">
+          <div className="panel">
+            <div className="panel-title">黑盒扫描外部目标</div>
+            <div className="panel-body" style={{ padding: "9px 13px", display: "grid", gap: 7 }}>
+              <input
+                className="text-input"
+                type="url"
+                placeholder="http://127.0.0.1:3000 或 https://..."
+                value={bbUrl}
+                onChange={(e) => setBbUrl(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" && canStart && bbUrl.trim()) startBlackbox();
+                }}
+                disabled={!canStart}
+              />
+              <div className="row">
+                <button className="btn small" onClick={pickBlackboxProject} disabled={!canStart}>
+                  契约目录
+                </button>
+                <span className="small muted ellipsis grow" title={bbProject ?? ""}>
+                  {bbProject ?? "未选择（扫描时再选）"}
+                </span>
+              </div>
+              <button
+                className="btn primary"
+                onClick={startBlackbox}
+                disabled={!canStart || !bbUrl.trim()}
+                title="只对运行中的目标发起外部 HTTP 请求；远程目标必须为 https"
+              >
+                扫描外部目标
+              </button>
+            </div>
+          </div>
           <div className="panel">
             <div className="panel-title">修复工作流</div>
             <div className="panel-body" style={{ padding: "8px 9px" }}>

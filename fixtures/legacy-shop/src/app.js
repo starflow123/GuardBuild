@@ -37,6 +37,14 @@ function readBody(req) {
   });
 }
 
+function readForm(req) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    req.on("data", (c) => chunks.push(c));
+    req.on("end", () => resolve(new URLSearchParams(Buffer.concat(chunks).toString("utf8"))));
+  });
+}
+
 export async function handleRequest(req, res) {
   const url = new URL(req.url, "http://127.0.0.1");
   const pathname = url.pathname;
@@ -49,6 +57,19 @@ export async function handleRequest(req, res) {
   }
   if (method === "GET" && pathname === "/__diag/decisions") {
     return json(res, 200, { entries: decisionLog });
+  }
+
+  // ---- 认证（form 登录 + 302 + Set-Cookie 会话，模拟传统 Web 形态）----
+  if (method === "POST" && pathname === "/session/login") {
+    const form = await readForm(req);
+    const result = login(form.get("email") ?? "", form.get("password") ?? "");
+    if (!result) return json(res, 401, { error: "邮箱或密码错误" });
+    res.writeHead(302, {
+      Location: "/api/me",
+      "Set-Cookie": `sid=${result.token}; Path=/; HttpOnly; SameSite=Lax`,
+      "Content-Length": "0",
+    });
+    return res.end();
   }
 
   // ---- 认证（email 登录 + 嵌套 token，模拟真实项目响应形状）----

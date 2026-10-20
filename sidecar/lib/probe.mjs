@@ -122,28 +122,31 @@ async function httpJson(ctx, opts) {
     identity = null,
     body = null,
     storeAs = null,
+    storeCookieAs = null,
     credentialPath = null,
     credentialPrefix = null,
     credentialHeader = null,
     extraHeaders = null,
+    contentType = null,
     redact = true,
     graphql = false,
   } = opts;
+  const headers = { ...(ctx.loginConfig?.extraHeaders ?? {}) };
+  if (body) headers["Content-Type"] = contentType ?? "application/json";
   const params = {
     // 黑盒模式把目标主机令牌放在 http 槽位（远程 net.egress）；常规流程仍用 net。
     token: ctx.tokens.http ?? ctx.tokens.net,
     method,
     url: `${baseUrl.replace(/\/+$/, "")}${path}`,
-    headers: body ? { "Content-Type": "application/json" } : {},
+    headers,
   };
   if (body) params.body = body;
   if (identity) params.identityRef = identity;
-  if (storeAs) {
-    params.storeCredentialAs = storeAs;
-    params.credentialPath = credentialPath;
-    params.credentialPrefix = credentialPrefix;
-    if (credentialHeader) params.credentialHeader = credentialHeader;
-  }
+  if (storeAs) params.storeCredentialAs = storeAs;
+  if (storeCookieAs) params.storeCookieAs = storeCookieAs;
+  if (credentialPath) params.credentialPath = credentialPath;
+  if (credentialPrefix != null) params.credentialPrefix = credentialPrefix;
+  if (credentialHeader) params.credentialHeader = credentialHeader;
   // 合并全局额外 header（如 X-Tenant-Id）
   if (extraHeaders && typeof extraHeaders === "object") {
     Object.assign(params.headers, extraHeaders);
@@ -222,6 +225,20 @@ export function buildLoginBody(identity, loginCfg) {
   return { email: identity.email ?? "", password: identity.password };
 }
 
+/** 登录请求体编码：JSON（默认）或 form-urlencoded。 */
+export function encodeLoginBody(body, form) {
+  if (!form) return { body: JSON.stringify(body), contentType: "application/json" };
+  const params = new URLSearchParams();
+  for (const [k, v] of Object.entries(body ?? {})) {
+    if (Array.isArray(v)) {
+      for (const item of v) params.append(k, item == null ? "" : String(item));
+    } else {
+      params.append(k, v == null ? "" : String(v));
+    }
+  }
+  return { body: params.toString(), contentType: "application/x-www-form-urlencoded" };
+}
+
 /** 从登录响应中提取用户对象：契约 userPath > 顶层 user > authentication.user */
 function pickUser(json, loginCfg) {
   if (!json || typeof json !== "object") return null;
@@ -288,8 +305,15 @@ export async function loginAll(ctx, baseUrl) {
     // GraphQL 登录：同一 HTTP 端点上的 mutation，文档由静态分析出的登录字段（SDL）构造
     const gqlLogin = ctx.plan.graphql?.login ?? null;
     const isGqlLogin = !!gqlLogin?.field && path === gqlLogin.path && looksLikeGraphqlPath(path);
+    const cookieAuth = cfg?.cookieAuth === true;
+    const formAuth = cfg?.encoding === "form";
     for (const ident of ctx.identities) {
       const bodyPlain = buildLoginBody(ident, cfg);
+      // Cookie 登录允许 3xx：登录接口常用 302 下发 Set-Cookie 并跳转
+      const loginOk = (r) =>
+        !!r &&
+        r.storedIdentity === ident.name &&
+        (cookieAuth ? r.status >= 200 && r.status < 400 : okStatus(r.status));
       const gqlReq = isGqlLogin ? graphqlLoginRequest(gqlLogin, bodyPlain) : null;
       if (isGqlLogin && !gqlReq) {
         throw new ProbeError(`GraphQL 登录字段 ${gqlLogin.field} 的请求文档无法构造`, {
@@ -300,6 +324,8 @@ export async function loginAll(ctx, baseUrl) {
       const wraps = isTrpcProc ? [true, false] : [false];
       let res = null;
       for (const wrap of wraps) {
+        const encoded =
+          gqlReq || isTrpcProc ? null : encodeLoginBody(bodyPlain, formAuth);
         res = await httpJson(ctx, {
           baseUrl,
           method: "POST",
@@ -308,14 +334,16 @@ export async function loginAll(ctx, baseUrl) {
             ? gqlReq.body
             : isTrpcProc
               ? encodeInput(bodyPlain, wrap)
-              : JSON.stringify(bodyPlain),
-          storeAs: ident.name,
+              : encoded.body,
+          contentType: encoded?.contentType,
+          storeAs: cookieAuth ? null : ident.name,
+          storeCookieAs: cookieAuth ? ident.name : null,
           credentialPath: cfg?.credentialPath ?? "token",
           credentialPrefix: cfg?.credentialPrefix ?? "Bearer ",
           credentialHeader: cfg?.credentialHeader ?? null,
           graphql: !!gqlReq,
         });
-        if (okStatus(res.status) && res.storedIdentity === ident.name) {
+        if (loginOk(res)) {
           if (isTrpcProc && ctx._trpcWrap == null) {
             ctx._trpcWrap = wrap;
             ctx._trpcVariant = wrap ? 0 : 1;
@@ -331,24 +359,37 @@ export async function loginAll(ctx, baseUrl) {
         if (isTrpcProc && inputRejected(res)) continue; // 形态问题，换下一种
         break;
       }
-      if (okStatus(res.status) && res.storedIdentity === ident.name) {
+      if (loginOk(res)) {
         const user = pickUser(res.json, cfg);
         ctx.emit({
           kind: "identity",
           severity: SEVERITY.INFO,
-          message: `身份「${ident.name}」登录成功（${path}），令牌已存入 Host 保险库（响应中的 token 对 Sidecar 显示为 ***）`,
-          data: { identity: ident.name, user, stored: true, endpoint: path },
+          message: cookieAuth
+            ? `身份「${ident.name}」登录成功（${path}），会话 Cookie 已存入 Host 保险库（对 Sidecar 不可见）`
+            : `身份「${ident.name}」登录成功（${path}），令牌已存入 Host 保险库（响应中的 token 对 Sidecar 显示为 ***）`,
+          data: {
+            identity: ident.name,
+            user,
+            stored: true,
+            credentialKind: cookieAuth ? "cookie" : "token",
+            endpoint: path,
+          },
         });
         loggedIn.push({ ...ident, user });
         continue;
       }
       attempts.push({ path, identity: ident.name, status: res.status });
-      if (okStatus(res.status) && res.storedIdentity !== ident.name) {
+      const statusAccepted = cookieAuth ? res.status >= 200 && res.status < 400 : okStatus(res.status);
+      if (statusAccepted && res.storedIdentity !== ident.name) {
         throw new ProbeError(
-          `登录返回 HTTP ${res.status}，但响应中未找到凭据字段「${cfg?.credentialPath ?? "token"}」`,
+          cookieAuth
+            ? `登录返回 HTTP ${res.status}，但响应未包含 Set-Cookie 会话`
+            : `登录返回 HTTP ${res.status}，但响应中未找到凭据字段「${cfg?.credentialPath ?? "token"}」`,
           {
-            code: "credential_path_missing",
-            hint: `请检查 guardbuild.json 的 login.credentialPath（当前为 "${cfg?.credentialPath ?? "token"}"）；嵌套令牌应写如 "authentication.token"`,
+            code: cookieAuth ? "cookie_missing" : "credential_path_missing",
+            hint: cookieAuth
+              ? "请确认登录接口确实通过 Set-Cookie 下发会话；若实际返回 JSON 令牌，请移除 login.cookieAuth 并检查 login.credentialPath"
+              : `请检查 guardbuild.json 的 login.credentialPath（当前为 "${cfg?.credentialPath ?? "token"}"）；嵌套令牌应写如 "authentication.token"`,
           }
         );
       }

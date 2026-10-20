@@ -52,6 +52,20 @@ function makeShop(name, { fixed = false } = {}) {
   return dir;
 }
 
+function makeCookieShop(name) {
+  const dir = makeShop(name);
+  const cfgPath = path.join(dir, "guardbuild.json");
+  const cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
+  cfg.login = {
+    path: "/session/login",
+    bodyTemplate: { email: "{email}", password: "{password}" },
+    cookieAuth: true,
+    encoding: "form",
+  };
+  writeFileSync(cfgPath, `${JSON.stringify(cfg, null, 2)}\n`);
+  return dir;
+}
+
 function startServer(dir) {
   return new Promise((resolve, reject) => {
     const child = spawn("node", ["server.js"], {
@@ -174,7 +188,7 @@ async function main() {
   const fixedShop = makeShop("shop-fixed", { fixed: true });
   const before = snapshot(vulnShop);
 
-  log("1/3 漏洞目标");
+  log("1/4 漏洞目标");
   const vuln = await startServer(vulnShop);
   try {
     const r = await runBlackbox({
@@ -197,7 +211,7 @@ async function main() {
     vuln.child.kill();
   }
 
-  log("2/3 已修复目标");
+  log("2/4 已修复目标");
   const fixed = await startServer(fixedShop);
   try {
     const r = await runBlackbox({
@@ -216,7 +230,26 @@ async function main() {
     fixed.child.kill();
   }
 
-  log("3/3 不可达目标");
+  log("3/4 Cookie 会话鉴权目标（form 登录 + 302 Set-Cookie）");
+  const cookieShop = makeCookieShop("shop-cookie");
+  const cookie = await startServer(cookieShop);
+  try {
+    const r = await runBlackbox({
+      url: `http://127.0.0.1:${cookie.port}`,
+      project: cookieShop,
+      label: "cookie",
+    });
+    check("退出码 = 1", r.code === 1, `code=${r.code}`);
+    check("Host Cookie 登录成功（alice/bob）", r.gate?.blackbox?.login?.ok === true, `path=${r.gate?.blackbox?.login?.path}`);
+    const report = readReport("cookie");
+    check("Cookie 会话下仍复现 IDOR（Cookie 注入生效）", (report?.blackbox?.findings ?? []).length === 1);
+    const raw = JSON.stringify(report ?? {});
+    check("报告不泄露会话 Cookie", !/sid=sess_[A-Za-z0-9]+/.test(raw), raw.match(/sid=[^"]{0,16}/)?.[0] ?? "");
+  } finally {
+    cookie.child.kill();
+  }
+
+  log("4/4 不可达目标");
   const deadPort = await freePort();
   const r = await runBlackbox({
     url: `http://127.0.0.1:${deadPort}`,

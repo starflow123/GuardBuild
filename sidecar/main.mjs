@@ -99,6 +99,7 @@ function createCtx(params) {
     sessionId: params.sessionId,
     projectRoot: params.projectRoot,
     projectName: params.projectRoot.replace(/[\\/]+$/, "").split(/[\\/]/).pop() ?? "project",
+    blackboxUrl: typeof params.blackboxUrl === "string" && params.blackboxUrl.trim() ? params.blackboxUrl.trim() : null,
     tokens: { project: params.token },
     identities: loadIdentities(),
     loginConfig: null,
@@ -771,6 +772,44 @@ async function shutdownProcs(ctx) {
   ctx.procs = {};
 }
 
+/**
+ * 终态清理隔离 worktree：先停掉占用目录的实例，再由 Host 删除（Host 会先摘除 junction/symlink）。
+ * 清理失败只告警，不覆盖会话结论；重复调用安全。
+ */
+async function removeWorktree(ctx) {
+  const wt = ctx.view.patch?.worktree ?? ctx._worktree;
+  if (!wt || ctx._worktreeCleanupAttempted) return;
+  ctx._worktreeCleanupAttempted = true;
+  if (ctx.procs.worktree) {
+    await killProc(ctx, ctx.procs.worktree.pid);
+    ctx.procs.worktree = null;
+  }
+  const token = ctx.tokens.worktree;
+  if (!token) return;
+  try {
+    await ctx.rpc.request(
+      RPC_TO_HOST.GIT_WORKTREE_REMOVE,
+      { token, path: wt },
+      { timeoutMs: 60_000 }
+    );
+    emit(ctx, {
+      kind: "session",
+      severity: SEVERITY.INFO,
+      message: `已清理隔离 worktree（${wt}）`,
+      data: { worktree: wt },
+    });
+  } catch (e) {
+    // 允许后续（如新会话启动时）再试一次
+    ctx._worktreeCleanupAttempted = false;
+    emit(ctx, {
+      kind: "session",
+      severity: SEVERITY.WARN,
+      message: `隔离 worktree 自动清理失败：${e.message}（可手动删除 ${wt}）`,
+      data: { worktree: wt, error: e.message },
+    });
+  }
+}
+
 /** 按契约 prepare 步骤顺序执行（依赖安装/构建等），失败即中止会话 */
 async function runPrepare(ctx, { cwd, label }) {
   const steps = ctx.targetConfig?.prepare ?? [];
@@ -1265,11 +1304,15 @@ async function stageVerify(ctx) {
       state: STATE.VERIFY_FAILED,
       error: { code: err.code, message: err.message, hint: err.hint, details: err.details },
     });
+    // gate 会在状态跃迁时立即退出，必须先清掉临时 worktree；交互模式保留现场供审查
+    if (ctx.gate) await removeWorktree(ctx);
     setState(ctx, STATE.VERIFY_FAILED);
     throw err;
   }
 
   await emitReport(ctx, { outcome: "vulnerable", patchStatus: "verified", exitCode: 1, state: STATE.WRITEBACK_PENDING });
+  // gate 模式结构化禁止写回，验收通过即可清理；交互模式需保留到用户授权写回之后
+  if (ctx.gate) await removeWorktree(ctx);
   setState(ctx, STATE.WRITEBACK_PENDING);
   emit(ctx, {
     kind: "verify",
@@ -1398,6 +1441,7 @@ async function runBlackboxFlow(ctx, rawUrl) {
 
   const allowMutation =
     process.env.GUARDBUILD_BLACKBOX_MUTATE === "1" || cfg.blackbox?.allowMutation === true;
+  const configuredMaxRoutes = Number.isFinite(cfg.blackbox?.maxRoutes) ? cfg.blackbox.maxRoutes : null;
   // 先落一份最小视图：扫描（含不可达）失败时报告仍能按黑盒模式渲染。
   ctx.view.blackbox = {
     mode: "blackbox",
@@ -1411,6 +1455,7 @@ async function runBlackboxFlow(ctx, rawUrl) {
     login: null,
     rateLimited: false,
     allowMutation,
+    maxRoutes: configuredMaxRoutes,
     reachable: null,
     outcome: null,
     exitCode: null,
@@ -1444,6 +1489,7 @@ async function runBlackboxFlow(ctx, rawUrl) {
     login: result.login,
     rateLimited: result.rateLimited,
     allowMutation: result.configuredMutation,
+    maxRoutes: result.maxRoutes ?? configuredMaxRoutes,
     reachable: true,
     outcome,
     exitCode,
@@ -1477,7 +1523,7 @@ async function runFlow(ctx) {
     ctx.db.ensureSession(sessionId, ctx.projectRoot, ctx.projectRoot);
     pushView(ctx);
 
-    const blackboxUrl = process.env.GUARDBUILD_BLACKBOX_URL;
+    const blackboxUrl = ctx.blackboxUrl || process.env.GUARDBUILD_BLACKBOX_URL;
     if (blackboxUrl) {
       await runBlackboxFlow(ctx, blackboxUrl);
       return;
@@ -1597,6 +1643,7 @@ async function runFlow(ctx) {
 async function abortSession(ctx) {
   emit(ctx, { kind: "session", severity: SEVERITY.WARN, message: "会话已中止", data: {} });
   await emitReport(ctx, { outcome: "aborted", exitCode: 2, state: STATE.ABORTED });
+  await removeWorktree(ctx);
   if (ctx.sm.can(STATE.ABORTED)) setState(ctx, STATE.ABORTED);
   else {
     ctx.sm.state = STATE.ABORTED;
@@ -1633,6 +1680,7 @@ async function failSession(ctx, e) {
     message: `执行失败：${e.message}${e.hint ? `（建议：${e.hint}）` : ""}`,
     data: payload,
   });
+  await removeWorktree(ctx);
   if (ctx.sm.can(STATE.ERROR)) setState(ctx, STATE.ERROR);
   else {
     ctx.sm.state = STATE.ERROR;
@@ -1664,6 +1712,8 @@ peer.onClose = () => {
 peer.onRequest(RPC_TO_SIDECAR.SESSION_START, async (params) => {
   if (active) {
     if (!TERMINAL_STATES.has(active.sm?.state)) return { ok: false, error: "已有会话进行中" };
+    // 旧会话若保留了 worktree（如交互式 verify_failed），新会话启动时一并清理
+    await removeWorktree(active);
     endSession(active);
   }
   const ctx = createCtx(params);
@@ -1676,9 +1726,10 @@ async function handleSessionCancel() {
   const ctx = active;
   if (!ctx) return { ok: true };
   ctx.cancelled = true;
-  // 空闲等待用户操作的阶段直接中止；运行中的阶段会在下一个检查点退出
+  // 空闲等待用户操作的阶段直接中止；运行中的阶段会在下一个检查点退出。
+  // 必须 await：Host 在收到确认后立即吊销令牌，worktree 清理需在此之前完成。
   const idleStates = [STATE.PATCH_REVIEW, STATE.WRITEBACK_PENDING, STATE.VERIFY_FAILED];
-  if (ctx.sm && idleStates.includes(ctx.sm.state)) abortSession(ctx);
+  if (ctx.sm && idleStates.includes(ctx.sm.state)) await abortSession(ctx);
   return { ok: true };
 }
 // Host 可能以请求（期待确认）或通知（单向）形式发送取消，两者都处理
@@ -1738,10 +1789,7 @@ peer.onRequest(RPC_TO_SIDECAR.WRITEBACK_APPROVED, async ({ token, patchHash } = 
       diff: ctx.view.patch?.diff,
     });
     if (ctx.view.patch) ctx.view.patch.status = "written_back";
-    if (ctx.procs.worktree) {
-      await killProc(ctx, ctx.procs.worktree.pid);
-      ctx.procs.worktree = null;
-    }
+    await removeWorktree(ctx);
     setState(ctx, STATE.APPLIED);
     emit(ctx, {
       kind: "writeback",
@@ -1766,6 +1814,7 @@ peer.onRequest(RPC_TO_SIDECAR.ROLLBACK_APPROVED, async ({ token, backupId } = {}
   try {
     const res = await rollbackWorkspace(ctx, { token, backupId });
     if (ctx.view.patch) ctx.view.patch.status = "rolled_back";
+    await removeWorktree(ctx);
     setState(ctx, STATE.ROLLED_BACK);
     emit(ctx, {
       kind: "rollback",

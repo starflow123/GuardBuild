@@ -15,10 +15,20 @@ export function login(email, password) {
   return { token, user: publicUser(user) };
 }
 
-// 认证中间件：解析 Authorization 头，返回当前用户或 null
+function cookieToken(req) {
+  const raw = req.headers["cookie"] || "";
+  for (const part of raw.split(";")) {
+    const [name, ...rest] = part.trim().split("=");
+    if (name === "sid") return rest.join("=");
+  }
+  return "";
+}
+
+// 认证中间件：解析 Authorization 或 Cookie 会话，返回当前用户或 null
 export function authenticate(req) {
   const header = req.headers["authorization"] || "";
-  const token = header.startsWith("Bearer ") ? header.slice(7) : "";
+  const bearer = header.startsWith("Bearer ") ? header.slice(7) : "";
+  const token = bearer || cookieToken(req);
   if (!token) return null;
   const session = store.sessions.get(token);
   if (!session) return null;

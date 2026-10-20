@@ -1009,3 +1009,34 @@ body {
 .grow {
   flex: 1;
 }
+
+.ellipsis {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.text-input {
+  width: 100%;
+  background: #0b1524;
+  border: 1px solid var(--line);
+  border-radius: 7px;
+  color: var(--text);
+  padding: 6px 9px;
+  font-size: 12px;
+  font-family: var(--mono);
+  outline: none;
+}
+
+.text-input::placeholder {
+  color: #56688a;
+}
+
+.text-input:focus {
+  border-color: var(--accent-dim);
+}
+
+.text-input:disabled {
+  opacity: 0.55;
+}

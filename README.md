@@ -61,8 +61,8 @@ npm run app:build      # 构建（--no-bundle）
 # 无头验收（零 npm 依赖：构建宿主后即可运行）
 npm run host:headless  # 构建无头宿主（--no-default-features）
 npm run e2e            # 主工作流 E2E（31 断言，自动生成 .demo 演示目标）
-npm run e2e:gate       # CI gate 演练（51 断言，7 轮裁决 + 报告产物）
-npm run e2e:blackbox   # 纯黑盒外部扫描演练（18 断言：漏洞/已修复/不可达三种目标）
+npm run e2e:gate       # CI gate 演练（53 断言，7 轮裁决 + 报告产物）
+npm run e2e:blackbox   # 纯黑盒外部扫描演练（22 断言：漏洞/已修复/Cookie 会话/不可达）
 npm run e2e:llm        # LLM 接入侦察演练（40 断言，本机 mock DeepSeek，含无密钥磁盘缓存复用轮）
 npm run seed-demo      # 单独生成演示工作区 .demo/vibeshop（供桌面端手动演练）
 
@@ -107,7 +107,7 @@ npm run test:rust      # Rust Host
 - 启动失败诊断：识别 `next_no_build` / `port_in_use` / `missing_env` / `dependency_unreachable` / `db_not_initialized` / `django_migrations` / `command_not_found` / `python_missing_dependency` / `missing_dependency` / `script_missing` / `bind_address` / `permission_denied` / `syntax_error` 等常见原因并给出处置建议，附退出码与日志尾部摘录
 - `start`：就绪以 `readyPattern` 在 stdout 出现为准（解析前先剥 ANSI 色码，依次识别行内 JSON `port` → `host:port` → 「端口 NNNN」/ `listening on port NNNN` 文本形状）。端口两种写法任选：`env.PORT=0` 让服务自选端口（要求服务把真实端口打进就绪行）；硬编码端口或打印字面量的服务改用 **`${GB_PORT}` 槽位**——宿主每次 spawn 前分配一个空闲端口注入，`cmd` / `args` / `env` 均可使用（修复阶段会先停止原始实例，验收实例与原始实例不再争用端口）
 - `prepare`：目标启动前按序执行的前置命令（安装依赖 / 构建），`cwd` 相对项目根；在「原始工作区」与「隔离 worktree」各执行一次——修复阶段的验收不依赖原工作区的构建产物
-- `login`：登录契约——`path` 指定登录端点（优先级高于静态分析候选）；`bodyTemplate` 适配非 `username` 的请求体形状，值支持 `{name}` / `{username}` / `{email}` / `{password}` 占位符；`credentialPath` 支持点路径（如 `authentication.token`），`credentialHeader` / `credentialPrefix` 缺省为 `Authorization` / `Bearer `
+- `login`：登录契约——`path` 指定登录端点（优先级高于静态分析候选）；`bodyTemplate` 适配非 `username` 的请求体形状，值支持 `{name}` / `{username}` / `{email}` / `{password}` 占位符；`credentialPath` 支持点路径（如 `authentication.token`），`credentialHeader` / `credentialPrefix` 缺省为 `Authorization` / `Bearer `；`encoding: "form"` 以 `application/x-www-form-urlencoded` 提交；`cookieAuth: true` 表示会话鉴权——登录响应可返回 3xx，`Set-Cookie` 由 Host 收进保险库并在后续请求以 `Cookie` 头注入（`credentialPath` 不填），Cookie 明文不会回到 Sidecar/报告
 - `responses`：声明列表 / 单体资源在响应 JSON 中的位置（点路径，如 `data.items`）；不声明时自适应——列表找「顶层数组 → 首个含 `id` 的对象数组」，单体找「首个对象值字段 → 响应自身」；资源名参与用例文案（`order` 显示为「订单」）
 - `identities`：支持 `username` / `email` / 自定义 `fields` 三种形状；至少 2 个，否则回退到内置演示身份；`role: "admin"` 的身份用于管理端用例
 - `scopes`：仅 CI gate 模式读取，作为「预声明授权」白名单；桌面模式不生效（仍逐次征求用户授权）
@@ -166,10 +166,12 @@ guardbuild-headless --url https://staging.example.com --project ./my-project --g
 
 - 探测面：OpenAPI 发现 + 常见路由目录探测；未认证读取、跨用户读取（IDOR，需 ≥2 个普通测试身份）、SQL 注入（错误回显 / 稳定基线布尔盲注）、路径穿越、敏感文件与 actuator 暴露、限流观察。
 - 写操作越权（PUT IDOR）默认关闭，避免修改目标数据；显式开启：`guardbuild.json` 的 `blackbox.allowMutation: true` 或环境变量 `GUARDBUILD_BLACKBOX_MUTATE=1`（修改后尽力恢复原值）。
-- 登录/身份来自 `guardbuild.json` 的 `login` / `identities`；可加 `blackbox.loginPaths` 补充登录端点候选。
+- 登录/身份来自 `guardbuild.json` 的 `login` / `identities`；可加 `blackbox.loginPaths` 补充登录端点候选。表单登录（`login.encoding: "form"`）与 Cookie 会话（`login.cookieAuth: true`，兼容 302 + `Set-Cookie`）同样适用于黑盒模式。
+- `blackbox.maxRoutes`（10–200，缺省 60）控制 OpenAPI/目录探测合并后的路由上限；每类攻击的探测候选默认最多 14 条，调低 `maxRoutes` 时同步收紧。
+- 桌面端入口：左侧「黑盒外部目标」面板填写已运行目标 URL、选择契约目录后点击「扫描外部目标」；白盒启动流程不受影响。
 - 裁决：发现可复现漏洞 → `completed` + `vulnerable_unfixed`，exit 1；无可复现漏洞 → `completed` + `no_findings`，exit 0；目标不可达/执行错误 → `failed`，exit 2（不可达会在一次短超时预检后立即失败，不做整轮探测）。
 - 报告：`report.json` / `report.md` 为黑盒版式，含路由发现、登录结果、证据级别与复现 curl；证据中令牌一律为 `***vault:<identity>***` 占位。
-- 回归：`npm run e2e:blackbox`（18 断言：漏洞目标 exit 1、已修复目标 exit 0、不可达 exit 2 + 快速短路、报告一致性与令牌不泄露）。
+- 回归：`npm run e2e:blackbox`（22 断言：漏洞目标 exit 1、已修复目标 exit 0、Cookie 会话目标沿 form 登录 + 302 Set-Cookie 复现 IDOR、不可达 exit 2 + 快速短路、报告一致性与凭证不泄露）。
 
 ## Docker 容器沙箱（目标进程隔离）
 
@@ -210,6 +212,7 @@ guardbuild-headless --url https://staging.example.com --project ./my-project --g
     project: .                # 目标项目路径（可含 guardbuild.json）
     report-dir: guardbuild-report
     # data-dir: guardbuild-evidence
+    # url: http://127.0.0.1:3000   # 可选：对已运行目标做纯黑盒扫描（不读源码/不写回）
 ```
 
 退出码可直接决定 job 成败：

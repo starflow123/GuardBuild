@@ -82,6 +82,8 @@ export async function createPatch(ctx) {
     throw e;
   }
   const worktree = wtRes.path;
+  // 供终态清理使用：补丁生成中途失败时 view.patch 尚未建立，也不能泄漏 worktree
+  ctx._worktree = worktree;
   const wtRoot = worktree.replace(/[\\/]+$/, "");
 
   // 1.5 链接依赖目录（顶层与一级子目录的 node_modules，如 monorepo 的 backend/、client/；

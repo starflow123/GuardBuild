@@ -174,24 +174,27 @@ async function main() {
   const md1 = existsSync(md1Path) ? readFileSync(md1Path, "utf8") : "";
   check("报告 markdown 含结论文案与验收摘要", md1.includes("## 结论与建议") && md1.includes("双重验收") && md1.includes(g1.patchHash.slice(0, 12)), "");
 
-  // 收集管线产出的修复版 app.js（供第 2 轮使用）
+  // gate 终态必须清理隔离 worktree（避免残留 node_modules junction / 磁盘占用）
   const worktreesRoot = path.join(dataDir, "worktrees");
-  let fixedAppJs = null;
-  for (const s of readdirSync(worktreesRoot)) {
-    const sRoot = path.join(worktreesRoot, s);
-    if (!statSync(sRoot).isDirectory()) continue;
-    for (const fix of readdirSync(sRoot)) {
-      const p = path.join(sRoot, fix, "src", "app.js");
-      if (existsSync(p)) fixedAppJs = readFileSync(p, "utf8");
-    }
-  }
-  check("已获取管线修复产物（隔离 worktree）", !!fixedAppJs && !fixedAppJs.includes('decision: "no-check"'), "");
+  const leftovers = existsSync(worktreesRoot)
+    ? readdirSync(worktreesRoot).flatMap((s) => {
+        const sRoot = path.join(worktreesRoot, s);
+        return statSync(sRoot).isDirectory() ? readdirSync(sRoot).map((f) => path.join(sRoot, f)) : [];
+      })
+    : [];
+  check("gate 结束后隔离 worktree 已清理", leftovers.length === 0, leftovers.join(", ") || "none");
+
+  // 修复产物改从报告的 patch.diff 还原（worktree 已被清理），供第 2 轮使用
+  const patchDiff = rep1?.patch?.diff ?? "";
+  check("报告携带可复用的补丁 diff", patchDiff.includes('decision: "no-check"'), "");
+  const fixedWs = makeWorkspace("fixed-shop");
+  const patchFile = path.join(demoDir, "reports", "r1", "patch.diff");
+  writeFileSync(patchFile, patchDiff);
+  const applyRes = spawnSync("git", ["apply", patchFile], { cwd: fixedWs, encoding: "utf8" });
+  check("补丁可应用于干净工作区", applyRes.status === 0, applyRes.stderr?.trim() ?? "");
 
   // ---------- ② 已修复目标 → exit 0 ----------
   console.log("\n[GATE] 2/7 已修复目标：期望 exit 0（静态无候选）…");
-  const fixedWs = makeWorkspace("fixed-shop", {
-    mutate: (ws) => writeFileSync(path.join(ws, "src", "app.js"), fixedAppJs ?? ""),
-  });
   const r2 = await runGate(fixedWs, "r2");
   check("退出码 = 0（无漏洞证据）", r2.code === 0, `code=${r2.code}`);
   check("verdict=no_candidates", r2.gate?.verdict === "no_candidates", `verdict=${r2.gate?.verdict} state=${r2.gate?.state}`);

@@ -118,13 +118,16 @@ pub async fn pick_project_dir() -> Option<String> {
 #[tauri::command]
 pub async fn start_session(
     project_root: String,
+    target_url: Option<String>,
     state: tauri::State<'_, AppState>,
 ) -> Result<Value, String> {
     let host = state.host.clone();
-    tauri::async_runtime::spawn_blocking(move || host.start_session(&project_root))
-        .await
-        .map_err(|e| e.to_string())?
-        .map_err(|e| e.to_string())
+    tauri::async_runtime::spawn_blocking(move || {
+        host.start_session(&project_root, target_url.as_deref())
+    })
+    .await
+    .map_err(|e| e.to_string())?
+    .map_err(|e| e.to_string())
 }
 
 #[tauri::command]

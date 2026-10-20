@@ -115,11 +115,82 @@ pub fn worktree_add(root: &Path, target_dir: &Path) -> HostResult<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn is_link_meta(md: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    md.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_link_meta(md: &std::fs::Metadata) -> bool {
+    md.file_type().is_symlink()
+}
+
+fn remove_link(path: &Path, md: &std::fs::Metadata) -> std::io::Result<()> {
+    #[cfg(windows)]
+    {
+        // junction 表现为目录重解析点；目录符号链接则两种删除方式都可能适用
+        if md.is_dir() {
+            std::fs::remove_dir(path).or_else(|_| std::fs::remove_file(path))
+        } else {
+            std::fs::remove_file(path).or_else(|_| std::fs::remove_dir(path))
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = md;
+        std::fs::remove_file(path)
+    }
+}
+
+/// 摘除目录树中的链接/junction 本身（绝不跟随目标）。
+/// `git worktree remove --force` 会穿透 Windows junction，先摘链接才能保住 node_modules 等外部目录。
+pub fn scrub_links(dir: &Path) -> HostResult<usize> {
+    let mut removed = 0usize;
+    let mut visited = 0usize;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(cur) = stack.pop() {
+        let entries = match std::fs::read_dir(&cur) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for ent in entries.flatten() {
+            visited += 1;
+            if visited > 200_000 {
+                return Ok(removed);
+            }
+            let path = ent.path();
+            let Ok(md) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if is_link_meta(&md) {
+                remove_link(&path, &md)
+                    .map_err(|e| HostError::Io(format!("移除链接失败 {:?}: {e}", path)))?;
+                removed += 1;
+            } else if md.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    Ok(removed)
+}
+
+/// 删除隔离 worktree（幂等）。先停实例再调用；目录不存在时仅清理 git 注册。
 pub fn worktree_remove(root: &Path, target_dir: &Path) -> HostResult<()> {
+    if std::fs::symlink_metadata(target_dir).is_err() {
+        let _ = run_git(root, &["worktree", "prune"]);
+        return Ok(());
+    }
+    scrub_links(target_dir)?;
     let dir_str = target_dir.to_string_lossy().to_string();
     let (ok, _, stderr) = run_git(root, &["worktree", "remove", "--force", &dir_str])?;
     if !ok {
-        return Err(HostError::Git(format!("git worktree remove 失败: {stderr}")));
+        // worktree 注册可能已丢失（上次清理中断）：清掉注册后直接删除本会话临时目录
+        let _ = run_git(root, &["worktree", "prune"]);
+        std::fs::remove_dir_all(target_dir).map_err(|e| {
+            HostError::Git(format!("git worktree remove 失败: {stderr}；目录清理失败: {e}"))
+        })?;
     }
     Ok(())
 }
@@ -369,6 +440,46 @@ mod tests {
         assert!(matches!(err, HostError::Conflict(_)), "应返回冲突错误，实际: {err:?}");
         let content3 = std::fs::read_to_string(repo.join("src/app.js")).unwrap();
         assert!(content3.contains("const a = 999"), "拒绝写回后本地文件不应被改动: {content3}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn worktree_remove_scrubs_links_without_following_target() {
+        let base = std::env::temp_dir().join(format!("gb_git_rm_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        git_init(&repo);
+        std::fs::write(repo.join("src/app.js"), "const a = 1;\n").unwrap();
+        let run = |args: &[&str]| {
+            let mut c = Command::new("git");
+            c.arg("-C").arg(&repo).args(args);
+            apply_no_window(&mut c);
+            let out = c.output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["add", "-A"]);
+        run(&["commit", "-qm", "base"]);
+
+        let wt = base.join("wt");
+        worktree_add(&repo, &wt).unwrap();
+        // 模拟 patcher 的 node_modules 链接（Windows junction / Unix symlink）
+        let deps = base.join("deps");
+        std::fs::create_dir_all(deps.join("pkg")).unwrap();
+        std::fs::write(deps.join("pkg/keep.txt"), "keep").unwrap();
+        fsops::link_dir(&deps, &wt.join("node_modules")).unwrap();
+
+        worktree_remove(&repo, &wt).unwrap();
+        assert!(!wt.exists(), "worktree 目录应被删除");
+        assert!(
+            deps.join("pkg/keep.txt").exists(),
+            "链接目标（node_modules）必须保留"
+        );
+        assert!(repo.join("src/app.js").exists(), "原工作区不应受影响");
+
+        // 幂等：二次清理不报错
+        worktree_remove(&repo, &wt).unwrap();
 
         let _ = std::fs::remove_dir_all(&base);
     }

@@ -216,11 +216,6 @@ fn finish_gate(host: &Arc<Host>, exit_code: i32, mut payload: Value) -> ! {
 fn main() {
     let mut args = parse_args();
 
-    // 纯黑盒模式：把 --url 透传给 sidecar
-    if let Some(ref url) = args.url {
-        std::env::set_var("GUARDBUILD_BLACKBOX_URL", url);
-    }
-
     let data_dir = std::env::var("GUARDBUILD_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("guardbuild-headless-data"));
@@ -287,6 +282,7 @@ fn main() {
 
     if let Some(p) = args.project.clone() {
         let h = host.clone();
+        let blackbox = args.url.clone();
         std::thread::spawn(move || {
             for _ in 0..300 {
                 if h.sidecar_ready() {
@@ -294,7 +290,7 @@ fn main() {
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            match h.start_session(&p) {
+            match h.start_session(&p, blackbox.as_deref()) {
                 Ok(v) => println!("GB_RESULT {}", json!({ "cmd": "autostart", "ok": true, "data": v })),
                 Err(e) => println!("GB_RESULT {}", json!({ "cmd": "autostart", "ok": false, "error": e.to_string() })),
             }
@@ -322,7 +318,12 @@ fn main() {
         let result: Result<Value, String> = match cmd.as_str() {
             "start" => {
                 let project = msg.get("project").and_then(|p| p.as_str()).unwrap_or("").to_string();
-                host.start_session(&project).map_err(|e| e.to_string())
+                let target = msg
+                    .get("targetUrl")
+                    .or_else(|| msg.get("blackboxUrl"))
+                    .and_then(|u| u.as_str())
+                    .map(|s| s.to_string());
+                host.start_session(&project, target.as_deref()).map_err(|e| e.to_string())
             }
             "patch_approve" => {
                 let hash = msg.get("patchHash").and_then(|h| h.as_str()).unwrap_or("").to_string();

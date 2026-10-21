@@ -32,7 +32,7 @@ export class PatchError extends Error {
  * 为静态分析得到的候选端点生成修复补丁。
  * 返回 { worktree, patch: {id, hash, diff, files, strategies}, filePatches, skipped, llm }
  */
-export async function createPatch(ctx) {
+export async function createPatch(ctx, { feedback = null } = {}) {
   const useLlm = patchEnabled(ctx);
   const allCandidates = ctx.analysis?.candidates ?? [];
   const patchableKinds = useLlm ? LLM_KINDS : TEMPLATE_KINDS;
@@ -321,6 +321,7 @@ export async function createPatch(ctx) {
           model: ctx.llmConfig?.model ?? null,
           getToken: ctx.llmGetToken,
           maxFiles: ctx.llmConfig?.patchMaxFiles,
+          feedback,
           // 提示词只喂脱敏后的源码，真实锚点校验走上面的 wtBytes
           readRedacted: async () => {
             const r = await ctx.rpc.request(

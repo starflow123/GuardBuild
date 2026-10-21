@@ -255,15 +255,20 @@ const SYSTEM_PROMPT = `你是资深应用安全工程师，为「已通过动态
 5. 无法在单文件内安全修复时，返回 {"patches":[]} 并在 note 字段说明原因，不要勉强编造补丁。
 6. 不要输出代码之外的解释文字，不要输出 markdown 代码块以外的内容。`;
 
-/** 构造提示词：只喂脱敏后的源码片段与已固化的证据摘要 */
-export function buildPatchPrompt({ rel, candidates, evidence, snippet, note = null }) {
+/** 构造提示词：只喂脱敏后的源码片段、已固化证据与上一轮失败反馈 */
+export function buildPatchPrompt({ rel, candidates, evidence, snippet, note = null, feedback = null }) {
   const body = {
     file: normRel(rel),
     candidates: describeCandidates(candidates),
     reproduced_evidence: evidenceFor(candidates, evidence),
-    note: note ?? "修复必须让上述攻击用例被拒绝（401/403/空结果），同时合法用户的正常请求仍返回 2xx。",
+    note:
+      note ??
+      (feedback
+        ? "上一轮补丁未通过双重验收。请基于失败用例重新生成最小补丁：攻击必须被拒绝（401/403/空结果），业务基线必须保持原有 2xx 与响应契约。"
+        : "修复必须让上述攻击用例被拒绝（401/403/空结果），同时合法用户的正常请求仍返回 2xx。"),
     source_lines: snippet,
   };
+  if (feedback) body.previous_attempt = feedback;
   return JSON.stringify(body, null, 1);
 }
 
@@ -304,7 +309,7 @@ async function readRedactedSnippet(ctx, file, readRedacted) {
  */
 export async function requestPatchIntent(
   ctx,
-  { file, rel, content, candidates, evidence, model = null, getToken, chatImpl = chat, maxFiles = MAX_LLM_FILES_PER_SESSION, readRedacted = null } = {}
+  { file, rel, content, candidates, evidence, model = null, getToken, chatImpl = chat, maxFiles = MAX_LLM_FILES_PER_SESSION, readRedacted = null, feedback = null } = {}
 ) {
   const empty = { ops: [], accepted: [], rejected: [], model: model ?? null, usage: null, failure: null };
   if (!Array.isArray(candidates) || candidates.length === 0) return empty;
@@ -332,6 +337,7 @@ export async function requestPatchIntent(
     candidates,
     evidence,
     snippet: snippet.snippet,
+    feedback,
   });
 
   let res;

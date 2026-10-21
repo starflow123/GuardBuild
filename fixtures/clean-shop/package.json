@@ -1,0 +1,10 @@
+{
+  "name": "clean-shop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "CleanShop - 已实现归属与角色校验的对照靶场（GuardBuild 精度基准：应判定无漏洞）",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

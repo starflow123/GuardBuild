@@ -75,6 +75,21 @@ export function DiffViewer({
           )}
         </div>
       )}
+      {patch.fixLoop && patch.fixLoop.rounds.length > 0 && (
+        <div className="patch-meta" style={{ borderBottom: "1px solid var(--line-soft)" }}>
+          <span className="muted small">
+            修复循环：{patch.fixLoop.attempts} 轮（重试上限 {patch.fixLoop.maxRounds}）
+            {patch.fixLoop.resolvedRound ? `，第 ${patch.fixLoop.resolvedRound} 轮通过` : "，未收敛"}
+            {patch.fixLoop.rounds
+              .map((r) =>
+                r.pass
+                  ? ` · 第 ${r.round} 轮通过`
+                  : ` · 第 ${r.round} 轮未通过（攻击回归 ${r.verdict?.attackRegressed ?? "?"}、业务回归 ${r.verdict?.businessRegressed ?? "?"}）`
+              )
+              .join("")}
+          </span>
+        </div>
+      )}
       {patch.skipped && patch.skipped.length > 0 && (
         <div className="patch-meta" style={{ borderBottom: "1px solid var(--line-soft)" }}>
           <span className="small" style={{ color: "#f7dc9b" }}>

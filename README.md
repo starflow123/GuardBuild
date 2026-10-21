@@ -65,6 +65,8 @@ npm run e2e:gate       # CI gate 演练（53 断言，7 轮裁决 + 报告产物
 npm run e2e:blackbox   # 纯黑盒外部扫描演练（22 断言：漏洞/已修复/Cookie 会话/不可达）
 npm run e2e:llm        # LLM 接入侦察演练（40 断言，本机 mock DeepSeek，含无密钥磁盘缓存复用轮）
 npm run e2e:llm-patch  # LLM 编码代理补丁演练（53 断言，本机 mock：守规矩 / 不守规矩 / 无密钥三轮）
+npm run e2e:fix-agent  # 本地修复循环演练（17 断言：首轮漏修 → 失败证据回传 → 第二轮通过）
+npm run benchmark      # 精度基准（8 个标注靶场：漏报 / 误报 / 退出码一致性）
 npm run seed-demo      # 单独生成演示工作区 .demo/vibeshop（供桌面端手动演练）
 
 # 单元测试
@@ -157,7 +159,7 @@ npm run e2e:llm                # 本机 mock DeepSeek 演练，无需真实密�
 
 ```json
 {
-  "llm": { "enabled": false, "patch": true, "autoVerify": true, "patchMaxFiles": 6 },
+  "llm": { "enabled": false, "patch": true, "autoVerify": true, "patchMaxFiles": 6, "fixRounds": 2 },
   "scopes": ["project.read", "worktree.write", "proc.spawn", "net.probe", "net.egress:api.deepseek.com"]
 }
 ```
@@ -170,12 +172,24 @@ npm run e2e:llm-patch          # 本机 mock DeepSeek 三轮演练，无需真�
 - 输出形状约束：模型只被允许返回补丁意图 JSON 对象 `{"patches":[{"file":"相对路径","search":"文件中逐字连续原文","replace":"替换后的文本","candidate":"METHOD /path","reason":"一句话"}]}`（JSON 模式、非流式），**不返回整份文件、不返回 diff**。Sidecar 把每条意图规整成 `{ find, replace, count: 1 }` 的精确锚点替换
 - 逐条校验关（任一条不过即拒绝该条意图，不影响其余）：结构白名单（只收 `file` / `search` / `replace` / `candidate` / `reason`）→ 目标文件必须等于该候选定位到的源码文件（禁越界改文件）→ 禁改 `package.json` / 锁文件 / `guardbuild.json` / `.env` 与证书私钥类文件 / 配置（yml、toml、ini、conf、sql）/ 测试与 `fixtures` / 构建产物与 `node_modules` 目录 → 锚点须在文件中**唯一**命中（缺失或重复即拒绝）→ 新增内容不得含 `child_process` / `eval` / `new Function` / `rm -rf` 等与修复无关的危险调用 → `search` 与 `replace` 相同（空操作）即拒绝。单会话最多 6 个候选文件（`patchMaxFiles` 可调 1–10），每条意图限制锚点 80 行 / 新增 24 行
 - 自动双重验收（`autoVerify`，默认开）：补丁落地后在隔离 worktree 启动修复候选实例，自动跑「攻击用例全部阻断 + 业务用例零回归」。通过 → 进入 `writeback_pending` 交您在界面审查 Diff 并授权写回；未通过 → 终态 `verify_failed`，`report.json` 保留漏洞裁决（`verdict: vulnerable` + `patchStatus: verify_failed`），gate 仍 exit 1 **不放行**，绝不把未验证的补丁交给人工
+- 修复循环（仅本地/GUI，`fixRounds` 默认 2、上限 3）：验收未通过时，把失败用例（用例名 / 实际响应 / 回归计数）作为 `previous_attempt` 回传给编码代理，从 HEAD 重新生成补丁并丢弃失败轮 worktree；每轮独立记录补丁 hash 与验收裁决。gate 模式始终单轮、不重试，避免 CI 里反复外发与耗时
 - 确定性模板补丁语义不变：仍走「人工批准后再验收」的 `patch_review` 流程，`autoVerify` 只作用于编码代理产出的补丁
 - 安全边界：提示词只含脱敏后的源码片段（密钥字符替换为 `***`）、候选端点与已复现的攻击证据，**不含 `guardbuild.json` 契约、测试身份口令与 API 密钥**；出站同样走 Host 的 `net.egress`；补丁只写隔离 worktree，gate 模式下原工作区结构性不可写
 - 裁决边界不变：LLM 不判定漏洞、不生成身份，也不参与验收裁决——是否放行只由实测证据（攻击阻断 / 业务回归）决定
-- 可观测：视图与报告的补丁对象新增 `strategy: "llm-coding-agent"`、`autoVerify`、`llm`（模型 / token 用量 / 采纳与拒绝统计 / 涉及文件与补丁数）；`report.md` 新增「LLM 编码代理（补丁意图）」章节，逐条列出被拒绝的意图与原因；GUI 在补丁面板展示同一份统计
+- 可观测：视图与报告的补丁对象新增 `strategy: "llm-coding-agent"`、`autoVerify`、`llm`（模型 / token 用量 / 采纳与拒绝统计 / 涉及文件与补丁数）、`fixLoop`（`maxRounds` / `attempts` / `resolvedRound` / 逐轮 `verdict` 与失败用例）；`report.md` 新增「LLM 编码代理（补丁意图）」章节与逐轮修复循环记录，并逐条列出被拒绝的意图与原因；GUI 在补丁面板展示同一份统计与轮次
 - 无密钥 / 未开启：编码代理整体关闭，行为回落到「模板能补就补，补不动就 `vulnerable_unfixed` + exit 1 交人工」，零模型调用、零外发
-- 回归：`npm run e2e:llm-patch`（53 断言，三轮：守规矩模型 → 自动验收通过 exit 1 且全程不进 `patch_review`；不守规矩模型 → 越界与歧义锚点被拒、双重验收拦下 `verify_failed`；无密钥 → 零外发 + `vulnerable_unfixed`），靶场为 `fixtures/llm-patch-shop`（其取数形态经静态校验确认两条确定性模板都补不动）
+- 回归：`npm run e2e:llm-patch`（53 断言，gate 三轮：守规矩模型 → 自动验收通过 exit 1 且全程不进 `patch_review`；不守规矩模型 → 越界与歧义锚点被拒、双重验收拦下 `verify_failed`；无密钥 → 零外发 + `vulnerable_unfixed`），靶场为 `fixtures/llm-patch-shop`（其取数形态经静态校验确认两条确定性模板都补不动）；`npm run e2e:fix-agent`（17 断言，本地模式两轮：首轮故意漏修 → 第二轮收到失败证据后补齐 → `writeback_pending`，含失败轮 worktree 清理与逐轮审计）
+
+## 精度基准（固定标注靶场）
+
+`npm run benchmark` 对 `benchmarks/corpus.json` 中的标注靶场逐个运行真实 gate，量化检测能力而不是只看单个 e2e 是否通过：
+
+- 语料字段：`expectedExit`（期望退出码）、`expectedVulnerableCases`（期望复现的攻击用例，未命中即漏报）、`expectedStatic`（期望静态候选，仅统计召回）、`expectedOutcomes`（可选，期望裁决）
+- 指标：攻击用例**动态召回率**、**误报率**（被判 vulnerable 但不在标注集合内的用例；干净靶场出现任何 vulnerable 都算误报）、**退出码一致率**、静态召回率（诊断用）
+- 判定：任一靶场漏报、误报、退出码不一致或执行失败，基准即以非零码退出；新增适配器/探测能力时在语料追加标注条目并保持全绿
+- 干净对照：`fixtures/clean-shop` 的对象接口把归属校验封装在辅助函数中（静态看起来可疑、运行期真实拒绝），用于验证「动态澄清静态误报」与 exit 0 路径
+- 产物：`.benchmark/benchmark-report.json` / `.benchmark/benchmark-report.md`（逐靶场漏报、误报、静态命中与裁决）；CI 每次自测都会执行并上传
+- 当前基线（2026-10-21）：8 个靶场 · 动态召回 17/17 · 误报 0/17 · 退出码一致 8/8 · 零模型调用
 
 ## 纯黑盒外部扫描（已运行 / 沙箱中的目标）
 

@@ -21,6 +21,8 @@ guardbuild-data/
 .demo-blackbox/
 .demo-blackbox-e2e/
 .demo-docker-e2e/
+.demo-fix-agent/
+.benchmark/
 guardbuild.db*
 *.tsbuildinfo
 

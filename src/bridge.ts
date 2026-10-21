@@ -95,6 +95,29 @@ export interface ViewLlmPatch {
   usage?: { file: string; prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }[];
 }
 
+export interface ViewFixRound {
+  round: number;
+  patchHash: string | null;
+  pass: boolean;
+  verdict?: {
+    attackBlocked?: number;
+    attackTotal?: number;
+    attackRegressed?: number;
+    businessPassed?: number;
+    businessTotal?: number;
+    businessRegressed?: number;
+  } | null;
+  failed?: string[];
+  llm?: { model: string | null; appliedOps: number; rejected: number } | null;
+}
+
+export interface ViewFixLoop {
+  maxRounds: number;
+  attempts: number;
+  resolvedRound?: number | null;
+  rounds: ViewFixRound[];
+}
+
 export interface ViewPatch {
   hash: string;
   diff: string;
@@ -107,6 +130,7 @@ export interface ViewPatch {
   llm?: ViewLlmPatch | null;
   fixes?: { file: string; appliedOps: number; fixes: { candidate: string; strategy: string; reason?: string | null }[] }[];
   skipped?: { file: string; candidate?: string; reason: string; llm?: string }[];
+  fixLoop?: ViewFixLoop | null;
 }
 
 export interface AcceptanceView {

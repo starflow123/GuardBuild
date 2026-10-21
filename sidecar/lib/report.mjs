@@ -22,8 +22,10 @@ function buildPocList(preEvidence, baseUrl) {
 }
 
 import { PROTOCOL_VERSION, RPC_TO_HOST, SEVERITY, STATE_LABELS } from "../../shared/protocol.mjs";
+import { buildFixBriefs } from "./fixbrief.mjs";
 
 const MD_EVIDENCE_CAP = 20;
+const MD_FIX_BRIEF_CAP = 10;
 
 const GRADE_LABELS = { strong: "决策轨迹", "cross-proven": "内容归属", "http-only": "仅HTTP" };
 
@@ -250,6 +252,37 @@ function renderLlmPatchSection(llm) {
   return lines.join("\n");
 }
 
+function inlineCode(value) {
+  return `\`${String(value ?? "").replace(/`/g, "\\`")}\``;
+}
+
+function renderFixBriefs(briefs) {
+  if (!briefs?.length) return null;
+  const lines = [
+    `## 修复简报（${briefs.length}）\n`,
+    "> 每条含风险说明、建议排查的代码形态、修复方向、复现命令与修复后复测方法；完整字段见 `report.json` 的 `summary.fixBriefs`。\n",
+  ];
+  for (const [i, b] of briefs.slice(0, MD_FIX_BRIEF_CAP).entries()) {
+    const endpoint = [b.method, b.path].filter(Boolean).join(" ");
+    const loc = b.file ? inlineCode(`${b.file}${b.startLine ? `:${b.startLine}` : ""}`) : null;
+    lines.push(`### ${i + 1}. ${b.familyLabel}${endpoint ? `：${endpoint}` : ""}\n`);
+    lines.push(`- 证据类型：${b.type}`);
+    if (loc) lines.push(`- 位置：${loc}`);
+    lines.push(`- 风险：${b.risk}`);
+    lines.push("- 建议排查的代码形态：");
+    for (const s of b.inspect ?? []) lines.push(`  - ${s}`);
+    lines.push(`- 修复方向：${b.fix}`);
+    if (b.reproduce) lines.push(`- 复现：${inlineCode(b.reproduce)}`);
+    lines.push(`- 修复后复测：${inlineCode(b.verify)}`);
+    lines.push(`- 复测预期：${b.verifyExpectation}`);
+    lines.push("");
+  }
+  if (briefs.length > MD_FIX_BRIEF_CAP) {
+    lines.push(`_其余 ${briefs.length - MD_FIX_BRIEF_CAP} 条见 report.json 的 summary.fixBriefs。_\n`);
+  }
+  return lines.join("\n");
+}
+
 function renderMarkdown(r) {
   const acc = r.acceptance;
   const bb = r.blackbox ?? null;
@@ -283,10 +316,11 @@ function renderMarkdown(r) {
   );
 
   parts.push(`## 摘要\n`);
+  const bruteRouteCount = (bb?.routes ?? []).filter((x) => x.source === "brute").length;
   const summaryLines = bb
     ? [
         `- 扫描目标：\`${esc(bb.url)}\``,
-        `- 路由发现：${bb.routeCount ?? 0} 条${bb.openapiFound ? `（含 OpenAPI ${bb.openapiRouteCount ?? 0} 条模板路径）` : "（目录探测）"}`,
+        `- 路由发现：${bb.routeCount ?? 0} 条（OpenAPI ${bb.openapiRouteCount ?? 0} 条 / 前端提取 ${bb.frontendRouteCount ?? 0} 条 / 目录探测 ${bruteRouteCount} 条）`,
         `- 黑盒证据：${bbEvidence.length} 条，其中 vulnerable ${bbEvidence.filter((e) => e.verdict === "vulnerable").length} 条`,
         `- 登录：${
           bb.login?.ok
@@ -322,6 +356,13 @@ function renderMarkdown(r) {
     summaryLines.push(
       `- 补丁：\`${r.patch.hash?.slice(0, 12)}…\`（${r.patch.files?.length ?? 0} 个文件，${esc(r.patch.status)}；策略 ${esc(r.patch.strategy ?? "—")}${llmBits}）`
     );
+    if (r.patch.fixLoop?.rounds?.length) {
+      summaryLines.push(
+        `- 修复循环：${r.patch.fixLoop.attempts} 轮（重试上限 ${r.patch.fixLoop.maxRounds}；${
+          r.patch.fixLoop.resolvedRound ? `第 ${r.patch.fixLoop.resolvedRound} 轮通过` : "未收敛"
+        }）`
+      );
+    }
   }
   const sb = r.summary.supabase;
   if (!bb && sb?.detected) {
@@ -358,6 +399,8 @@ function renderMarkdown(r) {
         "",
       ].join("\n")
     );
+    const fix = renderFixBriefs(r.summary.fixBriefs);
+    if (fix) parts.push(fix);
   }
 
   if (bb) {
@@ -377,6 +420,8 @@ function renderMarkdown(r) {
     } else {
       parts.push("_未发现可复现漏洞。_\n");
     }
+    const fix = renderFixBriefs(r.summary.fixBriefs);
+    if (fix) parts.push(fix);
     parts.push(`## 黑盒探测证据（${bbEvidence.length} 条）\n`);
     parts.push(evidenceTable(bbEvidence));
   } else {
@@ -406,6 +451,19 @@ function renderMarkdown(r) {
         `- 文件：${fileDesc || "—"}`,
         `- 隔离位置：\`${esc(r.patch.worktree)}\``,
         `- 状态：${esc(r.patch.status)}（${r.patch.lineCount ?? 0} 行改动）`,
+        ...(r.patch.fixLoop?.rounds?.length
+          ? [
+              `- 修复循环：共 ${r.patch.fixLoop.attempts} 轮（重试上限 ${r.patch.fixLoop.maxRounds}；${
+                r.patch.fixLoop.resolvedRound ? `第 ${r.patch.fixLoop.resolvedRound} 轮通过` : "未收敛"
+              }）`,
+              ...r.patch.fixLoop.rounds.map((x) => {
+                const v = x.verdict ?? {};
+                const failedText =
+                  !x.pass && x.failed?.length ? `；失败用例：${x.failed.slice(0, 3).map((f) => esc(f)).join("；")}` : "";
+                return `  - 第 ${x.round} 轮：${x.pass ? "通过" : "未通过"}（攻击阻断 ${v.attackBlocked ?? 0}/${v.attackTotal ?? 0}，业务保持 ${v.businessPassed ?? 0}/${v.businessTotal ?? 0}；patch \`${String(x.patchHash ?? "").slice(0, 12)}…\`）${failedText}`;
+              }),
+            ]
+          : []),
         "",
         "<details><summary>Diff</summary>",
         "",
@@ -481,6 +539,13 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
             routeCount: blackbox.routeCount ?? 0,
             openapiFound: !!blackbox.openapiFound,
             openapiRouteCount: blackbox.openapiRouteCount ?? 0,
+            frontendRouteCount: blackbox.frontendRouteCount ?? 0,
+            frontendScripts: blackbox.frontendScripts ?? 0,
+            routeSources: (blackbox.routes ?? []).reduce((acc, r) => {
+              const key = r.source ?? "unknown";
+              acc[key] = (acc[key] ?? 0) + 1;
+              return acc;
+            }, {}),
             findingCount: (blackbox.findings ?? []).length,
             login: blackbox.login ?? null,
             rateLimited: !!blackbox.rateLimited,
@@ -544,12 +609,14 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
             reason: s.reason ?? null,
           })),
           llm: summarizeLlmPatch(view.patch.llm),
+          fixLoop: view.patch.fixLoop ?? null,
         }
       : null,
     acceptance: view.acceptance ?? null,
     targets: view.targets ?? {},
     error,
   };
+  r.summary.fixBriefs = buildFixBriefs(r);
   return { json: r, markdown: renderMarkdown(r) };
 }
 

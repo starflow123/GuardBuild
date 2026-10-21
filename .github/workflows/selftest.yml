@@ -83,6 +83,12 @@ jobs:
       - name: LLM 编码代理补丁 E2E（本机 mock：意图校验 + 自动双重验收 + 无密钥回落）
         run: node scripts/e2e-llm-patch.mjs
 
+      - name: Fix agent 自纠错 E2E（两轮：失败证据回传 + 重生成补丁）
+        run: node scripts/e2e-fix-agent.mjs
+
+      - name: 精度基准（8 个标注靶场：漏报 / 误报 / 退出码一致性）
+        run: node scripts/benchmark.mjs
+
       - name: Docker 沙箱 E2E（无可用 Docker 时自动跳过）
         run: node scripts/e2e-docker.mjs
 
@@ -122,3 +128,6 @@ jobs:
             .demo-llm-patch/data/guardbuild.db
             .demo-docker-e2e/reports
             .demo-docker-e2e/data/guardbuild.db
+            .benchmark/benchmark-report.md
+            .benchmark/benchmark-report.json
+            .benchmark/reports

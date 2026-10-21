@@ -813,6 +813,37 @@ async function removeWorktree(ctx) {
   }
 }
 
+/**
+ * 丢弃当前隔离 worktree（修复循环重试前）：先停实例，再交由 Host 删除。
+ * 与 removeWorktree 不同，这里不设一次性哨兵，后续轮次仍可再清理。
+ */
+async function discardWorktree(ctx) {
+  if (ctx.procs.worktree) {
+    await killProc(ctx, ctx.procs.worktree.pid);
+    ctx.procs.worktree = null;
+  }
+  const wt = ctx.view.patch?.worktree ?? ctx._worktree;
+  if (!wt) return;
+  try {
+    await ctx.rpc.request(RPC_TO_HOST.GIT_WORKTREE_REMOVE, { token: ctx.tokens.worktree, path: wt }, { timeoutMs: 60_000 });
+    emit(ctx, {
+      kind: "session",
+      severity: SEVERITY.INFO,
+      message: `已清理未通过验收的隔离 worktree（${wt}）`,
+      data: { worktree: wt },
+    });
+  } catch (e) {
+    emit(ctx, {
+      kind: "session",
+      severity: SEVERITY.WARN,
+      message: `未通过验收的 worktree 清理失败：${e.message}（可手动删除 ${wt}）`,
+      data: { worktree: wt, error: e.message },
+    });
+  }
+  if (ctx._worktree === wt) ctx._worktree = null;
+  ctx._worktreeCleanupAttempted = false;
+}
+
 /** 按契约 prepare 步骤顺序执行（依赖安装/构建等），失败即中止会话 */
 async function runPrepare(ctx, { cwd, label }) {
   const steps = ctx.targetConfig?.prepare ?? [];
@@ -897,8 +928,10 @@ function acceptanceVerdict(summary) {
     pass,
     attackBlocked: summary.attackBlocked,
     attackTotal: summary.attackBlocked + summary.attackRepro + summary.attackRegressed,
+    attackRegressed: summary.attackRegressed,
     businessPassed: summary.businessPassed,
     businessTotal: summary.businessTotal,
+    businessRegressed: summary.businessRegressed,
     counts: summary.counts,
   };
 }
@@ -925,6 +958,39 @@ function mergeSummary(base, add) {
     businessTotal: num(base.businessTotal) + num(add.businessTotal),
     supabaseLeak: num(add.leaks ?? add.supabaseLeak),
     targets: { ...(base.targets ?? {}), ...(add.targets ?? {}) },
+  };
+}
+
+function fixLoopView(loop, resolvedRound = null) {
+  if (!loop) return null;
+  return {
+    maxRounds: loop.maxRounds,
+    attempts: loop.rounds.length,
+    resolvedRound,
+    rounds: loop.rounds,
+  };
+}
+
+/** 把失败轮次的证据压缩成可回传编码代理的反馈（不含源码/身份/密钥） */
+function buildFixFeedback(post, verdict, round) {
+  const failed = post.evidence
+    .filter((e) => e.verdict === VERDICT.REGRESSED || e.verdict === VERDICT.INCONCLUSIVE)
+    .slice(0, 8)
+    .map((e) => ({
+      case: e.caseName ?? e.caseId ?? null,
+      category: e.caseCategory ?? null,
+      verdict: e.verdict,
+      actual: e.actual ?? null,
+      status: e.response?.status ?? null,
+    }));
+  return {
+    round,
+    reason: "上一轮补丁未通过双重验收",
+    attack_regressed: verdict.attackRegressed,
+    business_regressed: verdict.businessRegressed,
+    failed_cases: failed,
+    instruction:
+      "请重新生成最小补丁：所有攻击用例必须被拒绝（401/403/空结果），业务基线必须保持原有 2xx 与响应契约；不要重复上一轮的改动方式。",
   };
 }
 
@@ -1248,6 +1314,15 @@ async function stagePatch(ctx) {
   const lineCount = result.patch.diff.split("\n").filter((l) => l.startsWith("+") || l.startsWith("-")).length;
   const usedLlm = !!result.usedLlm;
   const autoVerify = usedLlm && ctx.llmConfig?.autoVerify !== false;
+  // 修复循环只在交互/本地模式启用；gate 始终单轮、无自主重试
+  const configuredRounds = Number(ctx.llmConfig?.fixRounds);
+  const maxFixRounds =
+    !ctx.gate && autoVerify
+      ? Number.isFinite(configuredRounds)
+        ? Math.min(3, Math.max(0, Math.floor(configuredRounds)))
+        : 2
+      : 0;
+  ctx.fixLoop = { maxRounds: maxFixRounds, round: 0, rounds: [] };
   ctx.view.patch = {
     hash: result.patch.hash,
     diff: result.patch.diff,
@@ -1260,6 +1335,7 @@ async function stagePatch(ctx) {
     strategy: result.filePatches.flatMap((f) => f.fixes.map((x) => x.strategy)).join(",") || "none",
     llm: result.llm?.enabled ? result.llm : null,
     autoVerify,
+    fixLoop: fixLoopView(ctx.fixLoop),
   };
   pushView(ctx);
 
@@ -1296,27 +1372,147 @@ async function stagePatch(ctx) {
 async function stageVerify(ctx) {
   ensureAlive(ctx);
   setState(ctx, STATE.VERIFYING);
-  const wtTarget = ctx.procs.worktree;
-  if (!wtTarget) throw new SessionError("隔离实例未运行，无法验收", { code: "no_worktree_target" });
 
-  emit(ctx, { kind: "verify", severity: SEVERITY.INFO, message: "在隔离实例上执行双重验收（攻击阻断 + 业务回归）", data: {} });
-  const post = await runPhase(ctx, { phase: "post", baseUrl: wtTarget.url });
-  ctx.pushEvidence(post.evidence);
-  ctx.view.phases.post = post.summary;
-  recordAcceptanceRows(ctx, "post", post.evidence);
+  for (;;) {
+    const wtTarget = ctx.procs.worktree;
+    if (!wtTarget) throw new SessionError("隔离实例未运行，无法验收", { code: "no_worktree_target" });
+    const loop = ctx.fixLoop ?? null;
+    const roundNo = (loop?.round ?? 0) + 1;
+    const roundText = loop?.maxRounds > 0 ? `（第 ${roundNo} 轮，最多 ${loop.maxRounds + 1} 轮）` : "";
 
-  const verdict = acceptanceVerdict(post.summary);
-  ctx.view.acceptance = { ...verdict, phase: "post", at: Date.now() };
-  pushView(ctx);
+    emit(ctx, {
+      kind: "verify",
+      severity: SEVERITY.INFO,
+      message: `在隔离实例上执行双重验收${roundText}（攻击阻断 + 业务回归）`,
+      phase: STATE.VERIFYING,
+      data: { round: roundNo },
+    });
+    const post = await runPhase(ctx, { phase: "post", baseUrl: wtTarget.url });
+    ctx.pushEvidence(post.evidence);
+    ctx.view.phases.post = post.summary;
+    recordAcceptanceRows(ctx, "post", post.evidence);
 
-  if (!verdict.pass) {
+    const verdict = acceptanceVerdict(post.summary);
+    ctx.view.acceptance = { ...verdict, phase: "post", at: Date.now(), round: roundNo };
+    pushView(ctx);
+
+    if (verdict.pass) {
+      if (loop) loop.rounds.push({ round: roundNo, patchHash: ctx.view.patch?.hash ?? null, pass: true, verdict });
+      if (ctx.view.patch) ctx.view.patch.fixLoop = fixLoopView(loop, roundNo);
+      pushView(ctx);
+
+      await emitReport(ctx, { outcome: "vulnerable", patchStatus: "verified", exitCode: 1, state: STATE.WRITEBACK_PENDING });
+      // gate 模式结构化禁止写回，验收通过即可清理；交互模式需保留到用户授权写回之后
+      if (ctx.gate) await removeWorktree(ctx);
+      setState(ctx, STATE.WRITEBACK_PENDING);
+      emit(ctx, {
+        kind: "verify",
+        severity: SEVERITY.SUCCESS,
+        message: `双重验收通过：攻击阻断 ${verdict.attackBlocked}/${verdict.attackTotal}，业务保持 ${verdict.businessPassed}/${verdict.businessTotal}${
+          loop && loop.rounds.length > 1 ? `（经 ${roundNo} 轮修正）` : ""
+        }`,
+        phase: STATE.WRITEBACK_PENDING,
+        data: verdict,
+      });
+      return post;
+    }
+
     const failed = post.evidence
       .filter((e) => e.verdict === VERDICT.REGRESSED || e.verdict === VERDICT.INCONCLUSIVE)
       .map((e) => `${e.caseName}（${e.actual}）`);
+    if (loop) {
+      loop.rounds.push({
+        round: roundNo,
+        patchHash: ctx.view.patch?.hash ?? null,
+        pass: false,
+        verdict,
+        failed: failed.slice(0, 8),
+        llm: ctx.view.patch?.llm
+          ? {
+              model: ctx.view.patch.llm.model ?? null,
+              appliedOps: ctx.view.patch.llm.appliedOps ?? 0,
+              rejected: (ctx.view.patch.llm.rejected ?? []).length,
+            }
+          : null,
+        at: Date.now(),
+      });
+    }
+
+    const canRetry = !ctx.gate && loop && loop.maxRounds > 0 && loop.round < loop.maxRounds;
+    if (canRetry) {
+      const nextRound = roundNo + 1;
+      emit(ctx, {
+        kind: "verify",
+        severity: SEVERITY.WARN,
+        message: `第 ${roundNo} 轮验收未通过（攻击回归 ${verdict.attackRegressed}，业务回归 ${verdict.businessRegressed}）；把失败证据回传给编码代理生成第 ${nextRound} 轮补丁`,
+        phase: STATE.VERIFYING,
+        data: { round: roundNo, failed: failed.slice(0, 8), remaining: loop.maxRounds - loop.round },
+      });
+
+      let result;
+      try {
+        result = await createPatch(ctx, { feedback: buildFixFeedback(post, verdict, roundNo) });
+      } catch (e) {
+        const err = new SessionError(`修复循环在第 ${nextRound} 轮中止：${e.message}`, {
+          code: "verify_failed",
+          hint: e.hint ?? "上一轮补丁未通过验收，且未能生成修订补丁；请人工查看 post 证据",
+          details: { cause: e.code ?? null, causeDetails: e.details ?? null, rounds: loop.rounds },
+        });
+        if (ctx.view.patch) ctx.view.patch.fixLoop = fixLoopView(loop);
+        await emitReport(ctx, {
+          outcome: "vulnerable",
+          patchStatus: "verify_failed",
+          exitCode: 1,
+          state: STATE.VERIFY_FAILED,
+          error: { code: err.code, message: err.message, hint: err.hint, details: err.details },
+        });
+        setState(ctx, STATE.VERIFY_FAILED);
+        throw err;
+      }
+
+      loop.round += 1;
+      await discardWorktree(ctx);
+      const lineCount = result.patch.diff.split("\n").filter((l) => l.startsWith("+") || l.startsWith("-")).length;
+      ctx.view.patch = {
+        hash: result.patch.hash,
+        diff: result.patch.diff,
+        files: result.patch.files,
+        worktree: result.worktree,
+        status: "pending_review",
+        lineCount,
+        fixes: result.filePatches,
+        skipped: result.skipped,
+        strategy: result.filePatches.flatMap((f) => f.fixes.map((x) => x.strategy)).join(",") || "none",
+        llm: result.llm?.enabled ? result.llm : null,
+        autoVerify: true,
+        fixLoop: fixLoopView(loop),
+      };
+      pushView(ctx);
+      emit(ctx, {
+        kind: "patch",
+        severity: SEVERITY.INFO,
+        message: `编码代理已根据失败证据重写补丁（第 ${nextRound} 轮，patch_hash ${result.patch.hash.slice(0, 12)}…），重启隔离实例复测`,
+        phase: STATE.VERIFYING,
+        data: { round: nextRound, patchHash: result.patch.hash, llm: result.llm },
+      });
+
+      await runPrepare(ctx, { cwd: result.worktree, label: `隔离工作区（第 ${nextRound} 轮）` });
+      const wt = await spawnTarget(ctx, {
+        cwd: result.worktree,
+        label: `隔离工作区（第 ${nextRound} 轮）`,
+        role: "target-post",
+      });
+      ctx.procs.worktree = wt;
+      ctx.view.targets.worktree = { ...wt, role: `隔离工作区（第 ${nextRound} 轮）` };
+      pushView(ctx);
+      continue;
+    }
+
+    if (ctx.view.patch) ctx.view.patch.fixLoop = fixLoopView(loop);
     const err = new SessionError("修复验收未通过：存在未阻断的攻击或业务回归", {
       code: "verify_failed",
       hint: "补丁已保留在隔离 worktree 中，可回看证据调整修复策略",
-      details: { failed, summary: post.summary },
+      details: { failed, summary: post.summary, rounds: loop?.rounds ?? [] },
     });
     await emitReport(ctx, {
       outcome: "vulnerable",
@@ -1330,19 +1526,6 @@ async function stageVerify(ctx) {
     setState(ctx, STATE.VERIFY_FAILED);
     throw err;
   }
-
-  await emitReport(ctx, { outcome: "vulnerable", patchStatus: "verified", exitCode: 1, state: STATE.WRITEBACK_PENDING });
-  // gate 模式结构化禁止写回，验收通过即可清理；交互模式需保留到用户授权写回之后
-  if (ctx.gate) await removeWorktree(ctx);
-  setState(ctx, STATE.WRITEBACK_PENDING);
-  emit(ctx, {
-    kind: "verify",
-    severity: SEVERITY.SUCCESS,
-    message: `双重验收通过：攻击阻断 ${verdict.attackBlocked}/${verdict.attackTotal}，业务保持 ${verdict.businessPassed}/${verdict.businessTotal}`,
-    phase: STATE.WRITEBACK_PENDING,
-    data: verdict,
-  });
-  return post;
 }
 
 async function recheckAfterWriteback(ctx) {
@@ -1471,6 +1654,8 @@ async function runBlackboxFlow(ctx, rawUrl) {
     routes: [],
     openapiFound: false,
     openapiRouteCount: 0,
+    frontendRouteCount: 0,
+    frontendScripts: 0,
     findings: [],
     evidenceCount: 0,
     login: null,
@@ -1505,6 +1690,8 @@ async function runBlackboxFlow(ctx, rawUrl) {
     routes: result.routes.map((r) => ({ method: r.method, path: r.path, source: r.source ?? null })),
     openapiFound: result.openapiFound,
     openapiRouteCount: result.openapiRouteCount,
+    frontendRouteCount: result.frontendRouteCount ?? 0,
+    frontendScripts: result.frontendScripts ?? 0,
     findings: result.findings,
     evidenceCount: result.evidence.length,
     login: result.login,

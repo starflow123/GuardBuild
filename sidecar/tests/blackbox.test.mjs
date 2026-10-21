@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { runBlackbox, openapiRoutes, extractItems, extractEntityById, extractOwner } from "../lib/blackbox.mjs";
+import { runBlackbox, openapiRoutes, extractItems, extractEntityById, extractOwner, extractRoutesFromText } from "../lib/blackbox.mjs";
 
 function jsonPath(obj, path) {
   return String(path)
@@ -265,7 +265,9 @@ test("runBlackbox: blackbox.maxRoutes 控制发现与探测上限", async () => 
     });
     assert.equal(dflt.maxRoutes, 60);
     assert.equal(dflt.openapiRouteCount, 30);
-    assert.equal(dflt.routes.length, 53, "30 条 OpenAPI + 23 条目录探测（404 亦视为路由存在）");
+    assert.equal(dflt.routes.length, 60, "OpenAPI 30 条优先占位，剩余名额由目录探测补满");
+    assert.ok(dflt.routes.filter((r) => r.source === "openapi").length === 30);
+    assert.ok(dflt.routes.length <= dflt.maxRoutes);
   } finally {
     await target.close();
   }
@@ -429,6 +431,83 @@ test("runBlackbox: 穿越 payload 注入声明的文件读取参数", async () =
     assert.ok(trav, JSON.stringify(result.evidence.map((e) => e.caseId)));
     assert.equal(trav.verdict, "vulnerable");
     assert.match(trav.actual, /root:x:/);
+  } finally {
+    await target.close();
+  }
+});
+
+test("extractRoutesFromText: 只取字面量 API 路径，跳过动态片段与静态资源", () => {
+  const routes = extractRoutesFromText(
+    [
+      `fetch('/api/x?y=1');`,
+      `const a = "/api/users/1";`,
+      `const b = "/api/users/\${id}";`,
+      `const c = '/assets/logo.png';`,
+      `const d = '/rest/products/search';`,
+      `const e = '/v1/orders';`,
+    ].join("\n")
+  );
+  assert.deepEqual(routes.sort(), ["/api/users/1", "/api/x", "/rest/products/search", "/v1/orders"].sort());
+});
+
+function frontendServer() {
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, "http://127.0.0.1");
+    const send = (status, body, type = "application/json") => {
+      res.writeHead(status, { "Content-Type": type });
+      res.end(typeof body === "string" ? body : JSON.stringify(body));
+    };
+    if (url.pathname === "/") {
+      return send(
+        200,
+        `<!doctype html><html><head><script type="module" src="/assets/app.js"></script></head>
+         <body><script>fetch('/api/from-inline')</script></body></html>`,
+        "text/html"
+      );
+    }
+    if (url.pathname === "/assets/app.js") {
+      return send(
+        200,
+        `fetch('/api/accounts/summary?full=1');
+         const logo = '/assets/logo.png';
+         const tpl = '/api/users/\${id}';`,
+        "application/javascript"
+      );
+    }
+    // 只在 JS 里出现、目录词表与 OpenAPI 都没有的端点：匿名返回敏感字段
+    if (url.pathname === "/api/accounts/summary") {
+      return send(200, { email: "admin@example.com", balance: 42 });
+    }
+    return send(404, { error: "not found" });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        url: `http://127.0.0.1:${server.address().port}`,
+        close: () => new Promise((r) => server.close(r)),
+      });
+    });
+  });
+}
+
+test("runBlackbox: 从首页脚本提取路由并发现词表外的未认证读取", async () => {
+  const target = await frontendServer();
+  const ctx = makeCtx(new Map());
+  try {
+    const result = await runBlackbox(ctx, target.url, {
+      config: { login: ctx.loginConfig, identities: ctx.identities, blackbox: null },
+      allowMutation: false,
+    });
+    const discovered = result.routes.find((r) => r.path === "/api/accounts/summary");
+    assert.ok(discovered, JSON.stringify(result.routes.map((r) => `${r.source}:${r.path}`)));
+    assert.equal(discovered.source, "frontend");
+    assert.equal(result.frontendScripts, 1);
+    assert.ok(result.frontendRouteCount >= 1);
+    assert.ok(!result.routes.some((r) => /\.(?:png|js)$/.test(r.path)), "静态资源不应进入路由表");
+    assert.ok(!result.routes.some((r) => r.path.includes("${")), "动态模板路径不应进入路由表");
+    const finding = result.findings.find((f) => f.path === "/api/accounts/summary");
+    assert.ok(finding, JSON.stringify(result.findings.map((f) => f.path)));
+    assert.match(finding.type, /未认证读取/);
   } finally {
     await target.close();
   }

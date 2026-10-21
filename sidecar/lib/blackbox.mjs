@@ -11,14 +11,27 @@ import { followRedirects } from "./http-follow.mjs";
 
 const OPENAPI_PATHS = ["/swagger.json", "/openapi.json", "/v3/api-docs", "/api-docs", "/swagger-ui.json"];
 const COMMON_API_PATHS = [
-  "/api/users", "/api/user", "/api/account",
+  "/api/users", "/api/user", "/api/account", "/api/accounts",
   "/api/orders", "/api/order", "/api/products", "/api/posts",
   "/api/projects", "/api/tickets", "/api/invoices",
   "/users", "/orders", "/products", "/posts",
-  "/api/profile", "/api/me",
-  "/api/files", "/api/download", "/api/static",
+  "/api/profile", "/api/me", "/api/settings", "/api/config",
+  "/api/files", "/api/download", "/api/static", "/api/uploads",
   "/api/orders/search", "/api/users/search", "/api/search", "/api/query",
+  "/api/messages", "/api/notifications", "/api/comments", "/api/items",
+  "/api/customers", "/api/payments", "/api/carts", "/api/cart",
+  "/api/documents", "/api/reports", "/api/tasks", "/api/events",
+  "/api/dashboard", "/api/health", "/api/status", "/api/version",
+  "/api/admin", "/api/admin/users", "/api/auth/me", "/api/auth/profile",
+  "/api/v1/users", "/api/v1/orders", "/api/v1/products", "/api/v1/me",
+  "/v1/users", "/v1/orders", "/v1/products", "/v1/me",
+  "/rest/products/search", "/rest/user/whoami", "/rest/basket",
+  "/graphql",
 ];
+const MAX_FRONTEND_SCRIPTS = 8;
+const MAX_FRONTEND_SCRIPT_CHARS = 500_000;
+const MAX_FRONTEND_ROUTES = 80;
+const ASSET_EXT = /\.(?:js|mjs|css|map|png|jpe?g|gif|svg|ico|webp|woff2?|ttf|eot|mp4|webm)$/i;
 const ATTACK_SURFACE_PATHS = [
   "/admin", "/admin/", "/admin/login",
   "/actuator", "/actuator/health", "/actuator/env",
@@ -233,7 +246,7 @@ export function openapiRoutes(found, limit = MAX_ROUTES) {
 export async function bruteRoutes(ctx, baseUrl) {
   const found = [];
   for (const p of COMMON_API_PATHS) {
-    const res = await httpJson(ctx, { baseUrl, method: "GET", path: p });
+    const res = await httpJson(ctx, { baseUrl, method: "GET", path: p, timeoutMs: 5_000 });
     if (res.ok || isDenied(res.status)) {
       found.push({ method: "GET", path: p, templated: false, status: res.status, source: "brute" });
     }
@@ -247,6 +260,108 @@ export async function bruteRoutes(ctx, baseUrl) {
     });
   }
   return found;
+}
+
+/** 从 HTML/JS 文本里提取字面量 API 路径；动态片段/静态资源路径一律跳过。 */
+export function extractRoutesFromText(text) {
+  const raw = String(text ?? "").replace(/\\\//g, "/");
+  const out = new Set();
+  const re = /["'`]((?:\/api|\/rest|\/graphql|\/v\d+)[^"'`\s\\]*)["'`]/g;
+  let m;
+  while ((m = re.exec(raw))) {
+    const route = normalizeFrontendRoute(m[1]);
+    if (route) out.add(route);
+    if (out.size >= MAX_FRONTEND_ROUTES) break;
+  }
+  return [...out];
+}
+
+function normalizeFrontendRoute(value) {
+  let p = String(value).split(/[?#]/)[0];
+  if (!p || p.length > 120) return null;
+  if (/[$`{}:*<>]/.test(p)) return null;
+  p = p.replace(/\/{2,}/g, "/").replace(/\/+$/, "");
+  if (p.length < 4) return null;
+  if (ASSET_EXT.test(p)) return null;
+  if (!/^\/[A-Za-z0-9._~\-/]+$/.test(p)) return null;
+  return p;
+}
+
+/** 首页 HTML 中的同源脚本地址（script src + modulepreload），转成可直接请求的 path。 */
+export function extractScriptPaths(html, baseUrl) {
+  const raw = String(html ?? "");
+  const out = [];
+  const push = (src) => {
+    if (!src || out.length >= MAX_FRONTEND_SCRIPTS) return;
+    try {
+      const url = new URL(src.replace(/&amp;/g, "&"), baseUrl);
+      if (url.origin !== new URL(baseUrl).origin) return;
+      if (!/\.m?js$/i.test(url.pathname)) return;
+      const path = `${url.pathname}${url.search}`;
+      if (!out.includes(path)) out.push(path);
+    } catch {
+      /* 非法 src 忽略 */
+    }
+  };
+  let m;
+  const scriptRe = /<script\b[^>]*\bsrc\s*=\s*["']([^"']+)["'][^>]*>/gi;
+  while ((m = scriptRe.exec(raw))) push(m[1]);
+  const preloadRe = /<link\b[^>]*\brel\s*=\s*["'](?:modulepreload|preload)["'][^>]*\bhref\s*=\s*["']([^"']+)["'][^>]*>/gi;
+  while ((m = preloadRe.exec(raw))) push(m[1]);
+  return out;
+}
+
+function inlineScripts(html, limit = 4) {
+  const raw = String(html ?? "");
+  const out = [];
+  const re = /<script\b(?![^>]*\bsrc\s*=)[^>]*>([\s\S]*?)<\/script>/gi;
+  let m;
+  while ((m = re.exec(raw)) && out.length < limit) out.push(m[1].slice(0, MAX_FRONTEND_SCRIPT_CHARS));
+  return out;
+}
+
+/** 抓首页与同源 JS，提取前端实际调用的字面量路由（SPA/无 OpenAPI 项目的补充发现手段）。 */
+export async function discoverFrontendRoutes(ctx, baseUrl, { html = null } = {}) {
+  let page = html;
+  if (page == null) {
+    const res = await httpJson(ctx, { baseUrl, method: "GET", path: "/", timeoutMs: 8_000 });
+    page = res.body ?? "";
+  }
+  const scripts = extractScriptPaths(page, baseUrl);
+  const routes = new Map();
+  const collect = (text) => {
+    for (const p of extractRoutesFromText(text)) if (!routes.has(p)) routes.set(p, true);
+  };
+  for (const snippet of inlineScripts(page)) collect(snippet);
+  let fetched = 0;
+  for (const src of scripts) {
+    const res = await httpJson(ctx, { baseUrl, method: "GET", path: src, timeoutMs: 8_000 });
+    if (!res.ok || !res.body) continue;
+    fetched += 1;
+    collect(res.body.slice(0, MAX_FRONTEND_SCRIPT_CHARS));
+  }
+  const list = [...routes.keys()].slice(0, MAX_FRONTEND_ROUTES).map((p) => ({
+    method: "GET",
+    path: p,
+    templated: false,
+    source: "frontend",
+  }));
+  if (list.length) {
+    ctx.emit({
+      kind: "discovery",
+      severity: SEVERITY.INFO,
+      message: `前端资源提取 ${list.length} 条字面量路由（扫描同源脚本 ${fetched}/${scripts.length} 个）`,
+      data: { routes: list.map((r) => r.path), scripts: scripts.length, fetched },
+    });
+  } else if (scripts.length) {
+    ctx.emit({
+      kind: "discovery",
+      severity: SEVERITY.INFO,
+      message: `首页引用 ${scripts.length} 个同源脚本，未提取到字面量 API 路由`,
+      data: { scripts: scripts.length, fetched },
+    });
+  }
+  return { routes: list, scripts: scripts.length, fetched };
 }
 
 function mergeRoutes(limit, ...lists) {
@@ -870,6 +985,8 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
       maxRoutes: routeCap,
       openapiFound: false,
       openapiRouteCount: 0,
+      frontendRouteCount: 0,
+      frontendScripts: 0,
       findings: [],
       evidence: [],
       summary: summarize([], [], { attempted: false, ok: false, path: null, identities: [] }),
@@ -883,7 +1000,8 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
   const openapiFound = await discoverOpenapi(ctx, baseUrl);
   const openapi = openapiRoutes(openapiFound, routeCap);
   const brute = await bruteRoutes(ctx, baseUrl);
-  const routes = mergeRoutes(routeCap, openapi, brute);
+  const frontend = await discoverFrontendRoutes(ctx, baseUrl, { html: health.body });
+  const routes = mergeRoutes(routeCap, openapi, frontend.routes, brute);
   const surface = await probeAttackSurface(ctx, baseUrl);
   const rate = await checkRateLimit(ctx, baseUrl);
   const rateLimited = rate.limited;
@@ -954,6 +1072,9 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
     maxRoutes: routeCap,
     openapiFound: !!openapiFound,
     openapiRouteCount: openapi.length,
+    frontendRouteCount: frontend.routes.length,
+    frontendScripts: frontend.scripts,
+    frontendScriptsFetched: frontend.fetched,
     findings,
     evidence: records,
     summary,

@@ -1,0 +1,100 @@
+{
+  "version": 1,
+  "description": "GuardBuild 白盒 gate 精度基准：固定标注靶场 + 期望退出码 + 期望复现的攻击用例。新增适配器时在 targets 追加条目并保持全绿。",
+  "targets": [
+    {
+      "id": "llm-patch-shop",
+      "fixture": "fixtures/llm-patch-shop",
+      "expectedExit": 1,
+      "expectedVulnerableCases": ["attack-read-foreign", "attack-cancel-foreign"],
+      "expectedStatic": [
+        { "kind": "idor-suspect", "method": "GET", "path": "/api/orders/:id" },
+        { "kind": "idor-suspect", "method": "POST", "path": "/api/orders/:id/cancel" }
+      ]
+    },
+    {
+      "id": "next-shop",
+      "fixture": "fixtures/next-shop",
+      "expectedExit": 1,
+      "expectedVulnerableCases": ["attack-read-foreign", "attack-cancel-foreign"],
+      "expectedStatic": [
+        { "kind": "idor-suspect", "method": "GET", "path": "/api/orders/:id" },
+        { "kind": "idor-suspect", "method": "POST", "path": "/api/orders/:id/cancel" }
+      ]
+    },
+    {
+      "id": "nest-shop",
+      "fixture": "fixtures/nest-shop",
+      "expectedExit": 1,
+      "expectedVulnerableCases": [
+        "attack-read-foreign",
+        "attack-cancel-foreign",
+        "attack-path-traversal"
+      ],
+      "expectedStatic": [
+        { "kind": "idor-suspect", "method": "GET", "path": "/api/orders/:id" },
+        { "kind": "idor-suspect", "method": "POST", "path": "/api/orders/:id/cancel" },
+        { "kind": "traversal-suspect", "path": "/api/orders/export" }
+      ]
+    },
+    {
+      "id": "trpc-shop",
+      "fixture": "fixtures/trpc-shop",
+      "expectedExit": 1,
+      "expectedVulnerableCases": ["attack-read-foreign", "attack-cancel-foreign"],
+      "expectedStatic": [
+        { "kind": "idor-suspect", "method": "GET", "path": "/api/trpc/orders.byId" },
+        { "kind": "idor-suspect", "method": "POST", "path": "/api/trpc/orders.cancel" }
+      ]
+    },
+    {
+      "id": "graphql-shop",
+      "fixture": "fixtures/graphql-shop",
+      "expectedExit": 1,
+      "expectedVulnerableCases": [
+        "attack-read-foreign",
+        "attack-cancel-foreign",
+        "attack-anonymous-read"
+      ],
+      "expectedStatic": [
+        { "kind": "idor-suspect", "method": "POST", "routeKeys": ["Query.order"] },
+        { "kind": "idor-suspect", "method": "POST", "routeKeys": ["Mutation.cancelOrder"] },
+        { "kind": "no-auth-suspect", "method": "POST", "routeKeys": ["Query.receipt"] }
+      ]
+    },
+    {
+      "id": "python-shop",
+      "fixture": "fixtures/python-shop",
+      "expectedExit": 1,
+      "requires": ["python"],
+      "expectedVulnerableCases": [
+        "attack-read-foreign",
+        "attack-cancel-foreign",
+        "attack-anonymous-read"
+      ],
+      "expectedStatic": [
+        { "kind": "idor-suspect", "method": "GET", "path": "/api/orders/:order_id" },
+        { "kind": "idor-suspect", "method": "POST", "path": "/api/orders/:order_id/cancel" },
+        { "kind": "no-auth-suspect", "method": "GET", "path": "/api/receipts/:receipt_id" }
+      ]
+    },
+    {
+      "id": "legacy-shop",
+      "fixture": "fixtures/legacy-shop",
+      "expectedExit": 1,
+      "expectedVulnerableCases": ["attack-read-foreign", "attack-cancel-foreign"],
+      "expectedStatic": [
+        { "kind": "idor-suspect", "method": "GET", "path": "/api/orders/:id" },
+        { "kind": "idor-suspect", "method": "POST", "path": "/api/orders/:id/cancel" }
+      ]
+    },
+    {
+      "id": "clean-shop",
+      "fixture": "fixtures/clean-shop",
+      "expectedExit": 0,
+      "expectedVulnerableCases": [],
+      "expectedOutcomes": ["not_reproducible"],
+      "expectedStatic": []
+    }
+  ]
+}

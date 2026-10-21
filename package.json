@@ -27,6 +27,8 @@
     "e2e:python": "node scripts/e2e-python.mjs",
     "e2e:llm": "node scripts/e2e-llm-scout.mjs",
     "e2e:llm-patch": "node scripts/e2e-llm-patch.mjs",
+    "e2e:fix-agent": "node scripts/e2e-fix-agent.mjs",
+    "benchmark": "node scripts/benchmark.mjs",
     "e2e:blackbox": "node scripts/e2e-blackbox.mjs",
     "e2e:docker": "node scripts/e2e-docker.mjs"
   },

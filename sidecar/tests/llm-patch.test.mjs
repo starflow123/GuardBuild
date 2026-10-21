@@ -157,6 +157,27 @@ test("提示词包含候选与命中的证据，不含无关端点", () => {
   assert.ok(prompt.includes("store.findById"));
 });
 
+test("提示词携带上一轮失败反馈（修复循环自纠错）", () => {
+  const prompt = buildPatchPrompt({
+    rel: REL,
+    candidates: [{ method: "GET", path: "/api/orders/:id", fullPath: "/api/orders/:id", kind: "idor-suspect" }],
+    evidence: [],
+    snippet: CONTENT,
+    feedback: {
+      round: 1,
+      reason: "上一轮补丁未通过双重验收",
+      attack_regressed: 1,
+      business_regressed: 0,
+      failed_cases: [{ case: "跨用户读取", verdict: "regressed", actual: "200 + 他人数据", status: 200 }],
+      instruction: "重新生成最小补丁",
+    },
+  });
+  const obj = JSON.parse(prompt);
+  assert.equal(obj.previous_attempt.round, 1);
+  assert.equal(obj.previous_attempt.failed_cases[0].case, "跨用户读取");
+  assert.match(obj.note, /上一轮补丁未通过双重验收/);
+});
+
 test("开关：需要 API 密钥，契约 patch 与环境变量可分别控制", () => {
   const savedKey = process.env.DEEPSEEK_API_KEY;
   const savedEnv = process.env.GUARDBUILD_LLM_PATCH;
@@ -184,6 +205,9 @@ test("契约 llm 字段：patch 跟随 enabled，autoVerify 默认开", () => {
   assert.equal(normalizeLlm({ enabled: true, autoVerify: false }).autoVerify, false);
   assert.equal(normalizeLlm({ enabled: false }).patch, false);
   assert.equal(normalizeLlm({ enabled: true, patchMaxFiles: 99 }).patchMaxFiles, 10);
+  assert.equal(normalizeLlm({ enabled: true }).fixRounds, 2, "默认允许两轮自纠错");
+  assert.equal(normalizeLlm({ enabled: true, fixRounds: 0 }).fixRounds, 0);
+  assert.equal(normalizeLlm({ enabled: true, fixRounds: 99 }).fixRounds, 3, "上限三轮");
 });
 
 const CANDIDATES = [
@@ -236,6 +260,28 @@ test("requestPatchIntent：采纳合法意图，丢弃模型给出的其它项",
   assert.equal(res.usage.total_tokens, 42);
   assert.equal(res.failure, null);
   assert.ok(sentPrompt.includes("GET /api/orders/:id"));
+});
+
+test("requestPatchIntent：feedback 透传到模型提示词", async () => {
+  const ctx = fakeCtx();
+  let sentPrompt = "";
+  await requestPatchIntent(ctx, {
+    file: `D:\\p\\${REL}`,
+    rel: REL,
+    content: CONTENT,
+    candidates: CANDIDATES,
+    evidence: [],
+    feedback: { round: 1, failed_cases: [{ case: "跨用户读取", verdict: "regressed" }] },
+    readRedacted: async () => CONTENT,
+    getToken: async () => "tok",
+    chatImpl: async (_c, { userPrompt }) => {
+      sentPrompt = userPrompt;
+      return { content: JSON.stringify({ patches: [patch()] }), model: "m", usage: null };
+    },
+  });
+  const obj = JSON.parse(sentPrompt);
+  assert.equal(obj.previous_attempt.round, 1);
+  assert.equal(obj.previous_attempt.failed_cases[0].case, "跨用户读取");
 });
 
 test("requestPatchIntent：非法规则文件不发起请求", async () => {

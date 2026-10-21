@@ -23,7 +23,7 @@
 | 6 | 双重验收 | 修复后：攻击用例必须全部不再复现，且业务用例必须全部保持通过 |
 | 7 | 产物 | `report.json` / `report.md` 报告 + SQLite 证据链（7 张表）；桌面模式可经用户授权写回原工作区 |
 
-**攻击类别**：对象级越权（IDOR）、无鉴权读取、路径穿越、SQL 注入（布尔绕过 / 数据库报错双证据）、命令注入（shell 展开令牌回显，避免输入反射误报）、Supabase 匿名读取与 service_role 暴露。注入与穿越类仅取证，不生成自动修复补丁（按 `vulnerable_unfixed` 阻断并给人工修复指引）。
+**攻击类别**：对象级越权（IDOR）、无鉴权读取、路径穿越、SQL 注入（布尔绕过 / 数据库报错双证据）、命令注入（shell 展开令牌回显，避免输入反射误报）、Supabase 匿名读取与 service_role 暴露。自动修复边界：确定性模板只修「带认证但缺归属校验」的 IDOR；开启 LLM 编码代理（`llm.patch`）后，IDOR / 无鉴权 / 穿越 / SQLi / 命令注入五类候选都可尝试生成补丁，仍须通过严格校验与双重验收才计为 `verified`；黑盒模式无源码、Supabase 属平台策略，均只取证并给人工修复指引（`vulnerable_unfixed`）。
 
 ## 架构与信任模型
 
@@ -294,7 +294,7 @@ guardbuild-headless --url https://staging.example.com --project ./my-project --g
 
 ## 已知边界
 
-- 静态路由适配已覆盖：Express 风格、Next.js（App/Pages Router）、NestJS、tRPC、GraphQL、Supabase/PostgREST、Python（FastAPI/Flask/Django + DRF）；NestJS / GraphQL / Python 等形态暂不提供自动补丁（证据成立时按 `vulnerable_unfixed` 阻断并给人工修复指引）
+- 静态路由适配已覆盖：Express 风格、Next.js（App/Pages Router）、NestJS、tRPC、GraphQL、Supabase/PostgREST、Python（FastAPI/Flask/Django + DRF）；确定性模板补丁只覆盖 Express / 手写路由等有明确归属校验插入位的形态，NestJS / GraphQL / Python 等暂不提供确定性模板补丁；开启 LLM 编码代理后这些形态的候选同样会进入编码代理尝试（须定位到源码文件，仍以双重验收为准），否则证据成立时按 `vulnerable_unfixed` 阻断并给人工修复指引
 - 取数形态覆盖：`findById`/`findOne`/`findUnique` 等 ORM 单查、Drizzle 链、`dbGet`/`db.get`/`pool.query`、`db.prepare(...).get(...)`、Prisma `$queryRaw`/`$queryRawUnsafe`、Knex `.first()`、`db.raw(...)`；Prisma 标签模板（`$queryRaw` 后接模板字符串）自动参数化，不误报为 SQL 注入
 - 注入静态识别基于「请求输入 → 模板/拼接 → SQL或 shell 首实参」的轻量污点传播；动态复现要求目标返回列表行数变化、数据库报错特征或 shell 展开令牌，无法确证时记为 inconclusive 而非漏洞
 - Flask/Django 的自定义路由注册、异步视图与中间件级鉴权等边缘形态仍可能漏检；动态复现要求项目能按 `guardbuild.json` 启动，并具备可登录的测试身份

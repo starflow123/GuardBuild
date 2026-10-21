@@ -72,6 +72,7 @@ function spGetRe() {
 /** 检测区块内路径穿越线索：返回离 sink 最近的请求输入 {source, param, sink} 或 null */
 export function findTraversalSignal(text) {
   const re = new RegExp(FS_READ_SINK.source, "g");
+  const taintedVars = collectRequestVars(text);
   let m;
   while ((m = re.exec(text))) {
     // 取 sink 调用前的窗口：覆盖「输入变量赋值 → 拼接 → 传参」的相邻语句链
@@ -88,6 +89,18 @@ export function findTraversalSignal(text) {
       if (qm) {
         const rest = window.slice(qm.index + qm[0].length);
         if (new RegExp(`\\b${qm[2]}\\b`).test(rest)) return { source: "query", param: qm[1], sink: m[1] };
+      }
+      // Python/JS 变量形态：sink 首参直接拼进已确认的请求可控变量
+      // （如 open("./data/" + datestamp)，datestamp 来自 FastAPI 形参或 request.args）
+      const openRel = m[0].lastIndexOf("(");
+      const argsText = callArgsSpan(text, m.index + openRel, 400);
+      if (argsText) {
+        const first = firstArgText(argsText);
+        for (const [name, info] of taintedVars) {
+          if (new RegExp(`\\b${escRe(name)}\\b`).test(first)) {
+            return { source: info.channel, param: info.param, sink: m[1] };
+          }
+        }
       }
       continue;
     }
@@ -171,7 +184,7 @@ export function findQueryParamSink(text) {
 // SQL 执行 sink：ORM 原始查询 / 驱动 query / SQLite helper / Python DB-API。
 // 仅当请求输入以拼接或模板方式进入「第一个 SQL 实参」时才作为注入线索（参数化查询不在其列）。
 export const SQL_SINK =
-  /\b(?:dbAll|dbRun|dbGet|dbExec|dbQuery|dbExecute|rawQuery|queryRaw|executeRaw|knexRaw)\s*\(|\b(?:db|database|conn|connection|pool|client|knex|trx|tx|sequelize|prisma|stmt|statement|session|cursor|cur)\s*\.\s*(?:prepare\s*\([^;\n]*\)\s*\.\s*)?(?:all|run|get|each|exec|query|execute|executemany|raw|whereRaw|havingRaw|orderByRaw|\$queryRaw(?:Unsafe)?|\$executeRaw(?:Unsafe)?)\s*\(/;
+  /\b(?:dbAll|dbRun|dbGet|dbExec|dbQuery|dbExecute|rawQuery|queryRaw|executeRaw|knexRaw)\s*\(|\b(?:db|database|conn|connection|pool|client|knex|trx|tx|sequelize|prisma|stmt|statement|session|cursor|cur)\s*\.\s*(?:prepare\s*\([^;\n]*\)\s*\.\s*)?(?:all|run|get|each|exec|query|execute|executemany|raw|whereRaw|havingRaw|orderByRaw|\$queryRaw(?:Unsafe)?|\$executeRaw(?:Unsafe)?)\s*\(|\bquery\s*\.\s*(?:execute|executemany|exec|raw)\s*\(/;
 
 // 命令执行 sink：Node child_process 与 Python os.system / subprocess 族。
 // 只覆盖会把字符串交给 shell 的入口；execFile/spawn 的数组参数形态在检测时因首参不含输入而自然排除。
@@ -195,6 +208,90 @@ function firstArgText(argsText) {
     else if (ch === "," && depth === 0) return argsText.slice(0, i);
   }
   return argsText;
+}
+
+/** 按顶层逗号切分参数（忽略括号/方括号/花括号与字符串内的逗号） */
+export function splitTopLevel(s) {
+  const out = [];
+  let depth = 0;
+  let cur = "";
+  let quote = null;
+  for (let i = 0; i < s.length; i += 1) {
+    const ch = s[i];
+    if (quote) {
+      cur += ch;
+      if (ch === "\\") {
+        if (i + 1 < s.length) cur += s[i + 1];
+        i += 1;
+      } else if (ch === quote) quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") {
+      quote = ch;
+      cur += ch;
+      continue;
+    }
+    if (ch === "(" || ch === "[" || ch === "{") depth += 1;
+    else if (ch === ")" || ch === "]" || ch === "}") depth -= 1;
+    else if (ch === "," && depth === 0) {
+      out.push(cur.trim());
+      cur = "";
+      continue;
+    }
+    cur += ch;
+  }
+  if (cur.trim()) out.push(cur.trim());
+  return out;
+}
+
+// Python 路由装饰器：@app.get("/x") / @router.post(...) / Flask 的 @bp.route(...)
+const PY_ROUTE_DECORATOR =
+  /@\s*[A-Za-z_]\w*(?:\.[A-Za-z_]\w+)*\s*\.\s*(?:get|post|put|patch|delete|head|options|api_route|route)\s*\(/;
+// 非请求输入的注入型/框架型参数
+const PY_NOT_INPUT = /\b(?:Request|Response|WebSocket|BackgroundTasks|Depends|Security|Body|Form|File|UploadFile)\b/;
+// FastAPI 标量注解（其余大写注解按请求体模型处理）
+const PY_SCALAR_ANN =
+  /^(?:int|str|float|bool|bytes|UUID|Decimal|datetime|date|time|Optional\[\s*(?:int|str|float|bool|bytes|UUID|Decimal)\s*\]|List\[\s*(?:int|str|float|bool)\s*\])$/;
+
+/**
+ * Python 路由处理函数签名里的请求可控参数。
+ * FastAPI 把「非依赖、非 Request 类」的参数当查询参数，最常见写法是没有注解的
+ * `def handler(request: Request, code="1")`——只认 Query(...) 会整类漏掉。
+ * 返回 [{ name, channel }]，channel 为 query（标量/未注解）或 body（模型注解）。
+ */
+export function pythonHandlerParams(text) {
+  const s = String(text ?? "");
+  const dec = PY_ROUTE_DECORATOR.exec(s);
+  if (!dec) return [];
+  const decArgs = callArgsSpan(s, dec.index + dec[0].length - 1, 600) ?? "";
+  const pathLit = /["']([^"']*)["']/.exec(decArgs);
+  const pathParams = new Set();
+  if (pathLit) {
+    for (const m of pathLit[1].matchAll(
+      /\{([A-Za-z_]\w*)(?::[^}]*)?\}|<(?:(?:int|str|float|path|uuid)[^:>]*:)?([A-Za-z_]\w*)>/g
+    )) {
+      pathParams.add(m[1] ?? m[2]);
+    }
+  }
+  // 装饰器之后的第一个 def 即路由处理器本体
+  const rel = /(?:async\s+)?\bdef\s+[A-Za-z_]\w*\s*\(/.exec(s.slice(dec.index));
+  if (!rel) return [];
+  const openIdx = dec.index + rel.index + rel[0].length - 1;
+  const argsText = callArgsSpan(s, openIdx, 4000);
+  if (argsText == null) return [];
+  const out = [];
+  for (const raw of splitTopLevel(argsText)) {
+    if (!raw || raw.startsWith("*")) continue;
+    const m = /^([A-Za-z_]\w*)\s*(?::\s*([\s\S]*?))?\s*(?:=\s*([\s\S]+))?$/.exec(raw);
+    if (!m) continue;
+    const [, name, annotation, defExpr] = m;
+    if (name === "self" || name === "cls" || pathParams.has(name)) continue;
+    if (PY_NOT_INPUT.test(annotation ?? "") || PY_NOT_INPUT.test(defExpr ?? "")) continue;
+    const ann = String(annotation ?? "").replace(/\s+/g, "");
+    const channel = ann && !PY_SCALAR_ANN.test(ann) ? "body" : "query";
+    out.push({ name, channel });
+  }
+  return out;
 }
 
 /** 直接请求输入：req.query.x / req.body.x / req.params.x / searchParams.get("x") / Python request.args */
@@ -251,6 +348,10 @@ function collectRequestVars(text) {
   )) {
     add(m[1], m[2] === "json" ? "body" : "query", m[3]);
   }
+  // Python 路由处理器签名参数（FastAPI 查询参数不写 request.args，直接是函数形参）
+  for (const p of pythonHandlerParams(text)) {
+    add(p.name, p.channel, p.name);
+  }
 
   const propagate = (re) => {
     for (let pass = 0; pass < 3; pass += 1) {
@@ -267,7 +368,8 @@ function collectRequestVars(text) {
           }
         }
         if (!hit) continue;
-        const built = /`[^`]*\$\{|\+\s*["'`]|["'`]\s*\+|\bf["'][^"']*\{|\.format\s*\(|%\s*\(/.test(rhs);
+        // Python f-string 本身就是构造串（引号内再出现引号时无法用 [^"']* 界定），一律判为 built
+        const built = /`[^`]*\$\{|\+\s*["'`]|["'`]\s*\+|\br?f["']|\.format\s*\(|%\s*\(/.test(rhs);
         vars.set(name, { ...hit, built: hit.built || built });
         changed = true;
       }

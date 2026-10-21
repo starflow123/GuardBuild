@@ -13,6 +13,7 @@
  *  - 响应体经 Host 脱敏后才返回给 Sidecar（写入证据的仍是掩码形式）
  */
 import { RPC_TO_HOST, VERDICT, CASE_CATEGORY, SEVERITY, shortId } from "../../shared/protocol.mjs";
+import { followRedirects } from "./http-follow.mjs";
 import {
   INPUT_VARIANTS,
   encodeInput,
@@ -155,7 +156,14 @@ async function httpJson(ctx, opts) {
 
   let res;
   try {
-    res = await ctx.rpc.request(RPC_TO_HOST.HTTP_REQUEST, params, { timeoutMs: 30_000 });
+    const url = `${baseUrl.replace(/\/+$/, "")}${path}`;
+    const followed = await followRedirects(
+      (next) => ctx.rpc.request(RPC_TO_HOST.HTTP_REQUEST, { ...params, url: next }, { timeoutMs: 30_000 }),
+      url,
+      { method }
+    );
+    res = followed.res;
+    if (followed.hops.length) res = { ...res, redirects: followed.hops };
   } catch (e) {
     throw new ProbeError(`请求 ${method} ${path} 失败：${e.message}`, {
       code: "probe_request_failed",
@@ -985,7 +993,7 @@ function injectionReq(cand, inj, payload) {
 }
 
 /** 行数/报错双证据：注入后返回更多行，或仅注入请求触发数据库报错特征 */
-function sqliProof(attack, benign, payload) {
+export function sqliProof(attack, benign, payload) {
   const baseArr = extractListItems(benign?.json, null);
   const attackArr = extractListItems(attack?.json, null);
   const baseCount = baseArr ? baseArr.length : null;
@@ -994,7 +1002,25 @@ function sqliProof(attack, benign, payload) {
     SQL_ERROR_RE.test(attack?.body ?? "") && !SQL_ERROR_RE.test(benign?.body ?? "");
   const rowsLeaked =
     attackCount != null && attackCount > 0 && (baseCount == null || attackCount > baseCount);
-  return { hit: rowsLeaked || errorSignature, baseCount, attackCount, errorSignature, payload };
+  // 单对象端点（fetchone/详情型）没有列表可比：正常值明确查不到（404/400），注入后却拿到对象，
+  // 说明 WHERE 条件被放开。要求基线是「确定性未命中」，避免把回声型端点当成注入。
+  const okStatus = (r) => r != null && r.status >= 200 && r.status < 300;
+  const baseMissed = !!benign && !okStatus(benign) && (benign.status === 404 || benign.status === 400);
+  const singleLeak =
+    okStatus(attack) &&
+    attack?.json != null &&
+    typeof attack.json === "object" &&
+    !Array.isArray(attack.json) &&
+    Object.keys(attack.json).length > 0 &&
+    baseMissed;
+  return {
+    hit: rowsLeaked || singleLeak || errorSignature,
+    baseCount,
+    attackCount,
+    errorSignature,
+    singleLeak,
+    payload,
+  };
 }
 
 /** 命令注入回显令牌：由 shell 展开（%OS% / $(id -u)），反射原文不含展开后的值 */
@@ -1407,7 +1433,9 @@ export function buildCases(ctx, targets) {
           ? `证据：${
               p.errorSignature
                 ? "注入请求触发数据库报错特征"
-                : `注入后返回 ${p.attackCount} 行（正常查询 ${p.baseCount} 行）`
+                : p.singleLeak
+                  ? "正常值未命中（404/400），注入后独占返回对象"
+                  : `注入后返回 ${p.attackCount} 行（正常查询 ${p.baseCount} 行）`
             }，载荷 ${p.payload}`
           : "";
         if (phase === "pre" && p.hit) {
@@ -1421,7 +1449,9 @@ export function buildCases(ctx, targets) {
         return {
           note: p.errorSignature
             ? `注入请求独有数据库报错特征，确认输入进入 SQL 解析（载荷 ${p.payload}）`
-            : `注入后行数由 ${p.baseCount ?? "未知"} 增至 ${p.attackCount}，确认查询条件被绕过`,
+            : p.singleLeak
+              ? `基线查询该值明确未命中，注入载荷后返回了对象，确认 WHERE 条件被绕过（载荷 ${p.payload}）`
+              : `注入后行数由 ${p.baseCount ?? "未知"} 增至 ${p.attackCount}，确认查询条件被绕过`,
         };
       },
       impact: (res) =>
@@ -1747,6 +1777,10 @@ export async function runPhase(ctx, { phase, baseUrl }) {
     }
   }
   const allCases = buildCases(ctx, targets);
+  // 路径穿越会把不存在的路径打到文件读取接口，个别实现会同步请求外部依赖并阻塞事件循环；
+  // 排在最后，避免一条挂起的用例拖掉整轮注入取证（后续请求仍返回 inconclusive）。
+  const isTraversal = (c) => c.category === CASE_CATEGORY.ATTACK && c.id.startsWith("attack-path-traversal");
+  const orderedCases = [...allCases.filter((c) => !isTraversal(c)), ...allCases.filter(isTraversal)];
   // 外部攻击面扫描：发常见管理路径/敏感文件，记录暴露面（pre 阶段才跑）
   if (phase === "pre") {
     await scanAttackSurface(ctx, baseUrl, loggedIn);
@@ -1754,7 +1788,7 @@ export async function runPhase(ctx, { phase, baseUrl }) {
   }
   // 修复后验收只覆盖补丁实际修复的类别：注入/穿越无自动修复模板，
   // 若与可修复项混在同一目标中，仍按原样复现会误判「补丁无效」
-  const cases = phase === "pre" ? allCases : allCases.filter((c) => !c.unfixable);
+  const cases = phase === "pre" ? orderedCases : orderedCases.filter((c) => !c.unfixable);
   const skippedUnfixable = phase === "pre" ? [] : allCases.filter((c) => c.unfixable);
   if (skippedUnfixable.length > 0) {
     ctx.emit({
@@ -1794,26 +1828,49 @@ export async function runPhase(ctx, { phase, baseUrl }) {
   }
 
   const evidence = [];
+  let consecutiveSendFailures = 0;
+  let skippedSendFailures = 0;
   for (const kase of cases) {
     let res;
     let sentPath = kase.path;
     let sentMethod = kase.method;
-    if (kase.send) {
-      // 自定义发送器（如路径穿越的多 payload 尝试），返回实际命中的请求
-      const out = await kase.send(ctx, baseUrl);
-      res = out.res;
-      sentPath = out.path ?? kase.path;
-      sentMethod = out.method ?? kase.method;
-    } else {
-      res = await httpJson(ctx, {
-        baseUrl,
-        method: kase.method,
-        path: kase.path,
-        identity: kase.identity,
-        body: kase.body ?? null,
-        graphql: !!kase.graphql,
+    try {
+      if (kase.send) {
+        // 自定义发送器（如路径穿越的多 payload 尝试），返回实际命中的请求
+        const out = await kase.send(ctx, baseUrl);
+        res = out.res;
+        sentPath = out.path ?? kase.path;
+        sentMethod = out.method ?? kase.method;
+      } else {
+        res = await httpJson(ctx, {
+          baseUrl,
+          method: kase.method,
+          path: kase.path,
+          identity: kase.identity,
+          body: kase.body ?? null,
+          graphql: !!kase.graphql,
+        });
+      }
+    } catch (e) {
+      if (e?.code !== "probe_request_failed") throw e;
+      // 单条用例的请求失败不足以否定其他候选：跳过并继续，连续两条才判定目标不可用
+      consecutiveSendFailures += 1;
+      skippedSendFailures += 1;
+      ctx.emit({
+        kind: "discovery",
+        severity: SEVERITY.WARN,
+        message: `攻击用例「${kase.name}」请求失败，跳过该用例继续取证：${String(e.message ?? e).slice(0, 240)}`,
+        data: { caseId: kase.id, code: e.code },
       });
+      if (consecutiveSendFailures >= 2) {
+        throw new ProbeError(`连续 ${consecutiveSendFailures} 条攻击用例请求失败，目标可能已不可用：${e.message}`, {
+          code: "probe_request_failed",
+          hint: "请确认目标服务仍在运行；若探测过程中目标崩溃或阻塞（例如同步请求外部依赖），请修复后重试",
+        });
+      }
+      continue;
     }
+    consecutiveSendFailures = 0;
     const fresh = await fetchNewDecisions(ctx, baseUrl);
     const decision = matchDecision(fresh, { method: sentMethod, path: sentPath, routeKey: kase.routeKey });
     const { verdict, actual } = kase.verify(res, phase);
@@ -1879,6 +1936,14 @@ export async function runPhase(ctx, { phase, baseUrl }) {
         crossProof: cross?.note ?? null,
         decision: decision ? { checks: decision.checks, decision: decision.decision, note: decision.note } : null,
       },
+    });
+  }
+
+  // 全轮请求失败不能当成「目标无漏洞」退出：没有证据是网络/可用性问题，不是复现结论
+  if (evidence.length === 0 && skippedSendFailures > 0) {
+    throw new ProbeError(`全部 ${skippedSendFailures} 条用例请求失败，未能建立任何证据`, {
+      code: "probe_request_failed",
+      hint: "请确认目标服务仍在运行；若探测过程中目标崩溃或阻塞，请修复后重试",
     });
   }
 

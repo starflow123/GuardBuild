@@ -283,3 +283,153 @@ test("runBlackbox: 目标不可达时 reachable=false（供调用方判失败）
   assert.equal(result.reachable, false);
   assert.equal(result.findings.length, 0);
 });
+
+/** 注入缺口靶子：搜索参数名是 query（不是写死的 q），值被直接拼进 LIKE；
+ *  spec=true 时通过 OpenAPI 声明参数名，false 时只能靠常见参数名回退。
+ *  复刻 DVWA-modern /api/products/search 的形态。 */
+function sqliTargetServer({ spec = true } = {}) {
+  const tokens = new Map([["tok-1", { id: 1 }]]);
+  const products = Array.from({ length: 20 }, (_, i) => ({ id: i + 1, name: `prod-${i + 1}`, price: i }));
+  const rows = (raw) => {
+    if (raw == null) return [];
+    if (/OR\s+1\s*=\s*1/.test(raw)) return products;
+    if (/OR\s+1\s*=\s*2/.test(raw)) return [];
+    return products.filter((p) => p.name.includes(raw));
+  };
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, "http://127.0.0.1");
+    const send = (status, body) => {
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(body));
+    };
+    if (req.method === "POST" && url.pathname === "/api/login") {
+      return send(200, { authentication: { token: "tok-1", user: { id: 1, role: "user" } } });
+    }
+    if (url.pathname === "/openapi.json" && spec) {
+      return send(200, {
+        openapi: "3.0.0",
+        paths: {
+          "/api/products": { get: { parameters: [{ name: "query", in: "query" }] } },
+          "/api/report": { get: { parameters: [{ name: "file", in: "query" }] } },
+          "/api/bank_codes": { get: { parameters: [{ name: "code", in: "query" }] } },
+        },
+      });
+    }
+    const authed = tokens.get((req.headers.authorization ?? "").replace(/^Bearer\s+/, ""));
+    if (url.pathname === "/api/products") {
+      if (!authed) return send(401, { error: "unauthorized" });
+      // 只认 query；未知参数（q=）被忽略，等价于做了参数白名单的框架
+      return send(200, { items: rows(url.searchParams.get("query")), total: rows(url.searchParams.get("query")).length });
+    }
+    if (url.pathname === "/api/report") {
+      if (!authed) return send(401, { error: "unauthorized" });
+      const f = url.searchParams.get("file") ?? "";
+      return send(200, {
+        content: f.includes("..") ? "root:x:0:0:root:/root:/bin/sh" : "quarterly report",
+      });
+    }
+    if (url.pathname === "/api/bank_codes") {
+      if (!authed) return send(401, { error: "unauthorized" });
+      const code = url.searchParams.get("code") ?? "";
+      // 复刻 fetchone 型端点：正常值查不到 404，注入放开 WHERE 后返回单对象
+      if (/OR\s+1\s*=\s*1/.test(code)) return send(200, { bank: "ADDIKO BANK", code: "115", swift: "HAAB HR 22" });
+      return send(404, { detail: "Item not found" });
+    }
+    return send(404, { error: "not found" });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        url: `http://127.0.0.1:${server.address().port}`,
+        close: () => new Promise((r) => server.close(r)),
+      });
+    });
+  });
+}
+
+test("openapiRoutes: 携带操作声明的查询参数名（注入用例的参数来源）", () => {
+  const found = {
+    doc: {
+      openapi: "3.0.0",
+      paths: {
+        "/api/products": { get: { parameters: [{ name: "query", in: "query" }, { name: "page", in: "query" }] } },
+        "/api/items/{id}": { get: { parameters: [{ name: "id", in: "path" }] } },
+      },
+    },
+  };
+  const routes = openapiRoutes(found);
+  assert.deepEqual(routes.find((r) => r.path === "/api/products").queryParams, ["query", "page"]);
+  assert.deepEqual(routes.find((r) => r.path === "/api/items/{id}").queryParams, [], "path 参数不是注入点");
+});
+
+test("runBlackbox: 注入打在 OpenAPI 声明的参数上（写死 q 会漏报）", async () => {
+  const target = await sqliTargetServer({ spec: true });
+  const ctx = makeCtx(new Map());
+  try {
+    const result = await runBlackbox(ctx, target.url, {
+      config: { login: ctx.loginConfig, identities: ctx.identities, blackbox: null },
+      allowMutation: false,
+    });
+    const sqli = result.evidence.find((e) => e.caseId.startsWith("blackbox-sqli-"));
+    assert.ok(sqli, JSON.stringify(result.findings.map((f) => f.type)));
+    assert.equal(sqli.verdict, "vulnerable");
+    assert.match(sqli.caseId, /^blackbox-sqli-(or|error|blind)-api-products-query$/);
+    assert.match(sqli.endpoint, /\/api\/products\?query=.*OR%201%3D1/);
+    assert.ok(result.findings.some((f) => /SQL 注入/.test(f.type)), "SQLi 要进入结论清单");
+  } finally {
+    await target.close();
+  }
+});
+
+test("runBlackbox: 单对象端点（基线 404、注入后返回对象）判为注入", async () => {
+  const target = await sqliTargetServer({ spec: true });
+  const ctx = makeCtx(new Map());
+  try {
+    const result = await runBlackbox(ctx, target.url, {
+      config: { login: ctx.loginConfig, identities: ctx.identities, blackbox: null },
+      allowMutation: false,
+    });
+    const sqli = result.evidence.find((e) => e.caseId.startsWith("blackbox-sqli-") && e.endpoint.includes("/api/bank_codes"));
+    assert.ok(sqli, JSON.stringify(result.evidence.map((e) => e.caseId)));
+    assert.equal(sqli.verdict, "vulnerable");
+    assert.match(sqli.caseId, /^blackbox-sqli-single-api-bank-codes-code$/);
+    assert.match(sqli.actual, /基线 HTTP 404/);
+    assert.ok(result.findings.some((f) => /SQL 注入/.test(f.type)), "SQLi 要进入结论清单");
+  } finally {
+    await target.close();
+  }
+});
+
+test("runBlackbox: 无 OpenAPI 规格时用常见参数名仍能复现注入", async () => {
+  const target = await sqliTargetServer({ spec: false });
+  const ctx = makeCtx(new Map());
+  try {
+    const result = await runBlackbox(ctx, target.url, {
+      config: { login: ctx.loginConfig, identities: ctx.identities, blackbox: null },
+      allowMutation: false,
+    });
+    const sqli = result.evidence.find((e) => e.caseId.startsWith("blackbox-sqli-"));
+    assert.ok(sqli, "常见参数名回退应命中 query");
+    assert.equal(sqli.verdict, "vulnerable");
+    assert.match(sqli.endpoint, /query=/);
+  } finally {
+    await target.close();
+  }
+});
+
+test("runBlackbox: 穿越 payload 注入声明的文件读取参数", async () => {
+  const target = await sqliTargetServer({ spec: true });
+  const ctx = makeCtx(new Map());
+  try {
+    const result = await runBlackbox(ctx, target.url, {
+      config: { login: ctx.loginConfig, identities: ctx.identities, blackbox: null },
+      allowMutation: false,
+    });
+    const trav = result.evidence.find((e) => e.caseId.startsWith("blackbox-traversal-") && e.endpoint.includes("file="));
+    assert.ok(trav, JSON.stringify(result.evidence.map((e) => e.caseId)));
+    assert.equal(trav.verdict, "vulnerable");
+    assert.match(trav.actual, /root:x:/);
+  } finally {
+    await target.close();
+  }
+});

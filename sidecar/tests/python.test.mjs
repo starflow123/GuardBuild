@@ -18,6 +18,7 @@ import {
 } from "../lib/python.mjs";
 import { analyzeProject } from "../lib/analyzer.mjs";
 import { buildProbePlan } from "../lib/planner.mjs";
+import { pythonHandlerParams, findSqlInjectionSignal, findTraversalSignal } from "../lib/signals.mjs";
 
 const R = "\\\\?\\D:\\proj"; // Host 返回的 Windows 扩展路径前缀形态
 const P = (...seg) => `${R}\\${seg.join("\\")}`;
@@ -294,4 +295,74 @@ test("analyzeProject: FastAPI 靶场生成 3 个候选并规划探测计划", as
   assert.equal(plan.adminListEndpoint?.path, "/api/admin/orders");
   assert.equal(plan.adminCancelEndpoint?.path, "/api/admin/orders/:order_id/cancel");
   assert.equal(plan.resource, "order");
+});
+
+/** 复刻开源靶场 vulnapi 的形态：FastAPI 查询参数是函数形参（不写 request.args），
+ *  值经 f-string / 拼接进入 SQL 与文件读取。修复前这两条链路都是漏报。 */
+const RANGE_MAIN = [
+  'from fastapi import FastAPI, Request',
+  "import sqlite3, os, time",
+  "",
+  "app = FastAPI()",
+  'sqldb = sqlite3.connect("data.sqlite")',
+  "",
+  '@app.get("/bank_codes/")',
+  'async def read_some_bank_codes(request: Request, code="1"):',
+  "    query = sqldb.cursor()",
+  '    parameter = f"select * from bank_codes where code=\'{code}\';"',
+  '    results = query.execute(parameter).fetchone()',
+  "    return {\"code\": results[1]}",
+  "",
+  '@app.get("/exchangerate/")',
+  'async def get_exchange_rates(request: Request, datestamp=time.strftime("%Y-%m-%d")):',
+  '    if os.path.exists("./data/" + datestamp):',
+  '        return open("./data/" + datestamp).read()',
+  '    return {"error": "missing"}',
+].join("\n");
+
+test("pythonHandlerParams: FastAPI 形参（字面量默认值/无注解）即查询参数", () => {
+  const sqliText = RANGE_MAIN.slice(RANGE_MAIN.indexOf('@app.get("/bank_codes/")'));
+  assert.deepEqual(pythonHandlerParams(sqliText.slice(0, 320)), [{ name: "code", channel: "query" }]);
+  const travText = RANGE_MAIN.slice(RANGE_MAIN.indexOf('@app.get("/exchangerate/")'));
+  assert.deepEqual(pythonHandlerParams(travText), [{ name: "datestamp", channel: "query" }]);
+});
+
+test("Python 信号：形参污点进入 query.execute 与 open 拼接", () => {
+  const sqliText = RANGE_MAIN.slice(RANGE_MAIN.indexOf('@app.get("/bank_codes/")'), RANGE_MAIN.indexOf('@app.get("/exchangerate/")'));
+  assert.deepEqual(findSqlInjectionSignal(sqliText), {
+    source: "query",
+    param: "code",
+    sink: "execute",
+    form: "variable",
+  });
+
+  const travText = RANGE_MAIN.slice(RANGE_MAIN.indexOf('@app.get("/exchangerate/")'));
+  const trav = findTraversalSignal(travText);
+  assert.equal(trav.param, "datestamp");
+  assert.equal(trav.sink, "open");
+  assert.equal(trav.source, "query");
+});
+
+test("analyzeProject: FastAPI 形参链路产出 sqli/traversal 候选", async () => {
+  const path = P("main.py");
+  const listing = { entries: [{ path, kind: "file", size: RANGE_MAIN.length }] };
+  const a = await analyzeProject({
+    projectRoot: R,
+    tokens: { project: "tok" },
+    rpc: {
+      request: async (method, params) => {
+        if (method === "fs.list") return listing;
+        if (method === "fs.read") return { content: RANGE_MAIN, size: RANGE_MAIN.length, redacted: false, redactions: [] };
+        throw new Error(`不应调用 ${method}`);
+      },
+    },
+  });
+  const byKind = Object.fromEntries(a.candidates.map((c) => [c.kind, c]));
+  assert.equal(byKind["sqli-suspect"]?.path, "/bank_codes");
+  assert.equal(byKind["sqli-suspect"]?.sqli.param, "code");
+  assert.equal(byKind["traversal-suspect"]?.path, "/exchangerate");
+  assert.equal(byKind["traversal-suspect"]?.traversal.param, "datestamp");
+
+  const plan = buildProbePlan(a);
+  assert.ok(plan.sqliCandidate || plan.traversalCandidate, "注入类候选要进入探测计划");
 });

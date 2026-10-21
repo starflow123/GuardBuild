@@ -579,7 +579,14 @@ impl Host {
                 &format!("用户拒绝授予作用域: {}", scope.summary()),
                 json!({}),
             );
-            return Err(HostError::ConsentDenied);
+            return Err(HostError::ConsentDenied(if self.cfg.gate {
+                format!(
+                    "CI gate 未预声明作用域 {grant_key}（拒绝即中止，不回落人工确认）。请在被测项目 guardbuild.json 的 scopes 中加入 \"{grant_key}\" 后重跑；已预声明: {}",
+                    self.cfg.granted_scopes.join(", ")
+                )
+            } else {
+                scope.summary()
+            }));
         }
 
         let ttl_ms: i64 = match p.kind.as_str() {

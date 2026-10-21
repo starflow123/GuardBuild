@@ -13,8 +13,8 @@ pub enum HostError {
     ScopeDenied(String),
     #[error("路径超出授权范围: {0}")]
     PathOutOfScope(String),
-    #[error("用户拒绝了授权请求")]
-    ConsentDenied,
+    #[error("授权被拒绝: {0}")]
+    ConsentDenied(String),
     #[error("目标不存在: {0}")]
     NotFound(String),
     #[error("状态冲突: {0}")]
@@ -41,7 +41,7 @@ impl HostError {
             HostError::TokenInvalid => 1001,
             HostError::ScopeDenied(_) => 1002,
             HostError::PathOutOfScope(_) => 1003,
-            HostError::ConsentDenied => 1004,
+            HostError::ConsentDenied(_) => 1004,
             HostError::NotFound(_) => 1005,
             HostError::Conflict(_) => 1007,
             HostError::Git(_) => 1008,
@@ -64,7 +64,7 @@ impl HostError {
             HostError::TokenInvalid => "token_invalid",
             HostError::ScopeDenied(_) => "scope_denied",
             HostError::PathOutOfScope(_) => "path_out_of_scope",
-            HostError::ConsentDenied => "consent_denied",
+            HostError::ConsentDenied(_) => "consent_denied",
             HostError::NotFound(_) => "not_found",
             HostError::Conflict(_) => "conflict",
             HostError::Git(_) => "git_error",

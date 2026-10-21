@@ -15,44 +15,10 @@
  * 修复策略：Python 的依赖注入/装饰器形态多元，v1 不提供自动修复；证据成立时按
  * vulnerable_unfixed 阻断并给出人工修复指引（与 NestJS/GraphQL 一致）。
  */
-import { callArgsSpan } from "./signals.mjs";
+import { callArgsSpan, pythonHandlerParams, splitTopLevel } from "./signals.mjs";
 
 const lineOf = (content, index) => content.slice(0, index).split("\n").length;
 const normFile = (p) => String(p).replace(/\\/g, "/");
-
-/** 按顶层逗号切分参数（忽略括号/方括号/引号内的逗号） */
-function splitTopLevel(s) {
-  const out = [];
-  let depth = 0;
-  let cur = "";
-  let quote = null;
-  for (let i = 0; i < s.length; i += 1) {
-    const ch = s[i];
-    if (quote) {
-      cur += ch;
-      if (ch === "\\") {
-        if (i + 1 < s.length) cur += s[i + 1];
-        i += 1;
-      } else if (ch === quote) quote = null;
-      continue;
-    }
-    if (ch === '"' || ch === "'" || ch === "`") {
-      quote = ch;
-      cur += ch;
-      continue;
-    }
-    if (ch === "(" || ch === "[" || ch === "{") depth += 1;
-    else if (ch === ")" || ch === "]" || ch === "}" ) depth -= 1;
-    else if (ch === "," && depth === 0) {
-      out.push(cur.trim());
-      cur = "";
-      continue;
-    }
-    cur += ch;
-  }
-  if (cur.trim()) out.push(cur.trim());
-  return out;
-}
 
 /** 首个字符串字面量（普通或 r"…" 前缀） */
 function firstStringLit(s) {
@@ -310,6 +276,9 @@ function collectFastApi(f, routers) {
     const fullPath = joinUrl(prefix, path);
     const forcedAuth = sig.auth || depSig.auth || AUTH_DECORATOR.test(text);
     const roleGuard = sig.role || depSig.role || pyRoleGuard(text) || undefined;
+    // 可寻址查询参数：Query(...)/标量注解之外的「未注解形参」（code="1"）同样是 FastAPI 查询参数
+    const handlerQuery = pythonHandlerParams(text).find((p) => p.channel === "query");
+    const qp = sig.queryParam ?? handlerQuery?.name ?? null;
     for (const method of uniqMethods) {
       sections.push({
         file: filePath,
@@ -321,7 +290,7 @@ function collectFastApi(f, routers) {
         forcedAuth,
         roleGuard: roleGuard || undefined,
         sinkHints: pySinkHints(text),
-        queryParamHint: sig.queryParam ? { param: sig.queryParam, form: "signature" } : pyQueryParam(text),
+        queryParamHint: qp ? { param: qp, form: "signature" } : pyQueryParam(text),
         ownerGuard: pyOwnerGuard(text),
         ownerFilter: pyOwnerFilter(text),
       });

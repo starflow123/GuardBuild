@@ -7,6 +7,7 @@
  */
 import { CASE_CATEGORY, RPC_TO_HOST, SEVERITY, VERDICT, shortId } from "../../shared/protocol.mjs";
 import { loginAll } from "./probe.mjs";
+import { followRedirects } from "./http-follow.mjs";
 
 const OPENAPI_PATHS = ["/swagger.json", "/openapi.json", "/v3/api-docs", "/api-docs", "/swagger-ui.json"];
 const COMMON_API_PATHS = [
@@ -79,14 +80,19 @@ async function httpJson(ctx, { baseUrl, method, path, identity = null, body = nu
   if (body != null) params.body = typeof body === "string" ? body : JSON.stringify(body);
   if (identity) params.identityRef = identity;
   try {
-    const res = await ctx.rpc.request(RPC_TO_HOST.HTTP_REQUEST, params, { timeoutMs: timeoutMs + 5_000 });
+    const followed = await followRedirects(
+      (url) => ctx.rpc.request(RPC_TO_HOST.HTTP_REQUEST, { ...params, url }, { timeoutMs: timeoutMs + 5_000 }),
+      params.url,
+      { method }
+    );
+    const res = followed.res;
     let json = null;
     try {
       json = JSON.parse(res.body);
     } catch {
       /* 非 JSON 响应 */
     }
-    return { ...res, json, ok: isOk(res.status) };
+    return { ...res, json, ok: isOk(res.status), redirects: followed.hops };
   } catch (e) {
     return { status: 0, statusText: "request_failed", body: "", json: null, ok: false, error: e.message };
   }
@@ -183,7 +189,9 @@ export async function discoverOpenapi(ctx, baseUrl) {
   return null;
 }
 
-/** OpenAPI 路径 → 路由列表；带 {param} 的模板单独标记（黑盒无法凭空构造有效 ID）。 */
+/** OpenAPI 路径 → 路由列表；带 {param} 的模板单独标记（黑盒无法凭空构造有效 ID）。
+ *  同时携带该操作声明的查询参数名（in=query）——注入/穿越用例必须打在真实参数上，
+ *  写死的参数名（如 q）对只做参数校验的框架会被静默忽略，造成漏报。 */
 export function openapiRoutes(found, limit = MAX_ROUTES) {
   const doc = found?.doc ?? null;
   if (!doc?.paths) return [];
@@ -194,16 +202,25 @@ export function openapiRoutes(found, limit = MAX_ROUTES) {
   } catch {
     base = "";
   }
+  const queryNames = (params) =>
+    Array.isArray(params)
+      ? params
+          .filter((p) => p && p.in === "query" && typeof p.name === "string" && p.name)
+          .map((p) => p.name)
+      : [];
   const out = [];
   for (const [p, methods] of Object.entries(doc.paths)) {
     if (!methods || typeof methods !== "object") continue;
     const path = `${base}${p.startsWith("/") ? p : `/${p}`}`;
+    const sharedParams = queryNames(methods.parameters);
     for (const method of Object.keys(methods)) {
       if (!["get", "post", "put", "patch", "delete"].includes(method.toLowerCase())) continue;
+      const op = methods[method] ?? {};
       out.push({
         method: method.toUpperCase(),
         path,
         templated: /\{[^}]+\}|:[A-Za-z_]\w*/.test(path),
+        queryParams: [...new Set([...sharedParams, ...queryNames(op.parameters)])].slice(0, 6),
         source: "openapi",
       });
       if (out.length >= limit) return out;
@@ -218,7 +235,7 @@ export async function bruteRoutes(ctx, baseUrl) {
   for (const p of COMMON_API_PATHS) {
     const res = await httpJson(ctx, { baseUrl, method: "GET", path: p });
     if (res.ok || isDenied(res.status)) {
-      found.push({ method: "GET", path: p, templated: false, source: "brute" });
+      found.push({ method: "GET", path: p, templated: false, status: res.status, source: "brute" });
     }
   }
   if (found.length) {
@@ -578,77 +595,160 @@ const SQL_ERROR_SIGNATURES = [
   "Microsoft SQL Server", "Unclosed quotation mark", "near \"", "syntax error",
 ];
 
+const slug = (s) =>
+  String(s)
+    .replace(/[^a-z0-9]+/gi, "-")
+    .replace(/^-|-$/g, "");
+
+/** 注入候选参数：OpenAPI 声明的参数优先（完整序列）；无规格的目标用常见参数名做轻量探测。
+ *  黑盒请求量必须设预算，否则 14 条路由 × 多参数会把目标打爆。 */
+const MAX_PARAMS_PER_ROUTE = 3;
+const MAX_SQLI_REQUESTS = 140;
+const MAX_TRAVERSAL_REQUESTS = 120;
+const GUESSED_PARAMS = ["q", "query", "search", "keyword"];
+
+function sqliParams(route) {
+  const declared = (route?.queryParams ?? []).filter((n) => typeof n === "string" && n.length > 0);
+  if (declared.length) return declared.slice(0, MAX_PARAMS_PER_ROUTE).map((name) => ({ name, declared: true }));
+  return GUESSED_PARAMS.slice(0, MAX_PARAMS_PER_ROUTE - 1).map((name) => ({ name, declared: false }));
+}
+
+const len = (r) => (r.body ?? "").length;
+
+/** 注入/穿越的请求配额要花在真实路由上：规格声明的路由优先，纯 404 占位的目录探测结果垫底 */
+function getRoutesForProbing(routes, limit) {
+  const rank = (r) => (r.source === "openapi" ? 0 : r.status === 404 ? 2 : 1);
+  return routes
+    .filter((r) => r.method === "GET")
+    .sort((a, b) => rank(a) - rank(b))
+    .slice(0, limit);
+}
+
+async function probeSqliOnParam(ctx, baseUrl, route, param, identity, budget, declared) {
+  const basePath = route.path;
+  const sep = basePath.includes("?") ? "&" : "?";
+  const url = (v) => `${basePath}${sep}${encodeURIComponent(param)}=${v}`;
+  const send = async (payload) => {
+    budget.remaining -= 1;
+    return httpJson(ctx, { baseUrl, method: "GET", path: url(encodeURIComponent(payload)), identity });
+  };
+
+  if (budget.remaining < (declared ? 5 : 3)) return null;
+  const baseline1 = await httpJson(ctx, { baseUrl, method: "GET", path: url("test"), identity });
+  budget.remaining -= 1;
+  if (baseline1.status === 0) return null;
+  const b1 = len(baseline1);
+
+  const errRes = await send("' OR 1=1--");
+  const errBody = errRes.body ?? "";
+  const signature = SQL_ERROR_SIGNATURES.find((s) => errBody.includes(s));
+  const errorRecord = () =>
+    makeRecord(ctx, baseUrl, {
+      caseId: `blackbox-sqli-error-${slug(`${basePath}:${param}`)}`,
+      name: `黑盒·SQL 注入（错误回显）${basePath} 参数 ${param}`,
+      method: "GET",
+      path: url(encodeURIComponent("' OR 1=1--")),
+      identity,
+      res: errRes,
+      expectation: "输入不得进入 SQL 语句导致数据库错误回显",
+      verdict: VERDICT.VULNERABLE,
+      actual: `响应包含数据库错误特征：${signature}`,
+      impact: "SQL 注入（错误回显）",
+    });
+  if (signature) return errorRecord();
+
+  // 单对象端点（fetchone/详情型）：正常值明确未命中，注入后却独占返回对象 → WHERE 条件被放开
+  const baseMissed = !isOk(baseline1.status) && (baseline1.status === 404 || baseline1.status === 400);
+  const obj = errRes.json;
+  if (
+    baseMissed &&
+    isOk(errRes.status) &&
+    obj != null &&
+    typeof obj === "object" &&
+    !Array.isArray(obj) &&
+    Object.keys(obj).length > 0
+  ) {
+    return makeRecord(ctx, baseUrl, {
+      caseId: `blackbox-sqli-single-${slug(`${basePath}:${param}`)}`,
+      name: `黑盒·SQL 注入（单对象条件绕过）${basePath} 参数 ${param}`,
+      method: "GET",
+      path: url(encodeURIComponent("' OR 1=1--")),
+      identity,
+      res: errRes,
+      expectation: "布尔条件不应让未命中的查询返回数据",
+      verdict: VERDICT.VULNERABLE,
+      actual: `基线 HTTP ${baseline1.status} 未命中，注入后返回对象（字段 ${Object.keys(obj).slice(0, 5).join(",")}）`,
+      impact: "SQL 注入（可绕过 WHERE 条件读取数据）",
+    });
+  }
+
+  // 恒真条件放大了结果集 → 用恒假条件对照，差值由注入而非业务波动解释
+  const falseRes = await send("' OR 1=2--");
+  const t = len(errRes);
+  const f = len(falseRes);
+  if (isOk(errRes.status) && isOk(falseRes.status) && b1 > 0 && t > b1 + Math.max(16, b1 * 0.3) && f < t * 0.5) {
+    return makeRecord(ctx, baseUrl, {
+      caseId: `blackbox-sqli-or-${slug(`${basePath}:${param}`)}`,
+      name: `黑盒·SQL 注入（恒真条件放开结果集）${basePath} 参数 ${param}`,
+      method: "GET",
+      path: url(encodeURIComponent("' OR 1=1--")),
+      identity,
+      res: errRes,
+      expectation: "布尔条件不应改变查询结果集",
+      verdict: VERDICT.VULNERABLE,
+      actual: `基线 ${b1}B → ' OR 1=1-- 得 ${t}B，' OR 1=2-- 仅 ${f}B`,
+      impact: "SQL 注入（可放开 WHERE 条件读取全量数据）",
+    });
+  }
+
+  if (!declared || budget.remaining < 3) return null;
+  const baseline2 = await httpJson(ctx, { baseUrl, method: "GET", path: url("test"), identity });
+  budget.remaining -= 1;
+  const stable = b1 > 0 && Math.abs(b1 - len(baseline2)) <= Math.max(1, b1 * 0.1);
+  if (!stable) return null;
+
+  const trueRes = await send("test' AND 1=1--");
+  const andFalse = await send("test' AND 1=2--");
+  const tt = len(trueRes);
+  const ff = len(andFalse);
+  const trueClose = Math.abs(tt - b1) <= Math.max(1, b1 * 0.2);
+  const falseDiff = Math.abs(ff - b1) > Math.max(16, b1 * 0.3);
+  if (isOk(trueRes.status) && isOk(andFalse.status) && trueClose && falseDiff) {
+    return makeRecord(ctx, baseUrl, {
+      caseId: `blackbox-sqli-blind-${slug(`${basePath}:${param}`)}`,
+      name: `黑盒·SQL 注入（布尔盲注）${basePath} 参数 ${param}`,
+      method: "GET",
+      path: url(encodeURIComponent("test' AND 1=1--")),
+      identity,
+      res: andFalse,
+      expectation: "布尔条件不应改变查询结果集",
+      verdict: VERDICT.VULNERABLE,
+      actual: `真条件响应 ${tt}B ≈ 基线 ${b1}B，假条件 ${ff}B 差异显著`,
+      impact: "SQL 注入（布尔盲注）",
+    });
+  }
+  return null;
+}
+
 async function probeSqli(ctx, baseUrl, routes, identity, limit = MAX_PROBE_ROUTES) {
   const records = [];
-  for (const route of routes.filter((r) => r.method === "GET").slice(0, limit)) {
-    const basePath = route.path;
-    const sep = basePath.includes("?") ? "&" : "?";
-    const baseline1 = await httpJson(ctx, { baseUrl, method: "GET", path: `${basePath}${sep}q=test`, identity });
-    if (baseline1.status === 0) continue;
-    const baseline2 = await httpJson(ctx, { baseUrl, method: "GET", path: `${basePath}${sep}q=test`, identity });
-    const len = (r) => (r.body ?? "").length;
-    const b1 = len(baseline1);
-    const b2 = len(baseline2);
-    const stable = b1 > 0 && Math.abs(b1 - b2) <= Math.max(1, b1 * 0.1);
-
-    const errRes = await httpJson(ctx, {
-      baseUrl,
-      method: "GET",
-      path: `${basePath}${sep}q=${encodeURIComponent("' OR 1=1--")}`,
-      identity,
-    });
-    const errBody = errRes.body ?? "";
-    const signature = SQL_ERROR_SIGNATURES.find((s) => errBody.includes(s));
-    if (signature) {
-      const rec = makeRecord(ctx, baseUrl, {
-        caseId: `blackbox-sqli-error-${basePath.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "")}`,
-        name: `黑盒·SQL 注入（错误回显）${basePath}`,
-        method: "GET",
-        path: `${basePath}${sep}q=' OR 1=1--`,
-        identity,
-        res: errRes,
-        expectation: "输入不得进入 SQL 语句导致数据库错误回显",
-        verdict: VERDICT.VULNERABLE,
-        actual: `响应包含数据库错误特征：${signature}`,
-        impact: "SQL 注入（错误回显）",
-      });
-      records.push(rec);
-      emitRecord(ctx, rec);
-      continue;
-    }
-
-    if (!stable) continue;
-    const trueRes = await httpJson(ctx, {
-      baseUrl,
-      method: "GET",
-      path: `${basePath}${sep}q=${encodeURIComponent("test' AND 1=1--")}`,
-      identity,
-    });
-    const falseRes = await httpJson(ctx, {
-      baseUrl,
-      method: "GET",
-      path: `${basePath}${sep}q=${encodeURIComponent("test' AND 1=2--")}`,
-      identity,
-    });
-    const t = len(trueRes);
-    const f = len(falseRes);
-    const trueClose = Math.abs(t - b1) <= Math.max(1, b1 * 0.2);
-    const falseDiff = Math.abs(f - b1) > Math.max(16, b1 * 0.3);
-    if (isOk(trueRes.status) && isOk(falseRes.status) && trueClose && falseDiff) {
-      const rec = makeRecord(ctx, baseUrl, {
-        caseId: `blackbox-sqli-blind-${basePath.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "")}`,
-        name: `黑盒·SQL 注入（布尔盲注）${basePath}`,
-        method: "GET",
-        path: `${basePath}${sep}q=test' AND 1=1--`,
-        identity,
-        res: falseRes,
-        expectation: "布尔条件不应改变查询结果集",
-        verdict: VERDICT.VULNERABLE,
-        actual: `真条件响应 ${t}B ≈ 基线 ${b1}B，假条件 ${f}B 差异显著`,
-        impact: "SQL 注入（布尔盲注）",
-      });
-      records.push(rec);
-      emitRecord(ctx, rec);
+  const budget = { remaining: MAX_SQLI_REQUESTS };
+  for (const route of getRoutesForProbing(routes, limit)) {
+    for (const { name, declared } of sqliParams(route)) {
+      if (budget.remaining < 3) {
+        ctx.emit({
+          kind: "discovery",
+          severity: SEVERITY.INFO,
+          message: `黑盒 SQLi 注入请求预算（${MAX_SQLI_REQUESTS}）已用尽，跳过剩余参数`,
+          data: { budget: MAX_SQLI_REQUESTS, route: route.path, param: name },
+        });
+        return records;
+      }
+      const rec = await probeSqliOnParam(ctx, baseUrl, route, name, identity, budget, declared);
+      if (rec) {
+        records.push(rec);
+        emitRecord(ctx, rec);
+      }
     }
   }
   return records;
@@ -658,33 +758,66 @@ const TRAVERSAL_PAYLOADS = ["../../../../etc/passwd", "..%2F..%2F..%2F..%2Fetc%2
 const TRAVERSAL_SIGNATURES = ["root:x:", "[fonts]", "[extensions]"];
 const TRAVERSAL_TEMPLATES = ["/api/files/{p}", "/files/{p}", "/static/{p}", "/download/{p}", "/api/download/{p}"];
 
-async function probeTraversal(ctx, baseUrl, identity) {
+async function probeTraversal(ctx, baseUrl, identity, routes = [], limit = MAX_PROBE_ROUTES) {
   const records = [];
   const tried = new Set();
+  const hit = (body) => TRAVERSAL_SIGNATURES.find((s) => body.includes(s));
+
+  const report = async (path, res, signature, label) => {
+    if (tried.has(path)) return;
+    tried.add(path);
+    const rec = makeRecord(ctx, baseUrl, {
+      caseId: `blackbox-traversal-${slug(path)}`,
+      name: `黑盒·路径穿越 ${label}`,
+      method: "GET",
+      path,
+      identity,
+      res,
+      expectation: "文件读取参数不得越出允许目录",
+      verdict: VERDICT.VULNERABLE,
+      actual: `响应包含系统文件特征：${signature}`,
+      impact: "任意文件读取",
+    });
+    records.push(rec);
+    emitRecord(ctx, rec);
+  };
+
   for (const tpl of TRAVERSAL_TEMPLATES) {
     for (const p of TRAVERSAL_PAYLOADS) {
       const path = tpl.replace("{p}", p);
       if (tried.has(path)) continue;
-      tried.add(path);
       const res = await httpJson(ctx, { baseUrl, method: "GET", path, identity });
-      const body = res.body ?? "";
-      const signature = TRAVERSAL_SIGNATURES.find((s) => body.includes(s));
+      const signature = hit(res.body ?? "");
       if (!signature) continue;
-      const rec = makeRecord(ctx, baseUrl, {
-        caseId: `blackbox-traversal-${path.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "")}`,
-        name: `黑盒·路径穿越 ${path}`,
-        method: "GET",
-        path,
-        identity,
-        res,
-        expectation: "文件读取参数不得越出允许目录",
-        verdict: VERDICT.VULNERABLE,
-        actual: `响应包含系统文件特征：${signature}`,
-        impact: "任意文件读取",
-      });
-      records.push(rec);
-      emitRecord(ctx, rec);
+      await report(path, res, signature, path);
       break;
+    }
+  }
+
+  // 已声明的查询参数：文件读取类参数（如 ?datestamp=/?file=）只有把 payload 打到真实参数名上才能复现
+  let budget = MAX_TRAVERSAL_REQUESTS;
+  for (const route of getRoutesForProbing(routes.filter((r) => r.queryParams?.length), limit)) {
+    for (const param of (route.queryParams ?? []).slice(0, MAX_PARAMS_PER_ROUTE)) {
+      if (budget < TRAVERSAL_PAYLOADS.length) {
+        ctx.emit({
+          kind: "discovery",
+          severity: SEVERITY.INFO,
+          message: `黑盒路径穿越请求预算（${MAX_TRAVERSAL_REQUESTS}）已用尽，跳过剩余参数`,
+          data: { budget: MAX_TRAVERSAL_REQUESTS, route: route.path, param },
+        });
+        return records;
+      }
+      const sep = route.path.includes("?") ? "&" : "?";
+      for (const p of TRAVERSAL_PAYLOADS) {
+        const path = `${route.path}${sep}${encodeURIComponent(param)}=${p}`;
+        if (tried.has(path)) continue;
+        const res = await httpJson(ctx, { baseUrl, method: "GET", path, identity });
+        budget -= 1;
+        const signature = hit(res.body ?? "");
+        if (!signature) continue;
+        await report(path, res, signature, `${route.path} 参数 ${param}`);
+        break;
+      }
     }
   }
   return records;
@@ -772,7 +905,7 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
   probes.push(...(await probeUnauthRead(ctx, baseUrl, routes, probeCap)));
   if (pair) probes.push(...(await probeIdor(ctx, baseUrl, routes, pair, probeCap)));
   if (who) probes.push(...(await probeSqli(ctx, baseUrl, routes, who, probeCap)));
-  probes.push(...(await probeTraversal(ctx, baseUrl, who)));
+  probes.push(...(await probeTraversal(ctx, baseUrl, who, routes)));
   if (pair && options.allowMutation) {
     probes.push(...(await probePutIdor(ctx, baseUrl, routes, pair, probeCap)));
   } else if (pair) {

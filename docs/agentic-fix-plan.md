@@ -103,7 +103,7 @@
 
 ### S1 · 先给眼睛（零新权限，最先做）
 
-改动点：`sidecar/main.mjs:975 buildFixFeedback()`
+落地位置：`sidecar/lib/fixfeedback.mjs`（原 `sidecar/main.mjs:975 buildFixFeedback()` 的薄实现已迁出并加厚）
 
 新增回传内容：
 1. 验证实例日志尾部（stdout + stderr 已带 `stream` 标记存进同一个 `RingBuffer`，`src-tauri/src/core/procops.rs:384` 起，取用即可）；
@@ -113,7 +113,9 @@
 
 配套：`sidecar/lib/targetconfig.mjs:384` 的 `fixRounds` 上限 3 → 5（仅 GUI 模式，gate 保持单轮）。
 
-**注意（S1 内含）**：这些日志会同时进入模型提示词与报告，出站前必须过 Host 的脱敏（`src-tauri/src/core/redact.rs`）；实现时先确认 `RingBuffer` 落的是 `resolve_log` 处理后的行还是原始行，未脱敏则在取用处补一道。
+**注意（S1 内含）**：这些日志会同时进入模型提示词与报告，出站前必须过 Host 的脱敏（`src-tauri/src/core/redact.rs`）。已核实：`proc.spawn` 传入的 `resolve_log`（`src-tauri/src/core/host.rs:1134`）对**每一条**日志行都做 `redactor.redact(line, vault)` 并恒返回 `Some`，因此 `RingBuffer` 落的即是脱敏行、`proc.logs` 出宿主即已脱敏（`procops.rs:398` 的 `unwrap_or(原始行)` 分支实际不可达）；取用侧无需再补一道，但报告/视图只回喂**摘要计数与诊断码**，日志原文不进产物。
+
+**落地记录（2026-10-22）**：已实现并合入。反馈构造独立成模块 `sidecar/lib/fixfeedback.mjs`（`buildFixFeedback` + `feedbackDigest`），诊断复用改为 `autostart.mjs` 导出的 `matchDiagnostics()`（返回全部命中而非首个）；`fixRounds` 上限 3 → 5（仅 GUI，gate 仍单轮）。回归：`sidecar/tests/fixfeedback.test.mjs`（7 项：日志/diff/诊断/预算/降级/摘要不含原文）+ `npm run e2e:fix-agent` 21 断言（新增「第二轮反馈带隔离实例真实日志」「带上一轮 diff」「摘要进 fixLoop 轮次记录」）。
 
 **价值**：不碰权限就提高现有单文件补丁的成功率。做完很可能发现，一部分「需要跨文件」的诉求本质是「agent 此前不知道错在哪」。
 

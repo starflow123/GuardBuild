@@ -461,11 +461,19 @@ function renderMarkdown(r) {
               `- 修复循环：共 ${r.patch.fixLoop.attempts} 轮（重试上限 ${r.patch.fixLoop.maxRounds}；${
                 r.patch.fixLoop.resolvedRound ? `第 ${r.patch.fixLoop.resolvedRound} 轮通过` : "未收敛"
               }）`,
-              ...r.patch.fixLoop.rounds.map((x) => {
+              ...r.patch.fixLoop.rounds.flatMap((x) => {
                 const v = x.verdict ?? {};
                 const failedText =
                   !x.pass && x.failed?.length ? `；失败用例：${x.failed.slice(0, 3).map((f) => esc(f)).join("；")}` : "";
-                return `  - 第 ${x.round} 轮：${x.pass ? "通过" : "未通过"}（攻击阻断 ${v.attackBlocked ?? 0}/${v.attackTotal ?? 0}，业务保持 ${v.businessPassed ?? 0}/${v.businessTotal ?? 0}；patch \`${String(x.patchHash ?? "").slice(0, 12)}…\`）${failedText}`;
+                const line = `  - 第 ${x.round} 轮：${x.pass ? "通过" : "未通过"}（攻击阻断 ${v.attackBlocked ?? 0}/${v.attackTotal ?? 0}，业务保持 ${v.businessPassed ?? 0}/${v.businessTotal ?? 0}；patch \`${String(x.patchHash ?? "").slice(0, 12)}…\`）${failedText}`;
+                if (!x.feedback || x.pass) return [line];
+                const fb = x.feedback;
+                return [
+                  line,
+                  `    - 回喂下一轮的证据：失败用例 ${fb.failedCases ?? 0} 条、隔离实例日志 ${fb.logLines ?? 0} 行${
+                    fb.targetExited ? `（进程已退出，退出码 ${fb.targetExitCode ?? "?"}）` : ""
+                  }${fb.diagnostics?.length ? `；诊断码 ${fb.diagnostics.join("、")}` : ""}；上一轮 diff ${fb.diffChars ?? 0} 字符`,
+                ];
               }),
             ]
           : []),

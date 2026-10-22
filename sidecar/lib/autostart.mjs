@@ -559,6 +559,19 @@ function tailLines(lines, n = 12) {
   return lines.slice(Math.max(0, lines.length - n));
 }
 
+/** 按诊断规则表全量扫描日志，返回每条命中（供修复循环回喂编码代理复用启动诊断知识） */
+export function matchDiagnostics(lines, { limit = 4 } = {}) {
+  const text = (Array.isArray(lines) ? lines : []).map((l) => String(l ?? "")).join("\n");
+  const hits = [];
+  for (const d of DIAGNOSTICS) {
+    const m = text.match(d.re);
+    if (!m) continue;
+    hits.push({ code: d.code, hint: d.hint, matched: String(m[0]).slice(0, 200) });
+    if (hits.length >= limit) break;
+  }
+  return hits;
+}
+
 /** 把启动失败日志翻译成可操作诊断；无日志时按退出状态给出通用建议 */
 export function diagnoseStartFailure({ output = [], exitCode = null, start = null } = {}) {
   const lines = (Array.isArray(output) ? output : []).map((l) => String(l ?? ""));

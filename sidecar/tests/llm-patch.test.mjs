@@ -207,7 +207,7 @@ test("契约 llm 字段：patch 跟随 enabled，autoVerify 默认开", () => {
   assert.equal(normalizeLlm({ enabled: true, patchMaxFiles: 99 }).patchMaxFiles, 10);
   assert.equal(normalizeLlm({ enabled: true }).fixRounds, 2, "默认允许两轮自纠错");
   assert.equal(normalizeLlm({ enabled: true, fixRounds: 0 }).fixRounds, 0);
-  assert.equal(normalizeLlm({ enabled: true, fixRounds: 99 }).fixRounds, 3, "上限三轮");
+  assert.equal(normalizeLlm({ enabled: true, fixRounds: 99 }).fixRounds, 5, "交互模式上限五轮（gate 始终单轮）");
 });
 
 const CANDIDATES = [

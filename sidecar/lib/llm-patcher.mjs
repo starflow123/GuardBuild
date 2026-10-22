@@ -264,7 +264,7 @@ export function buildPatchPrompt({ rel, candidates, evidence, snippet, note = nu
     note:
       note ??
       (feedback
-        ? "上一轮补丁未通过双重验收。请基于失败用例重新生成最小补丁：攻击必须被拒绝（401/403/空结果），业务基线必须保持原有 2xx 与响应契约。"
+        ? "上一轮补丁未通过双重验收。previous_attempt 里带有失败用例、修复后实例的真实日志尾部与上一轮 diff，请据此判断补丁的运行时后果，再重新生成最小补丁：攻击必须被拒绝（401/403/空结果），业务基线必须保持原有 2xx 与响应契约。"
         : "修复必须让上述攻击用例被拒绝（401/403/空结果），同时合法用户的正常请求仍返回 2xx。"),
     source_lines: snippet,
   };

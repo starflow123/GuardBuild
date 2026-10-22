@@ -311,6 +311,31 @@ async function main() {
     })(),
     ""
   );
+  const fb2 = (() => {
+    try {
+      return JSON.parse(state.prompts[1] ?? "{}").previous_attempt ?? {};
+    } catch {
+      return {};
+    }
+  })();
+  check(
+    "第二轮反馈带隔离实例真实日志（编码代理看得到运行后果）",
+    (fb2.target_log_tail ?? []).length >= 1 && typeof fb2.target_log_tail[0] === "string",
+    `logLines=${(fb2.target_log_tail ?? []).length} exited=${JSON.stringify(fb2.target_exit ?? null)} diagnostics=${JSON.stringify((fb2.diagnostics ?? []).map((d) => d.code))}`
+  );
+  check(
+    "第二轮反馈带上一轮落地 diff（避免重复同一改法）",
+    typeof fb2.previous_diff === "string" && fb2.previous_diff.includes("+"),
+    `diffChars=${String(fb2.previous_diff?.length ?? 0)}`
+  );
+  check(
+    "反馈摘要进 fixLoop 轮次记录（不含日志原文）",
+    (() => {
+      const fb = loop.rounds?.[0]?.feedback;
+      return !!fb && fb.logLines >= 1 && fb.diffChars > 0 && fb.failedCases >= 1 && !JSON.stringify(fb).includes("LLMPatchShop");
+    })(),
+    JSON.stringify(loop.rounds?.[0]?.feedback ?? null)
+  );
 
   check("视图记录修复循环 2 轮、上限 2", loop.attempts === 2 && loop.maxRounds === 2, `attempts=${loop.attempts} maxRounds=${loop.maxRounds}`);
   check("第 1 轮未通过、第 2 轮通过", loop.rounds?.[0]?.pass === false && loop.rounds?.[1]?.pass === true && loop.resolvedRound === 2, JSON.stringify((loop.rounds ?? []).map((r) => `${r.round}:${r.pass}`)));
@@ -334,6 +359,7 @@ async function main() {
     JSON.stringify(report?.patch?.fixLoop ?? null).slice(0, 160)
   );
   check("报告 markdown 含「修复循环」逐轮记录", md.includes("修复循环：共 2 轮") && md.includes("第 1 轮：未通过") && md.includes("第 2 轮：通过"), "");
+  check("报告 markdown 记录回喂证据的规模", md.includes("回喂下一轮的证据"), "");
   check("报告裁决为 verified", report?.verdict?.patchStatus === "verified" && report?.verdict?.outcome === "vulnerable", `patchStatus=${report?.verdict?.patchStatus}`);
 
   check("失败轮 worktree 已清理（只保留最终轮）", worktreeDirs().length <= 1, worktreeDirs().join(", ") || "none");

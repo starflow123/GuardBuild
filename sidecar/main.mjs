@@ -31,6 +31,7 @@ import { isEnabled as llmEnabled } from "./lib/llm.mjs";
 import { runBlackbox } from "./lib/blackbox.mjs";
 import { coverageSummary, describeOutcome } from "./lib/coverage.mjs";
 import { createPatch, writebackPatch, rollbackWorkspace, PatchError } from "./lib/patcher.mjs";
+import { buildFixFeedback, feedbackDigest } from "./lib/fixfeedback.mjs";
 import { emitReport } from "./lib/report.mjs";
 import {
   PROTOCOL_VERSION,
@@ -132,13 +133,15 @@ function createCtx(params) {
     docker: { containers: [], seq: 0 },
     cancelled: false,
     gate: params.gate === true,
+    outcomeLabel: null,
     _lastDecisionSeq: 0,
   };
   ctx.view.projectName = ctx.projectName;
   ctx.sm = new StateMachine(STATE.STARTING, (from, to) => {
     ctx.db.updateSessionState(ctx.sessionId, to);
     ctx.view.state = to;
-    ctx.view.stateLabel = STATE_LABELS[to] ?? to;
+    // 终态标签随状态同帧下发：exit 0 的语义结局（未命中覆盖范围等）不能显示成「执行出错」
+    ctx.view.stateLabel = (to === STATE.ERROR && ctx.outcomeLabel) || STATE_LABELS[to] || to;
     emit(ctx, {
       kind: "state",
       severity: to === STATE.ERROR || to === STATE.VERIFY_FAILED ? SEVERITY.WARN : SEVERITY.INFO,
@@ -972,29 +975,6 @@ function fixLoopView(loop, resolvedRound = null) {
   };
 }
 
-/** 把失败轮次的证据压缩成可回传编码代理的反馈（不含源码/身份/密钥） */
-function buildFixFeedback(post, verdict, round) {
-  const failed = post.evidence
-    .filter((e) => e.verdict === VERDICT.REGRESSED || e.verdict === VERDICT.INCONCLUSIVE)
-    .slice(0, 8)
-    .map((e) => ({
-      case: e.caseName ?? e.caseId ?? null,
-      category: e.caseCategory ?? null,
-      verdict: e.verdict,
-      actual: e.actual ?? null,
-      status: e.response?.status ?? null,
-    }));
-  return {
-    round,
-    reason: "上一轮补丁未通过双重验收",
-    attack_regressed: verdict.attackRegressed,
-    business_regressed: verdict.businessRegressed,
-    failed_cases: failed,
-    instruction:
-      "请重新生成最小补丁：所有攻击用例必须被拒绝（401/403/空结果），业务基线必须保持原有 2xx 与响应契约；不要重复上一轮的改动方式。",
-  };
-}
-
 // ---------- 工作流各阶段 ----------
 
 async function stageAnalyze(ctx) {
@@ -1320,7 +1300,7 @@ async function stagePatch(ctx) {
   const maxFixRounds =
     !ctx.gate && autoVerify
       ? Number.isFinite(configuredRounds)
-        ? Math.min(3, Math.max(0, Math.floor(configuredRounds)))
+        ? Math.min(5, Math.max(0, Math.floor(configuredRounds)))
         : 2
       : 0;
   ctx.fixLoop = { maxRounds: maxFixRounds, round: 0, rounds: [] };
@@ -1452,7 +1432,15 @@ async function stageVerify(ctx) {
 
       let result;
       try {
-        result = await createPatch(ctx, { feedback: buildFixFeedback(post, verdict, roundNo) });
+        const feedback = await buildFixFeedback(ctx, {
+          post,
+          verdict,
+          round: roundNo,
+          previousDiff: ctx.view.patch?.diff ?? null,
+        });
+        const prevRound = loop.rounds[loop.rounds.length - 1];
+        if (prevRound && prevRound.round === roundNo) prevRound.feedback = feedbackDigest(feedback);
+        result = await createPatch(ctx, { feedback });
       } catch (e) {
         const err = new SessionError(`修复循环在第 ${nextRound} 轮中止：${e.message}`, {
           code: "verify_failed",
@@ -1900,17 +1888,15 @@ async function failSession(ctx, e) {
     data: payload,
   });
   await removeWorktree(ctx);
-  if (ctx.sm.can(STATE.ERROR)) setState(ctx, STATE.ERROR);
-  else {
+  // 内部状态仍记为 error（便于会话槽位释放与终态判定），但面向用户的标签要说清语义：
+  // exit 0 的「未命中覆盖范围 / 未发现可复现漏洞」不是执行失败。
+  ctx.outcomeLabel = pres.kind === "failed" ? null : pres.stateLabel;
+  if (ctx.sm.can(STATE.ERROR)) {
+    setState(ctx, STATE.ERROR);
+  } else {
     ctx.sm.state = STATE.ERROR;
     ctx.view.state = STATE.ERROR;
-    ctx.view.stateLabel = STATE_LABELS[STATE.ERROR];
-    pushView(ctx);
-  }
-  // 内部状态仍记为 error（便于会话槽位释放与终态判定），但面向用户的标签
-  // 要说清语义：exit 0 的「未命中覆盖范围 / 未发现可复现漏洞」不是执行失败。
-  if (pres.kind !== "failed") {
-    ctx.view.stateLabel = pres.stateLabel;
+    ctx.view.stateLabel = ctx.outcomeLabel || STATE_LABELS[STATE.ERROR];
     pushView(ctx);
   }
   shutdownProcs(ctx).catch(() => {});

@@ -12,6 +12,7 @@
 - **验收防「只挡住一种写法」和「一刀切假修复」**：除基线用例外，引擎按三条只读轴自动派生同源攻击变体（换他人对象 ID / 换 ID 写法如前导零与首尾空格 / 换参数通道 `:id` ↔ `?id=`，每候选最多 6 条，变体全部由代码生成、模型不参与编写用例），补丁必须把同一越权入口的所有写法一起堵掉才算过；正向断言则要求**受害者本人**仍能读到自己的对象且**字段不比修复前少**，使「挂全局守卫一律 403」「删返回字段让攻击拿不到东西」这类假修复直接计为业务回归。修复前未复现的变体（该目标本就不认这种写法）不参与修复后计数，避免「这条路从来不通」被算成「补丁挡住了」；写/删类破坏性变体不做——修复前探针会删掉后续用例要读的对象，制造自伤式假通过
 - **验收落到「每条漏洞自己翻转」**：总体计数变好不算修复——补丁点名的每个入口（`METHOD 路径`）必须自己完成「修复前打穿 → 修复后阻断」，用例被判 `inconclusive` 或没能进入修复后阶段都算归因不成立，整轮判 `verify_failed`。这堵住了「修 A 端点顺带挡掉 B 的某种写法」被记成 B 已修复；被点名的注入/穿越/无鉴权候选（没有自动修复模板、只有编码代理能改）因此也必须复跑自己的用例，不再出现「声明修了却从未被验收」。补丁 hunk 是否落在该候选所在文件、距漏洞行多远会一并呈现，但只作线索不否决——真实修复常写在同文件的取数辅助函数里
 - **CI 门禁模式**：无人工交互、按预声明策略授权、结构性禁止写回——只输出报告与已验证补丁
+- **AI 修复「先看懂再动手」**：编码代理可在产出补丁前发起只读自查（`read` / `list` 隔离 worktree 里的真实源码，如它要改的文件所 import 的取数层），由 Sidecar 代执行、脱敏后回灌进下一轮提示；读得到不等于写得到——写入范围、逐条校验与双重验收一位没松
 
 ## 工作流原理
 
@@ -66,7 +67,7 @@ npm run e2e            # 主工作流 E2E（36 断言，自动生成 .demo 演�
 npm run e2e:gate       # CI gate 演练（53 断言，7 轮裁决 + 报告产物）
 npm run e2e:blackbox   # 纯黑盒外部扫描演练（22 断言：漏洞/已修复/Cookie 会话/不可达）
 npm run e2e:llm        # LLM 接入侦察演练（40 断言，本机 mock DeepSeek，含无密钥磁盘缓存复用轮）
-npm run e2e:llm-patch  # LLM 编码代理补丁演练（53 断言，本机 mock：守规矩 / 不守规矩 / 无密钥三轮）
+npm run e2e:llm-patch  # LLM 编码代理补丁演练（73 断言，本机 mock：守规矩 / 不守规矩 / 无密钥 / 先只读自查四轮）
 npm run e2e:fix-agent  # 本地修复循环演练（21 断言：首轮漏修 → 失败证据+运行日志回传 → 第二轮通过）
 npm run benchmark      # 精度基准（8 个标注靶场：漏报 / 误报 / 退出码一致性）
 npm run seed-demo      # 单独生成演示工作区 .demo/vibeshop（供桌面端手动演练）
@@ -116,7 +117,7 @@ npm run test:rust      # Rust Host
 - `responses`：声明列表 / 单体资源在响应 JSON 中的位置（点路径，如 `data.items`）；不声明时自适应——列表找「顶层数组 → 首个含 `id` 的对象数组」，单体找「首个对象值字段 → 响应自身」；资源名参与用例文案（`order` 显示为「订单」）
 - `identities`：支持 `username` / `email` / 自定义 `fields` 三种形状；至少 2 个，否则回退到内置演示身份；`role: "admin"` 的身份用于管理端用例
 - `scopes`：仅 CI gate 模式读取，作为「预声明授权」白名单；桌面模式不生效（仍逐次征求用户授权）
-- `llm`：可选 LLM 开关——接入侦察（`enabled` / `model` / `maxFiles`）与编码代理补丁（`patch` / `autoVerify` / `patchMaxFiles`），默认全关；启用与安全边界见下两节
+- `llm`：可选 LLM 开关——接入侦察（`enabled` / `model` / `maxFiles`）与编码代理补丁（`patch` / `autoVerify` / `patchMaxFiles` / `patchToolRounds`），默认全关；启用与安全边界见下两节
 - `docker`：可选容器沙箱（`enabled` / `image` / `containerPort` / `workdir` / `env` / `command` / `readyTimeoutMs`）；启用后目标只经受限 `docker run` 在容器内启动，见下节「Docker 容器沙箱」
 
 **真实项目接入的常见准备**：
@@ -161,26 +162,27 @@ npm run e2e:llm                # 本机 mock DeepSeek 演练，无需真实密�
 
 ```json
 {
-  "llm": { "enabled": false, "patch": true, "autoVerify": true, "patchMaxFiles": 6, "fixRounds": 2 },
+  "llm": { "enabled": false, "patch": true, "autoVerify": true, "patchMaxFiles": 6, "patchToolRounds": 2, "fixRounds": 2 },
   "scopes": ["project.read", "worktree.write", "proc.spawn", "net.probe", "net.egress:api.deepseek.com"]
 }
 ```
 
 ```bash
 export DEEPSEEK_API_KEY=...    # 只放环境变量；也可用 GUARDBUILD_LLM_PATCH=1 临时开启
-npm run e2e:llm-patch          # 本机 mock DeepSeek 三轮演练，无需真实密钥
+npm run e2e:llm-patch          # 本机 mock DeepSeek 四轮演练，无需真实密钥
 ```
 
 - 输出形状约束：模型只被允许返回补丁意图 JSON 对象 `{"patches":[{"file":"相对路径","search":"文件中逐字连续原文","replace":"替换后的文本","candidate":"METHOD /path","reason":"一句话"}]}`（JSON 模式、非流式），**不返回整份文件、不返回 diff**。Sidecar 把每条意图规整成 `{ find, replace, count: 1 }` 的精确锚点替换
+- 只读自查（agent 的「眼睛」，`patchToolRounds` 默认 2、上限 2）：所提供的源码不足以定位修法时（取数层、鉴权中间件、共享辅助函数在别的文件里），模型可先返回 `{"requests":[{"tool":"read","path":"src/db.js"},{"tool":"list","path":"src"}]}`，由 Sidecar 用**隔离 worktree 的只读令牌**代为执行，把脱敏后的内容回灌进下一轮提示再要补丁。守卫：只能 `read` / `list`，路径不得越出 worktree，依赖/产物/测试目录与依赖清单/锁文件/`guardbuild.json`/`.env`/证书私钥/数据库与配置类文件一律拒绝（启动契约里写着测试身份口令），只认源码扩展名；每轮最多 4 次调用、单文件 12000 字符、目录 80 条，重复请求走缓存，轮次用尽仍无补丁则诚实记「未产出补丁」而不是编造。**写权限一位没变**——自查只改变模型看得到什么，落地仍限候选文件、仍由 Sidecar 校验 + Host 写入 + 双重验收；被拒的读取请求连同原因回喂给模型，并在报告里逐条留痕
 - 逐条校验关（任一条不过即拒绝该条意图，不影响其余）：结构白名单（只收 `file` / `search` / `replace` / `candidate` / `reason`）→ 目标文件必须等于该候选定位到的源码文件（禁越界改文件）→ 禁改 `package.json` / 锁文件 / `guardbuild.json` / `.env` 与证书私钥类文件 / 配置（yml、toml、ini、conf、sql）/ 测试与 `fixtures` / 构建产物与 `node_modules` 目录 → 锚点须在文件中**唯一**命中（缺失或重复即拒绝）→ 新增内容不得含 `child_process` / `eval` / `new Function` / `rm -rf` 等与修复无关的危险调用 → `search` 与 `replace` 相同（空操作）即拒绝。单会话最多 6 个候选文件（`patchMaxFiles` 可调 1–10），每条意图限制锚点 80 行 / 新增 24 行
 - 自动双重验收（`autoVerify`，默认开）：补丁落地后在隔离 worktree 启动修复候选实例，自动跑「攻击用例（含引擎派生的同源变体）全部阻断 + 业务用例（含本人可见性与字段契约的正向断言）零回归」。通过 → 进入 `writeback_pending` 交您在界面审查 Diff 并授权写回；未通过 → 终态 `verify_failed`，`report.json` 保留漏洞裁决（`verdict: vulnerable` + `patchStatus: verify_failed`），gate 仍 exit 1 **不放行**，绝不把未验证的补丁交给人工
 - 修复循环（仅本地/GUI，`fixRounds` 默认 2、上限 5）：验收未通过时，把失败轮次的现场作为 `previous_attempt` 回传给编码代理——失败用例（用例名 / 实际响应 / 回归计数）+ 修复后隔离实例的真实日志尾部（经 Host `proc.logs`，每行入缓冲前已按保险库脱敏）+ 命中的启动/运行诊断码（复用自动接入的诊断规则表）+ 上一轮实际落地的 diff，然后从 HEAD 重新生成补丁并丢弃失败轮 worktree；每轮独立记录补丁 hash、验收裁决与「回喂了什么证据」的摘要（只记计数与诊断码，不含日志原文）。gate 模式始终单轮、不重试，避免 CI 里反复外发与耗时
 - 确定性模板补丁语义不变：仍走「人工批准后再验收」的 `patch_review` 流程，`autoVerify` 只作用于编码代理产出的补丁
-- 安全边界：提示词只含脱敏后的源码片段（密钥字符替换为 `***`）、候选端点与已复现的攻击证据，**不含 `guardbuild.json` 契约、测试身份口令与 API 密钥**；出站同样走 Host 的 `net.egress`；补丁只写隔离 worktree，gate 模式下原工作区结构性不可写
+- 安全边界：提示词只含脱敏后的源码片段（密钥字符替换为 `***`）、候选端点与已复现的攻击证据，**不含 `guardbuild.json` 契约、测试身份口令与 API 密钥**；只读自查同样只走 worktree 只读令牌 + 路径白名单 + Host 脱敏，读到的内容进提示词但不进报告（报告只记 `tool / path / ok / 字符数或条目数 / 被拒原因`）；出站同样走 Host 的 `net.egress`；补丁只写隔离 worktree，gate 模式下原工作区结构性不可写
 - 裁决边界不变：LLM 不判定漏洞、不生成身份，也不参与验收裁决——是否放行只由实测证据（攻击阻断 / 业务回归）决定
-- 可观测：视图与报告的补丁对象新增 `strategy: "llm-coding-agent"`、`autoVerify`、`llm`（模型 / token 用量 / 采纳与拒绝统计 / 涉及文件与补丁数）、`fixLoop`（`maxRounds` / `attempts` / `resolvedRound` / 逐轮 `verdict` 与失败用例）；`report.md` 新增「LLM 编码代理（补丁意图）」章节与逐轮修复循环记录，并逐条列出被拒绝的意图与原因；GUI 在补丁面板展示同一份统计与轮次
+- 可观测：视图与报告的补丁对象新增 `strategy: "llm-coding-agent"`、`autoVerify`、`llm`（模型 / token 用量 / 采纳与拒绝统计 / 涉及文件与补丁数 / `toolRounds` + `toolCalls` 只读自查留痕）、`fixLoop`（`maxRounds` / `attempts` / `resolvedRound` / 逐轮 `verdict` 与失败用例）；`report.md` 新增「LLM 编码代理（补丁意图）」章节（含「只读自查 N 轮，M 次调用」一行）与逐轮修复循环记录，并逐条列出被拒绝的意图与原因；GUI 在补丁面板展示同一份统计与轮次
 - 无密钥 / 未开启：编码代理整体关闭，行为回落到「模板能补就补，补不动就 `vulnerable_unfixed` + exit 1 交人工」，零模型调用、零外发
-- 回归：`npm run e2e:llm-patch`（53 断言，gate 三轮：守规矩模型 → 自动验收通过 exit 1 且全程不进 `patch_review`；不守规矩模型 → 越界与歧义锚点被拒、双重验收拦下 `verify_failed`；无密钥 → 零外发 + `vulnerable_unfixed`），靶场为 `fixtures/llm-patch-shop`（其取数形态经静态校验确认两条确定性模板都补不动）；`npm run e2e:fix-agent`（21 断言，本地模式两轮：首轮故意漏修 → 第二轮收到失败用例 + 隔离实例日志尾部 + 上一轮 diff 后补齐 → `writeback_pending`，含失败轮 worktree 清理与逐轮审计）
+- 回归：`npm run e2e:llm-patch`（73 断言，gate 四轮：守规矩模型 → 自动验收通过 exit 1 且全程不进 `patch_review`；不守规矩模型 → 越界与歧义锚点被拒、双重验收拦下 `verify_failed`；无密钥 → 零外发 + `vulnerable_unfixed`；先只读自查的模型 → read 取数层 + list 目录被代执行并脱敏回灌、read `guardbuild.json` 被路径守卫拒绝，补丁仍只落候选文件且逐候选归因通过），靶场为 `fixtures/llm-patch-shop`（其取数形态经静态校验确认两条确定性模板都补不动）；`npm run e2e:fix-agent`（24 断言，本地模式两轮：首轮故意漏修 → 第二轮收到失败用例 + 隔离实例日志尾部 + 上一轮 diff 后补齐 → `writeback_pending`，含失败轮 worktree 清理与逐轮审计）
 
 ## 精度基准（固定标注靶场）
 

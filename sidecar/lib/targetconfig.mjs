@@ -382,6 +382,8 @@ export function normalizeLlm(raw) {
     autoVerify: raw.autoVerify !== false,
     // 交互模式下的修复自纠错轮数（gate 始终单轮、不启用循环）
     fixRounds: Math.min(5, Math.max(0, Number.isFinite(raw.fixRounds) ? Math.floor(raw.fixRounds) : 2)),
+    // 编码代理的只读自查轮数（0 关闭；上限由 llm-patcher 的 MAX_TOOL_ROUNDS 兜住）
+    patchToolRounds: Math.min(2, Math.max(0, Number.isFinite(raw.patchToolRounds) ? Math.floor(raw.patchToolRounds) : 2)),
   };
   if (Number.isFinite(raw.patchMaxFiles)) {
     out.patchMaxFiles = Math.min(10, Math.max(1, Math.floor(raw.patchMaxFiles)));

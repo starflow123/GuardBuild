@@ -13,10 +13,15 @@
  *      于是「攻击未全部阻断」被双重验收拦下 → exit 1（verify_failed），补丁不会交给人工放行。
  *   r3 不提供密钥：编码代理关闭，模板又覆盖不到 → exit 1（vulnerable_unfixed / no_patchable_candidates），
  *      既不放行也不假装修复，且全程零模型调用。
+ *   r4 会先只读自查的模型：第一轮只要 read/list 上下文（读候选 import 的取数层、列目录、并试图读
+ *      guardbuild.json），Sidecar 在隔离 worktree 里代执行并把脱敏内容回灌进第二轮提示；
+ *      模型据此产出与 r1 相同的补丁 → 验收通过。路径守卫挡住契约文件，写入范围一位没变。
  *
  * 同时校验安全边界：
  *   - 出站走 Host http.request（回环地址用 net.probe 作用域令牌），密钥只从环境变量读取；
  *   - 发给模型的证据只含候选文件源码与已复现证据，不含 identities / 密码 / 契约内容 / 密钥；
+ *   - 只读自查只能用 worktree 令牌读 worktree 内的源码文件，配置/契约/数据文件由路径守卫拒绝，
+ *     读到的内容仍经 Host 脱敏（测试身份口令不进提示词）；
  *   - 密钥真实值不出现在 report.json / report.md / 事件流 / stderr；
  *   - gate 全程不改动被测工作区，结束后隔离 worktree 已清理。
  *
@@ -145,13 +150,52 @@ function startMockLlm() {
         } catch {
           /* 非法提示词：下面按无法修复响应 */
         }
+
+        const respond = (payload) => {
+          res.statusCode = 200;
+          res.setHeader("Content-Type", "application/json");
+          res.end(
+            JSON.stringify({
+              id: `mock-patch-${state.calls}`,
+              object: "chat.completion",
+              model: state.model ?? "deepseek-chat",
+              choices: [
+                {
+                  index: 0,
+                  message: { role: "assistant", content: JSON.stringify(payload) },
+                  finish_reason: "stop",
+                },
+              ],
+              usage: {
+                prompt_tokens: Math.ceil(userPrompt.length / 4),
+                completion_tokens: 180,
+                total_tokens: Math.ceil(userPrompt.length / 4) + 180,
+              },
+            })
+          );
+        };
+
+        // 只读自查：提示词里还没有 tool_history 时先索要上下文（含一次越界读契约的坏请求），
+        // Sidecar 代执行并回灌脱敏内容后，下一轮再产出补丁
+        if (promptObj && state.mode === "tool" && !Array.isArray(promptObj.tool_history)) {
+          state.returned.push("tool");
+          respond({
+            requests: [
+              { tool: "read", path: "src/data.js" },
+              { tool: "list", path: "src" },
+              { tool: "read", path: "guardbuild.json" },
+            ],
+            note: "mock: 先读候选文件 import 的取数层与目录结构",
+          });
+          return;
+        }
         const src = String(promptObj?.source_lines ?? "");
         const file = String(promptObj?.file ?? "src/app.js");
         const candidates = (promptObj?.candidates ?? []).map((c) => c.candidate);
         const patches = [];
         let note = "mock: 无法定位可安全修复的锚点";
 
-        if (promptObj && state.mode === "good") {
+        if (promptObj && (state.mode === "good" || state.mode === "tool")) {
           for (const cand of candidates) {
             const block = locateBlock(src, ID_VAR_BY_CANDIDATE[cand] ?? "");
             if (!block) continue;
@@ -198,28 +242,7 @@ function startMockLlm() {
           note = "mock: 混入越界与歧义锚点";
         }
         state.returned.push(patches.length);
-
-        res.statusCode = 200;
-        res.setHeader("Content-Type", "application/json");
-        res.end(
-          JSON.stringify({
-            id: `mock-patch-${state.calls}`,
-            object: "chat.completion",
-            model: state.model ?? "deepseek-chat",
-            choices: [
-              {
-                index: 0,
-                message: { role: "assistant", content: JSON.stringify({ patches, note }) },
-                finish_reason: "stop",
-              },
-            ],
-            usage: {
-              prompt_tokens: Math.ceil(userPrompt.length / 4),
-              completion_tokens: 180,
-              total_tokens: Math.ceil(userPrompt.length / 4) + 180,
-            },
-          })
-        );
+        respond({ patches, note });
       });
     });
     server.listen(0, "127.0.0.1", () => resolve({ server, port: server.address().port, state }));
@@ -308,7 +331,7 @@ function worktreeLeftovers() {
 }
 
 async function main() {
-  console.log("[LLM-PATCH] 0/3 准备演示目录…");
+  console.log("[LLM-PATCH] 0/4 准备演示目录…");
   rmSync(demoDir, { recursive: true, force: true });
   mkdirSync(dataDir, { recursive: true });
   if (!existsSync(exe)) {
@@ -323,27 +346,37 @@ async function main() {
 
   let r1;
   let r2;
+  let r3;
+  let r4;
   let callsAfterR1 = 0;
   let callsAfterR2 = 0;
+  let callsAfterR3 = 0;
+  let callsAfterR4 = 0;
   try {
-    console.log("\n[LLM-PATCH] 1/3 守规矩的编码代理：期望 exit 1（自动双重验收通过的补丁）…");
+    console.log("\n[LLM-PATCH] 1/4 守规矩的编码代理：期望 exit 1（自动双重验收通过的补丁）…");
     state.mode = "good";
     r1 = await runGate(makeWorkspace("patch-good"), "r1", llmEnv);
     callsAfterR1 = state.calls;
 
-    console.log("\n[LLM-PATCH] 2/3 不守规矩的编码代理：期望被校验拒绝并由双重验收拦下…");
+    console.log("\n[LLM-PATCH] 2/4 不守规矩的编码代理：期望被校验拒绝并由双重验收拦下…");
     state.mode = "sloppy";
     r2 = await runGate(makeWorkspace("patch-sloppy"), "r2", llmEnv);
     callsAfterR2 = state.calls;
+
+    console.log("\n[LLM-PATCH] 3/4 不提供密钥：期望编码代理关闭且诚实判定漏洞未修复…");
+    r3 = await runGate(makeWorkspace("patch-off"), "r3", {
+      DEEPSEEK_API_KEY: "",
+      DEEPSEEK_BASE_URL: "",
+    });
+    callsAfterR3 = state.calls;
+
+    console.log("\n[LLM-PATCH] 4/4 会只读自查的编码代理：先要 read/list 上下文，再据回灌的源码产出补丁…");
+    state.mode = "tool";
+    r4 = await runGate(makeWorkspace("patch-tool"), "r4", llmEnv);
+    callsAfterR4 = state.calls;
   } finally {
     await new Promise((r) => server.close(r));
   }
-
-  console.log("\n[LLM-PATCH] 3/3 不提供密钥：期望编码代理关闭且诚实判定漏洞未修复…");
-  const r3 = await runGate(makeWorkspace("patch-off"), "r3", {
-    DEEPSEEK_API_KEY: "",
-    DEEPSEEK_BASE_URL: "",
-  });
 
   // ======================= r1：补丁意图 → 自动验收通过 =======================
   const g1 = r1.gate ?? {};
@@ -576,18 +609,66 @@ async function main() {
     `verdict=${g3.verdict} code=${g3.error?.code}`
   );
   check("r3 裁决提示指向 llm.patch 开关", String(g3.error?.hint ?? "").includes("llm.patch"), `hint=${String(g3.error?.hint ?? "").slice(0, 48)}…`);
-  check("r3 零模型调用（未配密钥不外发）", state.calls === callsAfterR2, `calls=${state.calls}`);
+  check("r3 零模型调用（未配密钥不外发）", callsAfterR3 === callsAfterR2, `calls=${callsAfterR3}`);
   check("r3 未出现编码代理补丁事件", !r3.stdout.includes("LLM 编码代理为"), "");
   check("r3 报告无补丁对象", rep3?.patch === null, `patch=${rep3?.patch ? "有" : "无"}`);
   const vuln3 = (rep3?.evidence?.pre ?? []).filter((e) => e.verdict === "vulnerable");
   check("r3 修复前证据仍复现越权（≥ 2）", vuln3.length >= 2, `vulnerable=${vuln3.length}`);
   check("r3 被测工作区未被修改", git(["status", "--porcelain"], path.join(demoDir, "patch-off")).trim() === "", "");
 
+  // ======================= r4：只读自查 → 据真实上下文产出补丁 =======================
+  const g4 = r4.gate ?? {};
+  const v4 = lastView(r4.stdout) ?? {};
+  const llm4 = v4.patch?.llm ?? {};
+  const rep4 = readReport("r4");
+  const md4 = readMd("r4");
+  // r4 的两条提示词：第一条没有 tool_history（只要上下文），第二条带着自查结果
+  const tp1 = state.prompts[callsAfterR3] ?? "";
+  const tp2 = state.prompts[callsAfterR3 + 1] ?? "";
+
+  check("r4 退出码 = 1 且补丁经自动双重验收通过", r4.code === 1 && g4.patchStatus === "verified", `code=${r4.code} patchStatus=${g4.patchStatus} state=${g4.state}`);
+  check("r4 只读自查多花一轮往返（本轮 2 次调用，累计 4）", callsAfterR4 - callsAfterR3 === 2 && callsAfterR4 === 4, `calls=${callsAfterR4} delta=${callsAfterR4 - callsAfterR3}`);
+  check("r4 首轮提示不带 tool_history（自查前）", tp1.includes("tool_history") === false && tp1.includes("GET /api/orders/:id"), `${tp1.length} 字符`);
+  check(
+    "r4 次轮提示含自查回灌：真实取数层源码 + 目录清单 + 被拒请求的原因",
+    tp2.includes("tool_history") &&
+      tp2.includes("export function findOrderById") &&
+      tp2.includes("src/app.js") &&
+      /guardbuild\.json/.test(tp2) &&
+      tp2.includes("属于依赖清单"),
+    `${tp2.length} 字符`
+  );
+  check("r4 自查内容已脱敏：取数层里的测试口令不进提示词", !tp2.includes("alice123") && !tp2.includes(MOCK_KEY), "");
+  check("r4 提示词不含启动契约内容（只给了读取被拒的事实）", !tp2.includes("readyPattern") && !tp2.includes("identities"), "");
+  check(
+    "视图记录只读自查统计（1 轮：读源码 + 列目录成功，读契约被路径守卫拒绝）",
+    llm4.toolRounds === 1 &&
+      (llm4.toolCalls ?? []).some((t) => t.tool === "read" && t.path === "src/data.js" && t.ok === true && Number(t.chars) > 0) &&
+      (llm4.toolCalls ?? []).some((t) => t.tool === "list" && t.path === "src" && t.ok === true && Number(t.entries) > 0) &&
+      (llm4.toolCalls ?? []).some((t) => t.tool === "read" && t.path === "guardbuild.json" && t.ok === false),
+    `toolRounds=${llm4.toolRounds} calls=${JSON.stringify((llm4.toolCalls ?? []).map((t) => `${t.tool}:${t.path}:${t.ok}`))}`
+  );
+  check(
+    "r4 补丁仍只落在候选文件（读权限扩大没有带动写权限）",
+    (llm4.appliedFiles ?? []).length === 1 &&
+      llm4.appliedFiles[0].file === "src/app.js" &&
+      llm4.appliedOps === 2 &&
+      (llm4.rejected ?? []).length === 0,
+    `appliedFiles=${JSON.stringify(llm4.appliedFiles)} appliedOps=${llm4.appliedOps}`
+  );
+  check("r4 双重验收通过 + 归因：点名的 2 个入口均自行翻转", v4.acceptance?.pass === true && (v4.acceptance?.attribution?.claimedCount ?? 0) === 2 && v4.acceptance.attribution.blockedCount === 2, `attack=${v4.acceptance?.attackBlocked}/${v4.acceptance?.attackTotal} claimed=${v4.acceptance?.attribution?.claimedCount} blocked=${v4.acceptance?.attribution?.blockedCount}`);
+  check("r4 报告写入 toolRounds 与逐次只读调用留痕", rep4?.patch?.llm?.toolRounds === 1 && (rep4?.patch?.llm?.toolCalls ?? []).length === 3, `toolRounds=${rep4?.patch?.llm?.toolRounds} toolCalls=${(rep4?.patch?.llm?.toolCalls ?? []).length}`);
+  check("r4 报告 markdown 有「只读自查」留痕行", md4.includes("只读自查") && md4.includes("写入范围未变"), (md4.match(/\| 只读自查[^\n]*/) ?? [""])[0].slice(0, 160));
+  check("r4 事件流说明自查只读 worktree 源码", /只读自查/.test(r4.stdout) || /只读自查/.test(md4), "");
+  check("r4 被测工作区未被修改", git(["status", "--porcelain"], path.join(demoDir, "patch-tool")).trim() === "", "");
+  check("r4 隔离 worktree 已清理", worktreeLeftovers().length === 0, worktreeLeftovers().slice(0, 3).join(", ") || "none");
+
   // ======================= 密钥不泄漏 =======================
   const blob = [
     JSON.stringify(rep1 ?? {}), md1, r1.stdout, r1.stderr,
     JSON.stringify(rep2 ?? {}), md2, r2.stdout, r2.stderr,
     JSON.stringify(rep3 ?? {}), readMd("r3"), r3.stdout, r3.stderr,
+    JSON.stringify(rep4 ?? {}), md4, r4.stdout, r4.stderr,
   ].join("\n");
   check("mock 密钥不进入报告/事件流/stderr", !blob.includes(MOCK_KEY), "");
 

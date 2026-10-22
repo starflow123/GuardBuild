@@ -6,7 +6,11 @@ import {
   buildPatchPrompt,
   patchEnabled,
   requestPatchIntent,
+  parseToolRequests,
+  toolPathAllowed,
+  makeReadTools,
 } from "../lib/llm-patcher.mjs";
+import { RPC_TO_HOST } from "../../shared/protocol.mjs";
 import { normalizeLlm } from "../lib/targetconfig.mjs";
 
 const REL = "src/routes/orders.js";

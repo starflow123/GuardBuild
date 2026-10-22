@@ -3,6 +3,8 @@
  *
  * 信任模型（与侦察模块同一条边界）：
  *  - LLM 只能返回 {file, search, replace, reason}，不写文件、不执行命令、不批准补丁；
+ *    自查代码时只能返回 {requests:[{tool:"read"|"list",path}]}，由 Sidecar 用隔离 worktree 的
+ *    只读令牌执行并回喂脱敏内容——模型自己不接触文件系统，路径与规模都受白名单约束；
  *  - 真正的写入由 Host 在隔离 worktree 的真实字节上执行（fs.write，count=1），
  *    Sidecar 先在真实内容上校验锚点唯一、文件在候选范围内、改动规模受限；
  *  - 补丁生成后仍要跑「攻击用例失效 + 业务用例不回归」双重验收，通过才交人工审查；
@@ -34,6 +36,14 @@ const TEST_FILE_RE = /(?:\.(?:test|spec)\.[cm]?[jt]sx?$|_test\.go$|test_[^/]+\.p
 // 补丁里新增这些调用意味着「修复」在做与本漏洞无关的事（起进程/执行任意代码）
 const DANGEROUS_ADDITION_RE = /(?:\bchild_process\b|\brequire\s*\(\s*['"]child_process|\bimport\s+[\s\S]{0,40}child_process|\beval\s*\(|\bnew\s+Function\s*\(|\brm\s+-rf\b)/i;
 
+// 只读工具循环的预算：轮次与每轮调用数都封顶，超出即按「未产出补丁」诚实收尾
+const MAX_TOOL_ROUNDS = 2;
+const MAX_TOOL_REQUESTS_PER_ROUND = 4;
+const MAX_TOOL_FILE_CHARS = 12_000;
+const MAX_TOOL_LIST_ENTRIES = 80;
+const TOOL_TIMEOUT_MS = 20_000;
+const TOOL_KINDS = new Set(["read", "list"]);
+
 function normRel(v) {
   return String(v ?? "").replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+/g, "/");
 }
@@ -49,6 +59,104 @@ export function patchTargetAllowed(rel) {
   if (TEST_FILE_RE.test(r)) return { ok: false, reason: "属于测试文件" };
   if (!SOURCE_EXT_RE.test(r)) return { ok: false, reason: "不是可识别的源码文件" };
   return { ok: true, reason: null };
+}
+
+/**
+ * 只读工具的路径守卫。读比写宽（可以看它 import 的模块），但绝不放目录越界，
+ * 也不放依赖清单/锁文件/配置/环境文件/数据库进提示词——启动契约里就写着测试身份口令。
+ */
+export function toolPathAllowed(rel, { forList = false } = {}) {
+  const r = normRel(rel);
+  if (!r) return { ok: false, reason: forList ? "缺少 path（用 \".\" 表示 worktree 根）" : "缺少 path" };
+  if (r.includes("..") || r.startsWith("/") || /^[A-Za-z]:[\\/]/.test(String(rel ?? ""))) {
+    return { ok: false, reason: "路径越出隔离 worktree" };
+  }
+  if (FORBIDDEN_DIR_RE.test(r)) return { ok: false, reason: "位于依赖/产物/测试目录" };
+  if (!forList) {
+    if (FORBIDDEN_FILE_RE.test(r)) return { ok: false, reason: "属于依赖清单、锁文件、配置、密钥或数据文件" };
+    if (!SOURCE_EXT_RE.test(r)) return { ok: false, reason: "不是可识别的源码文件" };
+  }
+  return { ok: true, reason: null };
+}
+
+/**
+ * 解析模型的只读工具请求。
+ * @returns {{ asked: boolean, requests: Array<{tool:string,path:string}>, rejected: object[] }}
+ */
+export function parseToolRequests(raw) {
+  const asked = raw && typeof raw === "object" && raw.requests !== undefined;
+  const requests = [];
+  const rejected = [];
+  if (!asked) return { asked: false, requests, rejected };
+  if (!Array.isArray(raw.requests)) {
+    return { asked: true, requests, rejected: [{ tool: null, path: null, reason: "requests 必须是数组" }] };
+  }
+  for (const item of raw.requests) {
+    const tool = String(item?.tool ?? "").toLowerCase();
+    const path = String(item?.path ?? "");
+    if (requests.length >= MAX_TOOL_REQUESTS_PER_ROUND) {
+      rejected.push({ tool: tool || null, path: normRel(path) || null, reason: `单轮最多 ${MAX_TOOL_REQUESTS_PER_ROUND} 次只读调用` });
+      continue;
+    }
+    if (!TOOL_KINDS.has(tool)) {
+      rejected.push({ tool: tool.slice(0, 24) || null, path: normRel(path) || null, reason: "只支持 read / list 两种只读工具" });
+      continue;
+    }
+    const allowed = toolPathAllowed(path, { forList: tool === "list" });
+    if (!allowed.ok) {
+      rejected.push({ tool, path: normRel(path) || null, reason: allowed.reason });
+      continue;
+    }
+    requests.push({ tool, path: normRel(path) });
+  }
+  return { asked: true, requests, rejected };
+}
+
+/**
+ * 绑定到隔离 worktree 的只读工具实现（走 Host fs.list / fs.read，默认脱敏）。
+ * 目录列表的绝对路径回给模型前一律折成 worktree 相对路径。
+ */
+export function makeReadTools(ctx, wtRoot, { timeoutMs = TOOL_TIMEOUT_MS } = {}) {
+  const root = String(wtRoot ?? "").replace(/[\\/]+$/, "");
+  const rootSlash = root.replace(/\\/g, "/");
+  const relOf = (abs) => {
+    const a = String(abs ?? "").replace(/\\/g, "/");
+    if (a.toLowerCase().startsWith(rootSlash.toLowerCase())) {
+      return a.slice(rootSlash.length).replace(/^\/+/, "") || ".";
+    }
+    return a;
+  };
+  const toRel = (v) => (v === "." || !v ? "" : normRel(v));
+  const join = (v) => {
+    const r = toRel(v);
+    return r ? `${root}/${r}` : root;
+  };
+  return {
+    async read(rel) {
+      const res = await ctx.rpc.request(
+        RPC_TO_HOST.FS_READ,
+        { token: ctx.tokens.worktree, path: join(rel) },
+        { timeoutMs }
+      );
+      return String(res?.content ?? "");
+    },
+    async list(rel) {
+      const res = await ctx.rpc.request(
+        RPC_TO_HOST.FS_LIST,
+        { token: ctx.tokens.worktree, path: join(rel), depth: 2 },
+        { timeoutMs }
+      );
+      const out = [];
+      for (const e of res?.entries ?? []) {
+        const r = relOf(e?.path);
+        if (!r || r.includes("..")) continue;
+        if (FORBIDDEN_DIR_RE.test(r)) continue;
+        out.push({ path: r, kind: e?.kind ?? (e?.dir ? "dir" : "file") });
+        if (out.length >= MAX_TOOL_LIST_ENTRIES) break;
+      }
+      return out;
+    },
+  };
 }
 
 function countOccurrences(haystack, needle) {
@@ -252,11 +360,12 @@ const SYSTEM_PROMPT = `你是资深应用安全工程师，为「已通过动态
 2. search 必须逐字复制所提供源码中真实存在的连续片段（含缩进与标点），并在该文件中唯一出现；不要改写、不要省略、不要加行号。
 3. replace 是最小改动：只加入权限/归属校验或参数化处理，保持原有功能与响应契约，不重构、不调整格式、不新增依赖、不改动其它逻辑。
 4. 不得改动依赖清单、锁文件、配置、环境变量、测试或数据文件；只改所提供的那一个源码文件。
-5. 无法在单文件内安全修复时，返回 {"patches":[]} 并在 note 字段说明原因，不要勉强编造补丁。
-6. 不要输出代码之外的解释文字，不要输出 markdown 代码块以外的内容。`;
+5. 所提供源码不足以定位正确修法时（例如取数逻辑、鉴权中间件、共享辅助函数在别的文件里），先返回只读自查请求：{"requests":[{"tool":"read","path":"src/db.js"},{"tool":"list","path":"src"}]}。Sidecar 只会在隔离 worktree 里执行 read/list，把脱敏后的内容回灌进下一轮提示，最多 2 轮、每轮最多 4 次，且只能读源码文件；自查结束后仍然只输出对那一个候选文件的补丁。
+6. 无法在单文件内安全修复时，返回 {"patches":[]} 并在 note 字段说明原因，不要勉强编造补丁。
+7. 不要输出代码之外的解释文字，不要输出 markdown 代码块以外的内容。`;
 
 /** 构造提示词：只喂脱敏后的源码片段、已固化证据与上一轮失败反馈 */
-export function buildPatchPrompt({ rel, candidates, evidence, snippet, note = null, feedback = null }) {
+export function buildPatchPrompt({ rel, candidates, evidence, snippet, note = null, feedback = null, toolHistory = [] }) {
   const body = {
     file: normRel(rel),
     candidates: describeCandidates(candidates),
@@ -264,11 +373,13 @@ export function buildPatchPrompt({ rel, candidates, evidence, snippet, note = nu
     note:
       note ??
       (feedback
-        ? "上一轮补丁未通过双重验收。previous_attempt 里带有失败用例、修复后实例的真实日志尾部与上一轮 diff，请据此判断补丁的运行时后果，再重新生成最小补丁：攻击必须被拒绝（401/403/空结果），业务基线必须保持原有 2xx 与响应契约。"
+        ? "上一轮补丁未通过双重验收。previous_attempt 里带有失败用例、修复后实例的真实日志尾部与上一轮 diff，请据此判断补丁的运行时后果，再重新生成最小补丁：攻击必须被拒绝（401/403/空结果），业务基线必须保持原有 2xx 与响应契约。若所需上下文在其它文件，按规则 5 先发起只读自查。"
         : "修复必须让上述攻击用例被拒绝（401/403/空结果），同时合法用户的正常请求仍返回 2xx。"),
     source_lines: snippet,
   };
   if (feedback) body.previous_attempt = feedback;
+  // 只读自查的历史结果累积呈现：模型看到的是同一条上下文链，不依赖多轮会话状态
+  if (toolHistory.length) body.tool_history = toolHistory;
   return JSON.stringify(body, null, 1);
 }
 
@@ -305,13 +416,29 @@ async function readRedactedSnippet(ctx, file, readRedacted) {
 
 /**
  * 为一个文件的候选请求补丁意图。
- * @returns {Promise<{ops:object[], accepted:object[], rejected:object[], model:string|null, usage:object|null, failure:string|null}>}
+ * 模型可以先发起只读自查（read/list），由 Sidecar 在隔离 worktree 上代执行并回喂脱敏内容；
+ * 写权限不受影响——自查只改变「模型看得到什么」，不改变「谁能改文件」。
+ * @returns {Promise<{ops:object[], accepted:object[], rejected:object[], model:string|null, usage:object|null, failure:string|null, toolRounds:number, toolCalls:object[]}>}
  */
 export async function requestPatchIntent(
   ctx,
-  { file, rel, content, candidates, evidence, model = null, getToken, chatImpl = chat, maxFiles = MAX_LLM_FILES_PER_SESSION, readRedacted = null, feedback = null } = {}
+  {
+    file,
+    rel,
+    content,
+    candidates,
+    evidence,
+    model = null,
+    getToken,
+    chatImpl = chat,
+    maxFiles = MAX_LLM_FILES_PER_SESSION,
+    readRedacted = null,
+    feedback = null,
+    tools = null,
+    maxToolRounds = MAX_TOOL_ROUNDS,
+  } = {}
 ) {
-  const empty = { ops: [], accepted: [], rejected: [], model: model ?? null, usage: null, failure: null };
+  const empty = { ops: [], accepted: [], rejected: [], model: model ?? null, usage: null, failure: null, toolRounds: 0, toolCalls: [] };
   if (!Array.isArray(candidates) || candidates.length === 0) return empty;
 
   const allowed = patchTargetAllowed(rel);
@@ -332,34 +459,114 @@ export async function requestPatchIntent(
   }
 
   const candidateKeys = describeCandidates(candidates).map((c) => c.candidate);
-  const userPrompt = buildPatchPrompt({
-    rel,
-    candidates,
-    evidence,
-    snippet: snippet.snippet,
-    feedback,
-  });
+  // 配置只能收紧不能放宽
+  const roundsCap = Number.isFinite(maxToolRounds)
+    ? Math.max(0, Math.min(MAX_TOOL_ROUNDS, Math.floor(maxToolRounds)))
+    : MAX_TOOL_ROUNDS;
 
-  let res;
-  try {
-    res = await chatImpl(ctx, {
-      systemPrompt: SYSTEM_PROMPT,
-      userPrompt,
-      getToken,
-      model,
-      timeoutMs: PATCH_TIMEOUT_MS,
-      maxTokens: 1200,
-      purpose: "发送补丁意图（编码代理）",
+  const toolHistory = [];
+  const toolCalls = [];
+  const cache = new Map();
+  let roundsUsed = 0;
+  let res = null;
+  let raw = null;
+  let failure = null;
+
+  for (let step = 0; ; step++) {
+    const userPrompt = buildPatchPrompt({
+      rel,
+      candidates,
+      evidence,
+      snippet: snippet.snippet,
+      feedback,
+      toolHistory,
     });
-  } catch (e) {
-    return { ...empty, failure: `LLM 请求失败：${e?.message ?? e}` };
+    try {
+      res = await chatImpl(ctx, {
+        systemPrompt: SYSTEM_PROMPT,
+        userPrompt,
+        getToken,
+        model,
+        timeoutMs: PATCH_TIMEOUT_MS,
+        maxTokens: 1200,
+        purpose: roundsUsed ? "只读自查后重发补丁意图（编码代理）" : "发送补丁意图（编码代理）",
+      });
+    } catch (e) {
+      return { ...empty, toolRounds: roundsUsed, toolCalls, model: model ?? null, failure: `LLM 请求失败：${e?.message ?? e}` };
+    }
+    try {
+      raw = parseJson(res.content);
+    } catch (e) {
+      return {
+        ...empty,
+        toolRounds: roundsUsed,
+        toolCalls,
+        model: res?.model ?? model ?? null,
+        usage: res?.usage ?? null,
+        failure: `LLM 输出非法 JSON：${e?.message ?? e}`,
+      };
+    }
+
+    const parsed = parseToolRequests(raw);
+    const hasPatches = Array.isArray(raw?.patches);
+    // 只读自查只在「本轮没有补丁」时执行；两者同时出现以补丁为准，避免无界往返
+    if (!parsed.asked || hasPatches) {
+      if (parsed.asked && hasPatches) {
+        toolCalls.push({ tool: null, path: null, ok: false, reason: "同时给出 requests 与 patches，忽略自查请求" });
+      }
+      break;
+    }
+    for (const rj of parsed.rejected) toolCalls.push({ ...rj, ok: false });
+
+    if (roundsUsed >= roundsCap) {
+      failure = parsed.requests.length
+        ? `只读自查轮次已达上限（${roundsCap} 轮），未执行本轮请求且没有产出补丁`
+        : "只读自查请求全部被路径守卫拒绝，未产出补丁";
+      break;
+    }
+    if (!tools) {
+      failure = "模型请求只读自查，但本次运行没有可用的只读工具（未启用或不在 worktree 阶段）";
+      break;
+    }
+
+    roundsUsed += 1;
+    const served = [];
+    for (const req of parsed.requests) {
+      const key = `${req.tool} ${req.path}`;
+      if (cache.has(key)) {
+        served.push({ tool: req.tool, path: req.path, reused: true, result: cache.get(key) });
+        toolCalls.push({ tool: req.tool, path: req.path, ok: true, reused: true });
+        continue;
+      }
+      try {
+        if (req.tool === "read") {
+          const text = String(await tools.read(req.path));
+          const clipped = text.length > MAX_TOOL_FILE_CHARS ? `${text.slice(0, MAX_TOOL_FILE_CHARS)}\n/* …(截断，共 ${text.length} 字符)… */` : text;
+          cache.set(key, clipped);
+          served.push({ tool: "read", path: req.path, truncated: clipped !== text, result: clipped });
+          toolCalls.push({ tool: "read", path: req.path, ok: true, chars: text.length });
+        } else {
+          const entries = await tools.list(req.path);
+          cache.set(key, entries);
+          served.push({ tool: "list", path: req.path, result: entries });
+          toolCalls.push({ tool: "list", path: req.path, ok: true, entries: (entries ?? []).length });
+        }
+      } catch (e) {
+        // 工具失败也回喂：模型需要知道「这个路径读不到」才不会反复要它
+        toolCalls.push({ tool: req.tool, path: req.path, ok: false });
+        served.push({ tool: req.tool, path: req.path, error: String(e?.message ?? e).slice(0, 200) });
+      }
+    }
+    toolHistory.push({
+      round: roundsUsed,
+      requested: parsed.requests.map((r) => `${r.tool} ${r.path}`),
+      rejected: parsed.rejected,
+      results: served,
+    });
   }
 
-  let raw;
-  try {
-    raw = parseJson(res.content);
-  } catch (e) {
-    return { ...empty, model: res?.model ?? model, failure: `LLM 输出非法 JSON：${e?.message ?? e}` };
+  if (failure) {
+    return { ...empty, toolRounds: roundsUsed, toolCalls, model: res?.model ?? model ?? null, usage: res?.usage ?? null, failure };
   }
 
   const validated = validatePatchOutput(raw, { rel, content, candidateKeys });
@@ -370,6 +577,8 @@ export async function requestPatchIntent(
     model: res?.model ?? model ?? null,
     usage: res?.usage ?? null,
     truncatedSnippet: !!snippet.truncated,
+    toolRounds: roundsUsed,
+    toolCalls,
     note: typeof raw.note === "string" ? raw.note.slice(0, 300) : null,
     failure: validated.ops.length === 0 ? validated.rejected[0]?.reason ?? "模型未给出可用补丁" : null,
   };

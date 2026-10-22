@@ -93,6 +93,9 @@ export interface ViewLlmPatch {
   rejected?: { file: string; candidate?: string | null; reason: string }[];
   failures?: { file: string; reason: string }[];
   usage?: { file: string; prompt_tokens?: number; completion_tokens?: number; total_tokens?: number }[];
+  /** 只读自查：轮数与逐次调用留痕（读到的内容不回传界面） */
+  toolRounds?: number;
+  toolCalls?: { file?: string | null; tool?: string | null; path?: string | null; ok?: boolean; chars?: number | null; entries?: number | null; reason?: string | null }[];
 }
 
 export interface ViewFixRound {

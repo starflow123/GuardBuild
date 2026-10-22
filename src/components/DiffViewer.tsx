@@ -66,6 +66,9 @@ export function DiffViewer({
             LLM 编码代理（{patch.llm.model ?? "未知模型"}）：请求 {patch.llm.requestedFiles?.length ?? 0} 个文件 · 采纳
             {patch.llm.appliedOps ?? 0} 处补丁意图 · 校验拒绝 {patch.llm.rejected?.length ?? 0} 条
             {patch.autoVerify ? " · 已自动执行双重验收，通过后再由您审查写回" : ""}
+            {patch.llm.toolRounds
+              ? ` · 只读自查 ${patch.llm.toolRounds} 轮（读取 worktree 内源码，写入范围未变）`
+              : null}
           </span>
           {(patch.llm.rejected?.length ?? 0) > 0 && (
             <span className="muted small" style={{ display: "block" }}>

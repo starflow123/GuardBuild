@@ -234,6 +234,17 @@ function summarizeLlmPatch(llm) {
     usage: (llm.usage ?? []).slice(0, 8),
     rejected: (llm.rejected ?? []).slice(0, 12),
     failures: (llm.failures ?? []).slice(0, 8),
+    toolRounds: llm.toolRounds ?? 0,
+    // 只读自查留痕：模型看了哪些文件、哪些请求被路径守卫挡下（内容不进报告）
+    toolCalls: (llm.toolCalls ?? []).slice(0, 24).map((t) => ({
+      file: t.file ?? null,
+      tool: t.tool ?? null,
+      path: t.path ?? null,
+      ok: !!t.ok,
+      chars: t.chars ?? null,
+      entries: t.entries ?? null,
+      reason: t.reason ?? null,
+    })),
   };
 }
 
@@ -245,6 +256,15 @@ function renderLlmPatchSection(llm) {
     `| 模型 | ${esc(llm.model ?? "—")} |`,
     `| 请求文件 | ${llm.requestedFiles} 个 |`,
     `| 采纳补丁 | ${llm.appliedOps} 处（${llm.appliedFiles.map((f) => `${f.file}×${f.ops}`).join("、") || "无"}） |`,
+    ...(llm.toolRounds
+      ? [
+          `| 只读自查 | ${llm.toolRounds} 轮，${(llm.toolCalls ?? []).length} 次调用（${
+            (llm.toolCalls ?? [])
+              .map((t) => `${t.tool ?? "?"} ${t.path ?? "?"}${t.ok ? "" : "（被拒）"}`)
+              .join("、") || "无"
+          }）——只读 worktree 内源码，写入范围未变 |`,
+        ]
+      : []),
     ...(llm.usage?.length
       ? [
           `| Token 用量 | ${llm.usage

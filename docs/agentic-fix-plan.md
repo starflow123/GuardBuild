@@ -149,11 +149,25 @@
 
 ### S2 · 再给手（配齐约束）
 
-1. **只读工具循环**：agent 修改前可 `list / grep / read` 自查代码（走 Host `project.read` 令牌，返回脱敏内容）。这正对应「让 AI 读源码、按报告找到对应部分去改」。
+1. **只读工具循环**：agent 修改前可 `list / grep / read` 自查代码（走 Host `project.read` 令牌，返回脱敏内容）。这正对应「让 AI 读源码、按报告找到对应部分去改」。**已落地为 S2-lite（见下节），工具收敛为 `read` / `list`。**
 2. **依赖闭包允许集**：以漏洞文件为根，允许改它 import 到的模块 + 新建文件，而不是全仓库任意改。删掉 `llm-patcher.mjs:120` 的单文件硬规则，换成集合判定。
-3. **归因校验 + 不可碰清单**（§2.2 两条）。
+3. **归因校验 + 不可碰清单**（§2.2 两条）。**归因校验已落地**（见上节），不可碰清单在写侧早已生效（`patchTargetAllowed`），读侧另有一层 `toolPathAllowed`。
 4. **风险画像 UI**（§2.1），验收通过后才呈现，用户再决定写回。
 5. `replay_cases(caseIds)` 按需复跑单条用例（延后，非阻塞项）。
+
+### S2-lite · 只读工具循环（§3 S2 第 1 条的落地）
+
+放「手」之前先放「眼」，而且只放**只读**的那半只手：读只改变模型看得到什么，不扩大写入爆炸半径，§2.2 的归因链与 §2.3 的顺序都不被打断。跨文件写入、新建文件仍属 S2-full，待拍板。
+
+**落地记录（2026-10-22）**：
+
+1. **请求形状与预算**：模型在无补丁时可返回 `{"requests":[{"tool":"read"|"list","path":"相对路径"}]}`。`MAX_TOOL_ROUNDS = 2`（契约 `llm.patchToolRounds` 可配 0–2，0 即关闭自查回落单轮）、每轮最多 4 次调用、单文件 12000 字符、目录 80 条、单次 20 秒超时。没有 `grep`：Host 侧无 ripgrep 能力，`list` + `read` 的组合已足够定位 import 关系，与其造一个语义含糊的假 grep，不如留给 S2-full。
+2. **权限边界**：工具实现 `makeReadTools(ctx, wtRoot)` 绑定的是 **worktree 令牌**而非 `project.read`——模型永远读不到原工作区，也读不出 worktree。`toolPathAllowed` 比写侧的 `patchTargetAllowed` 宽（允许看它 import 的模块，这正是自查的意义），但同样拒绝依赖/产物/测试目录，读侧还额外拒绝 `guardbuild.json`、`.env`、锁文件、证书私钥与 `.yml/.toml/.ini/.conf/.sql/.db` 类文件（启动契约里写着测试身份口令），并且只认源码扩展名。`list` 把 Host 返回的绝对路径折成 worktree 相对路径再进提示词，越界条目直接丢弃。
+3. **内容处理**：走 Host `fs.read` 的默认脱敏（保险库整值替换 + 规则），实测进提示词的是 `password=***REDACTED***`；读失败或被拒也回喂事实（模型不会反复要同一条路径）；同一 `tool + path` 命中缓存标 `reused`，不重复外发 RPC。
+4. **有界往返**：`requestPatchIntent` 由单次请求改为循环，`tool_history` 随轮次累积进同一条提示链（不依赖会话状态）；一轮里同时给 `requests` 与 `patches` 时**以补丁为准**并记一条「忽略自查请求」，避免无界往返；轮次用尽仍无补丁、或请求全被守卫挡下，则诚实写 `failure` 而不是编造补丁。
+5. **写权限一位没变 + 可观测**：落地仍限「该候选定位到的那一个源码文件」，仍走 Sidecar 锚点/规模/危险调用校验 → Host 写 worktree → 双重验收 → 逐候选归因。`llmStats.toolRounds / toolCalls` 进视图 `patch.llm`、`report.json`、`report.md` 的「只读自查 N 轮，M 次调用（…）——只读 worktree 内源码，写入范围未变」一行，以及 GUI 补丁面板；**被拒的读取请求与原因进报告，读到的文件内容不进报告**。
+
+回归：`sidecar/tests/llm-tools.test.mjs` 11 项（真实两轮往返、路径守卫拒绝并回喂、轮次上限、requests+patches 补丁优先、无工具时诚实失败、缓存复用、读错误回喂、`parseToolRequests` 形状与配额、`toolPathAllowed` 读写宽窄差异、`makeReadTools` 的 RPC 载荷与令牌与目录折叠、`normalizeLlm` 的 `patchToolRounds` 默认与钳制），单测 263/263。端到端 `npm run e2e:llm-patch` 73 断言新增 r4 轮：模型先请求 `read src/data.js` + `list src` + `read guardbuild.json`，前两者由 Sidecar 在隔离 worktree 代执行、脱敏后回灌，第三者被路径守卫挡下；第二轮提示词 11792 字符里带着真实取数层源码（`export function findOrderById`）与被拒原因，却不含 `alice123` 与任何契约字段；补丁仍是 2 处且只落 `src/app.js`，`toolRounds=1`、3 条 `toolCalls` 逐条留痕，归因 2/2 翻转，工作区未被改动、worktree 已清理。`npm run e2e` 38 断言、`npm run e2e:fix-agent` 24 断言、`npx tsc -b` 同步全绿。
 
 ### S3 · 最后做启动 agent
 

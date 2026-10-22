@@ -12,7 +12,7 @@
 import { relative, sep } from "node:path";
 import { RPC_TO_HOST, SEVERITY, shortId } from "../../shared/protocol.mjs";
 import { FIX_STRATEGIES, candKey } from "./planner.mjs";
-import { patchEnabled, requestPatchIntent } from "./llm-patcher.mjs";
+import { makeReadTools, patchEnabled, requestPatchIntent } from "./llm-patcher.mjs";
 
 /** 确定性模板策略覆盖的候选（仅 IDOR：有明确的归属校验插入位） */
 const TEMPLATE_KINDS = new Set(["idor-suspect"]);
@@ -197,7 +197,12 @@ export async function createPatch(ctx, { feedback = null } = {}) {
     failures: [],
     model: null,
     usage: [],
+    toolRounds: 0,
+    toolCalls: [],
   };
+  // 只读自查工具绑定在隔离 worktree 上：模型能读到的范围永远不包括原工作区
+  const llmTools = useLlm ? makeReadTools(ctx, wtRoot) : null;
+  const toolRounds = ctx.llmConfig?.patchToolRounds;
   for (const [file, cands] of byFile) {
     const rel = relative(ctx.projectRoot, file).split(sep).join("/");
     const wtPath = `${wtRoot}/${rel}`;
@@ -322,6 +327,8 @@ export async function createPatch(ctx, { feedback = null } = {}) {
           getToken: ctx.llmGetToken,
           maxFiles: ctx.llmConfig?.patchMaxFiles,
           feedback,
+          tools: llmTools,
+          maxToolRounds: toolRounds,
           // 提示词只喂脱敏后的源码，真实锚点校验走上面的 wtBytes
           readRedacted: async () => {
             const r = await ctx.rpc.request(
@@ -335,6 +342,8 @@ export async function createPatch(ctx, { feedback = null } = {}) {
         if (llmRes.model) llmStats.model = llmRes.model;
         if (llmRes.usage) llmStats.usage.push({ file: rel, ...llmRes.usage });
         for (const r of llmRes.rejected) llmStats.rejected.push({ file: rel, ...r });
+        llmStats.toolRounds = Math.max(llmStats.toolRounds, llmRes.toolRounds ?? 0);
+        for (const t of llmRes.toolCalls ?? []) llmStats.toolCalls.push({ file: rel, ...t });
 
         const covered = new Set(llmRes.accepted.map((a) => String(a.candidate ?? "").toLowerCase()));
         if (llmRes.ops.length > 0) {

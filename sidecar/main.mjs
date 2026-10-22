@@ -1863,9 +1863,11 @@ async function abortSession(ctx) {
 }
 
 async function failSession(ctx, e) {
-  const pres = describeOutcome(e.code ?? "internal");
+  // Host 错误走 JSON-RPC 数字码，符号名在 data.code_name（conflict / scope_denied …）
+  const code = typeof e.code === "number" ? e.data?.code_name ?? String(e.code) : e.code ?? "internal";
+  const pres = describeOutcome(code);
   const payload = {
-    code: e.code ?? "internal",
+    code,
     message: e.message,
     hint: e.hint ?? null,
     details: e.details ?? null,

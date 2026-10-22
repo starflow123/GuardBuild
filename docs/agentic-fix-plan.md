@@ -134,6 +134,7 @@
 ### 顺带（不属于 agentic，但影响体感）
 
 - **B 文案**：`no_candidates` 改为「未命中覆盖范围」+ 列出当前支持的栈清单，不再显示成「执行失败」。
+  - **落地记录（2026-10-22）**：`no_candidates` 已收口（提交 `34aa8a7`）。本轮补上写回冲突：Host 早已有写回前校验（`src-tauri/src/core/gitops.rs:244` 的 `git apply --check` 预检 + `src-tauri/src/core/host.rs:1039-1049` 的「审批哈希 == 当前 worktree diff」复核，原子拒绝、不存在半写入），所以这一步**没有重复造校验器**，改的是呈现层——`failSession` 把 Host JSON-RPC 的数字码归一为符号码（1007 → `conflict`，取自 `data.code_name`），`coverage.mjs` 为 `conflict` 新增终态措辞（kind=blocked、exit 1 语义、「工作区已变化，补丁未写回」），`report.mjs` 给出「原文件未被修改 + 重跑 / 自行合并 Diff」两条路径。回归：`npm run e2e` 36 断言，新增场景实测「用户改了同一行 → 写回被拒 → 工作区字节不变」。
 - **Java/Spring**：双硬边界（§1.5），要么补适配器 + 启动器白名单，要么在接入前明确告知不支持。
 
 ---

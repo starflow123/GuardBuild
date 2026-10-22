@@ -60,7 +60,7 @@ npm run app:build      # 构建（--no-bundle）
 
 # 无头验收（零 npm 依赖：构建宿主后即可运行）
 npm run host:headless  # 构建无头宿主（--no-default-features）
-npm run e2e            # 主工作流 E2E（32 断言，自动生成 .demo 演示目标）
+npm run e2e            # 主工作流 E2E（36 断言，自动生成 .demo 演示目标；含写回冲突不半写入回归）
 npm run e2e:gate       # CI gate 演练（53 断言，7 轮裁决 + 报告产物）
 npm run e2e:blackbox   # 纯黑盒外部扫描演练（22 断言：漏洞/已修复/Cookie 会话/不可达）
 npm run e2e:llm        # LLM 接入侦察演练（40 断言，本机 mock DeepSeek，含无密钥磁盘缓存复用轮）
@@ -266,6 +266,7 @@ guardbuild-headless --url https://staging.example.com --project ./my-project --g
 
 - 输出：`verdict`、`exit-code`、`patch-hash`；报告目录含 `report.json`、`report.md`、`gate.json`（GB_GATE 裁决行）、`gate.log`
 - **exit 0 / 1 都是完成取证的正常终态**：`no_candidates` 表示项目形态未命中当前覆盖范围（已覆盖的漏洞类别与框架形态、以及暂无适配器的形态由 `sidecar/lib/coverage.mjs` 统一给出，并写进报告「结论与建议」），`not_reproducible` 表示静态有候选但攻击在真实实例上打不通；两者都**不是执行失败**，桌面界面按中性提示渲染（状态标签分别为「未命中覆盖范围」「未发现可复现漏洞」），内部仍记为 error 终态以便会话槽位释放与 gate 判定
+- **写回预检被拒也不是执行失败**：授权写回时若原工作区已变化，Host 在 `git apply --check` 阶段原子拒绝（先预检后落盘，不会写到一半）。Sidecar 把 Host 的 JSON-RPC 数字码归一为符号码 `conflict`，界面呈现「补丁未写回 · 工作区已变化」而非「执行出错」，报告明确写出原文件未被修改、补丁仍在隔离 worktree，并给出「按当前代码重跑会话」与「自行合并报告中的 Diff」两条落地路径
 - gate 语义：无人工交互；作用域仅按 `guardbuild.json.scopes` 预声明签发（审批留痕 `via: gate-policy`）；`workspace.write` 被结构性禁止，**不修改被测工作区**，只输出已验证补丁供人工应用
 
 ## 安全模型

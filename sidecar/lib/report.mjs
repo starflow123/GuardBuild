@@ -86,6 +86,12 @@ function suggestions(r) {
   const { outcome, patchStatus } = r.verdict;
   const supabase = r.supabase ?? null;
   const lines = [];
+  if (r.error?.code === "conflict") {
+    lines.push(`- 写回预检未通过（Host 在 \`git apply --check\` 阶段拒绝）：${r.error.message ?? ""}`);
+    lines.push(`- 原工作区**未被修改**、漏洞仍在；补丁保留在隔离 worktree：\`${r.patch?.worktree ?? "—"}\`。`);
+    lines.push("- 两种落地方式：按当前代码重跑一次会话（重新生成 + 重新验收），或自行把上面的 Diff 合并进工作区后用同一用例复测。");
+    return lines.join("\n");
+  }
   if (r.blackbox) {
     const bb = r.blackbox;
     if (outcome === "vulnerable_unfixed") {

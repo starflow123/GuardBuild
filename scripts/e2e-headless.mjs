@@ -327,6 +327,41 @@ try {
   send({ cmd: "cancel" });
   await waitState("aborted", 120_000);
   check("变体会话可正常中止", view.state === "aborted");
+
+  // ---------- 写回预检冲突：批准期间用户又改了补丁覆盖的那几行 ----------
+  console.log("\n[E2E] 回归：写回预检冲突（工作区基线变化 → 拒绝写回，原文件不动）…");
+  const conflictPrevSession = view.sessionId;
+  send({ cmd: "start", project: workspace });
+  await waitFor(
+    (v) => v.state === "patch_review" && v.sessionId !== conflictPrevSession,
+    "写回冲突场景会话完成取证",
+    240_000
+  );
+  send({ cmd: "patch_approve" });
+  await waitState("writeback_pending", 240_000);
+  const beforeConflict = readFileSync(workspaceAppJs, "utf8");
+  const NOTE_LINE = 'note: "查询订单后直接返回，未校验订单归属"';
+  if (!beforeConflict.includes(NOTE_LINE)) throw new Error("冲突场景前置条件不成立：补丁覆盖的 note 行不在工作区文件中");
+  writeFileSync(workspaceAppJs, beforeConflict.replace(NOTE_LINE, 'note: "用户在审批期间改了这行"'));
+  const afterUserEdit = readFileSync(workspaceAppJs, "utf8");
+  send({ cmd: "writeback_approve" });
+  await waitState("error", 120_000);
+  check(
+    "写回被 Host 预检拒绝（Host 数字码 1007 已归一为符号码 conflict）",
+    view.error?.code === "conflict",
+    `code=${view.error?.code} kind=${view.error?.kind}`
+  );
+  check(
+    "写回冲突呈现为「补丁未写回」而不是执行失败",
+    view.error?.title === "工作区已变化，补丁未写回" && view.stateLabel === "补丁未写回 · 工作区已变化",
+    `title=${view.error?.title} stateLabel=${view.stateLabel}`
+  );
+  check("冲突建议说明原文件未被修改", String(view.error?.semanticHint ?? "").includes("原文件未被修改"), "");
+  check(
+    "工作区仍是用户自己的内容（没有半写入）",
+    readFileSync(workspaceAppJs, "utf8") === afterUserEdit,
+    `字节一致=${readFileSync(workspaceAppJs, "utf8") === afterUserEdit}`
+  );
 } catch (e) {
   await fail(e.message);
 }

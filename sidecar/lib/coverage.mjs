@@ -70,6 +70,13 @@ const OUTCOME_PRESENTATION = {
     stateLabel: "证据成立 · 待人工修复",
     hint: "攻击已复现（exit 1 阻断门禁）：候选中没有可自动修复的端点，报告逐条给出修复指引。",
   },
+  conflict: {
+    outcome: "vulnerable_unfixed",
+    kind: "blocked",
+    title: "工作区已变化，补丁未写回",
+    stateLabel: "补丁未写回 · 工作区已变化",
+    hint: "Host 在写回预检（git apply --check）阶段拒绝，原文件未被修改：补丁生成基线与当前工作区代码不再一致。补丁仍保留在隔离 worktree，可重跑会话按最新代码重新生成，或自行合并 report.md 中的 Diff。",
+  },
   failed: {
     outcome: "failed",
     kind: "failed",

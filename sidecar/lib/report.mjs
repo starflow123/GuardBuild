@@ -42,6 +42,14 @@ function esc(v) {
   return String(v ?? "").replace(/\|/g, "\\|").replace(/\n/g, " ");
 }
 
+/** 归因结论的中文措辞（与 attribution.mjs 的 status 一一对应） */
+const ATTRIBUTION_LABELS = {
+  blocked: "已翻转",
+  still_vulnerable: "仍可越权",
+  unverified: "归因不成立",
+  not_reproduced: "修复前未复现",
+};
+
 function headline(outcome, patchStatus, supabase, blackbox = null) {
   if (blackbox) {
     if (outcome === "vulnerable_unfixed") {
@@ -516,6 +524,34 @@ function renderMarkdown(r) {
         }。正向断言：本人读取仍返回完整对象且字段不少于修复前基线，防止用「整端点拒绝」或「删字段」冒充修复。\n`
       );
     }
+    const at = acc.attribution;
+    if (at && (at.claimedCount || at.rows?.length)) {
+      parts.push(
+        `**逐候选归因**：补丁点名 ${at.claimedCount} 个入口，其中 ${at.blockedCount} 个完成了自己的「修复前打穿 → 修复后阻断」翻转${
+          at.unverifiedCount ? `；${at.unverifiedCount} 个归因不成立` : ""
+        }${at.stillVulnerableCount ? `；${at.stillVulnerableCount} 个修复后仍可越权` : ""}。总体计数变好不算修复——只有该候选自身的用例翻转才计入「已修复」。\n`
+      );
+      const rows = (at.rows ?? []).filter((x) => x.claimed);
+      if (rows.length) {
+        parts.push(
+          `| 补丁点名的入口 | 修复前复现用例 | 修复后判定 | 源码位置 | 补丁命中 | 结论 |\n| --- | --- | --- | --- | --- | --- |\n` +
+            rows
+              .map((x) =>
+                `| \`${esc(x.candidate)}\` | ${x.preReproCases} | ${x.postCases}/${x.preReproCases} 阻断 | ${
+                  x.file ? `\`${esc(x.file)}${Number.isFinite(x.line) ? `:${x.line}` : ""}\`` : "—"
+                } | ${
+                  x.locality === "same_file"
+                    ? `同文件 ${x.hunksInFile} 处${Number.isFinite(x.hunkDistance) ? `（距漏洞行 ${x.hunkDistance}）` : ""}`
+                    : x.locality === "other_file"
+                      ? "改动未落在该文件"
+                      : "—"
+                } | ${ATTRIBUTION_LABELS[x.status] ?? x.status}${x.reason ? `：${esc(x.reason)}` : ""} |`
+              )
+              .join("\n") +
+            "\n"
+        );
+      }
+    }
     parts.push(evidenceTable(post));
   } else if (post.length) {
     parts.push(`## 修复后证据（post，${post.length} 条）\n`);
@@ -638,7 +674,11 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
           fixes: (view.patch.fixes ?? []).map((f) => ({
             file: f.file,
             appliedOps: f.appliedOps ?? (f.fixes ?? []).length,
-            candidates: (f.fixes ?? []).map((x) => ({ candidate: x.candidate, strategy: x.strategy })),
+            candidates: (f.fixes ?? []).map((x) => ({
+              candidate: x.candidate,
+              candidateKey: x.candidateKey ?? null,
+              strategy: x.strategy,
+            })),
           })),
           skipped: (view.patch.skipped ?? []).slice(0, 12).map((s) => ({
             candidate: s.candidate ?? null,

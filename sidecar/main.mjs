@@ -31,6 +31,7 @@ import { isEnabled as llmEnabled } from "./lib/llm.mjs";
 import { runBlackbox } from "./lib/blackbox.mjs";
 import { coverageSummary, describeOutcome } from "./lib/coverage.mjs";
 import { createPatch, writebackPatch, rollbackWorkspace, PatchError } from "./lib/patcher.mjs";
+import { buildAttribution } from "./lib/attribution.mjs";
 import { buildFixFeedback, feedbackDigest } from "./lib/fixfeedback.mjs";
 import { emitReport } from "./lib/report.mjs";
 import {
@@ -942,6 +943,36 @@ function acceptanceVerdict(summary) {
   };
 }
 
+/** 补丁点名的候选集合（验收范围据此决定是否复跑无模板候选的用例） */
+function setClaimedCandidates(ctx, result) {
+  ctx._claimedCandidates = new Set(result?.claimedKeys ?? []);
+}
+
+/**
+ * 双重验收 = 汇总判定 + 逐候选归因。
+ * 汇总口径（攻击零回归 + 至少一条阻断）会被「修了 A 顺带挡了别的」满足，
+ * 因此补丁点名的每个候选都必须自己完成「修复前打穿 → 修复后阻断」才算 verified。
+ */
+function acceptanceVerdictWithAttribution(ctx, summary, evidence) {
+  const verdict = acceptanceVerdict(summary);
+  const attribution = buildAttribution(ctx, evidence);
+  return {
+    ...verdict,
+    pass: verdict.pass && attribution.pass,
+    attribution: {
+      pass: attribution.pass,
+      claimedCount: attribution.claimedCount,
+      blockedCount: attribution.blockedCount,
+      unverifiedCount: attribution.unverifiedCount,
+      stillVulnerableCount: attribution.stillVulnerableCount,
+      failing: attribution.failing
+        .slice(0, 12)
+        .map((r) => ({ candidate: r.candidate, status: r.status, reason: r.reason })),
+      rows: attribution.rows.slice(0, 24),
+    },
+  };
+}
+
 /** 合并同一阶段的两份 summary（本地探测 + Supabase 探测）：计数字段相加，任一份缺失则返回另一份 */
 function mergeSummary(base, add) {
   if (!base) return add ?? null;
@@ -1294,6 +1325,7 @@ async function stagePatch(ctx) {
   }
 
   const result = await createPatch(ctx);
+  setClaimedCandidates(ctx, result);
   const lineCount = result.patch.diff.split("\n").filter((l) => l.startsWith("+") || l.startsWith("-")).length;
   const usedLlm = !!result.usedLlm;
   const autoVerify = usedLlm && ctx.llmConfig?.autoVerify !== false;
@@ -1314,6 +1346,7 @@ async function stagePatch(ctx) {
     status: "pending_review",
     lineCount,
     fixes: result.filePatches,
+    claimed: result.claimedKeys ?? [],
     skipped: result.skipped,
     strategy: result.filePatches.flatMap((f) => f.fixes.map((x) => x.strategy)).join(",") || "none",
     llm: result.llm?.enabled ? result.llm : null,
@@ -1375,7 +1408,7 @@ async function stageVerify(ctx) {
     ctx.view.phases.post = post.summary;
     recordAcceptanceRows(ctx, "post", post.evidence);
 
-    const verdict = acceptanceVerdict(post.summary);
+    const verdict = acceptanceVerdictWithAttribution(ctx, post.summary, post.evidence);
     ctx.view.acceptance = { ...verdict, phase: "post", at: Date.now(), round: roundNo };
     pushView(ctx);
 
@@ -1403,6 +1436,10 @@ async function stageVerify(ctx) {
     const failed = post.evidence
       .filter((e) => e.verdict === VERDICT.REGRESSED || e.verdict === VERDICT.INCONCLUSIVE)
       .map((e) => `${e.caseName}（${e.actual}）`);
+    // 归因不成立的候选即使汇总计数好看也要回喂：否则代理收到「全绿」却不知道自己没修到那条入口
+    for (const r of verdict.attribution.failing) {
+      failed.unshift(`归因不成立：${r.candidate} —— ${r.reason}`);
+    }
     if (loop) {
       loop.rounds.push({
         round: roundNo,
@@ -1427,7 +1464,9 @@ async function stageVerify(ctx) {
       emit(ctx, {
         kind: "verify",
         severity: SEVERITY.WARN,
-        message: `第 ${roundNo} 轮验收未通过（攻击回归 ${verdict.attackRegressed}，业务回归 ${verdict.businessRegressed}）；把失败证据回传给编码代理生成第 ${nextRound} 轮补丁`,
+        message: `第 ${roundNo} 轮验收未通过（攻击回归 ${verdict.attackRegressed}，业务回归 ${verdict.businessRegressed}${
+          verdict.attribution.failing.length ? `，${verdict.attribution.failing.length} 个点名入口归因不成立` : ""
+        }）；把失败证据回传给编码代理生成第 ${nextRound} 轮补丁`,
         phase: STATE.VERIFYING,
         data: { round: roundNo, failed: failed.slice(0, 8), remaining: loop.maxRounds - loop.round },
       });
@@ -1463,6 +1502,7 @@ async function stageVerify(ctx) {
 
       loop.round += 1;
       await discardWorktree(ctx);
+      setClaimedCandidates(ctx, result);
       const lineCount = result.patch.diff.split("\n").filter((l) => l.startsWith("+") || l.startsWith("-")).length;
       ctx.view.patch = {
         hash: result.patch.hash,
@@ -1472,6 +1512,7 @@ async function stageVerify(ctx) {
         status: "pending_review",
         lineCount,
         fixes: result.filePatches,
+        claimed: result.claimedKeys ?? [],
         skipped: result.skipped,
         strategy: result.filePatches.flatMap((f) => f.fixes.map((x) => x.strategy)).join(",") || "none",
         llm: result.llm?.enabled ? result.llm : null,
@@ -1534,7 +1575,7 @@ async function recheckAfterWriteback(ctx) {
     ctx.pushEvidence(re.evidence);
     ctx.view.phases.post_writeback = re.summary;
     recordAcceptanceRows(ctx, "post_writeback", re.evidence);
-    const verdict = acceptanceVerdict(re.summary);
+    const verdict = acceptanceVerdictWithAttribution(ctx, re.summary, re.evidence);
     ctx.view.acceptance = { ...ctx.view.acceptance, writebackRecheck: { ...verdict, phase: "post_writeback", at: Date.now() } };
     pushView(ctx);
     emit(ctx, {

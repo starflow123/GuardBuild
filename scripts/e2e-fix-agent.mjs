@@ -297,6 +297,16 @@ async function main() {
 
   check("终态 writeback_pending（自纠错后验收通过）", view.state === "writeback_pending", `state=${view.state}`);
   check("验收通过（攻击全部阻断 + 业务零回归）", acceptance.pass === true && acceptance.attackBlocked === acceptance.attackTotal, `attack=${acceptance.attackBlocked}/${acceptance.attackTotal} business=${acceptance.businessPassed}/${acceptance.businessTotal}`);
+  check(
+    "最终验收逐候选归因通过（点名的入口全部自行翻转）",
+    acceptance.attribution?.pass === true &&
+      acceptance.attribution.claimedCount === 2 &&
+      acceptance.attribution.blockedCount === 2 &&
+      (acceptance.attribution.failing ?? []).length === 0 &&
+      (acceptance.attribution.rows ?? []).every((r) => r.claimed && r.locality === "same_file"),
+    JSON.stringify((acceptance.attribution?.rows ?? []).map((r) => `${r.candidate}:${r.locality}:${r.file}`))
+  );
+  check("报告 markdown 含逐候选归因表", md.includes("逐候选归因") && md.includes("已翻转"), "");
   check("模型恰好调用 2 次（首轮 + 修正轮）", state.calls === 2, `calls=${state.calls} returned=${JSON.stringify(state.returned)}`);
   check("首轮提示词不含 previous_attempt", !state.prompts[0]?.includes("previous_attempt"), "");
   check(
@@ -335,6 +345,12 @@ async function main() {
       return !!fb && fb.logLines >= 1 && fb.diffChars > 0 && fb.failedCases >= 1 && !JSON.stringify(fb).includes("LLMPatchShop");
     })(),
     JSON.stringify(loop.rounds?.[0]?.feedback ?? null)
+  );
+
+  check(
+    "反馈摘要含归因失败计数（unattributed 随失败用例一起回喂模型）",
+    typeof loop.rounds?.[0]?.feedback?.unattributed === "number",
+    `unattributed=${String(loop.rounds?.[0]?.feedback?.unattributed ?? "缺省")} 轮1判定=${JSON.stringify((loop.rounds?.[0]?.verdict?.attribution?.failing ?? []).map((f) => `${f.candidate}:${f.status}`))}`
   );
 
   check("视图记录修复循环 2 轮、上限 2", loop.attempts === 2 && loop.maxRounds === 2, `attempts=${loop.attempts} maxRounds=${loop.maxRounds}`);

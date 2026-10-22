@@ -71,11 +71,23 @@ export async function buildFixFeedback(ctx, { post, verdict, round, previousDiff
   const diagnostics = matchDiagnostics(tail);
   const diff = previousDiff ? clip(previousDiff, DIFF_CHARS) : null;
 
+  // 归因不成立的候选：汇总计数可能照样好看（修了 A 顺带挡了别的），但被点名的入口自己没翻转
+  const unattributed = (verdict.attribution?.failing ?? []).map((r) => ({
+    candidate: r.candidate,
+    status: r.status,
+    reason: r.reason,
+  }));
+
   const evidence = [];
   if (diff) evidence.push("previous_diff 是上一轮实际落地的改动");
   if (tail.length) evidence.push("target_log_tail 是修复后隔离实例的真实输出");
   if (diagnostics.length) evidence.push(`diagnostics 给出日志命中的诊断码（${diagnostics.map((d) => d.code).join("、")}）`);
   if (log.exited) evidence.push(`隔离实例已退出（退出码 ${log.exited.exitCode ?? "?"}），说明上一轮补丁让应用无法运行`);
+  if (unattributed.length) {
+    evidence.push(
+      `unattributed_candidates 列出补丁声明要修、但没能自己完成「修复前打穿 → 修复后阻断」翻转的入口（${unattributed.length} 个）`
+    );
+  }
 
   return {
     round,
@@ -83,6 +95,7 @@ export async function buildFixFeedback(ctx, { post, verdict, round, previousDiff
     attack_regressed: verdict.attackRegressed,
     business_regressed: verdict.businessRegressed,
     failed_cases: failed,
+    unattributed_candidates: unattributed,
     target_log_tail: tail,
     target_exit: log.exited,
     diagnostics,
@@ -92,6 +105,9 @@ export async function buildFixFeedback(ctx, { post, verdict, round, previousDiff
       (evidence.length
         ? `修订时请依据 previous_attempt 里的 ${evidence.join("；")}，给出与上一轮不同且更完整的修法；`
         : "不要重复上一轮的改动方式；") +
+      (unattributed.length
+        ? "unattributed_candidates 中列出的入口必须自己完成翻转（改了别的东西让它们顺带不通不算修好）；"
+        : "") +
       "不要改动其它逻辑，不要新增依赖。",
   };
 }
@@ -102,6 +118,7 @@ export function feedbackDigest(fb) {
   return {
     round: fb.round ?? null,
     failedCases: (fb.failed_cases ?? []).length,
+    unattributed: (fb.unattributed_candidates ?? []).length,
     logLines: (fb.target_log_tail ?? []).length,
     targetExited: !!fb.target_exit,
     targetExitCode: fb.target_exit?.exitCode ?? null,

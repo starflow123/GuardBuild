@@ -423,6 +423,35 @@ async function main() {
   );
   const post1Vuln = (rep1?.evidence?.post ?? []).filter((e) => e.verdict === "vulnerable");
   check("r1 修复后证据：无越权成功", post1Vuln.length === 0, `vulnerable=${post1Vuln.length}`);
+
+  // 逐候选归因：补丁点名的每个入口必须自己完成「打穿 → 阻断」，总体变好不算了数
+  const attr1 = acc1.attribution ?? {};
+  check(
+    "r1 归因：点名的 2 个入口均自行翻转（打穿 → 阻断），无 unverified",
+    attr1.pass === true &&
+      attr1.claimedCount === 2 &&
+      attr1.blockedCount === 2 &&
+      attr1.unverifiedCount === 0 &&
+      attr1.stillVulnerableCount === 0 &&
+      (attr1.failing ?? []).length === 0,
+    `claimed=${attr1.claimedCount} blocked=${attr1.blockedCount} unverified=${attr1.unverifiedCount}`
+  );
+  const claimedRows1 = (attr1.rows ?? []).filter((r) => r.claimed);
+  check(
+    "r1 归因给出补丁 hunk 与候选源码的同文件定位（行距可算）",
+    claimedRows1.length === 2 && claimedRows1.every((r) => r.locality === "same_file" && r.hunksInFile >= 1 && Number.isFinite(r.hunkDistance)),
+    JSON.stringify(claimedRows1.map((r) => `${r.candidate}:${r.locality}:${r.file}:${r.hunkDistance}`))
+  );
+  check(
+    "归因表只落仓库相对路径，不含用户绝对路径",
+    (attr1.rows ?? []).every((r) => !String(r.file ?? "").includes(".demo-llm-patch") && !/\\\\/.test(String(r.file ?? ""))),
+    JSON.stringify((attr1.rows ?? []).map((r) => r.file))
+  );
+  check(
+    "r1 报告 markdown 有「逐候选归因」表（入口 / 结论）",
+    readMd("r1").includes("逐候选归因") && readMd("r1").includes("已翻转"),
+    ""
+  );
   check(
     "r1 修复后证据：越权读与越权取消均被拒绝",
     (rep1?.evidence?.post ?? []).filter((e) => e.category === "attack" && e.verdict === "blocked").length >= 2,
@@ -502,6 +531,20 @@ async function main() {
     "r2 双重验收未通过：越权读仍在",
     v2.acceptance?.pass === false && v2.acceptance.attackBlocked < v2.acceptance.attackTotal,
     `attack=${v2.acceptance?.attackBlocked}/${v2.acceptance?.attackTotal} business=${v2.acceptance?.businessPassed}/${v2.acceptance?.businessTotal}`
+  );
+  // 归因只对「补丁点名却没翻转」的入口行使否决权；未点名的入口仍要如实呈现
+  const attr2 = v2.acceptance?.attribution ?? {};
+  check(
+    "r2 归因：点名的取消入口自证翻转，未点名的越权读记为仍可越权",
+    attr2.claimedCount === 1 &&
+      attr2.blockedCount === 1 &&
+      (attr2.rows ?? []).some((r) => !r.claimed && r.status === "still_vulnerable" && r.preReproCases >= 1),
+    `claimed=${attr2.claimedCount} blocked=${attr2.blockedCount} rows=${JSON.stringify((attr2.rows ?? []).map((r) => `${r.candidate}:${r.claimed}:${r.status}`))}`
+  );
+  check(
+    "r2 报告 markdown 的归因表只列点名的取消入口",
+    md2.includes("逐候选归因") && /\| `POST \/api\/orders\/:id\/cancel` \| \d+ \| .*已翻转/.test(md2),
+    (md2.match(/逐候选归因[\s\S]{0,400}/) ?? [""])[0].replace(/\n/g, " | ").slice(0, 260)
   );
   check("r2 报告记录被拒绝意图章节", md2.includes("被拒绝的补丁意图"), "");
   check(

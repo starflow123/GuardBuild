@@ -44,6 +44,7 @@ import {
   rawTokenRequest,
   variantCaseId,
 } from "./attackvariants.mjs";
+import { candKey } from "./planner.mjs";
 
 export class ProbeError extends Error {
   constructor(message, { code = "probe_failed", hint = null } = {}) {
@@ -1147,6 +1148,7 @@ export function buildCases(ctx, targets) {
     const req = candRequest(ctx, cand, readTarget.id);
     cases.push({
       id: `attack-read-foreign${suffix}`,
+      candidateKey: candKey(cand),
       category: CASE_CATEGORY.ATTACK,
       name: `${attacker.name} 读取 ${victim.name} 的${candLabel} #${readTarget.id}${multi}`,
       identity: attacker.name,
@@ -1224,6 +1226,7 @@ export function buildCases(ctx, targets) {
       const caseId = variantCaseId("attack-read-foreign", v.axis, axisSeq[v.axis]);
       cases.push({
         id: caseId,
+        candidateKey: candKey(primaryRead),
         category: CASE_CATEGORY.ATTACK,
         name: `变体·${v.label}：${attacker.name} 读取 ${victim.name} 的${candLabel}`,
         identity: attacker.name,
@@ -1268,6 +1271,7 @@ export function buildCases(ctx, targets) {
     const req = candRequest(ctx, cand, cancelTarget.id);
     cases.push({
       id: `attack-cancel-foreign${suffix}`,
+      candidateKey: candKey(cand),
       category: CASE_CATEGORY.ATTACK,
       name: `${attacker.name} 取消 ${victim.name} 的${candLabel} #${cancelTarget.id}${multi}`,
       identity: attacker.name,
@@ -1346,6 +1350,7 @@ export function buildCases(ctx, targets) {
     const req = candRequest(ctx, cand, anonTarget.id);
     cases.push({
       id: `attack-anonymous-read${suffix}`,
+      candidateKey: candKey(cand),
       category: CASE_CATEGORY.ATTACK,
       name: `未携带凭证读取${candLabel} #${anonTarget.id}（无鉴权端点${multiText}）`,
       identity: null,
@@ -1385,6 +1390,7 @@ export function buildCases(ctx, targets) {
     const firstAttempt = traversalAttemptPath(routePath, trav, TRAVERSAL_PAYLOADS[0], false);
     cases.push({
       id: `attack-path-traversal${suffix}`,
+      candidateKey: candKey(cand),
       category: CASE_CATEGORY.ATTACK,
       unfixable: true,
       name: `路径穿越读取服务器文件（${routePath}${trav.param ? ` · 参数 ${trav.param}` : ""}）`,
@@ -1466,6 +1472,7 @@ export function buildCases(ctx, targets) {
     const injIdentity = attacker?.name ?? victim?.name ?? null;
     cases.push({
       id: `attack-sql-injection${suffix}`,
+      candidateKey: candKey(cand),
       category: CASE_CATEGORY.ATTACK,
       unfixable: true,
       name: `SQL 注入（${routePath} · 参数 ${injection.param ?? "?"}）`,
@@ -1559,6 +1566,7 @@ export function buildCases(ctx, targets) {
     const injIdentity = attacker?.name ?? victim?.name ?? null;
     cases.push({
       id: `attack-command-injection${suffix}`,
+      candidateKey: candKey(cand),
       category: CASE_CATEGORY.ATTACK,
       unfixable: true,
       name: `命令注入（${routePath} · 参数 ${injection.param ?? "?"}）`,
@@ -1842,6 +1850,25 @@ export function buildCases(ctx, targets) {
  * 执行一个阶段的完整探测（pre：修复前 / post：修复后指向 worktree 实例）。
  * 返回该阶段的证据与统计，证据已落库并推送 UI 事件。
  */
+/**
+ * 修复后阶段的用例范围（纯函数，便于单测）。
+ *  - `unfixable`（无确定性模板）用例：只有补丁点名了它的候选才复跑——否则「本来就没修它」会被算成补丁无效；
+ *  - `requiresPreRepro` 变体：只有修复前确实复现过才参与（目标本就不认这种写法时，路由 404 不是补丁的功劳）。
+ */
+export function postPhaseCases(orderedCases, { claimed = new Set(), preVerdicts = new Map() } = {}) {
+  const cases = [];
+  let variantSkipped = 0;
+  for (const c of orderedCases) {
+    if (c.unfixable && !(c.candidateKey && claimed.has(c.candidateKey))) continue;
+    if (c.requiresPreRepro && preVerdicts.get(c.id) !== VERDICT.VULNERABLE) {
+      variantSkipped += 1;
+      continue;
+    }
+    cases.push(c);
+  }
+  return { cases, variantSkipped };
+}
+
 export async function runPhase(ctx, { phase, baseUrl }) {
   ctx._lastDecisionSeq = 0;
   ctx.emit({
@@ -1889,22 +1916,16 @@ export async function runPhase(ctx, { phase, baseUrl }) {
     await scanAttackSurface(ctx, baseUrl, loggedIn);
     await rateLimitCheck(ctx, baseUrl, loggedIn);
   }
-  // 修复后验收只覆盖补丁实际修复的类别：注入/穿越无自动修复模板，
-  // 若与可修复项混在同一目标中，仍按原样复现会误判「补丁无效」
-  let cases = phase === "pre" ? orderedCases : orderedCases.filter((c) => !c.unfixable);
-  // 变体用例只在「修复前确实复现过」时参与验收：目标本就不认这种写法（路由 404）
-  // 不能被记成「补丁挡住了」，否则变体越多、假通过越多。
+  // 修复后验收覆盖范围：补丁没点名的注入/穿越/无鉴权候选没有自动修复模板，若与可修复项混在
+  // 同一目标中仍按原样复现，会把「本来就没修它」误判成「补丁无效」；但补丁一旦声明修了某个
+  // 无模板候选（LLM 编码代理路径），它的用例必须进修复后阶段——否则该候选的「已修复」无从归属。
+  const claimed = ctx._claimedCandidates instanceof Set ? ctx._claimedCandidates : new Set();
   let variantSkipped = 0;
+  let cases = orderedCases;
   if (phase !== "pre") {
-    const kept = [];
-    for (const c of cases) {
-      if (c.requiresPreRepro && ctx._preCaseVerdicts?.get(c.id) !== VERDICT.VULNERABLE) {
-        variantSkipped += 1;
-        continue;
-      }
-      kept.push(c);
-    }
-    cases = kept;
+    const scoped = postPhaseCases(orderedCases, { claimed, preVerdicts: ctx._preCaseVerdicts });
+    cases = scoped.cases;
+    variantSkipped = scoped.variantSkipped;
   }
   const variantPlanned = orderedCases.filter((c) => c.requiresPreRepro).length;
   if (phase !== "pre" && variantSkipped > 0) {
@@ -2004,6 +2025,11 @@ export async function runPhase(ctx, { phase, baseUrl }) {
     if (phase === "pre") {
       // 记下修复前结论与「本人可见」的字段基线，供修复后验收判定变体是否参与、字段是否被删减
       (ctx._preCaseVerdicts ??= new Map()).set(kase.id, verdict);
+      (ctx._preCaseMeta ??= new Map()).set(kase.id, {
+        candidateKey: kase.candidateKey ?? null,
+        category: kase.category,
+        name: kase.name,
+      });
       if (kase.contract) {
         const keys = kase.contract(res);
         if (keys?.length) (ctx._ownerContract ??= new Map()).set(kase.id, keys);
@@ -2045,6 +2071,8 @@ export async function runPhase(ctx, { phase, baseUrl }) {
       caseId: kase.id,
       caseCategory: kase.category,
       caseName: kase.name,
+      caseCandidate: kase.candidateKey ?? null,
+      caseVariant: kase.variant ? { axis: kase.variant.axis, label: kase.variant.label } : null,
       createdAt: Date.now(),
     };
     ctx.db.insertEvidence(record);

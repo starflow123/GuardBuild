@@ -11,7 +11,7 @@
  */
 import { relative, sep } from "node:path";
 import { RPC_TO_HOST, SEVERITY, shortId } from "../../shared/protocol.mjs";
-import { FIX_STRATEGIES } from "./planner.mjs";
+import { FIX_STRATEGIES, candKey } from "./planner.mjs";
 import { patchEnabled, requestPatchIntent } from "./llm-patcher.mjs";
 
 /** 确定性模板策略覆盖的候选（仅 IDOR：有明确的归属校验插入位） */
@@ -254,7 +254,7 @@ export async function createPatch(ctx, { feedback = null } = {}) {
         try {
           const candOps = strat.builder(content, cand);
           templateOps.push(...candOps);
-          used.push({ candidate: key, strategy: strat.name });
+          used.push({ candidate: key, candidateKey: candKey(cand), strategy: strat.name });
           applied = true;
           break;
         } catch (e) {
@@ -345,8 +345,12 @@ export async function createPatch(ctx, { feedback = null } = {}) {
           llmStats.appliedOps += llmRes.ops.length;
           llmStats.appliedFiles.push({ file: rel, ops: llmRes.ops.length });
           for (const a of llmRes.accepted) {
+            const claimed = cands.find(
+              (c) => keyOf(c) === String(a.candidate ?? attempted[0]).toLowerCase()
+            );
             used.push({
               candidate: a.candidate ?? attempted[0],
+              candidateKey: claimed ? candKey(claimed) : null,
               strategy: "llm-coding-agent",
               reason: a.reason ?? null,
               addedLines: a.addedLines ?? null,
@@ -467,6 +471,10 @@ export async function createPatch(ctx, { feedback = null } = {}) {
     worktree,
     patch: { id: patch.id, hash: patch.patchHash, diff: patch.diff, files: patch.files, status: patch.status },
     filePatches,
+    // 补丁实际点名的候选（candKey 形态），验收归因据此判定「这条候选的翻转算不算补丁带来的」
+    claimedKeys: [
+      ...new Set(filePatches.flatMap((f) => f.fixes.map((x) => x.candidateKey).filter(Boolean))),
+    ],
     skipped,
     usedLlm,
     llm: llmStats,

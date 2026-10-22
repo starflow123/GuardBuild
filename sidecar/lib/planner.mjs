@@ -39,8 +39,9 @@ function paramCount(p) {
   return String(p ?? "").match(/:[A-Za-z_]\w*/g)?.length ?? 0;
 }
 
-/** 候选的唯一标识：GraphQL 全部过程共用一个 HTTP 端点，必须再带上字段名才不会被 top-K 去重吞掉 */
-function candKey(c) {
+/** 候选的唯一标识：GraphQL 全部过程共用一个 HTTP 端点，必须再带上字段名才不会被 top-K 去重吞掉。
+ *  探测用例、补丁产物与验收归因共用这一把键（patcher/probe/attribution），否则三处字符串对不上。 */
+export function candKey(c) {
   const base = `${c.method} ${epPath(c)}`;
   return c.graphql ? `${base} ${c.graphql.root}.${c.graphql.field}` : base;
 }

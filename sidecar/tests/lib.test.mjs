@@ -25,6 +25,7 @@ import {
   extractEntity,
   buildCases,
   loginAll,
+  postPhaseCases,
 } from "../lib/probe.mjs";
 import { loadTargetConfig, startUsesPortSlot, renderStart, PORT_SLOT } from "../lib/targetconfig.mjs";
 import {
@@ -2278,4 +2279,70 @@ test("buildCases: 注入用例（请求通道构造 + unfixable + 布尔/报错/
     "inconclusive",
     "未命中的反射原文不得判定为可利用"
   );
+});
+
+test("buildCases: 攻击用例绑定候选键（逐候选归因据此把用例与补丁对上了才算修好）", () => {
+  const ctx = {
+    plan: {
+      resource: "order",
+      readCandidates: [{ method: "GET", fullPath: "/api/orders/:id", routeKeys: ["orders.get"], file: "src/app.js", startLine: 11 }],
+      unauthReadCandidates: [{ method: "GET", fullPath: "/api/feeds/:id", routeKeys: ["feeds.get"], file: "src/app.js", startLine: 40 }],
+      listEndpoint: { path: "/api/orders", routeKey: "orders.list" },
+    },
+    targetConfig: null,
+  };
+  const targets = {
+    attacker: { name: "alice", user: { id: 1 } },
+    victim: { name: "bob", user: { id: 2 } },
+    admin: null,
+    readTarget: { id: 11 },
+    attackCancelTarget: null,
+    adminCancelTarget: null,
+    ownReadTarget: { id: 14 },
+    ownCancelTarget: null,
+    ownNotCancellable: null,
+    anonTargets: [{ path: "/api/feeds/:id", item: { id: 21 } }],
+  };
+  const cases = buildCases(ctx, targets);
+  const read = cases.find((c) => c.id === "attack-read-foreign");
+  assert.equal(read.candidateKey, "GET /api/orders/:id", "读取用例应带上所属候选的 candKey");
+  const anon = cases.find((c) => c.id === "attack-anonymous-read");
+  assert.equal(anon.candidateKey, "GET /api/feeds/:id");
+  const variant = cases.find((c) => c.id.startsWith("attack-read-foreign-"));
+  assert.equal(variant?.candidateKey, read.candidateKey, "同源变体归到主候选名下");
+  const biz = cases.find((c) => c.id === "business-read-own");
+  assert.equal(biz.candidateKey, undefined, "业务用例不参与逐候选翻转判定");
+});
+
+test("postPhaseCases: 补丁点名的无模板候选必须复跑，未点名的仍跳过", () => {
+  const ordered = [
+    { id: "attack-read-foreign", candidateKey: "GET /api/orders/:id" },
+    { id: "attack-sql-injection", candidateKey: "GET /api/search", unfixable: true },
+    { id: "attack-path-traversal", candidateKey: "GET /api/file", unfixable: true },
+    { id: "business-read-own" },
+  ];
+  const scoped = postPhaseCases(ordered, {
+    claimed: new Set(["GET /api/search"]),
+    preVerdicts: new Map(),
+  });
+  assert.deepEqual(
+    scoped.cases.map((c) => c.id),
+    ["attack-read-foreign", "attack-sql-injection", "business-read-own"],
+    "编码代理声称修了 SQLi 入口，它的用例就得进修复后验收；没被点名的穿越类仍不复跑"
+  );
+});
+
+test("postPhaseCases: 修复前未复现的变体剔除并计数", () => {
+  const ordered = [
+    { id: "attack-read-foreign", candidateKey: "GET /api/orders/:id" },
+    { id: "attack-read-foreign-enc1", candidateKey: "GET /api/orders/:id", requiresPreRepro: true },
+    { id: "attack-read-foreign-enc2", candidateKey: "GET /api/orders/:id", requiresPreRepro: true },
+  ];
+  const preVerdicts = new Map([
+    ["attack-read-foreign-enc1", "vulnerable"],
+    ["attack-read-foreign-enc2", "blocked"],
+  ]);
+  const scoped = postPhaseCases(ordered, { claimed: new Set(["GET /api/orders/:id"]), preVerdicts });
+  assert.deepEqual(scoped.cases.map((c) => c.id), ["attack-read-foreign", "attack-read-foreign-enc1"]);
+  assert.equal(scoped.variantSkipped, 1);
 });

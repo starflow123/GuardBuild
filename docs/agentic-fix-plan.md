@@ -133,6 +133,20 @@
 
 回归：`sidecar/tests/attackvariants.test.mjs`（8 项，含变体 ID/路径全集、判定语义、无素材降级、仅主候选派生、victim 正向断言）；`npm run e2e` 36 断言、`npm run e2e:fix-agent` 21 断言（第 1 轮故意漏修时，新增的「变体·他人对象」「变体·ID 前导零」用例被判定为攻击仍可成功并回喂给代理，第二轮补齐）、`npm run e2e:llm-patch` 53 断言全绿。实测证据：`.demo/data/guardbuild.db` 修复前 `/api/orders/5005`、`/5006`、`/05002` 为 `vulnerable`，`%205002`、`5002%20`（blocked，路由不吃）与 `?id=5002`（inconclusive）在修复后行中缺席——正是 `requiresPreRepro` 的过滤结果。
 
+### 补丁归因校验 · 逐候选翻转（§2.2 归因硬规则的落地）
+
+§2.2 的硬规则是「验收不看总体变好，只看这条 candidate 的那一发攻击从打穿变阻断，且业务零回归」。§3 的变体加厚解决的是「同一发攻击换写法绕过」，但汇总口径本身仍然会放过另一种假通过：补丁改的是 A 端点，B 端点的用例因为身份/数据变化顺带不通，`attackBlocked/attackTotal` 照样满，报告就写「已修复」。
+
+**落地记录（2026-10-22）**：
+
+1. **统一键空间**：`planner.mjs` 的 `candKey(c)`（`METHOD epPath`，GraphQL 再附 `graphql.root.field`）改为导出，planner / probe / patcher / attribution 四处共用同一个 key，避免归因表和用例绑定各算各的哈希。probe 在 7 个攻击用例点上打 `candidateKey`（`attack-vertical-escalation` 故意不绑——admin 列表接口本就没有对应代码候选），业务用例不绑。
+2. **点名集合**：`createPatch` 返回值新增 `claimedKeys`（模板策略取 `used[].candidateKey`，编码代理策略取 `keyOf` 解析出的候选），main 侧写入 `ctx._claimedCandidates` 并进视图 `patch.claimed`。归因只对「补丁自己声明要修」的入口行使否决权，其余入口的残留状态仍如实呈现但不否决（那本来就不在本轮范围内）。
+3. **行为判定优先，静态命中只作线索**：`sidecar/lib/attribution.mjs` 按候选分组修复前用例，只取修复前确实 `vulnerable` 的那些，要求它们在修复后全部 `blocked`；缺修复后用例或判 `inconclusive` 一律 `unverified`。`inconclusive`/缺席算不成立而不是算通过，是刻意选择——拿不到可比证据就是没证明。hunk 定位（`parseDiffHunks` 从 unified diff 的 `@@ -a,b +c,d @@` 取新侧区间，`patchLocality` 按路径尾段与候选绝对路径对齐，Windows `\\?\` 扩展前缀在此消化）输出 `same_file/other_file/no_source` 与距漏洞行行距，进报告但**不参与否决**：真实修复常落在同文件的取数辅助函数甚至上游中间件里，硬否决会误伤好补丁。
+4. **顺手补掉一个既有漏洞**：修复前阶段被 `unfixable` 标记跳过的注入/穿越/无鉴权用例，此前在修复后阶段也一并跳过——而编码代理的覆盖范围包含这 5 类候选，于是「代理声明修了 SQLi」可以完全没被复验就进 `verified`。现在 `postPhaseCases()`（纯函数，便于单测）按 `claimedKeys` 决定这些用例是否进修复后阶段：点名了就复跑，没点名仍跳过。
+5. **失败回喂与终态复用**：`acceptanceVerdictWithAttribution()` 把 `pass` 与归因结果相与，沿用既有 `verify_failed` 终态与退出码，不新增状态；归因不成立的入口以「归因不成立：`候选` —— `原因`」置入失败列表，`fixfeedback` 另出 `unattributed_candidates` 字段并在指令里写明「列出的入口必须自己完成翻转，改了别的东西让它们顺带不通不算修好」；`report.md` 增「逐候选归因」表（修复前复现用例数 / 修复后判定 / 源码位置 / 补丁命中 / 结论），表内只落仓库相对路径，不含用户绝对路径。
+
+回归：`sidecar/tests/attribution.test.mjs` 13 项（hunk 解析与 `/dev/null` 跳过、行距与同文件判定、全阻断通过、缺修复用例/inconclusive/仍可越权三种不成立、点名未复现、无对应用例的合成行、未点名翻转不影响裁决、业务用例排除、`other_file` 不否决、`\\?\` 绝对路径对齐、空上下文降级）；`postPhaseCases` 3 项 + `buildFixFeedback` 的 `unattributed_candidates` 1 项进 `lib.test.mjs` / `fixfeedback.test.mjs`，单测 252/252。端到端：`npm run e2e` 38 断言（新增「确定性模板补丁点名 2 个入口且 locality 均为 same_file」「写回后复核同样过归因」）、`npm run e2e:llm-patch` 59 断言（r1 `claimed=2 blocked=2`、行距 11/8、表内路径为 `src/app.js`；r2 点名项自证翻转、未点名的越权读记为 `still_vulnerable`）、`npm run e2e:fix-agent` 24 断言（最终轮归因通过 + 反馈摘要含 `unattributed` 计数）全绿。
+
 ### S2 · 再给手（配齐约束）
 
 1. **只读工具循环**：agent 修改前可 `list / grep / read` 自查代码（走 Host `project.read` 令牌，返回脱敏内容）。这正对应「让 AI 读源码、按报告找到对应部分去改」。

@@ -105,6 +105,31 @@ test("buildFixFeedback: 日志预算从尾部保留（越接近失败现场越�
   assert.match(fb.target_log_tail[fb.target_log_tail.length - 1], /log 59/);
 });
 
+test("buildFixFeedback: 汇总没回归但归因不成立的入口要单独回喂", async () => {
+  const ctx = ctxWith({ lines: [], exited: false, exitCode: null });
+  const fb = await buildFixFeedback(ctx, {
+    post: { evidence: [] },
+    verdict: {
+      attackRegressed: 0,
+      businessRegressed: 0,
+      attribution: {
+        failing: [
+          { candidate: "GET /api/orders/:id", status: "unverified", reason: "1/1 条修复前已复现的用例未进入修复后验收" },
+          { candidate: "POST /api/orders/:id/cancel", status: "still_vulnerable", reason: "修复后仍有 1/1 条越权用例复现" },
+        ],
+      },
+    },
+    round: 1,
+    previousDiff: "@@ -1 +1 @@\n+x\n",
+  });
+  assert.deepEqual(
+    fb.unattributed_candidates.map((u) => `${u.candidate}:${u.status}`),
+    ["GET /api/orders/:id:unverified", "POST /api/orders/:id/cancel:still_vulnerable"]
+  );
+  assert.match(fb.instruction, /unattributed_candidates 中列出的入口必须自己完成翻转/);
+  assert.equal(feedbackDigest(fb).unattributed, 2);
+});
+
 test("feedbackDigest: 只留计数与诊断码，不带日志原文", async () => {
   const ctx = ctxWith({
     lines: [{ stream: "stderr", line: "ECONNREFUSED 127.0.0.1:5432" }],

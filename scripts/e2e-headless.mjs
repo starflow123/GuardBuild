@@ -194,6 +194,15 @@ try {
   check("业务用例全部保持", acc.businessPassed === acc.businessTotal && acc.businessTotal >= 6, `businessTotal=${acc.businessTotal}`);
   const postEvidence = (view.evidence ?? []).filter((e) => e.phase === "post");
   check("修复后存在 blocked 证据", postEvidence.some((e) => e.verdict === "blocked"), `post 证据 ${postEvidence.length} 条`);
+  check(
+    "确定性模板补丁同样逐候选归因：点名的入口全部自行翻转",
+    (view.patch?.claimed ?? []).length >= 1 &&
+      acc.attribution?.pass === true &&
+      acc.attribution.claimedCount >= 1 &&
+      acc.attribution.blockedCount === acc.attribution.claimedCount &&
+      (acc.attribution.rows ?? []).filter((r) => r.claimed).every((r) => r.locality === "same_file"),
+    `claimed=${JSON.stringify(view.patch?.claimed ?? [])} blocked=${acc.attribution?.blockedCount}/${acc.attribution?.claimedCount} locality=${(acc.attribution?.rows ?? []).filter((r) => r.claimed).map((r) => r.locality).join("/")}`
+  );
   check("原工作区仍未被修改（写回前）", readFileSync(workspaceAppJs, "utf8").includes("no-check"));
 
   // ---------- 5. 授权写回 → 写回后复核 ----------
@@ -207,6 +216,11 @@ try {
   );
   const recheck = view.acceptance.writebackRecheck;
   check("写回后复核通过", recheck.pass === true, `攻击阻断 ${recheck.attackBlocked}/${recheck.attackTotal}，业务保持 ${recheck.businessPassed}/${recheck.businessTotal}`);
+  check(
+    "写回后的真实工作区也过了逐候选归因",
+    recheck.attribution?.pass === true && recheck.attribution.claimedCount >= 1 && recheck.attribution.blockedCount === recheck.attribution.claimedCount,
+    `claimed=${recheck.attribution?.claimedCount} blocked=${recheck.attribution?.blockedCount}`
+  );
   const wsAfter = readFileSync(workspaceAppJs, "utf8");
   check("实际工作区已包含修复", !wsAfter.includes('checks: ["authenticated"], decision: "no-check"'), "");
   check("写回保留了未提交本地改动", wsAfter.includes(LOCAL_MARK));

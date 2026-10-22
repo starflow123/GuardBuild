@@ -36,6 +36,14 @@ import {
   isGraphqlDenied,
   graphqlShapeRejected,
 } from "./graphqlwire.mjs";
+import {
+  MAX_VARIANT_CASES,
+  channelVariantFor,
+  foreignObjectVariants,
+  idEncodingVariants,
+  rawTokenRequest,
+  variantCaseId,
+} from "./attackvariants.mjs";
 
 export class ProbeError extends Error {
   constructor(message, { code = "probe_failed", hint = null } = {}) {
@@ -565,6 +573,10 @@ function pickTargets(byUser, loggedIn, anonymousItems = [], anonTargets = []) {
     admin,
     attackerOwnIds,
     readTarget: victimItems[0] ?? anonymousItems[0] ?? null,
+    // 变体材料：victim 名下全部对象（供「换对象」变体取主键之外的其它归属对象）、
+    // victim 自己的对象（正向断言：修复后本人仍能看到完整对象）
+    victimItems,
+    victimOwnTarget: victimItems[0] ?? null,
     attackCancelTarget: victimPaid[0] ?? victimItems[1] ?? victimItems[0] ?? null,
     adminCancelTarget: victimPaid[1] ?? victimPaid[0] ?? victimItems[0] ?? null,
     ownReadTarget: attackerItems[0] ?? null,
@@ -1154,7 +1166,7 @@ export function buildCases(ctx, targets) {
           : "";
         if (isOwnResource) {
           // 不算越权：attacker 本来就能访问自己的资源
-          return { verdict: "inconclusive", detail: `目标 #${readTarget.id} 在 attacker 自己的资源列表中，疑似跨端点 id 串号，不计为越权` };
+          return { verdict: "inconclusive", actual: `目标 #${readTarget.id} 在 attacker 自己的资源列表中，疑似跨端点 id 串号，不计为越权` };
         }
         return verifyAttack(res, phase, detail, leaked);
       },
@@ -1169,6 +1181,81 @@ export function buildCases(ctx, targets) {
       },
       impact: (res) => (okStatus(res.status) ? `可读取他人${candLabel}详情及字段（id/userId/amount/address 等）` : null),
     });
+  }
+
+  // —— 同源攻击变体（换对象 / 换 ID 写法 / 换参数通道）——
+  // 只对首要读候选展开：基线用例可能「碰巧」因补丁只挡住了那一个对象、那一种写法而通过。
+  // 变体带 requiresPreRepro：修复前没复现的（该目标本就不认这种写法）不参与修复后验收。
+  const primaryRead = readCands[0];
+  if (primaryRead && targets.readTarget && attacker && victim) {
+    const candLabel = resourceLabelOf(primaryRead.resource ?? ctx.plan?.resource);
+    const targetId = targets.readTarget.id;
+    const variants = [];
+    for (const v of foreignObjectVariants(
+      targets.victimItems,
+      targetId,
+      targets.attackerOwnIds ?? new Set()
+    )) {
+      variants.push({
+        axis: "obj",
+        label: v.label,
+        targetId: v.item.id,
+        req: candRequest(ctx, primaryRead, v.item.id),
+      });
+    }
+    for (const v of idEncodingVariants(targetId)) {
+      const req = rawTokenRequest(primaryRead, v.token) ?? candRequest(ctx, primaryRead, v.token);
+      variants.push({ axis: "enc", label: `ID ${v.label}「${v.token}」`, targetId, req });
+    }
+    const channel = channelVariantFor(primaryRead);
+    if (channel) {
+      const sep = channel.base.includes("?") ? "&" : "?";
+      variants.push({
+        axis: "chan",
+        label: channel.label,
+        targetId,
+        req: { method: primaryRead.method ?? "GET", path: `${channel.base}${sep}${channel.param}=${encodeURIComponent(String(targetId))}`, body: null },
+      });
+    }
+    const axisSeq = {};
+    for (const v of variants.slice(0, MAX_VARIANT_CASES)) {
+      if (!v.req?.path) continue;
+      axisSeq[v.axis] = (axisSeq[v.axis] ?? 0) + 1;
+      const caseId = variantCaseId("attack-read-foreign", v.axis, axisSeq[v.axis]);
+      cases.push({
+        id: caseId,
+        category: CASE_CATEGORY.ATTACK,
+        name: `变体·${v.label}：${attacker.name} 读取 ${victim.name} 的${candLabel}`,
+        identity: attacker.name,
+        method: v.req.method ?? "GET",
+        path: v.req.path,
+        body: v.req.body,
+        graphql: v.req.graphql ?? null,
+        routeKey: primaryRead.routeKeys?.[0] ?? readKey,
+        variant: { axis: v.axis, label: v.label },
+        requiresPreRepro: true,
+        expect: `同一越权入口的变体应被拒绝（401/403/404），补丁不能只挡住基线写法`,
+        verify: (res, phase) => {
+          const o = extractEntity(res.json, entityPathFor(ctx, primaryRead.graphql));
+          const leaked = o && String(resourceIdOf(o)) === String(v.targetId);
+          if (leaked && targets.attackerOwnIds?.has(String(v.targetId))) {
+            return { verdict: "inconclusive", actual: `目标 #${v.targetId} 在 attacker 自己的资源列表中，疑似跨端点 id 串号，不计为越权` };
+          }
+          const detail = leaked
+            ? `证据：变体写法仍返回${candLabel} #${resourceIdOf(o)}（归属 ${ownerOf(o)}），补丁只挡住了部分入口`
+            : "";
+          return verifyAttack(res, phase, detail, leaked);
+        },
+        crossProof: (res) => {
+          const o = extractEntity(res.json, entityPathFor(ctx, primaryRead.graphql));
+          if (!o || String(resourceIdOf(o)) !== String(v.targetId)) return null;
+          if (victim.user?.id && ownerOf(o) !== victim.user.id) return null;
+          return { note: `变体「${v.label}」命中的对象 #${resourceIdOf(o)} 归属 ${ownerOf(o)}（与受害人一致）` };
+        },
+        impact: (res) =>
+          okStatus(res.status) ? `换一种写法即可绕过补丁继续越权读取他人${candLabel}` : null,
+      });
+    }
   }
 
   for (const [i, cand] of cancelCands.entries()) {
@@ -1530,29 +1617,45 @@ export function buildCases(ctx, targets) {
   }
 
   // —— 业务用例（回归防线）——
-  const own = targets.ownReadTarget;
-  if (readPath && own && attacker) {
-    const ownReq = candRequest(ctx, readCands[0], own.id);
-    cases.push({
-      id: "business-read-own",
+  // 正向断言：修复不得把「本人可见」一并关掉，也不得靠删字段/返回空壳来伪装「攻击已阻断」。
+  // 字段契约以修复前的响应为基线（runPhase 在 pre 阶段记录），修复后缺字段即判回归。
+  const ownerReadCase = (id, ident, ownTarget) => {
+    const req = candRequest(ctx, readCands[0], ownTarget.id);
+    const entityOf = (res) => extractEntity(res.json, entityPathFor(ctx, readCands[0]?.graphql));
+    return {
+      id,
       category: CASE_CATEGORY.BUSINESS,
-      name: `${attacker.name} 读取自己的${label} #${own.id}`,
-      identity: attacker.name,
-      method: ownReq.method ?? "GET",
-      path: ownReq.path,
-      body: ownReq.body,
-      graphql: ownReq.graphql ?? null,
+      name: `${ident.name} 读取自己的${label} #${ownTarget.id}`,
+      identity: ident.name,
+      method: req.method ?? "GET",
+      path: req.path,
+      body: req.body,
+      graphql: req.graphql ?? null,
       routeKey: readKey,
-      expect: `本人${label}应正常可见（200，且归属本人）`,
+      expect: `本人${label}应正常可见（200，且归属本人、字段不减少）`,
+      contract: (res) => Object.keys(entityOf(res) ?? {}),
       verify: (res) =>
         verifyBusiness(res, 200, () => {
-          const o = extractEntity(res.json, entityPathFor(ctx, readCands[0]?.graphql));
+          const o = entityOf(res);
           if (!o) return `FAIL:响应缺少${label}对象`;
-          if (o.id !== own.id) return `FAIL:返回了错误的${label} #${o.id}`;
-          if (ownerOf(o) !== attacker.user?.id) return `FAIL:${label}归属异常 ${ownerOf(o)}`;
-          return `返回${label} #${o.id}，归属 ${ownerOf(o)}`;
+          if (String(resourceIdOf(o)) !== String(ownTarget.id)) return `FAIL:返回了错误的${label} #${resourceIdOf(o)}`;
+          if (ownerOf(o) !== ident.user?.id) return `FAIL:${label}归属异常 ${ownerOf(o)}`;
+          const base = ctx._ownerContract?.get(id) ?? [];
+          const missing = base.filter((k) => !(k in o));
+          if (missing.length) return `FAIL:字段契约缺失 ${missing.join("、")}（不得删减本人可见内容来冒充修复）`;
+          return `返回${label} #${resourceIdOf(o)}，归属 ${ownerOf(o)}，字段 ${Object.keys(o).length} 项`;
         }),
-    });
+    };
+  };
+
+  const own = targets.ownReadTarget;
+  if (readPath && own && attacker) {
+    cases.push(ownerReadCase("business-read-own", attacker, own));
+  }
+
+  // 受害人侧正向断言：补丁常见错误是「只放行 attacker 名下」这类按身份写死的判断
+  if (readPath && targets.victimOwnTarget && victim) {
+    cases.push(ownerReadCase("business-read-own-victim", victim, targets.victimOwnTarget));
   }
 
   if (listPath && attacker) {
@@ -1788,7 +1891,31 @@ export async function runPhase(ctx, { phase, baseUrl }) {
   }
   // 修复后验收只覆盖补丁实际修复的类别：注入/穿越无自动修复模板，
   // 若与可修复项混在同一目标中，仍按原样复现会误判「补丁无效」
-  const cases = phase === "pre" ? orderedCases : orderedCases.filter((c) => !c.unfixable);
+  let cases = phase === "pre" ? orderedCases : orderedCases.filter((c) => !c.unfixable);
+  // 变体用例只在「修复前确实复现过」时参与验收：目标本就不认这种写法（路由 404）
+  // 不能被记成「补丁挡住了」，否则变体越多、假通过越多。
+  let variantSkipped = 0;
+  if (phase !== "pre") {
+    const kept = [];
+    for (const c of cases) {
+      if (c.requiresPreRepro && ctx._preCaseVerdicts?.get(c.id) !== VERDICT.VULNERABLE) {
+        variantSkipped += 1;
+        continue;
+      }
+      kept.push(c);
+    }
+    cases = kept;
+  }
+  const variantPlanned = orderedCases.filter((c) => c.requiresPreRepro).length;
+  if (phase !== "pre" && variantSkipped > 0) {
+    ctx.emit({
+      kind: "phase",
+      severity: SEVERITY.INFO,
+      message: `修复后验收跳过 ${variantSkipped}/${variantPlanned} 条变体用例（修复前未复现，该目标不认这种写法）`,
+      phase,
+      data: { variantSkipped, variantPlanned },
+    });
+  }
   const skippedUnfixable = phase === "pre" ? [] : allCases.filter((c) => c.unfixable);
   if (skippedUnfixable.length > 0) {
     ctx.emit({
@@ -1874,6 +2001,14 @@ export async function runPhase(ctx, { phase, baseUrl }) {
     const fresh = await fetchNewDecisions(ctx, baseUrl);
     const decision = matchDecision(fresh, { method: sentMethod, path: sentPath, routeKey: kase.routeKey });
     const { verdict, actual } = kase.verify(res, phase);
+    if (phase === "pre") {
+      // 记下修复前结论与「本人可见」的字段基线，供修复后验收判定变体是否参与、字段是否被删减
+      (ctx._preCaseVerdicts ??= new Map()).set(kase.id, verdict);
+      if (kase.contract) {
+        const keys = kase.contract(res);
+        if (keys?.length) (ctx._ownerContract ??= new Map()).set(kase.id, keys);
+      }
+    }
     const impact = kase.impact ? kase.impact(res) : null;
     const cross = kase.crossProof ? kase.crossProof(res) : null;
     // 证据分级：strong=有服务端决策轨迹；cross-proven=内容归属交叉证明；http-only=仅 HTTP 状态
@@ -1967,6 +2102,9 @@ export async function runPhase(ctx, { phase, baseUrl }) {
     businessPassed: businessRecords.filter((e) => e.verdict === VERDICT.PASSED).length,
     businessRegressed: businessRecords.filter((e) => e.verdict === VERDICT.REGRESSED).length,
     businessTotal: businessRecords.length,
+    variantPlanned,
+    variantCounted: cases.filter((c) => c.requiresPreRepro).length,
+    variantSkipped,
     targets: {
       attacker: targets.attacker?.name ?? null,
       victim: targets.victim?.name ?? null,
@@ -1981,7 +2119,7 @@ export async function runPhase(ctx, { phase, baseUrl }) {
     message:
       phase === "pre"
         ? `修复前取证完成：复现漏洞 ${summary.attackRepro}/${attackRecords.length} 条攻击用例，业务基线 ${summary.businessPassed}/${summary.businessTotal} 通过`
-        : `修复后验收完成：攻击阻断 ${summary.attackBlocked}/${attackRecords.length}，业务回归 ${summary.businessPassed}/${summary.businessTotal} 通过`,
+        : `修复后验收完成：攻击阻断 ${summary.attackBlocked}/${attackRecords.length}（其中同源变体 ${summary.variantCounted} 条），业务回归 ${summary.businessPassed}/${summary.businessTotal} 通过`,
     phase,
     data: summary,
   });

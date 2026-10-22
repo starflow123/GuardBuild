@@ -632,8 +632,17 @@ test("buildCases: 条件化构建（无 cancel/admin 端点不虚构用例）+ �
   );
   assert.deepEqual(
     partial.map((c) => c.id),
-    ["attack-read-foreign", "business-read-own", "business-list-own", "business-unauth-401"],
-    "缺少 cancel/admin 端点时不应生成对应用例"
+    [
+      "attack-read-foreign",
+      "attack-read-foreign-enc1",
+      "attack-read-foreign-enc2",
+      "attack-read-foreign-enc3",
+      "attack-read-foreign-chan1",
+      "business-read-own",
+      "business-list-own",
+      "business-unauth-401",
+    ],
+    "缺少 cancel/admin 端点时不应生成对应用例（首要读候选仍展开同源变体）"
   );
   assert.equal(partial[0].path, "/api/users/11", "任意 :param 应被替换为对象 ID");
 
@@ -655,6 +664,10 @@ test("buildCases: 条件化构建（无 cancel/admin 端点不虚构用例）+ �
     full.map((c) => c.id),
     [
       "attack-read-foreign",
+      "attack-read-foreign-enc1",
+      "attack-read-foreign-enc2",
+      "attack-read-foreign-enc3",
+      "attack-read-foreign-chan1",
       "attack-cancel-foreign",
       "attack-vertical-escalation",
       "business-read-own",
@@ -666,7 +679,7 @@ test("buildCases: 条件化构建（无 cancel/admin 端点不虚构用例）+ �
       "business-nonadmin-denied",
       "business-unauth-401",
     ],
-    "端点齐全时用例顺序与既有 e2e 基线一致"
+    "端点齐全时用例顺序与既有 e2e 基线一致（基线读用例之后紧跟其同源变体）"
   );
 });
 
@@ -783,8 +796,17 @@ test("buildCases: 多候选逐一构建攻击用例（基名 + -2 后缀，N-5�
   const cases = buildCases(ctx, targets);
   assert.deepEqual(
     cases.filter((c) => c.category === "attack").map((c) => c.id),
-    ["attack-read-foreign", "attack-read-foreign-2", "attack-anonymous-read", "attack-anonymous-read-2"],
-    "每类候选按序构建，首候选保持基名"
+    [
+      "attack-read-foreign",
+      "attack-read-foreign-2",
+      "attack-read-foreign-enc1",
+      "attack-read-foreign-enc2",
+      "attack-read-foreign-enc3",
+      "attack-read-foreign-chan1",
+      "attack-anonymous-read",
+      "attack-anonymous-read-2",
+    ],
+    "每类候选按序构建，首候选保持基名；同源变体排在全部基线用例之后"
   );
   const read2 = cases.find((c) => c.id === "attack-read-foreign-2");
   assert.equal(read2.path, "/api/invoices/11", "第二读取候选应使用自身端点路径");

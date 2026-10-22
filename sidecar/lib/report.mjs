@@ -359,6 +359,13 @@ function renderMarkdown(r) {
     summaryLines.push(
       `- 双重验收：攻击阻断 ${acc.attackBlocked}/${acc.attackTotal}，业务保持 ${acc.businessPassed}/${acc.businessTotal} → ${acc.pass ? "通过" : "未通过"}`
     );
+    if (acc.variantCounted || acc.variantSkipped) {
+      summaryLines.push(
+        `- 验收含同源攻击变体 ${acc.variantCounted} 条（换对象 / 换 ID 写法 / 换参数通道）${
+          acc.variantSkipped ? `，另 ${acc.variantSkipped} 条因修复前未复现未计入` : ""
+        }`
+      );
+    }
   }
   if (r.patch) {
     const llmBits = r.patch.llm
@@ -502,6 +509,13 @@ function renderMarkdown(r) {
     parts.push(
       `攻击阻断 ${acc.attackBlocked}/${acc.attackTotal}，业务保持 ${acc.businessPassed}/${acc.businessTotal} → **${acc.pass ? "通过" : "未通过"}**\n`
     );
+    if (acc.variantCounted || acc.variantSkipped) {
+      parts.push(
+        `同源攻击变体 ${acc.variantCounted} 条参与验收（换对象 / 换 ID 写法 / 换参数通道；变体由引擎按模板生成，模型不参与编写用例）${
+          acc.variantSkipped ? `；${acc.variantSkipped} 条修复前未复现，不计入阻断` : ""
+        }。正向断言：本人读取仍返回完整对象且字段不少于修复前基线，防止用「整端点拒绝」或「删字段」冒充修复。\n`
+      );
+    }
     parts.push(evidenceTable(post));
   } else if (post.length) {
     parts.push(`## 修复后证据（post，${post.length} 条）\n`);

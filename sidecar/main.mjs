@@ -936,6 +936,8 @@ function acceptanceVerdict(summary) {
     businessPassed: summary.businessPassed,
     businessTotal: summary.businessTotal,
     businessRegressed: summary.businessRegressed,
+    variantCounted: summary.variantCounted ?? 0,
+    variantSkipped: summary.variantSkipped ?? 0,
     counts: summary.counts,
   };
 }

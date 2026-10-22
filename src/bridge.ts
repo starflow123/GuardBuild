@@ -150,6 +150,11 @@ export interface SessionError {
   message: string;
   hint?: string | null;
   details?: unknown;
+  /** 终态语义：coverage/clean 属正常结束（exit 0），blocked 为门禁阻断，failed 为真实执行失败 */
+  kind?: "coverage" | "clean" | "blocked" | "failed" | null;
+  outcome?: string | null;
+  title?: string | null;
+  semanticHint?: string | null;
 }
 
 export interface LlmView {

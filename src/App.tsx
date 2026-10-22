@@ -23,13 +23,16 @@ const ACTIVE_STATES = new Set([
 ]);
 const WAIT_STATES = new Set(["patch_review", "writeback_pending"]);
 const TERMINAL_STATES = new Set(["idle", "applied", "rolled_back", "error", "aborted", "verify_failed", "completed"]);
+/** exit 0 的正常终态：不是执行失败，界面不应染成红色 */
+const SOFT_ERROR_KINDS = new Set(["coverage", "clean"]);
 
-function stateChipClass(state: string): string {
+function stateChipClass(state: string, errorKind?: string | null): string {
   if (ACTIVE_STATES.has(state)) return "state-running";
   if (state === "applied" || state === "completed") return "state-ok";
   if (state === "patch_review" || state === "writeback_pending" || state === "verify_failed" || state === "rolled_back")
     return "state-warn";
-  if (state === "error" || state === "aborted") return "state-err";
+  if (state === "error" || state === "aborted")
+    return errorKind && SOFT_ERROR_KINDS.has(errorKind) ? "state-warn" : "state-err";
   return "";
 }
 
@@ -198,7 +201,7 @@ export function App() {
         <span className="project-path" title={view?.projectRoot ?? ""}>
           {view?.projectRoot ?? "尚未选择项目目录"}
         </span>
-        <span className={`chip ${stateChipClass(state)}`}>
+        <span className={`chip ${stateChipClass(state, view?.error?.kind)}`}>
           <span className="dot" />
           {view?.stateLabel ?? "空闲"}
         </span>
@@ -298,8 +301,13 @@ export function App() {
 
         <div className="col">
           {view?.error && (
-            <div className="banner err">
-              <b>会话错误</b>（{view.error.code}）：{view.error.message}
+            <div className={`banner ${view.error.kind && SOFT_ERROR_KINDS.has(view.error.kind) ? "warn" : "err"}`}>
+              <b>{view.error.title ?? "会话错误"}</b>（{view.error.code}）：{view.error.message}
+              {view.error.semanticHint && (
+                <div className="small" style={{ marginTop: 3 }}>
+                  {view.error.semanticHint}
+                </div>
+              )}
               {view.error.hint && <div className="small" style={{ marginTop: 3 }}>建议：{view.error.hint}</div>}
             </div>
           )}

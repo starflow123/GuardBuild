@@ -29,6 +29,7 @@ import { runSupabasePhase, isLoopbackHostname } from "./lib/supabase.mjs";
 import { runScout, applyScoutResult, recordScoutVerification } from "./lib/scout.mjs";
 import { isEnabled as llmEnabled } from "./lib/llm.mjs";
 import { runBlackbox } from "./lib/blackbox.mjs";
+import { coverageSummary, describeOutcome } from "./lib/coverage.mjs";
 import { createPatch, writebackPatch, rollbackWorkspace, PatchError } from "./lib/patcher.mjs";
 import { emitReport } from "./lib/report.mjs";
 import {
@@ -1088,9 +1089,9 @@ async function stageAnalyze(ctx) {
     const scanned = `已扫描 ${d.scannedFiles ?? 0} 个源文件（项目共 ${d.candidateFiles ?? 0} 个候选源文件${
       d.outputDirFiles > 0 ? `，其中产物目录 ${d.outputDirFiles} 个` : ""
     }${d.readFailures > 0 ? `，读取失败 ${d.readFailures} 个` : ""}）`;
-    throw new SessionError(`${scanned}，未发现对象级资源接口线索`, {
+    throw new SessionError(`${scanned}，未发现可探测的安全候选（未命中当前覆盖范围，非执行失败）`, {
       code: "no_candidates",
-      hint: `${scanned}。请确认项目包含「按对象 ID 取资源」的 HTTP 接口（如 /api/orders/:id）、「文件读取含请求可控路径」（路径穿越）或「请求输入拼接进 SQL/命令」（注入）的接口，或调整 guardbuild.json 的 scopes 后重试`,
+      hint: `${coverageSummary()} 想让这类项目进入检测：在 guardbuild.json 用 routes / openapi.file 声明路由，或开启 llm.enabled 做接入侦察。`,
     });
   }
 
@@ -1874,28 +1875,28 @@ async function abortSession(ctx) {
 }
 
 async function failSession(ctx, e) {
+  const pres = describeOutcome(e.code ?? "internal");
   const payload = {
     code: e.code ?? "internal",
     message: e.message,
     hint: e.hint ?? null,
     details: e.details ?? null,
+    outcome: pres.outcome,
+    kind: pres.kind,
+    title: pres.title,
+    semanticHint: pres.hint,
   };
-  const outcome =
-    payload.code === "no_candidates" ? "no_candidates"
-    : payload.code === "attack_not_reproducible" ? "not_reproducible"
-    : payload.code === "no_patchable_candidates" ? "vulnerable_unfixed"
-    : "failed";
   await emitReport(ctx, {
-    outcome,
-    exitCode: outcome === "failed" ? 2 : outcome === "vulnerable_unfixed" ? 1 : 0,
+    outcome: pres.outcome,
+    exitCode: pres.exitCode,
     state: STATE.ERROR,
     error: payload,
   });
   ctx.view.error = payload;
   emit(ctx, {
     kind: "session",
-    severity: SEVERITY.ERROR,
-    message: `执行失败：${e.message}${e.hint ? `（建议：${e.hint}）` : ""}`,
+    severity: pres.severity === "error" ? SEVERITY.ERROR : SEVERITY.WARN,
+    message: `${pres.title}：${e.message}${e.hint ? `（建议：${e.hint}）` : ""}`,
     data: payload,
   });
   await removeWorktree(ctx);
@@ -1904,6 +1905,12 @@ async function failSession(ctx, e) {
     ctx.sm.state = STATE.ERROR;
     ctx.view.state = STATE.ERROR;
     ctx.view.stateLabel = STATE_LABELS[STATE.ERROR];
+    pushView(ctx);
+  }
+  // 内部状态仍记为 error（便于会话槽位释放与终态判定），但面向用户的标签
+  // 要说清语义：exit 0 的「未命中覆盖范围 / 未发现可复现漏洞」不是执行失败。
+  if (pres.kind !== "failed") {
+    ctx.view.stateLabel = pres.stateLabel;
     pushView(ctx);
   }
   shutdownProcs(ctx).catch(() => {});

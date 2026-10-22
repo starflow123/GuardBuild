@@ -253,7 +253,16 @@ try {
   mkdirSync(emptyProj, { recursive: true });
   send({ cmd: "start", project: emptyProj });
   await waitState("error", 60_000);
-  check("空项目会话正确失败（no_candidates 终止）", view.error?.code === "no_candidates", `code=${view.error?.code}`);
+  check(
+    "空项目正常终止（no_candidates → 未命中覆盖范围）",
+    view.error?.code === "no_candidates" && view.error?.kind === "coverage",
+    `code=${view.error?.code} kind=${view.error?.kind}`
+  );
+  check(
+    "未命中覆盖范围不得显示为执行失败",
+    view.stateLabel === "未命中覆盖范围",
+    `stateLabel=${view.stateLabel}`
+  );
   const failedSessionId = view.sessionId;
   send({ cmd: "start", project: workspace });
   await waitFor(

@@ -23,6 +23,7 @@ function buildPocList(preEvidence, baseUrl) {
 
 import { PROTOCOL_VERSION, RPC_TO_HOST, SEVERITY, STATE_LABELS } from "../../shared/protocol.mjs";
 import { buildFixBriefs } from "./fixbrief.mjs";
+import { coverageSummary, describeOutcome } from "./coverage.mjs";
 
 const MD_EVIDENCE_CAP = 20;
 const MD_FIX_BRIEF_CAP = 10;
@@ -59,7 +60,7 @@ function headline(outcome, patchStatus, supabase, blackbox = null) {
         ? "发现可利用的对象级越权（IDOR）漏洞；修复补丁未通过双重验收，需人工审查证据"
         : "发现可利用的对象级越权（IDOR）漏洞，已生成双重验收通过的修复补丁（gate 未写回工作区）";
     case "no_candidates":
-      return "静态分析未发现可探测的安全候选端点（对象级越权 / 注入 / 路径穿越线索）。若项目是未识别框架，可在 guardbuild.json 提供 openapi.file 或 routes 字段声明路由后重试";
+      return "未命中当前覆盖范围（exit 0，非执行失败）：静态分析未发现可探测的安全候选端点。项目形态不在适配器覆盖内时属正常结果；未识别框架可在 guardbuild.json 用 routes / openapi.file 声明路由，或开启 llm.enabled 做接入侦察";
     case "vulnerable_unfixed":
       if (supaCritical) {
         return supabase.leaks > 0
@@ -113,7 +114,11 @@ function suggestions(r) {
     lines.push("- 补丁未通过双重验收（存在未阻断攻击或业务回归），请对照 post 证据中的 regressed/inconclusive 用例人工审查。");
     lines.push(`- 补丁保留在隔离 worktree：\`${r.patch?.worktree}\`。`);
   } else if (outcome === "no_candidates") {
-    lines.push("- 当前策略覆盖对象级越权（IDOR）/ 无鉴权读取 / 路径穿越 / SQL 与命令注入 / Supabase 数据暴露等场景类；如需其它漏洞类别，请扩展策略包与契约。");
+    lines.push("- 这是 exit 0 的正常终态（未命中覆盖范围），不是执行失败：引擎完成了源码扫描，只是没识别出可探测的对象级接口。");
+    lines.push(`- ${coverageSummary()}`);
+    lines.push(
+      "- 让这类项目进入检测：在 guardbuild.json 用 `routes` 或 `openapi.file` 显式声明路由；未知框架可开启 `llm.enabled` 做接入侦察；纯前端 + 托管后端（如 Supabase）请核对 `identities` 与登录契约。"
+    );
   } else if (outcome === "vulnerable_unfixed") {
     if (supabase && ((supabase.leaks ?? 0) > 0 || supabase.serviceRoleLeak)) {
       if ((supabase.leaks ?? 0) > 0) {
@@ -497,6 +502,10 @@ function renderMarkdown(r) {
 export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error = null, state = null }) {
   const view = ctx.view;
   const evidence = Array.isArray(view.evidence) ? view.evidence : [];
+  // exit 0 的正常终态（未命中覆盖范围 / 未发现可复现漏洞）不写「执行出错」
+  const errPres = error?.code ? describeOutcome(error.code) : null;
+  const stateLabel =
+    errPres && errPres.kind !== "failed" ? errPres.stateLabel : STATE_LABELS[state ?? view.state] ?? (state ?? view.state);
   const byPhase = (p) => evidence.filter((e) => e.phase === p);
   const finalState = state ?? view.state;
   const start = ctx.targetConfig?.start ?? null;
@@ -513,7 +522,7 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
       startedAt: view.startedAt,
       finishedAt: Date.now(),
       state: finalState,
-      stateLabel: STATE_LABELS[finalState] ?? finalState,
+      stateLabel,
     },
     verdict: {
       outcome,

@@ -209,7 +209,30 @@ function renderLlmSection(llm) {
     `| 证据 | ${llm.evidenceFiles?.length ?? 0} 个文件 / ${llm.evidenceChars ?? 0} 字符 |`,
     "",
   ];
-  if (llm.rejectedStart) {
+  if (Array.isArray(llm.startAttempts) && llm.startAttempts.length) {
+    lines.push(
+      "**启动候选实际验证**（按侦察给出的顺序逐个真实启动，首个就绪即止）\n",
+      "| # | 命令 | 结果 | 诊断 | 耗时 |",
+      "| --- | --- | --- | --- | --- |"
+    );
+    for (const a of llm.startAttempts) {
+      const cmd = `${a.cmd ?? "?"} ${(a.args ?? []).join(" ")}`.trim();
+      const result = a.skipped ? "跳过（预算不足）" : a.ok ? "已就绪" : "失败";
+      const diag = a.ok
+        ? "—"
+        : esc(
+            [a.diagnosisCode ?? a.code ?? "—", a.exitCode != null ? `exit ${a.exitCode}` : null]
+              .filter(Boolean)
+              .join(" · ")
+          );
+      lines.push(
+        `| ${a.index ?? "?"}/${a.total ?? "?"} | \`${esc(cmd)}\` | ${result} | ${a.skipped ? esc(a.hint ?? "—") : diag} | ${
+          a.durationMs != null ? `${a.durationMs}ms` : "—"
+        } |`
+      );
+    }
+    lines.push("");
+  } else if (llm.rejectedStart) {
     const rejected = llm.rejectedStart;
     lines.push(
       `- 启动回退：LLM 启动契约未通过实际启动验证（\`${esc(rejected.cmd ?? "?")} ${esc((rejected.args ?? []).join(" "))}\`）。`
@@ -663,6 +686,20 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
           applied: view.llm.applied ?? { start: false, login: false, routes: 0 },
           verified: view.llm.verified ?? { start: false, login: false },
           rejectedStart: view.llm.rejectedStart ?? null,
+          startAttempts: (view.llm.startAttempts ?? []).slice(0, 8).map((a) => ({
+            index: a.index ?? null,
+            total: a.total ?? null,
+            cmd: a.cmd ?? null,
+            args: a.args ?? [],
+            cwd: a.cwd ?? null,
+            ok: !!a.ok,
+            skipped: !!a.skipped,
+            code: a.code ?? null,
+            diagnosisCode: a.diagnosisCode ?? null,
+            exitCode: a.exitCode ?? null,
+            hint: a.hint ?? null,
+            durationMs: a.durationMs ?? null,
+          })),
           evidenceFiles: view.llm.evidenceFiles ?? [],
           evidenceChars: view.llm.evidenceChars ?? 0,
           usage: view.llm.usage ?? null,

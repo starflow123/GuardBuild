@@ -32,6 +32,8 @@ const MAX_TOTAL_CHARS = 24000;
 const MAX_ROUTE_FILES = 20;
 const MAX_ROUTE_FILE_BYTES = 128 * 1024;
 const MAX_ROUTES = 30;
+/** 启动候选上限（含首选）：多给几个退路，但重试成本必须可预期 */
+export const MAX_START_CANDIDATES = 4;
 const READ_FILE_TIMEOUT_MS = 15_000;
 const SCOUT_TIMEOUT_MS = 60_000;
 
@@ -190,14 +192,17 @@ const SYSTEM_PROMPT = [
   "你是后端项目接入侦察助手。只根据用户给出的目录树和文件片段，推断如何启动服务、如何登录、有哪些按对象取数的 HTTP 路由。",
   "只返回一个 JSON 对象，不要 markdown 包裹，不要多余解释：",
   "{",
-  '  "start": { "cmd": "node", "args": ["server.js"], "env": { "PORT": "' + GB + '" }, "cwd": null, "readyPattern": "listening", "readyTimeoutMs": 30000 } | null,',
+  '  "starts": [ { "cmd": "node", "args": ["server.js"], "env": { "PORT": "' + GB + '" }, "cwd": null, "readyPattern": "listening", "readyTimeoutMs": 30000 },',
+  '              { "cmd": "npm", "args": ["run", "dev"], "env": { "PORT": "' + GB + '" }, "cwd": null, "readyPattern": "ready", "readyTimeoutMs": 60000 } ],',
   '  "login": { "path": "/api/login", "method": "POST", "bodyTemplate": { "email": "{email}", "password": "{password}" }, "credentialPath": "token", "credentialHeader": "Authorization", "credentialPrefix": "Bearer ", "userPath": null } | null,',
   '  "routes": [ { "method": "GET", "path": "/api/orders/:id", "file": "src/app.js", "line": 42, "resource": "order", "hasAuth": true },',
   '               { "method": "GET", "path": "/api/orders", "file": "src/app.js", "line": 20, "resource": "order", "hasAuth": true, "list": true, "hasOwnerFilter": true } ],',
   '  "notes": ["简短说明，最多 5 条"]',
   "}",
   "规则：",
-  "- start.cmd 只能是 node / npm / npx / python / python3 / py / uvicorn / gunicorn / hypercorn / flask / fastapi / uv；",
+  "- starts 按可能性从高到低给出 1–4 个候选启动方式，引擎会按顺序实际启动，直到有一个真正就绪；第一个即首选；",
+  "- 候选必须来自证据中真实存在的入口或脚本（package.json 的 scripts、server.js / app.py、uvicorn 目标等）；不要编造不存在的文件；",
+  "- 每个候选的 cmd 只能是 node / npm / npx / python / python3 / py / uvicorn / gunicorn / hypercorn / flask / fastapi / uv；",
   "- 端口必须使用 " + GB + " 占位符；不要输出固定端口；",
   "- 不要输出 identities、账号、密码、token 或任何密钥；身份由用户在 guardbuild.json 提供；",
   "- login 只描述请求形态，bodyTemplate 用 {email}/{username}/{password} 占位；",
@@ -279,6 +284,11 @@ export function sanitizeStart(raw, { dirs = null } = {}, warnings = []) {
     readyPattern: sanitizeReadyPattern(raw.readyPattern, warnings),
     readyTimeoutMs,
   };
+}
+
+/** 启动方式指纹：命令 + 参数 + cwd；同一启动方式的 env/readyPattern 差异不视为新候选 */
+export function startSignature(start) {
+  return `${start.cmd}\u0000${(start.args ?? []).join("\u0000")}\u0000${start.cwd ?? ""}`;
 }
 
 /** 登录契约白名单校验；不通过返回 null。 */
@@ -421,7 +431,25 @@ function sanitizeRoute(raw, warnings) {
  * @param {object} opts { evidence, readFile }
  */
 export async function validateScoutResult(raw, { evidence, readFile }, warnings = []) {
-  const start = sanitizeStart(raw?.start, { dirs: evidence?.dirs ?? null }, warnings);
+  // starts 是主字段；旧缓存/旧模型只给 start 时按单候选兼容
+  const rawStarts = [];
+  if (Array.isArray(raw?.starts)) rawStarts.push(...raw.starts);
+  if (raw?.start && typeof raw.start === "object") rawStarts.push(raw.start);
+  const starts = [];
+  const seenStarts = new Set();
+  for (const item of rawStarts.slice(0, MAX_START_CANDIDATES * 3)) {
+    if (starts.length >= MAX_START_CANDIDATES) {
+      warnings.push(`LLM 启动候选超过 ${MAX_START_CANDIDATES} 个，已忽略后续候选`);
+      break;
+    }
+    const s = sanitizeStart(item, { dirs: evidence?.dirs ?? null }, warnings);
+    if (!s) continue;
+    const sig = startSignature(s);
+    if (seenStarts.has(sig)) continue;
+    seenStarts.add(sig);
+    starts.push(s);
+  }
+  const start = starts[0] ?? null;
   const login = sanitizeLogin(raw?.login, warnings);
 
   if (raw?.identities) {
@@ -474,7 +502,7 @@ export async function validateScoutResult(raw, { evidence, readFile }, warnings 
   const notes = Array.isArray(raw?.notes)
     ? raw.notes.filter((n) => typeof n === "string" && n.trim()).slice(0, 5).map((n) => n.slice(0, 200))
     : [];
-  return { start, login, routes, notes, warnings };
+  return { start, starts, login, routes, notes, warnings };
 }
 
 function cacheKeyFor(model, evidence) {
@@ -554,6 +582,7 @@ function writeDiskCache(ctx, key, result) {
     evidenceFiles: result.evidenceFiles ?? [],
     evidenceChars: result.evidenceChars ?? 0,
     start: result.start ?? null,
+    starts: result.starts ?? (result.start ? [result.start] : []),
     login: result.login ?? null,
     routes: result.routes ?? [],
     notes: result.notes ?? [],
@@ -595,10 +624,11 @@ async function readDiskCache(ctx, key, evidence) {
 
   const warnings = Array.isArray(data.warnings) ? [...data.warnings] : [];
   warnings.push(`使用磁盘缓存的侦察契约（保存于 ${new Date(data.savedAt).toISOString()}）`);
+  const cachedStarts = Array.isArray(data.starts) ? data.starts : data.start ? [data.start] : [];
   let checked;
   try {
     checked = await validateScoutResult(
-      { start: data.start, login: data.login, routes: data.routes, notes: data.notes },
+      { starts: cachedStarts, login: data.login, routes: data.routes, notes: data.notes },
       {
         evidence: { dirs: evidence?.dirs ?? null, files: evidence?.files ?? [] },
         readFile: (rel) => readProjectText(ctx, rel),
@@ -609,14 +639,22 @@ async function readDiskCache(ctx, key, evidence) {
     return null;
   }
 
-  let start = checked.start;
+  let starts = checked.starts;
   if (data.verified?.start === false) {
-    start = null;
+    starts = [];
     warnings.push("缓存中的启动方式在上次运行未通过实际启动验证，已忽略并改用确定性自动探测/缺省契约");
+  } else if (data.workingStart) {
+    // 上次实跑验证通过的候选提到最前，避免每次都从已知失败的猜测开始
+    const working = sanitizeStart(data.workingStart, { dirs: evidence?.dirs ?? null }, []);
+    if (working) {
+      const sig = startSignature(working);
+      starts = [working, ...starts.filter((s) => startSignature(s) !== sig)].slice(0, MAX_START_CANDIDATES);
+    }
   }
 
   return {
-    start,
+    start: starts[0] ?? null,
+    starts,
     login: checked.login,
     routes: checked.routes,
     notes: checked.notes,
@@ -652,12 +690,25 @@ export function recordScoutVerification(ctx, patch = {}) {
     Object.assign(verified, applied);
     data.verified = verified;
     data.verifiedAt = Date.now();
+    if (patch.start === true) {
+      // 本次启动成功：清掉上一轮的失败痕迹，避免报告/缓存继续呈现过期结论
+      delete data.rejectedStart;
+      delete data.rejectedStarts;
+    }
     if (patch.rejectedStart !== undefined) data.rejectedStart = patch.rejectedStart;
+    if (patch.rejectedStarts !== undefined) data.rejectedStarts = patch.rejectedStarts;
+    if (patch.workingStart !== undefined) data.workingStart = patch.workingStart;
     writeJsonAtomic(file, data);
     for (const entry of SCOUT_CACHE.values()) {
       if (entry.result?._cacheFile !== file) continue;
       entry.result.verified = { ...(entry.result.verified ?? {}), ...applied };
+      if (patch.start === true) {
+        delete entry.result.rejectedStart;
+        delete entry.result.rejectedStarts;
+      }
       if (patch.rejectedStart !== undefined) entry.result.rejectedStart = patch.rejectedStart;
+      if (patch.rejectedStarts !== undefined) entry.result.rejectedStarts = patch.rejectedStarts;
+      if (patch.workingStart !== undefined) entry.result.workingStart = patch.workingStart;
     }
     return true;
   } catch {
@@ -679,6 +730,7 @@ export async function runScout(
   if (evidence.files.length === 0) {
     return {
       start: null,
+      starts: [],
       login: null,
       routes: [],
       notes: [],

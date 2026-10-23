@@ -12,6 +12,9 @@
  *
  * 第二轮 r2 关闭 mock 且不提供密钥：验证侦察契约从磁盘缓存复用，
  * 仍会实际启动/登录验证，报告与视图标记 cacheSource=disk。
+ * r1 的 mock 返回两个启动候选（首选 node server.js 是合理但错误的猜测，
+ * 靶场里只有 boot.mjs）：引擎按序真实启动，首个候选失败后自动切换第二个；
+ * r2 从缓存复用时应把上次实际验证通过的候选提到最前，只尝试一次。
  *
  * 同时校验安全边界：
  *   - 侦察请求经 Host 出站，带 Bearer 鉴权；密钥只从环境变量读取；
@@ -23,7 +26,7 @@
 import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { createServer } from "node:http";
-import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -58,9 +61,10 @@ function git(args, cwd) {
   return r.stdout;
 }
 
-function makeWorkspace(name) {
+function makeWorkspace(name, mutate) {
   const ws = path.join(demoDir, name);
   cpSync(fixture, ws, { recursive: true });
+  if (mutate) mutate(ws);
   git(["init", "-q"], ws);
   git(["config", "user.email", "gate@guardbuild.local"], ws);
   git(["config", "user.name", "GuardBuild Gate"], ws);
@@ -72,14 +76,24 @@ function makeWorkspace(name) {
 
 /** mock DeepSeek chat completions：记录请求特征，返回固定契约 */
 const MOCK_CONTRACT = {
-  start: {
-    cmd: "node",
-    args: ["boot.mjs"],
-    env: { PORT: "${GB_PORT}" },
-    cwd: null,
-    readyPattern: "listening on port",
-    readyTimeoutMs: 30_000,
-  },
+  starts: [
+    {
+      cmd: "node",
+      args: ["server.js"],
+      env: { PORT: "${GB_PORT}" },
+      cwd: null,
+      readyPattern: "listening on port",
+      readyTimeoutMs: 8000,
+    },
+    {
+      cmd: "node",
+      args: ["boot.mjs"],
+      env: { PORT: "${GB_PORT}" },
+      cwd: null,
+      readyPattern: "listening on port",
+      readyTimeoutMs: 30_000,
+    },
+  ],
   login: {
     path: "/api/login",
     method: "POST",
@@ -108,12 +122,34 @@ const MOCK_CONTRACT = {
   notes: ["mock LLM contract: custom route table"],
 };
 
+/** 所有启动候选都不可用的场景：用于验证「候选全灭 → 回退确定性契约」与失败写回缓存 */
+const MOCK_DEAD_CONTRACT = {
+  ...MOCK_CONTRACT,
+  starts: [
+    {
+      cmd: "node",
+      args: ["server.js"],
+      env: { PORT: "${GB_PORT}" },
+      readyPattern: "listening on port",
+      readyTimeoutMs: 5000,
+    },
+    {
+      cmd: "node",
+      args: ["nope.mjs"],
+      env: { PORT: "${GB_PORT}" },
+      readyPattern: "listening on port",
+      readyTimeoutMs: 5000,
+    },
+  ],
+};
+
 function startMockLlm() {
   return new Promise((resolve) => {
     const state = {
       calls: 0,
       authHeaders: [],
       prompts: [],
+      models: [],
       responseFormat: null,
       stream: null,
       model: null,
@@ -136,10 +172,12 @@ function startMockLlm() {
           /* 交给下面的空体响应 */
         }
         state.model = body?.model ?? null;
+        state.models.push(state.model);
         state.responseFormat = body?.response_format?.type ?? null;
         state.stream = body?.stream ?? null;
         const userPrompt = body?.messages?.find((m) => m.role === "user")?.content ?? "";
         state.prompts.push(userPrompt);
+        const contract = state.model === "deepseek-dead" ? MOCK_DEAD_CONTRACT : MOCK_CONTRACT;
         res.statusCode = 200;
         res.setHeader("Content-Type", "application/json");
         res.end(
@@ -150,7 +188,7 @@ function startMockLlm() {
             choices: [
               {
                 index: 0,
-                message: { role: "assistant", content: JSON.stringify(MOCK_CONTRACT) },
+                message: { role: "assistant", content: JSON.stringify(contract) },
                 finish_reason: "stop",
               },
             ],
@@ -235,17 +273,30 @@ function findScoutCacheFiles() {
 }
 
 async function main() {
-  console.log("[LLM] 0/2 准备演示目录…");
+  console.log("[LLM] 0/3 准备演示目录…");
   rmSync(demoDir, { recursive: true, force: true });
   mkdirSync(dataDir, { recursive: true });
   if (!existsSync(exe)) throw new Error(`未找到无头宿主: ${exe}（先 cargo build --no-default-features --bin guardbuild-headless）`);
 
   const ws = makeWorkspace("llm-scout-shop");
+  // 同一份靶场、换一个模型名：缓存键不同，且 mock 会返回「所有启动候选都不可用」
+  const deadWs = makeWorkspace("llm-scout-dead", (dir) => {
+    const p = path.join(dir, "guardbuild.json");
+    const cfg = JSON.parse(readFileSync(p, "utf8"));
+    cfg.llm = { enabled: true, model: "deepseek-dead" };
+    writeFileSync(p, JSON.stringify(cfg, null, 2));
+  });
   const { server, port: mockPort, state } = await startMockLlm();
   let r1;
+  let r3;
   try {
-    console.log("\n[LLM] 1/2 未知框架 + mock DeepSeek：期望 exit 1（漏洞复现但无自动补丁）…");
+    console.log("\n[LLM] 1/3 未知框架 + mock DeepSeek：期望 exit 1（漏洞复现但无自动补丁）…");
     r1 = await runGate(ws, "r1", {
+      DEEPSEEK_API_KEY: MOCK_KEY,
+      DEEPSEEK_BASE_URL: `http://127.0.0.1:${mockPort}/v1`,
+    });
+    console.log("\n[LLM] 2/3 所有启动候选都不可用：期望回退确定性契约后失败，并写回缓存…");
+    r3 = await runGate(deadWs, "r3", {
       DEEPSEEK_API_KEY: MOCK_KEY,
       DEEPSEEK_BASE_URL: `http://127.0.0.1:${mockPort}/v1`,
     });
@@ -253,7 +304,7 @@ async function main() {
     await new Promise((r) => server.close(r));
   }
 
-  console.log("\n[LLM] 2/2 关闭 mock 且不提供密钥：期望命中磁盘缓存并仍实际验证…");
+  console.log("\n[LLM] 3/3 关闭 mock 且不提供密钥：期望命中磁盘缓存并仍实际验证…");
   const r2 = await runGate(ws, "r2", {
     DEEPSEEK_API_KEY: "",
     DEEPSEEK_BASE_URL: "",
@@ -273,10 +324,10 @@ async function main() {
   );
 
   // ---------- 侦察请求与证据安全 ----------
-  check("mock LLM 恰好收到 1 次侦察请求", state.calls === 1, `calls=${state.calls}`);
+  check("mock LLM 收到 2 次侦察请求（两个项目各一次）", state.calls === 2, `calls=${state.calls}`);
   check(
     "请求带 Bearer 鉴权（密钥经 Host 传递）",
-    state.authHeaders.length === 1 && state.authHeaders[0] === `Bearer ${MOCK_KEY}`,
+    state.authHeaders.length === 2 && state.authHeaders.every((h) => h === `Bearer ${MOCK_KEY}`),
     "Authorization: Bearer ***"
   );
   const prompt = state.prompts[0] ?? "";
@@ -291,7 +342,11 @@ async function main() {
     state.responseFormat === "json_object" && state.stream === false,
     `response_format=${state.responseFormat} stream=${state.stream}`
   );
-  check("模型名使用 deepseek-chat", state.model === "deepseek-chat", `model=${state.model}`);
+  check(
+    "模型名按契约传递（deepseek-chat / deepseek-dead）",
+    state.models[0] === "deepseek-chat" && state.models[1] === "deepseek-dead",
+    `models=${state.models.join(",")}`
+  );
 
   // ---------- 作用域与验证事件 ----------
   check(
@@ -320,6 +375,26 @@ async function main() {
     "视图记录实际验证通过（start + login）",
     llm.verified?.start === true && llm.verified?.login === true,
     `verified=${JSON.stringify(llm.verified)}`
+  );
+  const attempts = llm.startAttempts ?? [];
+  check(
+    "视图记录逐候选启动：首选失败（缺入口）→ 第二候选就绪",
+    attempts.length === 2 &&
+      attempts[0].index === 1 &&
+      attempts[0].ok === false &&
+      attempts[0].code === "target_not_ready" &&
+      attempts[0].diagnosisCode === "missing_dependency" &&
+      attempts[1].index === 2 &&
+      attempts[1].ok === true &&
+      attempts[1].cmd === "node" &&
+      (attempts[1].args ?? []).includes("boot.mjs"),
+    JSON.stringify(attempts.map((a) => `${a.index}:${a.ok}:${a.diagnosisCode}`))
+  );
+  check(
+    "事件流解释候选切换（不是一次失败就放弃）",
+    r1.stdout.includes("LLM 启动候选 1/2 未通过实际启动") &&
+      r1.stdout.includes("继续尝试启动候选 2/2"),
+    ""
   );
   check(
     "视图记录侦察证据文件与模型用量",
@@ -359,6 +434,20 @@ async function main() {
       (rep?.summary?.start?.args ?? []).includes("boot.mjs"),
     `source=${rep?.summary?.startSource} cmd=${rep?.summary?.start?.cmd}`
   );
+  check(
+    "报告记录逐候选启动结果（首个失败、第二个就绪）",
+    Array.isArray(rep?.llm?.startAttempts) &&
+      rep.llm.startAttempts.length === 2 &&
+      rep.llm.startAttempts[0].ok === false &&
+      rep.llm.startAttempts[0].diagnosisCode === "missing_dependency" &&
+      rep.llm.startAttempts[1].ok === true,
+    JSON.stringify((rep?.llm?.startAttempts ?? []).map((a) => `${a.index}:${a.ok}`))
+  );
+  check(
+    "报告 Markdown 呈现启动候选表",
+    md.includes("启动候选实际验证") && md.includes("missing_dependency") && md.includes("boot.mjs"),
+    ""
+  );
   const findingPaths = (rep?.summary?.findings ?? []).map((f) => f.path);
   check(
     "静态发现来自侦察路由（详情 + 取消）",
@@ -386,6 +475,40 @@ async function main() {
   check("DB：未写入补丁记录", patchN === 0, `patches=${patchN}`);
   check("DB：pre 攻击证据入库（≥ 2）", preVulnN >= 2, `pre vulnerable=${preVulnN}`);
 
+  // ---------- 全部启动候选失败：回退确定性契约，失败结论写回缓存 ----------
+  const g3 = r3.gate ?? {};
+  const view3 = lastView(r3.stdout) ?? {};
+  const llm3 = view3.llm ?? {};
+  const attempts3 = llm3.startAttempts ?? [];
+  check(
+    "r3 全部候选失败：exit 2 / verdict=failed / error=target_not_ready",
+    r3.code === 2 && g3.verdict === "failed" && g3.error?.code === "target_not_ready",
+    `code=${r3.code} verdict=${g3.verdict} error=${g3.error?.code}`
+  );
+  check(
+    "r3 逐个尝试所有 LLM 候选后才放弃（2 个候选均缺入口）",
+    attempts3.length === 2 &&
+      attempts3.every((a) => a.ok === false && a.diagnosisCode === "missing_dependency"),
+    JSON.stringify(attempts3.map((a) => `${a.index}:${a.ok}:${a.diagnosisCode}`))
+  );
+  check(
+    "r3 回退到确定性契约并记录被拒绝的首选启动方式",
+    r3.stdout.includes("回退到缺省启动契约重试") && (llm3.rejectedStart?.args ?? []).includes("server.js"),
+    `rejected=${JSON.stringify(llm3.rejectedStart?.args ?? [])}`
+  );
+  check(
+    "r3 失败结论写回缓存（verified.start=false，且没有 workingStart）",
+    findScoutCacheFiles().some((f) => {
+      try {
+        const d = JSON.parse(readFileSync(f, "utf8"));
+        return d.verified?.start === false && !d.workingStart;
+      } catch {
+        return false;
+      }
+    }),
+    ""
+  );
+
   // ---------- 第二轮：无密钥 / 无 mock 的磁盘缓存复用 ----------
   const g2 = r2.gate ?? {};
   check("r2 无密钥仍 exit 1（缓存契约 + 实际复现）", r2.code === 1, `code=${r2.code}`);
@@ -394,7 +517,7 @@ async function main() {
     g2.verdict === "vulnerable_unfixed" && g2.error?.code === "no_patchable_candidates",
     `verdict=${g2.verdict} code=${g2.error?.code}`
   );
-  check("r2 未再调用 LLM（mock 请求数仍为 1）", state.calls === 1, `calls=${state.calls}`);
+  check("r2 未再调用 LLM（mock 请求数仍为 2）", state.calls === 2, `calls=${state.calls}`);
   check("r2 事件流提示命中磁盘侦察缓存", r2.stdout.includes("命中磁盘侦察缓存"), "");
   const view2 = lastView(r2.stdout) ?? {};
   const llm2 = view2.llm ?? {};
@@ -407,6 +530,12 @@ async function main() {
     "r2 缓存契约仍经实际启动+登录验证",
     llm2.verified?.start === true && llm2.verified?.login === true,
     `verified=${JSON.stringify(llm2.verified)}`
+  );
+  const attempts2 = llm2.startAttempts ?? [];
+  check(
+    "r2 复用缓存时优先上次验证通过的候选（只启动一次）",
+    attempts2.length === 1 && attempts2[0].ok === true && (attempts2[0].args ?? []).includes("boot.mjs"),
+    JSON.stringify(attempts2.map((a) => `${a.index}:${a.ok}`))
   );
   check(
     "r2 侦察事件确认实际启动/登录验证",
@@ -451,9 +580,26 @@ async function main() {
     }),
     ""
   );
+  check(
+    "缓存记录可用的启动方式（workingStart=boot.mjs）与完整候选队列",
+    cacheFiles.some((f) => {
+      try {
+        const d = JSON.parse(readFileSync(f, "utf8"));
+        return (
+          Array.isArray(d.starts) &&
+          d.starts.length === 2 &&
+          d.workingStart?.cmd === "node" &&
+          (d.workingStart?.args ?? []).includes("boot.mjs")
+        );
+      } catch {
+        return false;
+      }
+    }),
+    ""
+  );
 
   // ---------- 密钥不泄漏 ----------
-  const blob = [JSON.stringify(rep ?? {}), md, r1.stdout, r1.stderr, JSON.stringify(rep2 ?? {}), r2.stdout, r2.stderr].join("\n");
+  const blob = [JSON.stringify(rep ?? {}), md, r1.stdout, r1.stderr, JSON.stringify(rep2 ?? {}), r2.stdout, r2.stderr, r3.stdout, r3.stderr].join("\n");
   check("mock 密钥不进入报告/事件流/stderr", !blob.includes(MOCK_KEY), "");
 
   const passed = checks.filter((c) => c.pass).length;

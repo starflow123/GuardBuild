@@ -181,6 +181,20 @@ export interface LlmView {
   } | null;
   verified?: { start: boolean; login: boolean };
   rejectedStart?: { cmd?: string; args?: string[] } | null;
+  startAttempts?: {
+    index?: number | null;
+    total?: number | null;
+    cmd?: string | null;
+    args?: string[];
+    cwd?: string | null;
+    ok?: boolean;
+    skipped?: boolean;
+    code?: string | null;
+    diagnosisCode?: string | null;
+    exitCode?: number | null;
+    hint?: string | null;
+    durationMs?: number | null;
+  }[];
 }
 
 export interface View {
@@ -442,6 +456,20 @@ function createMockBridge(): Bridge {
           usage: { prompt_tokens: 1200, completion_tokens: 240, total_tokens: 1440 },
           verified: { start: true, login: true },
           rejectedStart: null,
+          startAttempts: [
+            {
+              index: 1,
+              total: 2,
+              cmd: "node",
+              args: ["server.js"],
+              ok: false,
+              code: "target_not_ready",
+              diagnosisCode: "missing_dependency",
+              exitCode: 1,
+              durationMs: 640,
+            },
+            { index: 2, total: 2, cmd: "node", args: ["boot.mjs"], ok: true, durationMs: 420 },
+          ],
         };
         ev({ kind: "analyze", phase: st, severity: "warn", message: "发现 2 个对象级越权候选" });
         ev({ kind: "scout", phase: st, severity: "success", message: "LLM 接入侦察：启动/登录契约已验证（磁盘缓存复用）" });

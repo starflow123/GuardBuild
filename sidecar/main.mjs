@@ -20,13 +20,14 @@ import {
   DEFAULT_START,
   startUsesPortSlot,
   renderStart,
+  normalizeStart,
   PORT_SLOT,
 } from "./lib/targetconfig.mjs";
 import { diagnoseStartFailure } from "./lib/autostart.mjs";
 import { parsePortFromLine, stripAnsi } from "./lib/readyline.mjs";
 import { runPhase, ProbeError } from "./lib/probe.mjs";
 import { runSupabasePhase, isLoopbackHostname } from "./lib/supabase.mjs";
-import { runScout, applyScoutResult, recordScoutVerification } from "./lib/scout.mjs";
+import { runScout, applyScoutResult, recordScoutVerification, MAX_START_CANDIDATES } from "./lib/scout.mjs";
 import { isEnabled as llmEnabled } from "./lib/llm.mjs";
 import { runBlackbox } from "./lib/blackbox.mjs";
 import { coverageSummary, describeOutcome } from "./lib/coverage.mjs";
@@ -71,6 +72,10 @@ function truncate(text, limit) {
 // ---------- 会话状态 ----------
 
 let active = null; // 当前会话上下文
+
+const RETRYABLE_START_CODES = new Set(["target_spawn_failed", "target_not_ready", "port_parse_failed"]);
+/** LLM 启动候选的总重试预算：多候选不能把 gate 的整段超时吃掉 */
+const START_RETRY_BUDGET_MS = 120_000;
 
 // 终态：到达这些状态后槽位可被释放。applied 仍保留 active 以支持回滚，
 // 仅在新会话启动时才回收。
@@ -372,6 +377,11 @@ async function stageScout(ctx, targetConfig) {
   ctx.scoutApplied = applied;
   ctx.scoutFallbackStart = applied.start ? fallbackStart : null;
   ctx.scoutCacheFile = scout._cacheFile ?? null;
+  // 候选队列只在 LLM 启动契约真正生效时使用；显式契约/自动探测优先的会话不参与重试
+  ctx.scoutStartCandidates =
+    applied.start && Array.isArray(scout.starts) && scout.starts.length
+      ? scout.starts.slice(0, MAX_START_CANDIDATES).map(normalizeStart)
+      : null;
 
   const appliedDesc = [
     applied.start ? `启动 ${scout.start.cmd} ${scout.start.args.join(" ")}`.trim() : null,
@@ -395,6 +405,7 @@ async function stageScout(ctx, targetConfig) {
     usage: scout.usage ?? null,
     verified: { start: false, login: false },
     rejectedStart: scout.rejectedStart ?? null,
+    startAttempts: [],
   };
   pushView(ctx);
   if (scout.cached) {
@@ -1154,6 +1165,152 @@ async function stageAnalyze(ctx) {
   return ctx.plan;
 }
 
+/** 把启动失败压缩成可进视图/报告的一条记录；不带进程输出（可能含目标项目的敏感信息）。 */
+function startFailureRecord(e) {
+  const diag = e?.details?.diagnosis ?? null;
+  return {
+    code: e?.code ?? "unknown",
+    hint: e?.hint ?? diag?.hint ?? null,
+    diagnosisCode: diag?.code ?? null,
+    exitCode: Number.isInteger(diag?.exitCode)
+      ? diag.exitCode
+      : Number.isInteger(e?.details?.exitCode)
+        ? e.details.exitCode
+        : null,
+  };
+}
+
+/**
+ * 按 scout 候选顺序实际启动，直到有一个真正就绪。
+ * 只有可重试的启动错误才继续下一个候选；配置非法等错误直接抛出。
+ */
+async function tryScoutStartCandidates(ctx, { cwd, label, role }) {
+  const candidates =
+    Array.isArray(ctx.scoutStartCandidates) && ctx.scoutStartCandidates.length
+      ? ctx.scoutStartCandidates
+      : [ctx.targetConfig.start];
+  const attempts = ctx.view.llm.startAttempts;
+  const deadline = Date.now() + START_RETRY_BUDGET_MS;
+  let lastError = null;
+  for (let i = 0; i < candidates.length; i++) {
+    ensureAlive(ctx);
+    const candidate = candidates[i];
+    const attempt = {
+      index: i + 1,
+      total: candidates.length,
+      cmd: candidate.cmd,
+      args: [...(candidate.args ?? [])],
+      cwd: candidate.cwd ?? null,
+      ok: false,
+      code: null,
+      diagnosisCode: null,
+      exitCode: null,
+      hint: null,
+      durationMs: 0,
+      skipped: false,
+    };
+    attempts.push(attempt);
+    let start = candidate;
+    if (i > 0) {
+      const remaining = deadline - Date.now();
+      if (remaining < 5_000) {
+        attempt.skipped = true;
+        attempt.code = "budget_exhausted";
+        attempt.hint = `启动候选重试预算（${START_RETRY_BUDGET_MS}ms）已用尽，未尝试该候选`;
+        pushView(ctx);
+        emit(ctx, {
+          kind: "scout",
+          severity: SEVERITY.WARN,
+          message: `启动候选 ${i + 1}/${candidates.length} 跳过：${attempt.hint}`,
+          phase: STATE.PROBING,
+          data: { attempt },
+        });
+        continue;
+      }
+      // 备用候选只能用剩余预算，避免一个慢候选拖垮整轮重试
+      start = { ...candidate, readyTimeoutMs: Math.min(candidate.readyTimeoutMs ?? 30_000, remaining) };
+      emit(ctx, {
+        kind: "scout",
+        severity: SEVERITY.INFO,
+        message: `上次候选未通过，继续尝试启动候选 ${i + 1}/${candidates.length}：${candidate.cmd} ${(candidate.args ?? []).join(" ")}`.trim(),
+        phase: STATE.PROBING,
+        data: { attempt },
+      });
+    }
+    ctx.targetConfig.start = start;
+    ctx.targetConfig.startSource = "llm-scout";
+    const t0 = Date.now();
+    try {
+      const target = await spawnTarget(ctx, { cwd, label, role });
+      attempt.ok = true;
+      attempt.durationMs = Date.now() - t0;
+      ctx.targetConfig.start = candidate;
+      pushView(ctx);
+      return { target, start: candidate };
+    } catch (e) {
+      lastError = e;
+      attempt.durationMs = Date.now() - t0;
+      Object.assign(attempt, startFailureRecord(e));
+      pushView(ctx);
+      const retryable = RETRYABLE_START_CODES.has(e.code);
+      emit(ctx, {
+        kind: "scout",
+        severity: retryable ? SEVERITY.WARN : SEVERITY.ERROR,
+        message: `LLM 启动候选 ${i + 1}/${candidates.length} 未通过实际启动（${e.message}${
+          attempt.hint ? `；诊断：${attempt.hint}` : ""
+        }）`,
+        phase: STATE.PROBING,
+        data: { attempt },
+      });
+      if (!retryable) throw e;
+      if (ctx.targetConfig?.docker?.enabled) await cleanupDockerContainers(ctx);
+    }
+  }
+  return { target: null, start: null, error: lastError };
+}
+
+/** 所有 LLM 启动候选都失败时，回退到自动探测/缺省契约并重试一次。 */
+async function fallbackToDeterministicStart(ctx, error) {
+  if (!ctx.scoutFallbackStart) {
+    throw error ?? new SessionError("LLM 启动候选全部失败，且没有可回退的确定性启动契约", {
+      code: "target_spawn_failed",
+      hint: "请在 guardbuild.json 中声明可用的 start 契约",
+    });
+  }
+  const attempts = (ctx.view.llm?.startAttempts ?? []).filter((a) => !a.skipped);
+  const rejected = ctx.scoutStartCandidates?.[0] ?? ctx.targetConfig.start;
+  emit(ctx, {
+    kind: "scout",
+    severity: SEVERITY.WARN,
+    message: `${attempts.length > 1 ? `${attempts.length} 个 LLM 启动候选都` : "LLM 启动契约"}未通过实际启动验证（${
+      error?.message ?? "未知错误"
+    }），回退到${ctx.scoutFallbackStart.startSource === "auto" ? "自动探测" : "缺省"}启动契约重试`,
+    phase: STATE.PROBING,
+    data: { error: error?.message ?? null, code: error?.code ?? null, attempts },
+  });
+  ctx.targetConfig.start = ctx.scoutFallbackStart.start;
+  ctx.targetConfig.startSource = ctx.scoutFallbackStart.startSource;
+  ctx.scoutApplied.start = false;
+  ctx.scoutStartCandidates = null;
+  ctx.scoutFallbackStart = null;
+  recordScoutVerification(ctx, {
+    start: false,
+    rejectedStart: rejected,
+    rejectedStarts: attempts.map((a) => ({
+      cmd: a.cmd,
+      args: a.args,
+      ok: a.ok,
+      code: a.code,
+      diagnosisCode: a.diagnosisCode,
+    })),
+  });
+  if (ctx.view.llm) {
+    ctx.view.llm.rejectedStart = rejected;
+    pushView(ctx);
+  }
+  return spawnTarget(ctx, { cwd: ctx.projectRoot, label: "原始工作区（修复前）", role: "target-pre" });
+}
+
 async function stageReproduce(ctx) {
   ensureAlive(ctx);
   setState(ctx, STATE.PROBING);
@@ -1174,36 +1331,24 @@ async function stageReproduce(ctx) {
     await runPrepare(ctx, { cwd: ctx.projectRoot, label: "原始工作区" });
     if (ctx.scoutApplied?.start) recordScoutVerification(ctx, { start: false });
     let target;
-    try {
-      target = await spawnTarget(ctx, { cwd: ctx.projectRoot, label: "原始工作区（修复前）", role: "target-pre" });
-    } catch (e) {
-      const retryable = ["target_spawn_failed", "target_not_ready", "port_parse_failed"].includes(e.code);
-      if (!ctx.scoutApplied?.start || !ctx.scoutFallbackStart || !retryable) throw e;
-      // 第一道实际验证未通过：LLM 启动契约不可用，回退到自动探测/缺省启动契约
-      emit(ctx, {
-        kind: "scout",
-        severity: SEVERITY.WARN,
-        message: `LLM 启动契约未通过实际启动验证（${e.message}），回退到${ctx.scoutFallbackStart.startSource === "auto" ? "自动探测" : "缺省"}启动契约重试`,
-        phase: STATE.PROBING,
-        data: { error: e.message, code: e.code ?? null },
+    let verifiedStart = null;
+    if (ctx.scoutApplied?.start) {
+      const res = await tryScoutStartCandidates(ctx, {
+        cwd: ctx.projectRoot,
+        label: "原始工作区（修复前）",
+        role: "target-pre",
       });
-      const attempted = ctx.targetConfig.start;
-      ctx.targetConfig.start = ctx.scoutFallbackStart.start;
-      ctx.targetConfig.startSource = ctx.scoutFallbackStart.startSource;
-      ctx.scoutApplied.start = false;
-      ctx.scoutFallbackStart = null;
-      recordScoutVerification(ctx, { start: false, rejectedStart: attempted });
-      if (ctx.view.llm) {
-        ctx.view.llm.rejectedStart = attempted;
-        pushView(ctx);
-      }
+      target = res.target;
+      verifiedStart = res.start;
+      if (!target) target = await fallbackToDeterministicStart(ctx, res.error);
+    } else {
       target = await spawnTarget(ctx, { cwd: ctx.projectRoot, label: "原始工作区（修复前）", role: "target-pre" });
     }
     ctx.procs.original = target;
     ctx.view.targets.original = { ...target, role: "原始工作区（修复前）" };
     pushView(ctx);
     if (ctx.scoutApplied?.start) {
-      recordScoutVerification(ctx, { start: true });
+      recordScoutVerification(ctx, { start: true, workingStart: verifiedStart ?? ctx.targetConfig.start });
       ctx.view.llm.verified.start = true;
       pushView(ctx);
       emit(ctx, {

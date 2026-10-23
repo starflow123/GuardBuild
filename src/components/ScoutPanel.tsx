@@ -13,6 +13,9 @@ export function ScoutPanel({ view }: { view: View | null }) {
   const applied = llm.applied ?? { start: false, login: false, routes: 0 };
   const verified = llm.verified ?? { start: false, login: false };
   const warnings = llm.warnings ?? [];
+  const attempts = llm.startAttempts ?? [];
+  const okAttempt = attempts.find((a) => a.ok);
+  const failed = attempts.filter((a) => !a.ok && !a.skipped).length;
   const verifiedAll = verified.start && verified.login;
 
   return (
@@ -28,6 +31,10 @@ export function ScoutPanel({ view }: { view: View | null }) {
           <span className="k">启动</span>
           <span className="v">
             {applied.start ? "已应用" : "未应用"} · {verified.start ? "实际启动已验证" : "未验证"}
+            {okAttempt?.index != null && okAttempt.index > 1
+              ? ` · 第 ${okAttempt.index}/${okAttempt.total ?? attempts.length} 个候选可用`
+              : null}
+            {!verified.start && failed > 0 ? ` · ${failed} 个候选启动失败` : null}
           </span>
           <span className="k">登录</span>
           <span className="v">
@@ -44,6 +51,16 @@ export function ScoutPanel({ view }: { view: View | null }) {
             </>
           )}
         </div>
+        {attempts.length > 1 && (
+          <div className="scout-warn">
+            {attempts.map((a) => (
+              <div key={`${a.index}-${a.cmd}-${(a.args ?? []).join(" ")}`}>
+                · 启动候选 {a.index}/{a.total} {a.cmd} {(a.args ?? []).join(" ")}：
+                {a.skipped ? "跳过（预算不足）" : a.ok ? "已就绪" : `失败${a.diagnosisCode ? `（${a.diagnosisCode}）` : ""}`}
+              </div>
+            ))}
+          </div>
+        )}
         {(warnings.length > 0 || llm.rejectedStart) && (
           <div className="scout-warn">
             {llm.rejectedStart && <div>· 启动契约未通过实际验证，已回退到确定性启动方式</div>}

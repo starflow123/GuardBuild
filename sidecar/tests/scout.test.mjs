@@ -77,6 +77,15 @@ function tempDataDir() {
   };
 }
 
+const LLM_JSON_MULTI = JSON.stringify({
+  starts: [
+    { cmd: "node", args: ["server.js"], env: { PORT: "${GB_PORT}" }, readyPattern: "listening" },
+    { cmd: "npm", args: ["run", "dev"], env: { PORT: "${GB_PORT}" }, readyPattern: "ready" },
+  ],
+  login: { path: "/api/login" },
+  routes: [],
+});
+
 const LLM_JSON = JSON.stringify({
   start: { cmd: "node", args: ["server.js"], env: { PORT: "${GB_PORT}" }, readyPattern: "listening" },
   login: {
@@ -153,6 +162,35 @@ test("validateScoutResult：丢弃无法定位的路由，保留查询参数路�
   assert.equal(out.routes[2].list, true);
   assert.equal(out.routes[2].hasOwnerFilter, true);
   assert.ok(warnings.some((w) => w.includes("identities")));
+});
+
+test("validateScoutResult：启动候选按序去重、白名单过滤并限 4 个", async () => {
+  const warnings = [];
+  const evidence = { dirs: new Set([".", "app"]), files: [] };
+  const raw = {
+    starts: [
+      { cmd: "node", args: ["server.js"], readyPattern: "listening" },
+      { cmd: "bash", args: ["-c", "id"] },
+      { cmd: "node", args: ["server.js"], readyPattern: "另一条就绪行" },
+      { cmd: "npm", args: ["run", "dev"], cwd: "app" },
+      { cmd: "python", args: ["main.py"] },
+      { cmd: "uvicorn", args: ["app:api"] },
+      { cmd: "node", args: ["extra.js"] },
+    ],
+  };
+  const out = await validateScoutResult(raw, { evidence, readFile: async () => "" }, warnings);
+  assert.deepEqual(
+    out.starts.map((s) => `${s.cmd} ${s.args.join(" ")}`),
+    ["node server.js", "npm run dev", "python main.py", "uvicorn app:api"]
+  );
+  assert.equal(out.start.cmd, "node");
+  assert.ok(warnings.some((w) => w.includes("白名单")));
+  assert.ok(warnings.some((w) => w.includes("超过 4 个")));
+
+  // 旧结构只有 start 时仍按单候选兼容
+  const legacy = await validateScoutResult({ start: { cmd: "node", args: ["server.js"] } }, { evidence }, []);
+  assert.deepEqual(legacy.starts.map((s) => s.args[0]), ["server.js"]);
+  assert.equal(legacy.start.cmd, "node");
 });
 
 test("runScout：无 key 返回 null；有 chat 注入时校验、缓存且只调用一次", async () => {
@@ -274,6 +312,42 @@ test("recordScoutVerification：启动验证失败写回缓存，下次忽略该
     assert.equal(second.start, null);
     assert.equal(second.login.path, "/api/login");
     assert.ok(second.warnings.some((w) => w.includes("启动验证") && w.includes("已忽略")));
+  } finally {
+    clearScoutCache();
+    temp.restore();
+    if (saved == null) delete process.env.DEEPSEEK_API_KEY;
+    else process.env.DEEPSEEK_API_KEY = saved;
+  }
+});
+
+test("recordScoutVerification：实际验证通过的候选写回缓存，下次优先尝试", async () => {
+  clearScoutCache();
+  const temp = tempDataDir();
+  const saved = process.env.DEEPSEEK_API_KEY;
+  try {
+    process.env.DEEPSEEK_API_KEY = "test-key";
+    const { ctx } = makeRpcCtx({ files: FILES });
+    const chatImpl = async () => ({ content: LLM_JSON_MULTI, model: "deepseek-chat" });
+    const first = await runScout(ctx, { getToken: async () => "t", chatImpl, model: "deepseek-chat" });
+    assert.deepEqual(first.starts.map((s) => s.cmd), ["node", "npm"]);
+    ctx.scoutCacheFile = first._cacheFile;
+    assert.equal(recordScoutVerification(ctx, { start: true, workingStart: first.starts[1] }), true);
+    const savedData = JSON.parse(readFileSync(first._cacheFile, "utf8"));
+    assert.equal(savedData.verified.start, true);
+    assert.equal(savedData.workingStart.cmd, "npm");
+
+    clearScoutCache();
+    delete process.env.DEEPSEEK_API_KEY;
+    const second = await runScout(makeRpcCtx({ files: FILES }).ctx, {
+      getToken: async () => "t",
+      model: "deepseek-chat",
+    });
+    assert.equal(second.cached, true);
+    assert.equal(second.start.cmd, "npm");
+    assert.deepEqual(second.starts.map((s) => `${s.cmd} ${s.args.join(" ")}`), [
+      "npm run dev",
+      "node server.js",
+    ]);
   } finally {
     clearScoutCache();
     temp.restore();

@@ -32,10 +32,10 @@ import { spawn, spawnSync } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { createServer } from "node:http";
 import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { DatabaseSync } from "node:sqlite";
 import path from "node:path";
 import readline from "node:readline";
 import { fileURLToPath } from "node:url";
+import { openAuditDb, queryAudit } from "./lib/auditdb.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const demoDir = path.join(repoRoot, ".demo-bootstrap");
@@ -350,27 +350,21 @@ function readMarkdown(round) {
 }
 
 function agentActions(sessionId) {
-  const db = new DatabaseSync(path.join(dataDir, "guardbuild.db"), { readOnly: true });
-  try {
-    return db
-      .prepare(
-        "SELECT step, action, subject, ok, exit_code, duration_ms, budget_remaining_ms, note FROM agent_actions WHERE session_id = ? ORDER BY step, created_at"
-      )
-      .all(sessionId);
-  } finally {
-    db.close();
-  }
+  return queryAudit(
+    path.join(dataDir, "guardbuild.db"),
+    "SELECT step, action, subject, ok, exit_code, duration_ms, budget_remaining_ms, note FROM agent_actions WHERE session_id = ? ORDER BY step, created_at",
+    [sessionId],
+    { label: "agent_actions" }
+  );
 }
 
 function countVulnerablePre(sessionId) {
-  const db = new DatabaseSync(path.join(dataDir, "guardbuild.db"), { readOnly: true });
-  try {
-    return db
-      .prepare("SELECT COUNT(*) n FROM evidence WHERE session_id = ? AND phase='pre' AND verdict='vulnerable'")
-      .get(sessionId).n;
-  } finally {
-    db.close();
-  }
+  return queryAudit(
+    path.join(dataDir, "guardbuild.db"),
+    "SELECT COUNT(*) n FROM evidence WHERE session_id = ? AND phase='pre' AND verdict='vulnerable'",
+    [sessionId],
+    { single: true, label: "pre-vulnerable" }
+  ).n;
 }
 
 const actionSeq = (rows) => rows.map((r) => r.action).join("→");
@@ -468,7 +462,8 @@ async function main() {
       s1.log.includes("启动代理执行「npm run build」") && s1.log.includes("启动代理接管后就绪"),
       ""
     );
-    check("r1 接入层自救后，越权证据照旧复现（≥ 2 条 vulnerable）", countVulnerablePre(sid1) >= 2, `pre vulnerable=${countVulnerablePre(sid1)}`);
+    const preVuln1 = countVulnerablePre(sid1);
+    check("r1 接入层自救后，越权证据照旧复现（≥ 2 条 vulnerable）", preVuln1 >= 2, `pre vulnerable=${preVuln1}`);
     check(
       "r1 会话终态与接入层解耦：漏洞复现成立，改码仍按契约（不自动补丁 → 无可修补候选）",
       (s1.view.state === "error" && s1.view.error?.code === "no_patchable_candidates") ||
@@ -576,16 +571,22 @@ async function main() {
     check("发给模型的观察不含身份与密码", !promptBlob.includes("alice123") && !promptBlob.includes("identities"), "");
     check("发给模型的观察不含契约内容（哨兵未发送）", !promptBlob.includes(SENTINEL));
     check("模型哨兵不进入任何留痕（视图/事件/审计/报告）", ![s1.log, s2.log, JSON.stringify([s1.view, s2.view]), JSON.stringify(acts1), JSON.stringify(acts2), JSON.stringify(rep1), JSON.stringify(rep2), md1, readMarkdown("r2")].some((blob) => blob.includes(LEAK)), "");
-    const db = new DatabaseSync(path.join(dataDir, "guardbuild.db"), { readOnly: true });
-    const leakRows = db
-      .prepare("SELECT COUNT(*) n FROM events WHERE data_json LIKE ? OR message LIKE ?")
-      .get(`%${LEAK}%`, `%${LEAK}%`).n;
-    const keyRows = db
-      .prepare("SELECT COUNT(*) n FROM events WHERE data_json LIKE ? OR message LIKE ?")
-      .get(`%${MOCK_KEY}%`, `%${MOCK_KEY}%`).n;
-    const auditRows = db.prepare("SELECT COUNT(*) n FROM agent_actions").get().n;
     const sysPrompt = state.systems[0] ?? "";
-    db.close();
+    const db = openAuditDb(path.join(dataDir, "guardbuild.db"), { label: "跨轮安全边界" });
+    let leakRows = 0;
+    let keyRows = 0;
+    let auditRows = 0;
+    try {
+      leakRows = db
+        .prepare("SELECT COUNT(*) n FROM events WHERE data_json LIKE ? OR message LIKE ?")
+        .get(`%${LEAK}%`, `%${LEAK}%`).n;
+      keyRows = db
+        .prepare("SELECT COUNT(*) n FROM events WHERE data_json LIKE ? OR message LIKE ?")
+        .get(`%${MOCK_KEY}%`, `%${MOCK_KEY}%`).n;
+      auditRows = db.prepare("SELECT COUNT(*) n FROM agent_actions").get().n;
+    } finally {
+      db.close();
+    }
     check("事件库不含模型哨兵与密钥", leakRows === 0 && keyRows === 0, `leak=${leakRows} key=${keyRows}`);
     check("动作审计按步落库（两轮共 ≥ 7 行）", auditRows >= 7, `agent_actions=${auditRows}`);
     check(

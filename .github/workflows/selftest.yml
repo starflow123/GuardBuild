@@ -53,7 +53,7 @@ jobs:
       - name: gate 演练（7 轮裁决 + 报告产物）
         run: node scripts/e2e-gate.mjs
 
-      - name: 主工作流 E2E（31 断言）
+      - name: 主工作流 E2E（38 断言）
         run: node scripts/e2e-headless.mjs
 
       - name: Supabase 适配器 E2E（RLS 探测 + 密钥暴露，本机 mock）

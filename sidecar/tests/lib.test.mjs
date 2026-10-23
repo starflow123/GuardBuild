@@ -2235,8 +2235,8 @@ test("buildCases: 注入用例（请求通道构造 + unfixable + 布尔/报错/
   assert.equal(cmdiCase.path, "/api/ping");
   assert.match(
     JSON.parse(cmdiCase.body).host,
-    /^127\.0\.0\.1\s*&&?\s*echo GB/,
-    "命令注入应通过请求体字段投递 shell 载荷"
+    /^127\.0\.0\.1\s*(?:&&?|;)\s*echo GB/,
+    "命令注入应通过请求体字段投递 shell 载荷（分隔符随目标平台）"
   );
 
   assert.equal(

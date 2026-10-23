@@ -111,3 +111,10 @@ export function rawTokenRequest(cand, token) {
 export function variantCaseId(baseId, axis, index) {
   return `${baseId}-${axis}${index}`;
 }
+
+const VARIANT_AXIS_RE = /-(?:obj|enc|chan)\d+$/;
+
+/** 变体 caseId 还原为语料标注的基名（基准按基名统计召回，变体不另立标注） */
+export function variantBaseCaseId(caseId) {
+  return String(caseId ?? "").replace(VARIANT_AXIS_RE, "");
+}

@@ -13,6 +13,8 @@ import {
   foreignObjectVariants,
   idEncodingVariants,
   rawTokenRequest,
+  variantBaseCaseId,
+  variantCaseId,
 } from "../lib/attackvariants.mjs";
 import { buildCases } from "../lib/probe.mjs";
 
@@ -139,6 +141,16 @@ test("buildCases: 非首要读候选不展开变体（成本受控）", () => {
   const variantCands = cases.filter((c) => c.variant).map((c) => c.routeKey);
   assert.ok(variantCands.every((k) => k === "orders.get"), "变体只挂在首要读候选上");
   assert.ok(cases.some((c) => c.id === "attack-read-foreign-2"), "第二候选仍按基线用例构建");
+});
+
+test("variantBaseCaseId: 变体 fold 回标注基名，非变体 id 原样返回", () => {
+  assert.equal(variantBaseCaseId(variantCaseId("attack-read-foreign", "obj", 2)), "attack-read-foreign");
+  assert.equal(variantBaseCaseId("attack-read-foreign-enc3"), "attack-read-foreign");
+  assert.equal(variantBaseCaseId("attack-read-foreign-chan1"), "attack-read-foreign");
+  assert.equal(variantBaseCaseId("attack-read-foreign"), "attack-read-foreign");
+  assert.equal(variantBaseCaseId("attack-read-foreign-2"), "attack-read-foreign-2", "多候选序号不是变体轴");
+  assert.equal(variantBaseCaseId("attack-cancel-foreign"), "attack-cancel-foreign");
+  assert.equal(variantBaseCaseId(undefined), "");
 });
 
 test("buildCases: 正向断言——受害人本人读取同样必须可见，字段不得比修复前少", () => {

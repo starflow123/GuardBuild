@@ -10,6 +10,7 @@
  *
  * 判定：任何漏报、误报（vulnerable 但不在标注集合内）、退出码不一致、执行失败
  * 都会让基准以非零退出，作为新增适配器/探测能力的回归闸门。
+ * 引擎生成的同源变体（-objN/-encN/-chanN）折叠到其标注基名统计，不单独算误报。
  *
  * 用法:
  *   node scripts/benchmark.mjs                # 全量
@@ -27,6 +28,7 @@ import {
 } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { variantBaseCaseId } from "../sidecar/lib/attackvariants.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const benchRoot = path.join(repoRoot, ".benchmark");
@@ -143,10 +145,16 @@ function evaluate(target, run) {
   const expectedCases = target.expectedVulnerableCases ?? [];
   const findings = run.report?.summary?.findings ?? [];
   const pre = run.report?.evidence?.pre ?? [];
-  const actualVulnerable = pre
-    .filter((e) => e.category === "attack" && e.verdict === "vulnerable")
-    .map((e) => e.caseId);
-  const actualById = new Map(pre.map((e) => [e.caseId, e]));
+  // 引擎生成的同源变体（-objN/-encN/-chanN）并入其标注基名统计：
+  // 语料只标注漏洞入口，变体是同一入口的加厚写法，不应算成「未标注误报」。
+  const vulnerableByBase = new Map();
+  for (const e of pre) {
+    if (e.category !== "attack" || e.verdict !== "vulnerable") continue;
+    const base = variantBaseCaseId(e.caseId);
+    if (!vulnerableByBase.has(base)) vulnerableByBase.set(base, e);
+  }
+  const actualVulnerable = [...vulnerableByBase.keys()];
+  const actualById = vulnerableByBase;
   const matched = expectedCases.filter((id) => actualVulnerable.includes(id));
   const missed = expectedCases.filter((id) => !actualVulnerable.includes(id));
   const falsePositives = actualVulnerable.filter((id) => !expectedCases.includes(id));

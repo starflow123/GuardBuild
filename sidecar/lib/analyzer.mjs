@@ -17,6 +17,7 @@ import {
   OWNER_GUARD,
   ROLE_GUARD,
   AUTH_GUARD,
+  REJECT_UNAUTH,
   PUBLIC_PATH,
   OWNER_FILTER,
   FS_READ_SINK,
@@ -598,7 +599,10 @@ export async function analyzeProject(ctx) {
     const queryParam =
       s.queryParamHint ??
       (!hasPathParam && sinks.length > 0 && !s.graphql ? findQueryParamSink(s.text) : null);
-    const inlineAuth = AUTH_GUARD.test(s.text) || sectionRouteMwAuth(s.text) || s.forcedAuth === true;
+    const strongAuth = AUTH_GUARD.test(s.text) || sectionRouteMwAuth(s.text) || s.forcedAuth === true;
+    // 「未登录即拒」分支单独记一类来源：它证明端点确实要登录，但块内没有任何会话字段引用
+    const rejectAuth = !strongAuth && REJECT_UNAUTH.test(s.text);
+    const inlineAuth = strongAuth || rejectAuth;
     const mountAuth =
       !inlineAuth && (authGuards.mountGuarded.has(normFile) || authGuards.selfGuarded.has(normFile));
     const hasAuth = inlineAuth || mountAuth;
@@ -627,7 +631,16 @@ export async function analyzeProject(ctx) {
       routeKeys,
       matchVars,
       hasAuth,
-      authSource: s.forcedAuth === true ? "route" : inlineAuth ? "inline" : mountAuth ? "mount" : null,
+      authSource:
+        s.forcedAuth === true
+          ? "route"
+          : strongAuth
+            ? "inline"
+            : rejectAuth
+              ? "reject"
+              : mountAuth
+                ? "mount"
+                : null,
       hasOwnerGuard,
       hasRoleGuard,
       hasOwnerFilter,

@@ -31,6 +31,13 @@ export const ROLE_GUARD =
 export const AUTH_GUARD =
   /authenticate\s*\(|requireAuth|requireLogin|ensureAuth|auth\s*\.\s*user|req\s*\.\s*user|\bctx\s*\.\s*(?:user|session|auth)\b|getUser\s*\(|getServerSession|getServerAuthSession|getToken\s*\(|currentUser\s*\(|getAuth\s*\(|\bauth\s*\(\s*\)|withAuth|isAuthenticated|requireUser|assertAuth|UseGuards\s*\(/;
 
+// 手写守卫的「未登录即拒」分支：路由块内只判会话变量本身（`if (!auth) return 401`），
+// 不出现 auth.user / authenticate( 时 AUTH_GUARD 看不见它，候选会被误归 no-auth-suspect，
+// 于是只打匿名读取与提权用例——若应用确实拒绝匿名，两条都 blocked，真实跨用户越权从未被探测。
+// 只认会话类标识符；裸 `!user` 多是「对象不存在」检查，不能当认证守卫。
+export const REJECT_UNAUTH =
+  /!\s*(?:auth|session|token|jwt|credentials|ctx\s*\.\s*user|req\s*\.\s*user|request\s*\.\s*user|req\s*\.\s*auth)\b|!\s*(?:currentUser|isAuthenticated|getAuth|getToken)\s*\(/;
+
 // 公开端点路径段（登录/注册等）：无鉴权属预期公开，不作为越权候选
 export const PUBLIC_PATH =
   /\/(?:login|logout|sign-?in|sign-?up|register|registration|auth|token|refresh|password|forgot|captcha)\b/i;

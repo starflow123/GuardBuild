@@ -176,3 +176,6 @@
 命令走私的处理走「丢弃 + 只留痕字段名」：审计 `sanitize` 行记录 `cmd,args,shell` 与拒因，模型原文（含哨兵串）不进视图、事件、审计、报告、Markdown 任何一处；菜单本身也只给编号与形状，不给身份密码与契约内容。
 
 一处实测教训（不是测试噪声）：靶场 `fixtures/bootstrap-shop` 第一版把手写守卫写成路由块内只有 `if (!auth) return 401`、不引用 `auth.user`，`AUTH_GUARD` 因此判 `hasAuth=false`，候选归到 `no-auth-suspect`（未认证族），planner 只规划匿名读取与越权提权两条用例，而这两条都被应用正确拒绝 → pre `vulnerable=0`、终态 `attack_not_reproducible`（exit 0），真实的跨用户 IDOR 一次都没被打。已把靶场改成与 `llm-patch-shop` 同形的自描述写法，让「唯一障碍是接入」这个前提成立；但这类「块内不引用会话即漏报」本身是一处真实的检测缺口，另立任务跟进。
+
+检测缺口的引擎级修法（不是改靶场）：`sidecar/lib/signals.mjs` 新增 `REJECT_UNAUTH`，识别路由块内的「未登录即拒」分支（`!auth` / `!session` / `!token` / `!jwt` / `!credentials` / `!ctx.user` / `!req.user` / `!currentUser()` 等会话类标识符），`analyzer.mjs` 把它单独记为 `authSource: "reject"`，与 `AUTH_GUARD` 的 `inline` 分开留痕——因为它是「端点确实要登录」的证据，但不是「块内引用了会话身份」的证据。改判后候选进 `readCandidates`（跨用户越权用例）而不是 `unauthReadCandidates`。识别面刻意收窄：裸 `!user` 不算认证守卫（那多数是「对象不存在」检查），否则会把公开端点误判成已登录。
+验证：`sidecar/tests/lib.test.mjs` 新增一条三分支对照单测（只有 `if (!auth)` 的块 → `idor-suspect`/`authSource=reject`/入 `readCandidates`；无任何会话判断的块 → 仍 `no-auth-suspect`；`if (!user)` 存在性检查 → 仍 `no-auth-suspect`），Sidecar 单测 **318/318 exit 0**；`npm run benchmark` 不变差（动态召回 17/17、误报 0/17、静态召回 17/17、退出码一致 8/8，含 `clean-shop` 仍 0 候选，说明没有把干净靶场改判出候选）；`npm run e2e:cross-file` 62/62、`npm run e2e:bootstrap` 38/38（pre `vulnerable=4`），headless / blackbox / python / supabase 四套 exit 0。

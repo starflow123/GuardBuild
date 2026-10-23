@@ -1371,6 +1371,66 @@ test("analyzeProject: 无鉴权端点识别为 no-auth-suspect（登录路径/�
   );
 });
 
+test("analyzeProject: 手写「未登录即拒」守卫算认证（漏报类修复），裸 !user 不算", async () => {
+  const R = "\\\\?\\D:\\p";
+  const content = [
+    'const app = require("express")();',
+    // 形态一：块内只判会话变量本身，不出现 auth.user / authenticate( —— 过去 AUTH_GUARD 看不见它
+    'app.get("/api/orders/:id", async (req, res) => {',
+    "  const auth = resolveSession(req.headers.authorization);",
+    "  if (!auth) return res.status(401).json({ error: '未登录' });",
+    "  const order = await Order.findById(req.params.id);",
+    "  res.json(order);",
+    "});",
+    // 形态二：真的没有鉴权判断，应保持未鉴权候选
+    'app.get("/api/posts/:id", async (req, res) => {',
+    "  const post = await Post.findById(req.params.id);",
+    "  res.json(post);",
+    "});",
+    // 形态三：!user 判的是「对象不存在」，不是会话
+    'app.get("/api/profiles/:id", async (req, res) => {',
+    "  const user = await User.findById(req.params.id);",
+    "  if (!user) return res.status(404).json({ error: 'not found' });",
+    "  res.json(user);",
+    "});",
+  ].join("\n");
+  const a = await analyzeProject({
+    projectRoot: R,
+    tokens: { project: "tok" },
+    rpc: {
+      request: async (method) => {
+        if (method === "fs.list") return { entries: [{ path: `${R}\\src\\app.js`, kind: "file", size: 900 }] };
+        if (method === "fs.read") return { content, size: 900, redacted: false, redactions: [] };
+        throw new Error(`不应调用 ${method}`);
+      },
+    },
+  });
+  const order = a.candidates.find((c) => c.fullPath === "/api/orders/:id");
+  assert.ok(order, "手写 401 守卫的按 ID 取数端点应入候选");
+  assert.equal(order.hasAuth, true, "「未登录即拒」分支应证明端点需要登录");
+  assert.equal(order.authSource, "reject");
+  assert.equal(order.kind, "idor-suspect", "识别为已登录后才会改判跨用户越权，而非只打匿名读取");
+
+  const post = a.candidates.find((c) => c.fullPath === "/api/posts/:id");
+  assert.equal(post?.kind, "no-auth-suspect", "无会话判断的端点仍是未鉴权候选");
+  assert.equal(post?.authSource, null);
+
+  const profile = a.candidates.find((c) => c.fullPath === "/api/profiles/:id");
+  assert.equal(profile?.kind, "no-auth-suspect", "!user 的对象存在性检查不得当成认证守卫");
+  assert.equal(profile?.authSource, null);
+
+  const plan = buildProbePlan(a);
+  assert.deepEqual(
+    plan.readCandidates.map((c) => c.fullPath),
+    ["/api/orders/:id"],
+    "跨用户读取用例槽位应收到该候选"
+  );
+  assert.ok(
+    !plan.unauthReadCandidates.some((c) => c.fullPath === "/api/orders/:id"),
+    "已识别为需登录的候选不应再占未鉴权槽位"
+  );
+});
+
 test("analyzeProject: 路径穿越线索识别（fs 读取 + req 输入合流，固定路径不误报）", async () => {
   const R = "\\\\?\\D:\\p";
   const content = [

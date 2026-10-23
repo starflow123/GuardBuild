@@ -86,6 +86,12 @@ jobs:
       - name: Fix agent 自纠错 E2E（两轮：失败证据回传 + 重生成补丁）
         run: node scripts/e2e-fix-agent.mjs
 
+      - name: S2-full 跨文件/新建文件写权限 E2E（本机 mock：依赖闭包授权集 + 双重验收 + 越界拒绝）
+        run: node scripts/e2e-cross-file.mjs
+
+      - name: S3-full 有界启动代理 E2E（本机 mock：引擎拼装菜单 + 抗命拒绝 + gate 结构性禁用）
+        run: node scripts/e2e-bootstrap.mjs
+
       - name: 精度基准（8 个标注靶场：漏报 / 误报 / 退出码一致性）
         run: node scripts/benchmark.mjs
 
@@ -126,6 +132,10 @@ jobs:
             .demo-llm/data/guardbuild.db
             .demo-llm-patch/reports
             .demo-llm-patch/data/guardbuild.db
+            .demo-cross-file/reports
+            .demo-cross-file/data/guardbuild.db
+            .demo-bootstrap/reports
+            .demo-bootstrap/data/guardbuild.db
             .demo-docker-e2e/reports
             .demo-docker-e2e/data/guardbuild.db
             .benchmark/benchmark-report.md

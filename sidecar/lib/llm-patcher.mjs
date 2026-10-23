@@ -14,6 +14,7 @@
  */
 import { RPC_TO_HOST } from "../../shared/protocol.mjs";
 import { apiKey, chat, parseJson } from "./llm.mjs";
+import { createDirAllowed } from "./depgraph.mjs";
 
 export const LLM_PATCH_VERSION = "llm-patch-v1";
 
@@ -29,9 +30,9 @@ const REDACTION_MARKER = "***";
 
 const SOURCE_EXT_RE = /\.(?:js|mjs|cjs|ts|tsx|jsx|py|go|rb|php|cs|java|kt|graphql|gql)$/i;
 const FORBIDDEN_DIR_RE =
-  /(?:^|\/)(?:node_modules|dist|build|out|coverage|\.git|\.next|\.nuxt|vendor|tests?|__tests__|e2e|fixtures?|public|static)(?:\/|$)/i;
+  /(?:^|\/)(?:node_modules|dist|build|out|coverage|\.git|\.next|\.nuxt|vendor|tests?|__tests__|e2e|fixtures?|public|static|migrations)(?:\/|$)/i;
 const FORBIDDEN_FILE_RE =
-  /(?:^|\/)(?:package(?:-lock)?\.json|pnpm-lock\.yaml|npm-shrinkwrap\.json|yarn\.lock\w*|bun\.lockb|composer\.json|gemfile\*?|go\.sum|cargo\.toml|guardbuild\.json|\.babelrc|webpack\.config\.[cm]?js|vite\.config\.[cm]?[jt]s|dockerfile.*|docker-compose\.ya?ml|compose\.ya?ml|\.?env\w*|.*\.(?:pem|key|p12|pfx|crt|sqlite3?|db|toml|ya?ml|ini|conf|sql))(?:$|\/)/i;
+  /(?:^|\/)(?:package(?:-lock)?\.json|pnpm-lock\.yaml|npm-shrinkwrap\.json|yarn\.lock\w*|bun\.lockb|composer\.json|gemfile\*?|go\.sum|cargo\.toml|guardbuild\.json|\.babelrc|webpack\.config\.[cm]?js|vite\.config\.[cm]?[jt]s|dockerfile.*|docker-compose\.ya?ml|compose\.ya?ml|\.?env\w*|schema\.prisma|.*\.(?:pem|key|p12|pfx|crt|sqlite3?|db|toml|ya?ml|ini|conf|sql))(?:$|\/)/i;
 const TEST_FILE_RE = /(?:\.(?:test|spec)\.[cm]?[jt]sx?$|_test\.go$|test_[^/]+\.py$|\.robot$)/i;
 // 补丁里新增这些调用意味着「修复」在做与本漏洞无关的事（起进程/执行任意代码）
 const DANGEROUS_ADDITION_RE = /(?:\bchild_process\b|\brequire\s*\(\s*['"]child_process|\bimport\s+[\s\S]{0,40}child_process|\beval\s*\(|\bnew\s+Function\s*\(|\brm\s+-rf\b)/i;
@@ -43,6 +44,13 @@ const MAX_TOOL_FILE_CHARS = 12_000;
 const MAX_TOOL_LIST_ENTRIES = 80;
 const TOOL_TIMEOUT_MS = 20_000;
 const TOOL_KINDS = new Set(["read", "list"]);
+
+// —— 跨文件补丁（S2-full）：写集由依赖闭包算出，规模与新建数量都封顶 ——
+const MAX_CROSS_FILES_PER_REQUEST = 4;
+const MAX_CREATE_FILES_PER_REQUEST = 3;
+const MAX_CREATE_CHARS = 12_000;
+const MAX_CREATE_LINES = 120;
+const MAX_CROSS_FILE_READS = 8;
 
 function normRel(v) {
   return String(v ?? "").replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+/g, "/");
@@ -188,13 +196,29 @@ function normalizeEol(text, content) {
 }
 
 /**
- * 严格校验 LLM 返回的补丁意图。只接受锚点在真实内容中恰好出现一次的补丁。
- * @returns {{ ops: Array<{find:string,replace:string,count:number}>, accepted: object[], rejected: object[] }}
+ * 严格校验 LLM 返回的补丁意图。只接受锚点在目标文件真实内容中恰好出现一次的补丁。
+ *
+ * 默认（不传 writeSet）保持 S2-lite 语义：所有补丁只能落在候选文件本身。
+ * 传入 `{enabled:true, rolesLower, newFileDirs}` 时进入 S2-full：补丁可以落在依赖闭包写集内的
+ * 任意文件，并可声明 `create:true` 新建文件——两者都由这里拒绝越界项，绝不猜测修补。
+ *
+ * @param contents Map<rel, string>：写集内各文件的真实字节（候选文件走 content 参数兜底）
+ * @returns {{ops, byFile: Object<string, object[]>, accepted, rejected, creations}}
  */
-export function validatePatchOutput(raw, { rel, content, candidateKeys = [] } = {}) {
+export function validatePatchOutput(raw, { rel, content, candidateKeys = [], writeSet = null, contents = null } = {}) {
   const accepted = [];
   const rejected = [];
+  const creations = [];
   const ops = [];
+  const byFile = new Map();
+  const crossFile = writeSet?.enabled === true;
+  const target = normRel(rel);
+  const seen = new Set();
+  const touched = new Set();
+  const contentOf = (fileRel) => {
+    if (contents?.has(fileRel)) return contents.get(fileRel);
+    return fileRel === target ? content : null;
+  };
   const reject = (item, reason) => {
     rejected.push({
       file: normRel(item?.file ?? ""),
@@ -204,19 +228,22 @@ export function validatePatchOutput(raw, { rel, content, candidateKeys = [] } = 
   };
 
   if (!raw || typeof raw !== "object" || !Array.isArray(raw.patches)) {
-    return { ops: [], accepted, rejected: [{ file: "", candidate: null, reason: "输出缺少 patches 数组" }] };
+    return { ops: [], byFile: {}, accepted, rejected: [{ file: "", candidate: null, reason: "输出缺少 patches 数组" }], creations: [] };
   }
   if (raw.patches.length === 0) {
-    return { ops: [], accepted, rejected: [{ file: normRel(rel), candidate: null, reason: "模型判定无法安全自动修复" }] };
+    return {
+      ops: [],
+      byFile: {},
+      accepted,
+      rejected: [{ file: target, candidate: null, reason: "模型判定无法安全自动修复" }],
+      creations: [],
+    };
   }
 
-  const target = normRel(rel);
-  const seen = new Set();
+  const writableNote = () =>
+    [...(writeSet?.roles?.keys?.() ?? [])].join("、") || target;
+
   for (const item of raw.patches) {
-    if (accepted.length >= MAX_PATCHES_PER_FILE) {
-      reject(item, `超过单文件补丁上限 ${MAX_PATCHES_PER_FILE}`);
-      continue;
-    }
     if (!item || typeof item !== "object") {
       reject(item, "补丁项不是对象");
       continue;
@@ -226,13 +253,100 @@ export function validatePatchOutput(raw, { rel, content, candidateKeys = [] } = 
       reject(item, "缺少 file 字段");
       continue;
     }
-    if (fileRel.toLowerCase() !== target.toLowerCase()) {
-      reject(item, `补丁目标 ${fileRel} 越出本次候选文件 ${target}`);
-      continue;
+    const isCreate = item.create === true;
+    let role = "candidate";
+    if (!crossFile) {
+      // 先报「未开启跨文件」：这类拒绝的可操作原因是开开关，而不是路径写错
+      if (isCreate) {
+        reject(item, "未开启跨文件补丁（llm.patchCrossFile），不允许新建文件");
+        continue;
+      }
+      if (fileRel.toLowerCase() !== target.toLowerCase()) {
+        reject(item, `补丁目标 ${fileRel} 越出本次候选文件 ${target}`);
+        continue;
+      }
+    } else if (isCreate) {
+      role = "new";
+    } else {
+      role = writeSet.rolesLower?.get(fileRel.toLowerCase());
+      if (!role) {
+        reject(item, `补丁目标 ${fileRel} 不在本次候选的依赖闭包写集内（可写：${writableNote()}）`);
+        continue;
+      }
     }
-    const allowed = patchTargetAllowed(target);
+    const allowed = patchTargetAllowed(fileRel);
     if (!allowed.ok) {
       reject(item, `不允许修改该文件：${allowed.reason}`);
+      continue;
+    }
+
+    const cand = typeof item.candidate === "string" ? item.candidate.trim() : "";
+    if (cand && candidateKeys.length && !candidateKeys.some((k) => k.toLowerCase() === cand.toLowerCase())) {
+      reject(item, `candidate ${cand} 不在本次待修复清单中`);
+      continue;
+    }
+
+    if (isCreate) {
+      if (creations.length >= MAX_CREATE_FILES_PER_REQUEST) {
+        reject(item, `本次请求新建文件已达上限 ${MAX_CREATE_FILES_PER_REQUEST} 个`);
+        continue;
+      }
+      if (typeof item.content !== "string" || !item.content.trim()) {
+        reject(item, "create 项必须给出整份文件内容 content");
+        continue;
+      }
+      const dirOk = createDirAllowed(fileRel, writeSet?.newFileDirs);
+      if (!dirOk.ok) {
+        reject(item, `不能新建 ${fileRel}：${dirOk.reason}`);
+        continue;
+      }
+      if (item.content.includes(REDACTION_MARKER)) {
+        reject(item, "新建文件内容含脱敏掩码，会把遮蔽串写进源码");
+        continue;
+      }
+      const lines = lineCount(item.content.replace(/\r\n/g, "\n"));
+      if (lines > MAX_CREATE_LINES) {
+        reject(item, `新建文件 ${lines} 行，超过 ${MAX_CREATE_LINES} 行上限`);
+        continue;
+      }
+      if (item.content.length > MAX_CREATE_CHARS) {
+        reject(item, `新建文件 ${item.content.length} 字符，超过 ${MAX_CREATE_CHARS} 上限`);
+        continue;
+      }
+      if (DANGEROUS_ADDITION_RE.test(item.content)) {
+        reject(item, "新建文件含子进程/动态执行等与漏洞修复无关的危险调用");
+        continue;
+      }
+      creations.push({
+        file: fileRel,
+        content: normalizeEol(item.content, content ?? ""),
+        candidate: cand || null,
+        reason: typeof item.reason === "string" ? item.reason.slice(0, 300) : null,
+        addedLines: lines,
+      });
+      accepted.push({
+        file: fileRel,
+        candidate: cand || null,
+        reason: typeof item.reason === "string" ? item.reason.slice(0, 300) : null,
+        role: "new",
+        created: true,
+        addedLines: lines,
+      });
+      continue;
+    }
+
+    const fileContent = contentOf(fileRel);
+    if (typeof fileContent !== "string") {
+      reject(item, `未取得 ${fileRel} 的真实内容（超出跨文件读取上限或读取失败），无法校验锚点`);
+      continue;
+    }
+    const prevOps = byFile.get(fileRel) ?? [];
+    if (prevOps.length >= MAX_PATCHES_PER_FILE) {
+      reject(item, `超过单文件补丁上限 ${MAX_PATCHES_PER_FILE}`);
+      continue;
+    }
+    if (fileRel !== target && !touched.has(fileRel) && touched.size >= MAX_CROSS_FILES_PER_REQUEST) {
+      reject(item, `本次请求最多改动候选文件之外的 ${MAX_CROSS_FILES_PER_REQUEST} 个文件`);
       continue;
     }
     if (typeof item.search !== "string" || typeof item.replace !== "string") {
@@ -247,26 +361,22 @@ export function validatePatchOutput(raw, { rel, content, candidateKeys = [] } = 
       reject(item, "锚点含脱敏掩码，说明原文有敏感串已被遮蔽，无法定位真实字节");
       continue;
     }
-    const cand = typeof item.candidate === "string" ? item.candidate.trim() : "";
-    if (cand && candidateKeys.length && !candidateKeys.some((k) => k.toLowerCase() === cand.toLowerCase())) {
-      reject(item, `candidate ${cand} 不在本次待修复清单中`);
-      continue;
-    }
     if (DANGEROUS_ADDITION_RE.test(item.replace)) {
       reject(item, "补丁新增子进程/动态执行等与漏洞修复无关的危险调用");
       continue;
     }
-    if (normalizeEol(item.search, content) === normalizeEol(item.replace, content)) {
+    if (normalizeEol(item.search, fileContent) === normalizeEol(item.replace, fileContent)) {
       reject(item, "search 与 replace 相同（空操作）");
       continue;
     }
-    const find = normalizeEol(item.search, content);
-    const replace = normalizeEol(item.replace, content);
-    if (seen.has(find)) {
+    const find = normalizeEol(item.search, fileContent);
+    const replace = normalizeEol(item.replace, fileContent);
+    const seenKey = `${fileRel} ${find}`;
+    if (seen.has(seenKey)) {
       reject(item, "锚点重复（同一位置已被更早的补丁占用）");
       continue;
     }
-    const hits = countOccurrences(content, find);
+    const hits = countOccurrences(fileContent, find);
     if (hits === 0) {
       reject(item, "锚点未在文件真实内容中出现（模型改写了原文或存在未提交差异）");
       continue;
@@ -290,20 +400,27 @@ export function validatePatchOutput(raw, { rel, content, candidateKeys = [] } = 
       continue;
     }
     // 锚点之间不得重叠（否则第二条会在已被改写的内容上失配）
-    if (ops.some((o) => find.includes(o.find) || o.find.includes(find))) {
+    if (prevOps.some((o) => find.includes(o.find) || o.find.includes(find))) {
       reject(item, "锚点与更早的补丁重叠");
       continue;
     }
-    seen.add(find);
-    ops.push({ find, replace, count: 1 });
+    seen.add(seenKey);
+    if (fileRel !== target) touched.add(fileRel);
+    const op = { find, replace, count: 1 };
+    byFile.set(fileRel, [...prevOps, op]);
+    if (fileRel === target) ops.push(op);
     accepted.push({
+      file: fileRel,
       candidate: cand || null,
       reason: typeof item.reason === "string" ? item.reason.slice(0, 300) : null,
+      role,
       addedLines: added,
     });
   }
 
-  return { ops, accepted, rejected };
+  const byFileOut = {};
+  for (const [fileRel, list] of byFile) byFileOut[fileRel] = list;
+  return { ops, byFile: byFileOut, accepted, rejected, creations };
 }
 
 function describeCandidates(candidates) {
@@ -364,8 +481,27 @@ const SYSTEM_PROMPT = `你是资深应用安全工程师，为「已通过动态
 6. 无法在单文件内安全修复时，返回 {"patches":[]} 并在 note 字段说明原因，不要勉强编造补丁。
 7. 不要输出代码之外的解释文字，不要输出 markdown 代码块以外的内容。`;
 
+// 跨文件补丁（S2-full）追加段：显式替代第 4~6 条的「只改一个文件」限制，
+// 但写集本身由 Sidecar 依依赖闭包算出并在校验层强制执行，模型只能声明目标文件。
+const CROSS_FILE_RULES = `
+
+本次运行已开启跨文件补丁，以下条款替代上面的第 4、5、6 条：
+4b. 可以改动写集内的文件（见 writable_files）：候选文件本身、它 import 的模块（取数层/共享 helper），以及直接 import 候选文件的模块（应用启动文件、模块注册表）。每项的 file 用仓库相对路径原样书写；写集之外的文件一律会被丢弃，不要尝试。
+5b. 正确修法需要一个新的守卫/中间件模块时，可以新建：{"file":"src/guards/ownership.js","create":true,"content":"整份文件内容","candidate":"METHOD /path","reason":"…"}。新文件只能放在 writable_dirs 列出的目录里，不超过 120 行，且必须同时给出把它挂到路由/模块上的补丁项——只写不挂等于没修。
+6b. 跨文件的 search 锚点同样必须逐字来自那个文件的真实内容；不确定就按第 5 条先只读自查该文件再下补丁。一次请求最多改动候选文件之外的 4 个已有文件、新建 3 个文件。`;
+
+/** 是否启用跨文件/新建文件补丁（S2-full）：跟随编码代理开关，默认关闭，gate 模式结构性禁用 */
+export function crossFilePatchEnabled(ctx) {
+  if (ctx?.gate === true) return false;
+  if (!patchEnabled(ctx)) return false;
+  const cfg = ctx?.llmConfig ?? null;
+  if (cfg?.patchCrossFile === true) return true;
+  if (cfg?.patchCrossFile === false) return false;
+  return process.env.GUARDBUILD_LLM_CROSSFILE === "1";
+}
+
 /** 构造提示词：只喂脱敏后的源码片段、已固化证据与上一轮失败反馈 */
-export function buildPatchPrompt({ rel, candidates, evidence, snippet, note = null, feedback = null, toolHistory = [] }) {
+export function buildPatchPrompt({ rel, candidates, evidence, snippet, note = null, feedback = null, toolHistory = [], writeSet = null }) {
   const body = {
     file: normRel(rel),
     candidates: describeCandidates(candidates),
@@ -380,6 +516,10 @@ export function buildPatchPrompt({ rel, candidates, evidence, snippet, note = nu
   if (feedback) body.previous_attempt = feedback;
   // 只读自查的历史结果累积呈现：模型看到的是同一条上下文链，不依赖多轮会话状态
   if (toolHistory.length) body.tool_history = toolHistory;
+  if (writeSet?.enabled) {
+    body.writable_files = [...writeSet.roles.entries()].map(([file, role]) => ({ file, role }));
+    body.writable_dirs = writeSet.newFileDirs ?? [];
+  }
   return JSON.stringify(body, null, 1);
 }
 
@@ -436,11 +576,25 @@ export async function requestPatchIntent(
     feedback = null,
     tools = null,
     maxToolRounds = MAX_TOOL_ROUNDS,
+    writeSet = null,
+    fetchContents = null,
   } = {}
 ) {
-  const empty = { ops: [], accepted: [], rejected: [], model: model ?? null, usage: null, failure: null, toolRounds: 0, toolCalls: [] };
+  const empty = {
+    ops: [],
+    byFile: {},
+    accepted: [],
+    rejected: [],
+    creations: [],
+    model: model ?? null,
+    usage: null,
+    failure: null,
+    toolRounds: 0,
+    toolCalls: [],
+  };
   if (!Array.isArray(candidates) || candidates.length === 0) return empty;
 
+  const crossFile = writeSet?.enabled === true;
   const allowed = patchTargetAllowed(rel);
   if (!allowed.ok) {
     return { ...empty, rejected: [{ file: normRel(rel), candidate: null, reason: `不允许修改：${allowed.reason}` }] };
@@ -471,6 +625,7 @@ export async function requestPatchIntent(
   let res = null;
   let raw = null;
   let failure = null;
+  const systemPrompt = crossFile ? `${SYSTEM_PROMPT}${CROSS_FILE_RULES}` : SYSTEM_PROMPT;
 
   for (let step = 0; ; step++) {
     const userPrompt = buildPatchPrompt({
@@ -480,10 +635,11 @@ export async function requestPatchIntent(
       snippet: snippet.snippet,
       feedback,
       toolHistory,
+      writeSet,
     });
     try {
       res = await chatImpl(ctx, {
-        systemPrompt: SYSTEM_PROMPT,
+        systemPrompt,
         userPrompt,
         getToken,
         model,
@@ -569,8 +725,39 @@ export async function requestPatchIntent(
     return { ...empty, toolRounds: roundsUsed, toolCalls, model: res?.model ?? model ?? null, usage: res?.usage ?? null, failure };
   }
 
-  const validated = validatePatchOutput(raw, { rel, content, candidateKeys });
+  // 跨文件锚点必须在各目标文件的真实字节上校验：由调用方（patcher）从隔离副本按需提供，
+  // 这里只取模型实际点名的文件，读不到的一律在校验层落成明确拒绝原因。
+  let contents = null;
+  if (crossFile && typeof fetchContents === "function" && Array.isArray(raw.patches)) {
+    const targetLower = normRel(rel).toLowerCase();
+    const needed = [
+      ...new Set(
+        raw.patches
+          .filter((p) => p && p.create !== true)
+          .map((p) => normRel(p.file))
+          // 读盘清单先过写集：模型给出的越界/相对逃逸路径不会被拼成 worktree 路径
+          .filter(
+            (r) =>
+              r &&
+              r.toLowerCase() !== targetLower &&
+              (writeSet.rolesLower?.has(r.toLowerCase()) ?? false)
+          )
+      ),
+    ].slice(0, MAX_CROSS_FILE_READS);
+    if (needed.length > 0) {
+      try {
+        contents = await fetchContents(needed, writeSet);
+      } catch (e) {
+        toolCalls.push({ tool: "read-raw", path: needed.join(","), ok: false, reason: String(e?.message ?? e) });
+      }
+    }
+  }
+
+  const validated = validatePatchOutput(raw, { rel, content, candidateKeys, writeSet, contents });
   ctx._llmPatchFiles.add(normRel(rel));
+
+  const produced =
+    Object.values(validated.byFile).reduce((n, list) => n + list.length, 0) + validated.creations.length;
 
   return {
     ...validated,
@@ -580,6 +767,6 @@ export async function requestPatchIntent(
     toolRounds: roundsUsed,
     toolCalls,
     note: typeof raw.note === "string" ? raw.note.slice(0, 300) : null,
-    failure: validated.ops.length === 0 ? validated.rejected[0]?.reason ?? "模型未给出可用补丁" : null,
+    failure: produced === 0 ? validated.rejected[0]?.reason ?? "模型未给出可用补丁" : null,
   };
 }

@@ -26,6 +26,9 @@ use super::vault::Vault;
 
 pub const PROTOCOL_VERSION: &str = "guardbuild.rpc/1";
 pub const CONSENT_TIMEOUT_SECS: u64 = 180;
+/// 单次 fs.write 落盘内容的上限。跨文件补丁允许新建文件，但新建文件必须是最小改动，
+/// 上限既防止整份依赖产物被写进 worktree，也让「一次写一整个项目」在宿主层就不成立。
+pub const MAX_WRITE_BYTES: usize = 256 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct HostConfig {
@@ -486,6 +489,9 @@ impl Host {
             kind: String,
             #[serde(default)]
             host: Option<String>,
+            /// worktree.write：是否允许在隔离副本里新建文件（跨文件补丁用）
+            #[serde(rename = "allowCreate", default)]
+            allow_create: Option<bool>,
             #[serde(default)]
             note: Option<String>,
             #[serde(default)]
@@ -509,6 +515,7 @@ impl Host {
             },
             "worktree.write" => Scope::WorktreeWrite {
                 root: worktree_root.to_string_lossy().to_string(),
+                allow_create: p.allow_create.unwrap_or(false),
             },
             "proc.spawn" => Scope::ProcSpawn {
                 roots: vec![
@@ -661,7 +668,9 @@ impl Host {
         let mut roots: Vec<PathBuf> = Vec::new();
         for s in &token.scopes {
             match s {
-                Scope::ProjectRead { root } | Scope::WorktreeWrite { root } => roots.push(PathBuf::from(root)),
+                Scope::ProjectRead { root } | Scope::WorktreeWrite { root, .. } => {
+                    roots.push(PathBuf::from(root))
+                }
                 _ => {}
             }
         }
@@ -769,7 +778,9 @@ impl Host {
         let tokens = self.tokens.read().unwrap();
         let token = tokens.require(&p.token)?;
         let dst = self.resolve_for_token(token, &p.dst)?;
-        token.require_worktree_write_path(&dst)?;
+        // 目录链接不是「补丁新建文件」，不需要 allow_create（它落点是 node_modules 这类
+        // 依赖目录，因此也不走 fs.write 的产物目录守卫）
+        token.require_worktree_write_path(&dst, false)?;
         let src = match self.resolve_for_token(token, &p.src) {
             Ok(s) => {
                 token.require_read_path(&s)?;
@@ -818,8 +829,28 @@ impl Host {
         let tokens = self.tokens.read().unwrap();
         let token = tokens.require(&p.token)?;
         let abs = self.resolve_for_token(token, &p.path)?;
-        token.require_worktree_write_path(&abs)?;
+        // 「是否新建」由文件系统的实际状态决定，不接受客户端声明
+        let creating = !abs.exists();
+        token.require_worktree_write_path(&abs, creating)?;
+        let wt_roots: Vec<PathBuf> = token
+            .scopes
+            .iter()
+            .filter_map(|s| match s {
+                Scope::WorktreeWrite { root, .. } => Some(PathBuf::from(root)),
+                _ => None,
+            })
+            .collect();
         drop(tokens);
+
+        let rel_for_guard = wt_roots
+            .iter()
+            .find_map(|r| abs.strip_prefix(r).ok().map(|p| p.to_string_lossy().to_string()))
+            .unwrap_or_else(|| abs.to_string_lossy().to_string());
+        if let Some(seg) = super::token::denied_write_dir_segment(&rel_for_guard) {
+            return Err(HostError::ScopeDenied(format!(
+                "写入路径落入依赖/产物/元数据目录（`{seg}`），补丁只改源码文件: {rel_for_guard}"
+            )));
+        }
 
         // 定向替换：模型只提供「意图」（替换锚点与内容），由 Host 在真实字节上执行，
         // 原始文件内容不必流出 Host。
@@ -854,6 +885,13 @@ impl Host {
             }
             _ => return Err(HostError::InvalidParams("必须提供 content 或 ops".into())),
         };
+        if final_content.len() > MAX_WRITE_BYTES {
+            return Err(HostError::InvalidParams(format!(
+                "写入内容 {} 字节，超过单文件上限 {} 字节",
+                final_content.len(),
+                MAX_WRITE_BYTES
+            )));
+        }
 
         let sha = fsops::write_text(&abs, &final_content)?;
         self.push_event(
@@ -861,19 +899,21 @@ impl Host {
             "patching",
             "info",
             &format!(
-                "写入隔离副本: {}（{}）",
+                "{}隔离副本: {}（{}）",
+                if creating { "新建" } else { "写入" },
                 abs.strip_prefix(&self.cfg.data_dir)
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_else(|_| abs.to_string_lossy().to_string()),
                 if applied > 0 { format!("定向替换 {applied} 处") } else { "整文件写入".into() }
             ),
-            json!({ "sha256": sha, "beforeSha256": before_sha, "reason": p.reason, "ops": applied }),
+            json!({ "sha256": sha, "beforeSha256": before_sha, "reason": p.reason, "ops": applied, "created": creating }),
         );
         Ok(json!({
             "path": abs.to_string_lossy(),
             "sha256": sha,
             "beforeSha256": before_sha,
             "appliedOps": applied,
+            "created": creating,
         }))
     }
 
@@ -993,6 +1033,9 @@ impl Host {
         struct P {
             token: String,
             dir: String,
+            /// 本次补丁新建的文件（worktree 相对路径），登记进 diff 后才进得了补丁
+            #[serde(rename = "intentAdd", default)]
+            intent_add: Option<Vec<String>>,
         }
         let p: P = jget(&params)?;
         let _ = self.session_of_token(&p.token)?;
@@ -1009,8 +1052,32 @@ impl Host {
         if !allowed {
             return Err(HostError::PathOutOfScope(p.dir));
         }
+        let mut registered: Vec<String> = Vec::new();
+        if let Some(rels) = p.intent_add.filter(|v| !v.is_empty()) {
+            // intent-to-add 会改 worktree 的索引，只允许发生在隔离副本里
+            if !super::token::path_within(&wt_root, &dir) {
+                return Err(HostError::ScopeDenied(
+                    "新建文件登记（intentAdd）仅允许作用于隔离 worktree".into(),
+                ));
+            }
+            for rel in &rels {
+                let norm = rel.replace('\\', "/");
+                let seg = norm.trim_start_matches('/').split('/').next().unwrap_or("");
+                if super::token::denied_write_dir_segment(&norm).is_some() || seg == ".git" {
+                    return Err(HostError::ScopeDenied(format!(
+                        "新建文件 `{rel}` 位于依赖/产物目录，不纳入补丁"
+                    )));
+                }
+            }
+            registered = gitops::intent_to_add(&dir, &rels)?;
+        }
         let cap = gitops::diff_capture(&dir)?;
-        Ok(json!({ "diff": cap.diff, "files": cap.files, "patchHash": cap.patch_hash }))
+        Ok(json!({
+            "diff": cap.diff,
+            "files": cap.files,
+            "patchHash": cap.patch_hash,
+            "registeredNewFiles": registered,
+        }))
     }
 
     fn cap_git_writeback(&self, params: Value) -> HostResult<Value> {

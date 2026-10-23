@@ -1,0 +1,27 @@
+{
+  "_note": "本靶场的越权端点在 src/routes/orders.js，但「正确修法」是把归属守卫挂在 src/app.js 的分发处（反向依赖闭包）并新建守卫模块——单文件补丁做不到。处理器形态（normalizeId + store 取数）刻意规避确定性归属校验模板，修复只能由开启跨文件写权限的编码代理产出。",
+  "start": {
+    "cmd": "node",
+    "args": ["server.js"],
+    "env": { "PORT": "0" },
+    "readyPattern": "已就绪",
+    "readyTimeoutMs": 20000
+  },
+  "login": {
+    "path": "/api/login",
+    "bodyTemplate": { "username": "{username}", "password": "{password}" },
+    "credentialPath": "token"
+  },
+  "responses": { "list": "orders", "entity": "order" },
+  "identities": [
+    { "name": "alice", "username": "alice", "password": "alice123", "role": "user" },
+    { "name": "bob", "username": "bob", "password": "bob123", "role": "user" }
+  ],
+  "llm": { "enabled": false, "patch": true, "patchCrossFile": true, "autoVerify": true, "fixRounds": 0 },
+  "scopes": [
+    "project.read",
+    "worktree.write",
+    "proc.spawn",
+    "net.probe"
+  ]
+}

@@ -384,10 +384,14 @@ export function normalizeLlm(raw) {
     fixRounds: Math.min(5, Math.max(0, Number.isFinite(raw.fixRounds) ? Math.floor(raw.fixRounds) : 2)),
     // 编码代理的只读自查轮数（0 关闭；上限由 llm-patcher 的 MAX_TOOL_ROUNDS 兜住）
     patchToolRounds: Math.min(2, Math.max(0, Number.isFinite(raw.patchToolRounds) ? Math.floor(raw.patchToolRounds) : 2)),
+    // 跨文件/新建文件补丁（S2-full）：默认关闭，需契约显式开启；gate 模式由代码层禁用
+    patchCrossFile: raw.patchCrossFile === true,
   };
   if (Number.isFinite(raw.patchMaxFiles)) {
     out.patchMaxFiles = Math.min(10, Math.max(1, Math.floor(raw.patchMaxFiles)));
   }
+  // 缺省不写这个键：契约没表态时留给 GUARDBUILD_LLM_CROSSFILE 决定（显式 false 才是关）
+  if (typeof raw.patchCrossFile === "boolean") out.patchCrossFile = raw.patchCrossFile;
   return out;
 }
 

@@ -1,0 +1,10 @@
+{
+  "name": "crossfile-shop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "CrossFileShop - 示例订单服务（GuardBuild 靶场：正确修法落在候选文件的依赖闭包内，用于跨文件/新建文件补丁链路）",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

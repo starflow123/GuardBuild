@@ -195,7 +195,37 @@ pub fn worktree_remove(root: &Path, target_dir: &Path) -> HostResult<()> {
     Ok(())
 }
 
-/// 捕获目录相对 HEAD 的完整 diff（含未跟踪文件不处理；worktree 内我们只改已跟踪文件）。
+/// 为编排层**明确申报**的新文件建立 intent-to-add 记录，使其进入 `git diff` 与补丁。
+///
+/// 为什么必须显式申报而不是 `git add -N .`：worktree 里目标进程运行时会落下临时文件、
+/// 数据库文件、构建产物，全量登记会把它们混进「修复补丁」，让写回污染工作区。
+/// 任一申报路径失败即报错——静默漏掉一个新建文件会让验收通过的说法不成立。
+pub fn intent_to_add(dir: &Path, rels: &[String]) -> HostResult<Vec<String>> {
+    let mut added = Vec::new();
+    for rel in rels {
+        let p = rel.replace('\\', "/");
+        if p.is_empty() || p.contains("..") || p.starts_with('/') || Path::new(rel).is_absolute() {
+            return Err(HostError::InvalidParams(format!(
+                "intentAdd 只接受 worktree 内相对路径，收到 `{rel}`"
+            )));
+        }
+        let abs = dir.join(&p);
+        if !abs.exists() {
+            return Err(HostError::NotFound(format!("新建文件不存在，无法登记进补丁: {p}")));
+        }
+        let (ok, _out, stderr) = run_git(dir, &["add", "--intent-to-add", "--", &p])?;
+        if !ok {
+            return Err(HostError::Git(format!(
+                "git add --intent-to-add `{p}` 失败: {}",
+                stderr.trim()
+            )));
+        }
+        added.push(p);
+    }
+    Ok(added)
+}
+
+/// 捕获目录相对 HEAD 的完整 diff。未跟踪文件仅在 `intent_to_add` 显式登记后进入补丁。
 pub fn diff_capture(dir: &Path) -> HostResult<DiffCapture> {
     let (ok, diff, stderr) = run_git(dir, &["diff", "--no-color", "--no-ext-diff"])?;
     if !ok {
@@ -440,6 +470,59 @@ mod tests {
         assert!(matches!(err, HostError::Conflict(_)), "应返回冲突错误，实际: {err:?}");
         let content3 = std::fs::read_to_string(repo.join("src/app.js")).unwrap();
         assert!(content3.contains("const a = 999"), "拒绝写回后本地文件不应被改动: {content3}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn intent_to_add_puts_new_files_into_patch_and_rollback() {
+        let base = std::env::temp_dir().join(format!("gb_git_new_{}", std::process::id()));
+        let repo = base.join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        git_init(&repo);
+        std::fs::write(repo.join("src/app.js"), "const a = 1;\nconst b = 2;\n").unwrap();
+        let run = |args: &[&str]| {
+            let mut c = Command::new("git");
+            c.arg("-C").arg(&repo).args(args);
+            apply_no_window(&mut c);
+            let out = c.output().unwrap();
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        };
+        run(&["add", "-A"]);
+        run(&["commit", "-qm", "base"]);
+
+        let wt = base.join("wt");
+        worktree_add(&repo, &wt).unwrap();
+        std::fs::write(wt.join("src/app.js"), "const a = 1; // guarded\nconst b = 2;\n").unwrap();
+        std::fs::create_dir_all(wt.join("src/guards")).unwrap();
+        std::fs::write(wt.join("src/guards/owner.js"), "export const guard = true;\n").unwrap();
+        // 目标进程运行时落下的临时文件：未申报就不该进补丁
+        std::fs::write(wt.join("runtime.db"), "junk\n").unwrap();
+
+        let before = diff_capture(&wt).unwrap();
+        assert!(!before.diff.contains("owner.js"), "未登记的新文件不应进补丁: {}", before.diff);
+
+        let added = intent_to_add(&wt, &["src/guards/owner.js".to_string()]).unwrap();
+        assert_eq!(added, vec!["src/guards/owner.js".to_string()]);
+        let cap = diff_capture(&wt).unwrap();
+        assert!(cap.diff.contains("new file mode"), "新文件应以新建形态进补丁:\n{}", cap.diff);
+        assert_eq!(cap.files.len(), 2, "改动文件 + 新建文件: {:?}", cap.files);
+        assert!(!cap.diff.contains("runtime.db"), "未申报的运行时产物不得进补丁");
+
+        let backups = base.join("backups");
+        let manifest = writeback_patch(&repo, &cap.diff, &cap.patch_hash, "s_new", &backups).unwrap();
+        assert!(repo.join("src/guards/owner.js").exists(), "写回应创建新文件");
+        assert_eq!(manifest.files.len(), 2);
+
+        let (restored, conflicts) = rollback(&backups, &manifest.backup_id).unwrap();
+        assert!(conflicts.is_empty());
+        assert_eq!(restored.len(), 2);
+        assert!(!repo.join("src/guards/owner.js").exists(), "回滚应删除原本不存在的新建文件");
+        assert!(repo.join("src/app.js").exists(), "回滚不应删掉原有文件");
+
+        // 拒绝：越界路径与不存在的文件
+        assert!(intent_to_add(&wt, &["../escape.js".to_string()]).is_err());
+        assert!(intent_to_add(&wt, &["src/missing.js".to_string()]).is_err());
 
         let _ = std::fs::remove_dir_all(&base);
     }

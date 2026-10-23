@@ -258,6 +258,10 @@ function summarizeLlmPatch(llm) {
     rejected: (llm.rejected ?? []).slice(0, 12),
     failures: (llm.failures ?? []).slice(0, 8),
     toolRounds: llm.toolRounds ?? 0,
+    // 跨文件/新建文件（S2-full）：写集里到底动了哪些已有文件、新建了哪些，全部留痕可审计
+    crossFile: llm.crossFile === true,
+    crossFileFiles: (llm.crossFileFiles ?? []).map((f) => ({ from: f.from, to: f.to, role: f.role, ops: f.ops })),
+    createdFiles: (llm.createdFiles ?? []).slice(0, 12),
     // 只读自查留痕：模型看了哪些文件、哪些请求被路径守卫挡下（内容不进报告）
     toolCalls: (llm.toolCalls ?? []).slice(0, 24).map((t) => ({
       file: t.file ?? null,
@@ -288,6 +292,17 @@ function renderLlmPatchSection(llm) {
           }）——只读 worktree 内源码，写入范围未变 |`,
         ]
       : []),
+    ...(llm.crossFile
+      ? [
+          `| 写入范围 | 已开启跨文件补丁：候选文件外的已有文件 ${
+            (llm.crossFileFiles ?? []).length
+          } 个（${(llm.crossFileFiles ?? [])
+            .map((f) => `${f.to}·${f.role}`)
+            .join("、") || "无"}），新建 ${(llm.createdFiles ?? []).length} 个（${
+            (llm.createdFiles ?? []).join("、") || "无"
+          }）——均限于候选的依赖闭包写集与已扫描源码目录 |`,
+        ]
+      : []),
     ...(llm.usage?.length
       ? [
           `| Token 用量 | ${llm.usage
@@ -312,6 +327,33 @@ function renderLlmPatchSection(llm) {
     lines.push("**未产出补丁的文件**\n", ...llm.failures.slice(0, 6).map((f) => `- ${esc(f.file)}：${esc(f.reason)}`), "");
   }
   return lines.join("\n");
+}
+
+/** 改动范围画像：人工审查的第一问不是「diff 长什么样」，而是「这次动了哪些文件、它们还被谁用着」 */
+function renderScopeLines(scope) {
+  if (!scope) return [];
+  const untouched = (scope.files ?? []).filter((f) => f.untouched).map((f) => f.file);
+  const lines = [
+    `- 改动范围：候选文件 ${(scope.candidateFiles ?? []).length} 个、依赖闭包内已有文件 ${
+      (scope.closureFiles ?? []).length
+    } 个（${(scope.closureFiles ?? []).map((f) => `\`${f}\``).join("、") || "无"}）、新建 ${(scope.newFiles ?? []).length} 个（${
+      (scope.newFiles ?? []).map((f) => `\`${f}\``).join("、") || "无"
+    }）${scope.crossFile ? "——跨文件写权限由 llm.patchCrossFile 开启，范围严格限于候选的依赖闭包写集" : ""}`,
+  ];
+  if (untouched.length) {
+    lines.push(`  - 漏洞文件本身未改动（${untouched.map((f) => `\`${f}\``).join("、")}）：修法落在挂载点/共享模块，逐候选归因仍按入口翻转判定`);
+  }
+  if (scope.sharedFiles?.length) {
+    lines.push(
+      `  - 共享文件影响面：${scope.sharedFiles
+        .map((s) => `\`${s.file}\` 被 ${s.inDegree} 处 import`)
+        .join("；")}（入度越高越要确认其它调用方不受影响）`
+    );
+  }
+  if (scope.rejectedCount) {
+    lines.push(`  - 另有 ${scope.rejectedCount} 条补丁意图在校验层被拒（越界/锚点歧义/规模超限），未写入任何文件`);
+  }
+  return lines;
 }
 
 function inlineCode(value) {
@@ -518,6 +560,7 @@ function renderMarkdown(r) {
           ? [`- 未产出补丁的候选：${r.patch.skipped.length} 个（原因见 report.json 的 patch.skipped）`]
           : []),
         `- 文件：${fileDesc || "—"}`,
+        ...renderScopeLines(r.patch.scope),
         `- 隔离位置：\`${esc(r.patch.worktree)}\``,
         `- 状态：${esc(r.patch.status)}（${r.patch.lineCount ?? 0} 行改动）`,
         ...(r.patch.fixLoop?.rounds?.length
@@ -744,6 +787,8 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
           })),
           llm: summarizeLlmPatch(view.patch.llm),
           fixLoop: view.patch.fixLoop ?? null,
+          // 风险画像：改动范围（角色 + 入度 + 新建），人工据此判断「这一屏 diff 之外还动了什么」
+          scope: view.patch.scope ?? null,
         }
       : null,
     acceptance: view.acceptance ?? null,

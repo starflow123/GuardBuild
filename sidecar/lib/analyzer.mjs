@@ -10,6 +10,8 @@ import { collectNestSections } from "./nestjs.mjs";
 import { collectTrpcSections } from "./trpc.mjs";
 import { collectGraphqlSections } from "./graphql.mjs";
 import { collectPythonSections } from "./python.mjs";
+import { buildImportGraph, graphToJSON, toRel as relToRoot } from "./depgraph.mjs";
+import { crossFilePatchEnabled } from "./llm-patcher.mjs";
 import {
   SINK,
   OWNER_GUARD,
@@ -553,6 +555,18 @@ export async function analyzeProject(ctx) {
     for (const s of sectionize(f.path, res.content)) sections.push(s);
   }
 
+  // 依赖闭包：在已读过的那批文件上构图，零额外读取。编码代理的写集据此界定（S2-full）。
+  // 只在跨文件补丁开启时构建——gate/CI 的确定性流程不需要它，也不该为它付出扫描成本。
+  const depGraph = crossFilePatchEnabled(ctx)
+    ? graphToJSON(
+        buildImportGraph(
+          readContents
+            .map((f) => ({ rel: relToRoot(projectRoot, f.path), content: f.content }))
+            .filter((f) => f.rel)
+        )
+      )
+    : null;
+
   // 跨文件鉴权线索（挂载级 / 文件级中间件），补偿区块文本看不到的守卫
   const authGuards = collectFileAuthGuards(readContents);
   // 跨文件 handler 引用（router.get("/x", mw, appHandler.x)）→ 伪区块
@@ -854,6 +868,7 @@ export async function analyzeProject(ctx) {
   return {
     fileCount: files.length,
     readFiles,
+    depGraph,
     sections,
     endpoints,
     candidates,

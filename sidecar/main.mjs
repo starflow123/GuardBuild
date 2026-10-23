@@ -32,6 +32,7 @@ import { isEnabled as llmEnabled } from "./lib/llm.mjs";
 import { runBlackbox } from "./lib/blackbox.mjs";
 import { coverageSummary, describeOutcome } from "./lib/coverage.mjs";
 import { createPatch, writebackPatch, rollbackWorkspace, PatchError } from "./lib/patcher.mjs";
+import { crossFilePatchEnabled } from "./lib/llm-patcher.mjs";
 import { buildAttribution } from "./lib/attribution.mjs";
 import { buildFixFeedback, feedbackDigest } from "./lib/fixfeedback.mjs";
 import { emitReport } from "./lib/report.mjs";
@@ -246,7 +247,7 @@ function compactEvidence(r) {
 
 // ---------- Host 能力封装 ----------
 
-async function requestScope(ctx, kind, reason, host = null) {
+async function requestScope(ctx, kind, reason, host = null, extra = null) {
   emit(ctx, {
     kind: "scope",
     severity: SEVERITY.INFO,
@@ -255,6 +256,7 @@ async function requestScope(ctx, kind, reason, host = null) {
   });
   const params = { token: ctx.tokens.project, kind, reason };
   if (host) params.host = host;
+  if (extra) Object.assign(params, extra);
   const res = await ctx.rpc.request(RPC_TO_HOST.AUTH_REQUEST_SCOPE, params, { timeoutMs: 240_000 });
   return res.token;
 }
@@ -1025,6 +1027,17 @@ async function stageAnalyze(ctx) {
   ensureAlive(ctx);
   setState(ctx, STATE.ANALYZING);
   ctx.tokens.worktree = await requestScope(ctx, SCOPE_KINDS.WORKTREE_WRITE, "在隔离 Git worktree 中生成修复补丁");
+  // 跨文件补丁（S2-full）才会申请：新建文件需要带 allow_create 的作用域，
+  // 只有这一个令牌能创建文件，普通写补丁的令牌拿不到该权限。
+  if (crossFilePatchEnabled(ctx)) {
+    ctx.tokens.worktreeCreate = await requestScope(
+      ctx,
+      SCOPE_KINDS.WORKTREE_WRITE,
+      "跨文件补丁：在隔离 worktree 的源码目录内新建守卫/中间件文件",
+      null,
+      { allowCreate: true }
+    );
+  }
   ctx.tokens.spawn = await requestScope(ctx, SCOPE_KINDS.PROC_SPAWN, "启动目标项目进程进行动态复现与验收");
   ctx.tokens.net = await requestScope(ctx, SCOPE_KINDS.NET_PROBE, "向本机回环地址发送诊断探测请求");
 
@@ -1496,6 +1509,7 @@ async function stagePatch(ctx) {
     strategy: result.filePatches.flatMap((f) => f.fixes.map((x) => x.strategy)).join(",") || "none",
     llm: result.llm?.enabled ? result.llm : null,
     autoVerify,
+    scope: result.scope ?? null,
     fixLoop: fixLoopView(ctx.fixLoop),
   };
   pushView(ctx);
@@ -1662,6 +1676,7 @@ async function stageVerify(ctx) {
         strategy: result.filePatches.flatMap((f) => f.fixes.map((x) => x.strategy)).join(",") || "none",
         llm: result.llm?.enabled ? result.llm : null,
         autoVerify: true,
+        scope: result.scope ?? null,
         fixLoop: fixLoopView(loop),
       };
       pushView(ctx);

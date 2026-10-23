@@ -96,6 +96,10 @@ export interface ViewLlmPatch {
   /** 只读自查：轮数与逐次调用留痕（读到的内容不回传界面） */
   toolRounds?: number;
   toolCalls?: { file?: string | null; tool?: string | null; path?: string | null; ok?: boolean; chars?: number | null; entries?: number | null; reason?: string | null }[];
+  /** 跨文件/新建文件写权限（S2-full）：是否生效、候选外的已有文件、本次新建的文件 */
+  crossFile?: boolean;
+  crossFileFiles?: { from: string; to: string; role?: string | null; ops?: number }[];
+  createdFiles?: string[];
 }
 
 export interface ViewFixRound {
@@ -121,6 +125,28 @@ export interface ViewFixLoop {
   rounds: ViewFixRound[];
 }
 
+export interface ViewPatchScopeFile {
+  file: string;
+  role?: string | null;
+  created?: boolean;
+  /** 候选（漏洞）文件本身未被改动，修复落在依赖闭包里 */
+  untouched?: boolean;
+  insertions?: number;
+  deletions?: number;
+  /** 被多少处 import；越高影响面越大 */
+  inDegree?: number | null;
+}
+
+export interface ViewPatchScope {
+  crossFile?: boolean;
+  files?: ViewPatchScopeFile[];
+  candidateFiles?: string[];
+  closureFiles?: string[];
+  newFiles?: string[];
+  sharedFiles?: { file: string; inDegree?: number | null }[];
+  rejectedCount?: number;
+}
+
 export interface ViewPatch {
   hash: string;
   diff: string;
@@ -134,6 +160,8 @@ export interface ViewPatch {
   fixes?: { file: string; appliedOps: number; fixes: { candidate: string; strategy: string; reason?: string | null }[] }[];
   skipped?: { file: string; candidate?: string; reason: string; llm?: string }[];
   fixLoop?: ViewFixLoop | null;
+  /** 风险画像：改动范围、角色、共享文件影响面 */
+  scope?: ViewPatchScope | null;
 }
 
 export interface AcceptanceView {

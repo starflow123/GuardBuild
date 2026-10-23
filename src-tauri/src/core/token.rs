@@ -18,8 +18,14 @@ pub fn now_ms() -> i64 {
 pub enum Scope {
     #[serde(rename = "project.read")]
     ProjectRead { root: String },
+    /// 隔离 worktree 的写权限。`allow_create` 单独成维：默认只能改已跟踪文件，
+    /// 跨文件补丁要新建文件时必须显式申请带创建语义的令牌。
     #[serde(rename = "worktree.write")]
-    WorktreeWrite { root: String },
+    WorktreeWrite {
+        root: String,
+        #[serde(default)]
+        allow_create: bool,
+    },
     #[serde(rename = "proc.spawn")]
     ProcSpawn { roots: Vec<String> },
     #[serde(rename = "net.probe")]
@@ -59,7 +65,10 @@ impl Scope {
     pub fn summary(&self) -> String {
         match self {
             Scope::ProjectRead { root } => format!("project.read @ {root}"),
-            Scope::WorktreeWrite { root } => format!("worktree.write @ {root}"),
+            Scope::WorktreeWrite { root, allow_create } => format!(
+                "worktree.write @ {root}{}",
+                if *allow_create { "（可新建文件）" } else { "" }
+            ),
             Scope::ProcSpawn { roots } => format!("proc.spawn @ [{}]", roots.join(", ")),
             Scope::NetProbe {} => "net.probe @ loopback".to_string(),
             Scope::NetEgress { host } => format!("net.egress @ {host}"),
@@ -169,6 +178,37 @@ pub fn path_within(root: &Path, child: &Path) -> bool {
     c == r || c.starts_with(&format!("{r}\\"))
 }
 
+/// 写入路径中禁止落入的目录段（相对授权根之后）。
+///
+/// worktree 里存在指向真实项目的 `node_modules` junction，落进这类目录的写入会
+/// 穿透到被测工作区；构建产物与 git 元数据同样不属于补丁范围。读侧与目录链接
+/// （fs.linkDir 需要 legitimately 创建 node_modules 链接）不走这条判定。
+pub fn denied_write_dir_segment(rel: &str) -> Option<String> {
+    const DENIED: &[&str] = &[
+        ".git",
+        "node_modules",
+        ".next",
+        ".nuxt",
+        "dist",
+        "build",
+        "out",
+        "coverage",
+        "__pycache__",
+        ".venv",
+        "venv",
+        "target",
+    ];
+    for seg in rel.replace('\\', "/").split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if DENIED.contains(&seg.to_lowercase().as_str()) {
+            return Some(seg.to_string());
+        }
+    }
+    None
+}
+
 /// 在 root 约束下解析路径（允许目标不存在，用于写操作）。
 /// 相对路径基于 root 拼接；随后对最近的已存在祖先做 canonicalize，防止符号链接逃逸。
 pub fn resolve_in_root_allow_missing(root: &Path, requested: &str) -> HostResult<PathBuf> {
@@ -231,7 +271,7 @@ impl Token {
     pub fn require_read_path(&self, path: &Path) -> HostResult<()> {
         if any_scope(self, |s| match s {
             Scope::ProjectRead { root } => path_within(Path::new(root), path),
-            Scope::WorktreeWrite { root } => path_within(Path::new(root), path),
+            Scope::WorktreeWrite { root, .. } => path_within(Path::new(root), path),
             _ => false,
         }) {
             Ok(())
@@ -244,12 +284,21 @@ impl Token {
     }
 
     /// 校验：写入 worktree 内的路径。
-    pub fn require_worktree_write_path(&self, path: &Path) -> HostResult<()> {
+    /// `creating` 由 Host 依据文件系统事实判定（路径当前不存在即为新建）：
+    /// 新建文件需要令牌显式带 allow_create，客户端无法靠声明绕过。
+    pub fn require_worktree_write_path(&self, path: &Path, creating: bool) -> HostResult<()> {
         if any_scope(self, |s| match s {
-            Scope::WorktreeWrite { root } => path_within(Path::new(root), path),
+            Scope::WorktreeWrite { root, allow_create } => {
+                path_within(Path::new(root), path) && (!creating || *allow_create)
+            }
             _ => false,
         }) {
             Ok(())
+        } else if creating {
+            Err(HostError::ScopeDenied(format!(
+                "在 {:?} 新建文件需要带 allow_create 的 worktree.write 作用域",
+                path
+            )))
         } else {
             Err(HostError::ScopeDenied(format!(
                 "写入 {:?} 需要 worktree.write 作用域",
@@ -689,6 +738,43 @@ mod tests {
         let root = if cfg!(windows) { Path::new(r"D:\proj") } else { Path::new("/proj") };
         assert!(token.require_workspace_write(root, "abc123").is_ok());
         assert!(token.require_workspace_write(root, "other").is_err());
+    }
+
+    #[test]
+    fn new_file_write_requires_allow_create() {
+        let root = if cfg!(windows) { r"D:\wt\s1" } else { "/wt/s1" };
+        let mk = |allow_create: bool| Token {
+            id: "t".into(),
+            session_id: "s".into(),
+            scopes: vec![Scope::WorktreeWrite {
+                root: root.into(),
+                allow_create,
+            }],
+            issued_at: now_ms(),
+            expires_at: now_ms() + 1000,
+            via: "test".into(),
+        };
+        let existing = Path::new(root).join("src/app.js");
+        let fresh = Path::new(root).join("src/guards/owner.js");
+        assert!(mk(false).require_worktree_write_path(&existing, false).is_ok());
+        assert!(mk(false).require_worktree_write_path(&fresh, true).is_err(), "未授予 allow_create 不得新建文件");
+        assert!(mk(true).require_worktree_write_path(&fresh, true).is_ok());
+        // 新建许可不放宽目录越界
+        assert!(mk(true)
+            .require_worktree_write_path(Path::new(if cfg!(windows) { r"D:\other\x.js" } else { "/other/x.js" }), true)
+            .is_err());
+        assert!(Scope::WorktreeWrite { root: root.into(), allow_create: true }.summary().contains("可新建文件"));
+        assert!(!Scope::WorktreeWrite { root: root.into(), allow_create: false }.summary().contains("可新建文件"));
+    }
+
+    #[test]
+    fn denied_write_dir_segments_block_dependency_and_output_paths() {
+        assert_eq!(denied_write_dir_segment("src/guards/owner.js"), None);
+        assert_eq!(denied_write_dir_segment("node_modules/x/index.js").as_deref(), Some("node_modules"));
+        assert_eq!(denied_write_dir_segment("src/node_modules/x.js").as_deref(), Some("node_modules"));
+        assert_eq!(denied_write_dir_segment(".git/config").as_deref(), Some(".git"));
+        assert_eq!(denied_write_dir_segment("dist\\app.js").as_deref(), Some("dist"));
+        assert_eq!(denied_write_dir_segment("s1/src/app.js"), None);
     }
 
     #[test]

@@ -1,4 +1,46 @@
-import type { ViewPatch } from "../bridge";
+import type { ViewPatch, ViewPatchScope } from "../bridge";
+
+const ROLE_LABEL: Record<string, string> = {
+  candidate: "漏洞文件",
+  forward: "正向依赖",
+  reverse: "反向引用",
+  new: "新建",
+};
+
+function describeFile(f: NonNullable<ViewPatchScope["files"]>[number]): string {
+  const bits = [ROLE_LABEL[f.role ?? "candidate"] ?? f.role];
+  if (f.created) bits.push("新建");
+  if (f.untouched) bits.push("本次未改动");
+  if (f.insertions || f.deletions) bits.push(`+${f.insertions ?? 0}/-${f.deletions ?? 0}`);
+  if (typeof f.inDegree === "number" && f.inDegree > 0) bits.push(`被 ${f.inDegree} 处引用`);
+  return `${f.file}（${bits.filter(Boolean).join("·")}）`;
+}
+
+function PatchScopePanel({ scope }: { scope: ViewPatchScope }) {
+  const files = scope.files ?? [];
+  if (files.length === 0) return null;
+  return (
+    <div className="patch-meta" style={{ borderBottom: "1px solid var(--line-soft)" }}>
+      <span className="muted small">
+        改动范围：{files.map(describeFile).join("；")}
+        {scope.crossFile
+          ? "——跨文件写权限由 llm.patchCrossFile 开启，写入严格限于候选的依赖闭包写集与已扫描源码目录"
+          : null}
+      </span>
+      {scope.sharedFiles?.length ? (
+        <span className="muted small" style={{ display: "block" }}>
+          共享文件影响面：{scope.sharedFiles.map((s) => `${s.file} 被 ${s.inDegree ?? "?"} 处 import`).join("；")}
+          （入度越高越要确认其它调用方不受影响）
+        </span>
+      ) : null}
+      {scope.rejectedCount ? (
+        <span className="muted small" style={{ display: "block" }}>
+          另有 {scope.rejectedCount} 条补丁意图在校验层被拒（越界 / 锚点歧义 / 规模超限），未写入任何文件
+        </span>
+      ) : null}
+    </div>
+  );
+}
 
 function lineClass(line: string): string {
   if (line.startsWith("+++") || line.startsWith("---") || line.startsWith("diff --git") || line.startsWith("index "))
@@ -60,6 +102,7 @@ export function DiffViewer({
           </span>
         </div>
       )}
+      {patch.scope ? <PatchScopePanel scope={patch.scope} /> : null}
       {patch.llm?.enabled && (
         <div className="patch-meta" style={{ borderBottom: "1px solid var(--line-soft)" }}>
           <span className="muted small">

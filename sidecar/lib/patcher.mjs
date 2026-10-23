@@ -12,12 +12,65 @@
 import { relative, sep } from "node:path";
 import { RPC_TO_HOST, SEVERITY, shortId } from "../../shared/protocol.mjs";
 import { FIX_STRATEGIES, candKey } from "./planner.mjs";
-import { makeReadTools, patchEnabled, requestPatchIntent } from "./llm-patcher.mjs";
+import { crossFilePatchEnabled, makeReadTools, patchEnabled, requestPatchIntent } from "./llm-patcher.mjs";
+import { expandWriteSet, inDegree, reviveGraph } from "./depgraph.mjs";
 
 /** 确定性模板策略覆盖的候选（仅 IDOR：有明确的归属校验插入位） */
 const TEMPLATE_KINDS = new Set(["idor-suspect"]);
 /** LLM 编码代理额外覆盖的候选类别 */
 const LLM_KINDS = new Set(["idor-suspect", "no-auth-suspect", "traversal-suspect", "sqli-suspect", "cmdi-suspect"]);
+
+const normRelPath = (v) => String(v ?? "").replace(/\\/g, "/").replace(/^\.\//, "").replace(/\/+/g, "/");
+
+/**
+ * 补丁风险画像：人工审查先看「改动范围有多大、动的是不是共享文件」，再看 diff。
+ * 角色来自写集（候选文件 / 正向依赖 / 反向引用者 / 新建），入度来自依赖图——
+ * 入度越高说明这个文件被越多处 import，改它的影响面越大。
+ */
+export function buildScope({ crossFile = false, depNodes = null, filePatches = [], changedFiles = [], rejected = [] }) {
+  const meta = new Map();
+  for (const f of filePatches) {
+    const rel = normRelPath(f?.file);
+    if (!rel) continue;
+    const prev = meta.get(rel);
+    if (!prev) {
+      meta.set(rel, {
+        role: f.role ?? "candidate",
+        created: f.created === true,
+        crossFileOnly: f.crossFileOnly === true,
+      });
+    } else {
+      if (f.created === true) prev.created = true;
+      if (f.role && f.role !== "candidate") prev.role = f.role;
+    }
+  }
+  const delta = new Map();
+  // changedFiles 来自 Host 的 git.diff 响应（外部边界）：形状异常时画像不得炸掉补丁链路
+  for (const c of Array.isArray(changedFiles) ? changedFiles : []) {
+    const rel = normRelPath(c?.path ?? c?.file);
+    if (rel) delta.set(rel, { insertions: c.insertions ?? 0, deletions: c.deletions ?? 0 });
+  }
+  const files = [...new Set([...meta.keys(), ...delta.keys()])].map((rel) => ({
+    file: rel,
+    role: meta.get(rel)?.role ?? "candidate",
+    created: meta.get(rel)?.created === true,
+    // 候选文件本身没被改动、修复全在依赖闭包里：画像要说明「漏洞文件为什么没动」
+    untouched: meta.get(rel)?.crossFileOnly === true,
+    insertions: delta.get(rel)?.insertions ?? 0,
+    deletions: delta.get(rel)?.deletions ?? 0,
+    inDegree: depNodes ? inDegree(depNodes, rel) : null,
+  }));
+  const shared = files.filter((f) => (f.inDegree ?? 0) >= 2);
+  return {
+    crossFile: !!crossFile,
+    files,
+    candidateFiles: files.filter((f) => f.role === "candidate").map((f) => f.file),
+    closureFiles: files.filter((f) => f.role === "forward" || f.role === "reverse").map((f) => f.file),
+    newFiles: files.filter((f) => f.created).map((f) => f.file),
+    sharedFiles: shared.map((f) => ({ file: f.file, inDegree: f.inDegree })),
+    rejectedCount: (rejected ?? []).length,
+  };
+}
 
 export class PatchError extends Error {
   constructor(message, { code = "patch_failed", hint = null, details = null } = {}) {
@@ -188,6 +241,10 @@ export async function createPatch(ctx, { feedback = null } = {}) {
 
   const filePatches = [];
   const skipped = [];
+  const createdFiles = [];
+  // 跨文件写集（S2-full）：图由 analyzer 在已读文件上构建，只有开启该能力时才存在
+  const depNodes = useLlm && crossFilePatchEnabled(ctx) ? reviveGraph(ctx.analysis?.depGraph) : null;
+  const crossFileEnabled = !!depNodes && depNodes.size > 0;
   const llmStats = {
     enabled: useLlm,
     requestedFiles: [],
@@ -199,6 +256,9 @@ export async function createPatch(ctx, { feedback = null } = {}) {
     usage: [],
     toolRounds: 0,
     toolCalls: [],
+    crossFile: crossFileEnabled,
+    crossFileFiles: [],
+    createdFiles,
   };
   // 只读自查工具绑定在隔离 worktree 上：模型能读到的范围永远不包括原工作区
   const llmTools = useLlm ? makeReadTools(ctx, wtRoot) : null;
@@ -206,6 +266,17 @@ export async function createPatch(ctx, { feedback = null } = {}) {
   for (const [file, cands] of byFile) {
     const rel = relative(ctx.projectRoot, file).split(sep).join("/");
     const wtPath = `${wtRoot}/${rel}`;
+    // 写集：候选文件 + 正向闭包（取数层/helper）+ 反向闭包（挂载守卫的启动文件）
+    const writeSet = crossFileEnabled
+      ? { enabled: true, ...expandWriteSet({ nodes: depNodes, seeds: [rel], enabled: true }) }
+      : null;
+    // 归一化到写集内的规范相对路径：不在写集（或越界）一律返回 null，绝不拼成 worktree 路径
+    const canonOf = (r) => {
+      const norm = normRelPath(r);
+      if (!norm || norm.includes("..")) return null;
+      if (!writeSet?.rolesLower?.has(norm.toLowerCase())) return null;
+      return norm;
+    };
 
     // 未跟踪文件诊断：worktree 从 HEAD 检出，未提交的文件不在其中
     try {
@@ -272,6 +343,7 @@ export async function createPatch(ctx, { feedback = null } = {}) {
     }
 
     const writeSum = { appliedOps: 0, beforeSha256: null, sha256: null, wrote: false };
+    const extraWrites = [];
     const flushWrite = async (patchOps, reason) => {
       if (patchOps.length === 0) return;
       let write;
@@ -292,6 +364,70 @@ export async function createPatch(ctx, { feedback = null } = {}) {
       writeSum.beforeSha256 = writeSum.beforeSha256 ?? write.beforeSha256;
       writeSum.sha256 = write.sha256;
       writeSum.wrote = true;
+    };
+
+    /**
+     * 写集内其它文件的落盘。与候选文件不同：单个附属文件写失败不能拖垮整批补丁
+     * （锚点已在真实字节上校验过，此处失败多为权限/IO 问题），记录原因后继续。
+     */
+    const flushExtra = async (fileRel, patchOps, role, reason) => {
+      if (patchOps.length === 0) return;
+      try {
+        const write = await ctx.rpc.request(
+          RPC_TO_HOST.FS_WRITE,
+          { token: ctx.tokens.worktree, path: `${wtRoot}/${fileRel}`, ops: patchOps, reason },
+          { timeoutMs: 30_000 }
+        );
+        extraWrites.push({
+          file: fileRel,
+          role,
+          appliedOps: write.appliedOps ?? patchOps.length,
+          beforeSha256: write.beforeSha256,
+          sha256: write.sha256,
+          created: false,
+        });
+      } catch (e) {
+        llmStats.rejected.push({ file: fileRel, candidate: null, reason: `写入隔离副本失败：${e.message}` });
+      }
+    };
+
+    /** 新建文件：只接受「当前不存在」的目标，且必须使用带 allow_create 的令牌 */
+    const flushCreate = async (item, reason) => {
+      const fileRel = canonOf(item.file) ?? normRelPath(item.file);
+      const path = `${wtRoot}/${fileRel}`;
+      try {
+        await ctx.rpc.request(RPC_TO_HOST.FS_STAT, { token: ctx.tokens.worktree, path }, { timeoutMs: 15_000 });
+        llmStats.rejected.push({ file: fileRel, candidate: null, reason: "新建目标在隔离副本中已存在，拒绝整文件覆盖" });
+        return;
+      } catch {
+        /* 不存在正是新建的前提 */
+      }
+      if (!ctx.tokens.worktreeCreate) {
+        llmStats.rejected.push({ file: fileRel, candidate: null, reason: "未签发 allow_create 作用域，无法新建文件" });
+        return;
+      }
+      try {
+        const write = await ctx.rpc.request(
+          RPC_TO_HOST.FS_WRITE,
+          { token: ctx.tokens.worktreeCreate, path, content: item.content, reason },
+          { timeoutMs: 30_000 }
+        );
+        if (write.created !== true) {
+          llmStats.rejected.push({ file: fileRel, candidate: null, reason: "Host 判定该写入不是新建，已丢弃" });
+          return;
+        }
+        extraWrites.push({
+          file: fileRel,
+          role: "new",
+          appliedOps: 1,
+          beforeSha256: null,
+          sha256: write.sha256,
+          created: true,
+        });
+        createdFiles.push(fileRel);
+      } catch (e) {
+        llmStats.rejected.push({ file: fileRel, candidate: null, reason: `新建文件写入失败：${e.message}` });
+      }
     };
 
     await flushWrite(templateOps, `修复越权：${cands.map((c) => `${c.method} ${c.path}`).join("、")}`);
@@ -329,6 +465,26 @@ export async function createPatch(ctx, { feedback = null } = {}) {
           feedback,
           tools: llmTools,
           maxToolRounds: toolRounds,
+          writeSet,
+          // 跨文件锚点用隔离副本的真实字节校验；只取写集内、模型实际点名的文件
+          fetchContents: async (rels) => {
+            const out = new Map();
+            for (const r of rels) {
+              const canon = canonOf(r);
+              if (!canon) continue;
+              try {
+                const res = await ctx.rpc.request(
+                  RPC_TO_HOST.FS_READ,
+                  { token: ctx.tokens.worktree, path: `${wtRoot}/${canon}`, redact: false },
+                  { timeoutMs: 30_000 }
+                );
+                out.set(r, res.content);
+              } catch {
+                /* 读不到即不放进 map，由校验层给出「未取得真实内容」的拒绝原因 */
+              }
+            }
+            return out;
+          },
           // 提示词只喂脱敏后的源码，真实锚点校验走上面的 wtBytes
           readRedacted: async () => {
             const r = await ctx.rpc.request(
@@ -346,13 +502,35 @@ export async function createPatch(ctx, { feedback = null } = {}) {
         for (const t of llmRes.toolCalls ?? []) llmStats.toolCalls.push({ file: rel, ...t });
 
         const covered = new Set(llmRes.accepted.map((a) => String(a.candidate ?? "").toLowerCase()));
-        if (llmRes.ops.length > 0) {
-          await flushWrite(
-            llmRes.ops,
-            `LLM 编码代理修复：${llmRes.accepted.map((a) => a.candidate ?? "-").join("、")}`
-          );
-          llmStats.appliedOps += llmRes.ops.length;
-          llmStats.appliedFiles.push({ file: rel, ops: llmRes.ops.length });
+        const fileOps = Object.entries(llmRes.byFile ?? {});
+        const creations = llmRes.creations ?? [];
+        const anyProduced = fileOps.length > 0 || creations.length > 0;
+        if (anyProduced) {
+          const reason = `LLM 编码代理修复：${llmRes.accepted.map((a) => a.candidate ?? "-").join("、")}`;
+          let opsApplied = 0;
+          for (const [fileRel, list] of fileOps) {
+            const canon = fileRel === rel ? rel : (canonOf(fileRel) ?? fileRel);
+            opsApplied += list.length;
+            if (canon === rel) await flushWrite(list, reason);
+            else {
+              const role = writeSet?.rolesLower?.get(canon.toLowerCase()) ?? "forward";
+              await flushExtra(canon, list, role, `${reason}（跨文件·${role}）`);
+              llmStats.crossFileFiles.push({ from: rel, to: canon, role, ops: list.length });
+            }
+          }
+          for (const c of creations) {
+            await flushCreate(c, `${reason}（新建守卫文件）`);
+          }
+          const createdNow = creations.filter((c) =>
+            extraWrites.some((w) => w.created && w.file === normRelPath(c.file))
+          ).length;
+          llmStats.appliedOps += opsApplied + createdNow;
+          llmStats.appliedFiles.push({
+            file: rel,
+            ops: llmRes.ops.length,
+            crossFileOps: opsApplied - llmRes.ops.length,
+            created: createdNow,
+          });
           for (const a of llmRes.accepted) {
             const claimed = cands.find(
               (c) => keyOf(c) === String(a.candidate ?? attempted[0]).toLowerCase()
@@ -363,16 +541,24 @@ export async function createPatch(ctx, { feedback = null } = {}) {
               strategy: "llm-coding-agent",
               reason: a.reason ?? null,
               addedLines: a.addedLines ?? null,
+              file: a.file ?? rel,
+              role: a.role ?? "candidate",
             });
           }
           ctx.emit({
             kind: "patch",
             severity: SEVERITY.INFO,
-            message: `LLM 编码代理为 ${rel} 产出 ${llmRes.ops.length} 个补丁意图（锚点校验通过，已写入隔离副本）`,
+            message:
+              `LLM 编码代理为 ${rel} 产出 ${opsApplied} 个补丁意图` +
+              (creations.length ? `、新建 ${creations.length} 个文件` : "") +
+              (opsApplied > llmRes.ops.length ? "（含依赖闭包内其它文件）" : "") +
+              "（锚点校验通过，已写入隔离副本）",
             data: {
               file: rel,
               candidates: llmRes.accepted.map((a) => a.candidate),
               reasons: llmRes.accepted.map((a) => a.reason),
+              touched: fileOps.map(([f, list]) => ({ file: f, ops: list.length })),
+              created: creations.map((c) => c.file),
               rejected: llmRes.rejected.length,
               model: llmRes.model,
             },
@@ -389,7 +575,7 @@ export async function createPatch(ctx, { feedback = null } = {}) {
           else skipped.push({ file, candidate: key, reason });
         }
 
-        if (llmRes.ops.length === 0) {
+        if (!anyProduced) {
           const reason = llmRes.failure ?? llmRes.rejected[0]?.reason ?? "编码代理未产出可用补丁";
           llmStats.failures.push({ file: rel, reason });
           ctx.emit({
@@ -402,15 +588,40 @@ export async function createPatch(ctx, { feedback = null } = {}) {
       }
     }
 
-    if (!writeSum.wrote) continue;
+    if (!writeSum.wrote && extraWrites.length === 0) continue;
 
-    filePatches.push({
-      file: rel,
-      appliedOps: writeSum.appliedOps,
-      beforeSha256: writeSum.beforeSha256,
-      sha256: writeSum.sha256,
-      fixes: used,
-    });
+    if (writeSum.wrote) {
+      filePatches.push({
+        file: rel,
+        appliedOps: writeSum.appliedOps,
+        beforeSha256: writeSum.beforeSha256,
+        sha256: writeSum.sha256,
+        fixes: used,
+      });
+    } else {
+      // 候选文件本身未被改动、修复全部落在依赖闭包内：仍要保留归因，否则该候选的
+      // 验收翻转会被判成「补丁没点名」，报告也看不出修法在哪个文件
+      filePatches.push({
+        file: rel,
+        appliedOps: 0,
+        beforeSha256: null,
+        sha256: null,
+        fixes: used,
+        crossFileOnly: true,
+      });
+    }
+    for (const w of extraWrites) {
+      filePatches.push({
+        file: w.file,
+        role: w.role,
+        created: w.created,
+        appliedOps: w.appliedOps,
+        beforeSha256: w.beforeSha256,
+        sha256: w.sha256,
+        fixes: [],
+        fromCandidate: rel,
+      });
+    }
   }
 
   if (filePatches.length === 0) {
@@ -436,10 +647,11 @@ export async function createPatch(ctx, { feedback = null } = {}) {
     });
   }
 
-  // 3. 捕获 diff 与哈希
+  // 3. 捕获 diff 与哈希。新建文件默认是未跟踪的，git diff 看不见——先按逐条清单
+  //    登记 intent-to-add（仅允许发生在隔离 worktree），它们才会进入补丁与回滚
   const diffRes = await ctx.rpc.request(
     RPC_TO_HOST.GIT_DIFF,
-    { token: ctx.tokens.worktree, dir: worktree },
+    { token: ctx.tokens.worktree, dir: worktree, ...(createdFiles.length ? { intentAdd: [...new Set(createdFiles)] } : {}) },
     { timeoutMs: 30_000 }
   );
   if (!diffRes.diff || !diffRes.diff.trim()) {
@@ -462,24 +674,41 @@ export async function createPatch(ctx, { feedback = null } = {}) {
   ctx.db.insertPatch(patch);
 
   const lineCount = patch.diff.split("\n").filter((l) => l.startsWith("+") || l.startsWith("-")).length;
+  const registered = diffRes.registeredNewFiles ?? [];
+  const unregistered = [...new Set(createdFiles)].filter((f) => !registered.includes(f));
   ctx.emit({
     kind: "patch",
     severity: SEVERITY.SUCCESS,
-    message: `已在隔离 worktree 生成最小补丁（${filePatches.length} 个文件 / ${lineCount} 行变更；策略 ${patch.strategy}）${usedLlm ? "，含 LLM 编码代理产出的补丁意图，等待双重验收" : "，等待 Diff 审查与授权"}`,
+    message:
+      `已在隔离 worktree 生成最小补丁（${new Set(filePatches.map((f) => f.file)).size} 个文件 / ${lineCount} 行变更` +
+      `${registered.length ? `，含新建 ${registered.length} 个文件` : ""}；策略 ${patch.strategy}）` +
+      `${usedLlm ? "，含 LLM 编码代理产出的补丁意图，等待双重验收" : "，等待 Diff 审查与授权"}`,
     data: {
       patchHash: patch.patchHash,
       worktree,
       files: filePatches.map((f) => f.file),
+      createdFiles: registered,
+      crossFile: llmStats.crossFileFiles,
       skipped,
       strategy: patch.strategy,
       llmApplied: llmStats.appliedOps,
     },
   });
+  if (unregistered.length > 0) {
+    ctx.emit({
+      kind: "patch",
+      severity: SEVERITY.WARN,
+      message: `${unregistered.length} 个新建文件未能登记进补丁（${unregistered.join("、")}），写回时不会带上它们`,
+      data: { unregistered },
+    });
+  }
 
   return {
     worktree,
     patch: { id: patch.id, hash: patch.patchHash, diff: patch.diff, files: patch.files, status: patch.status },
     filePatches,
+    // 本次在写集内新建的文件（已登记进补丁），报告与 GUI 据此说明「为什么多了个文件」
+    createdFiles: registered,
     // 补丁实际点名的候选（candKey 形态），验收归因据此判定「这条候选的翻转算不算补丁带来的」
     claimedKeys: [
       ...new Set(filePatches.flatMap((f) => f.fixes.map((x) => x.candidateKey).filter(Boolean))),
@@ -487,6 +716,13 @@ export async function createPatch(ctx, { feedback = null } = {}) {
     skipped,
     usedLlm,
     llm: llmStats,
+    scope: buildScope({
+      crossFile: crossFileEnabled,
+      depNodes,
+      filePatches,
+      changedFiles: patch.files,
+      rejected: llmStats.rejected,
+    }),
   };
 }
 

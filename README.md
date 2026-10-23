@@ -210,14 +210,18 @@ guardbuild-headless --url http://127.0.0.1:3000 \
 guardbuild-headless --url https://staging.example.com --project ./my-project --gate
 ```
 
-- 探测面：OpenAPI 发现 + 常见路由目录探测；未认证读取、跨用户读取（IDOR，需 ≥2 个普通测试身份）、SQL 注入（错误回显 / 稳定基线布尔盲注）、路径穿越、敏感文件与 actuator 暴露、限流观察。
-- 写操作越权（PUT IDOR）默认关闭，避免修改目标数据；显式开启：`guardbuild.json` 的 `blackbox.allowMutation: true` 或环境变量 `GUARDBUILD_BLACKBOX_MUTATE=1`（修改后尽力恢复原值）。
+- 探测面（每个开关都会写进报告的「本轮攻击面」，GUI 同词）：OpenAPI 发现 + 常见路由目录探测（含管理端点命名猜测）；未认证读取、跨用户读取（IDOR，需 ≥2 个普通测试身份）、垂直越权（普通登录身份访问管理端点，有管理身份时做交叉证明，用于区分「端点不存在」与「正确拒绝」）、SQL 注入（错误回显 / 恒真恒假差分 / **数字语境** `1 OR 1=1` 三段差分 / 单对象条件绕过）、路径穿越（明文 + 二次编码 / 变形编码绕过）、敏感文件与 actuator 暴露、限流观察。
+- 写操作越权默认关闭，避免修改甚至销毁目标数据，分两级显式开启：
+  - 跨用户 PUT/PATCH 与匿名写入：`blackbox.allowMutation: true` 或 `GUARDBUILD_BLACKBOX_MUTATE=1`（修改后按归属人身份尽力恢复原值，恢复未确认会写进证据）。
+  - 跨用户 DELETE 不可回滚，需在上一级之外再加 `blackbox.allowDestructive: true` 或 `GUARDBUILD_BLACKBOX_DELETE=1`。
+  - 两类判定都不看状态码：写类以「归属人复核字段值确实被改」为准，DELETE 以「归属人复读对象是否消失」为准；请求被接受但数据未动只记 `inconclusive`，既不记漏洞也不记「已防住」。匿名写入的 canary 由归属人复读证明落库，随后尽力匿名删除自清理。
 - 登录/身份来自 `guardbuild.json` 的 `login` / `identities`；可加 `blackbox.loginPaths` 补充登录端点候选。表单登录（`login.encoding: "form"`）与 Cookie 会话（`login.cookieAuth: true`，兼容 302 + `Set-Cookie`）同样适用于黑盒模式。
-- `blackbox.maxRoutes`（10–200，缺省 60）控制 OpenAPI/目录探测合并后的路由上限；每类攻击的探测候选默认最多 14 条，调低 `maxRoutes` 时同步收紧。
+- `blackbox.maxRoutes`（10–200，缺省 60）控制 OpenAPI/目录探测合并后的路由上限；每类攻击的探测候选默认最多 14 条，调低 `maxRoutes` 时同步收紧。注入/穿越各有独立请求预算（字符串 140 / 数字 70 / 穿越 120），预算用尽在报告里明说而不是静默漏跑。
 - 桌面端入口：左侧「黑盒外部目标」面板填写已运行目标 URL、选择契约目录后点击「扫描外部目标」；白盒启动流程不受影响。
 - 裁决：发现可复现漏洞 → `completed` + `vulnerable_unfixed`，exit 1；无可复现漏洞 → `completed` + `no_findings`，exit 0；目标不可达/执行错误 → `failed`，exit 2（不可达会在一次短超时预检后立即失败，不做整轮探测）。
 - 报告：`report.json` / `report.md` 为黑盒版式，含路由发现、登录结果、证据级别与复现 curl；证据中令牌一律为 `***vault:<identity>***` 占位。
-- 回归：`npm run e2e:blackbox`（22 断言：漏洞目标 exit 1、已修复目标 exit 0、Cookie 会话目标沿 form 登录 + 302 Set-Cookie 复现 IDOR、不可达 exit 2 + 快速短路、报告一致性与凭证不泄露）。
+- 靶场：`fixtures/wide-shop`（管理端点只校验登录、订单读写删无归属校验、留言板匿名写删、`?year=` 数字拼 SQL、`?name=` 二次编码穿越），`GB_WIDE_HARDENED=1` 为整体加固版，用于「不该报」那一轮。
+- 回归：`npm run e2e:blackbox`（66 断言 / 8 轮：legacy-shop 漏洞 exit 1、已修复 exit 0、Cookie 会话复现 IDOR、不可达 exit 2 + 快速短路；wide-shop 默认探测只见无副作用族、`allowMutation` 补出 PUT/PATCH + 匿名写、再加 `allowDestructive` 补出 DELETE、加固版零 finding 且四类攻击全记 blocked）。断言按 caseId 用例集合而不是 finding 条数，新增探测族漏跑会被抓住。
 
 ## Docker 容器沙箱（目标进程隔离）
 

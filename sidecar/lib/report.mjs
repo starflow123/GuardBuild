@@ -96,6 +96,14 @@ function headline(outcome, patchStatus, supabase, blackbox = null) {
   }
 }
 
+/** 覆盖口径必须来自实际执行过的探测族，不能在报告里凭空罗列「都测过了」 */
+function coverageText(coverage) {
+  if (!Array.isArray(coverage) || coverage.length === 0) {
+    return "未认证读取、跨用户读取（IDOR）、路径穿越、SQL 注入、敏感文件/调试端点暴露";
+  }
+  return coverage.join("、");
+}
+
 function suggestions(r) {
   const { outcome, patchStatus } = r.verdict;
   const supabase = r.supabase ?? null;
@@ -114,10 +122,13 @@ function suggestions(r) {
       }
       lines.push("- 黑盒模式只取证、不改码：请在源码/配置/数据库策略中修复上述端点，再重跑同一 URL 验证。");
       if (!bb.allowMutation) {
-        lines.push("- 写操作类越权（PUT/POST）默认未执行（避免修改目标数据）；如需覆盖，设置 blackbox.allowMutation=true 或 GUARDBUILD_BLACKBOX_MUTATE=1 后重跑。");
+        lines.push("- 写操作类越权（跨用户 PUT/PATCH/DELETE、匿名写入）默认未执行（会修改甚至销毁目标数据）；如需覆盖，设置 blackbox.allowMutation=true 或 GUARDBUILD_BLACKBOX_MUTATE=1 后重跑（DELETE 还需 blackbox.allowDestructive=true 或 GUARDBUILD_BLACKBOX_DELETE=1）。");
+      } else if (!bb.allowDestructive) {
+        lines.push("- 已开启写操作探测，但跨用户 DELETE 仍未执行（不可回滚）；如需覆盖再加 blackbox.allowDestructive=true 或 GUARDBUILD_BLACKBOX_DELETE=1。");
       }
     } else if (outcome === "no_findings") {
-      lines.push("- 本次覆盖：未认证读取、跨用户读取（IDOR）、路径穿越、SQL 注入（错误/布尔盲注）、敏感文件/调试端点暴露；可选写操作越权默认关闭。");
+      lines.push(`- 本次覆盖：${coverageText(bb.coverage)}。`);
+      if (!bb.allowMutation) lines.push("- 写操作类越权（跨用户 PUT/PATCH/DELETE、匿名写入）本轮未执行，属未覆盖项。");
       lines.push("- 未发现不代表无漏洞：黑盒结果受路由发现、测试身份、资源可发现性与攻击面启发式限制；建议补充 guardbuild.json 的 login/identities/blackbox.loginPaths 或 OpenAPI 文档后重跑。");
     } else if (outcome === "failed") {
       lines.push(`- 执行失败（${r.error?.code}）：${r.error?.message ?? ""}${r.error?.hint ? `；建议：${r.error.hint}` : ""}`);
@@ -525,7 +536,12 @@ function renderMarkdown(r) {
             ? `成功（${esc(bb.login.path)}；身份 ${esc((bb.login.identities ?? []).map((i) => i.name).join("、") || "—")}）`
             : "失败或未配置（跨用户越权用例已跳过）"
         }`,
-        `- 写操作探测：${bb.allowMutation ? "已开启（会修改目标数据并尽力恢复）" : "关闭（默认只读探测）"}`,
+        `- 写操作探测：${
+          bb.allowMutation
+            ? `已开启（PUT/PATCH${bb.allowDestructive ? " + 不可回滚的 DELETE" : "；DELETE 未开启"}，会修改目标数据并尽力恢复）`
+            : "关闭（默认只读探测）"
+        }`,
+        `- 本轮攻击面：${coverageText(bb.coverage)}`,
         `- 目标可达：${
           bb.reachable === false
             ? "否（连接失败，未执行探测）"
@@ -809,6 +825,8 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
             login: blackbox.login ?? null,
             rateLimited: !!blackbox.rateLimited,
             allowMutation: !!blackbox.allowMutation,
+            allowDestructive: !!blackbox.allowDestructive,
+            coverage: blackbox.coverage ?? null,
           }
         : null,
       start: start

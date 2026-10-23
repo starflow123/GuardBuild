@@ -18,14 +18,6 @@ export const DEFAULT_IDENTITIES = [
 export const PROBE_TOP_K = 3;
 
 export function loadIdentities() {
-  const raw = process.env.GUARDBUILD_IDENTITIES;
-  if (!raw) return DEFAULT_IDENTITIES;
-  try {
-    const parsed = JSON.parse(raw);
-    if (Array.isArray(parsed) && parsed.length >= 2) return parsed;
-  } catch {
-    /* 使用默认 */
-  }
   return DEFAULT_IDENTITIES;
 }
 

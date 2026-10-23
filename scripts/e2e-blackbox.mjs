@@ -2,9 +2,19 @@
 /**
  * 纯黑盒外部模式 E2E：真实 HTTP 目标 + Host 网络/保险库 + gate 退出码。
  *
- *   ① 漏洞目标（legacy-shop IDOR） → exit 1，findingCount=1，cross-proven 证据
- *   ② 已修复目标（同一路由加归属校验） → exit 0，no_findings
- *   ③ 目标不可达 → exit 2，failed（且应在 30s 内短路，不做无意义探测）
+ * legacy-shop（单一 IDOR）：
+ *   ① 漏洞目标 → exit 1，findingCount=1，cross-proven 证据
+ *   ② 已修复目标（同一路由加归属校验）→ exit 0，no_findings
+ *   ③ Cookie 会话鉴权目标 → exit 1，Cookie 注入生效
+ *   ④ 目标不可达 → exit 2，failed（且应在 30s 内短路，不做无意义探测）
+ * wide-shop（宽攻击面：管理端点 / 写删 IDOR / 匿名写入 / 数字语境注入 / 二次编码穿越）：
+ *   ⑤ 默认探测 → 只应出现无副作用的探测族，写类与匿名写一律不出现
+ *   ⑥ allowMutation → 跨用户 PUT/PATCH + 匿名写入出现，DELETE 仍不出现
+ *   ⑦ allowMutation + allowDestructive → 跨用户 DELETE 出现
+ *   ⑧ 加固版（GB_WIDE_HARDENED=1）+ 两个开关都开 → exit 0，四类攻击全部记 blocked 而非静默或 404
+ *
+ * 断言按「用例集合」而非裸计数：每条探测族都要在证据里以真实 caseId 出现（或确实不出现），
+ * 否则新增探测族时 e2e 无法察觉漏跑。
  *
  * 同时校验：报告落盘且与 GB_GATE 一致；报告中不出现真实令牌；原 fixture 不被修改。
  *
@@ -19,6 +29,7 @@ import { fileURLToPath } from "node:url";
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const demoDir = path.join(repoRoot, ".demo-blackbox-e2e");
 const fixture = path.join(repoRoot, "fixtures", "legacy-shop");
+const wideFixture = path.join(repoRoot, "fixtures", "wide-shop");
 const reportsDir = path.join(demoDir, "reports");
 
 function resolveHeadlessBin() {
@@ -36,9 +47,9 @@ function check(name, cond, detail = "") {
   return !!cond;
 }
 
-function makeShop(name, { fixed = false } = {}) {
+function makeShop(name, { fixed = false, from = fixture } = {}) {
   const dir = path.join(demoDir, name);
-  cpSync(fixture, dir, { recursive: true });
+  cpSync(from, dir, { recursive: true });
   if (fixed) {
     const appPath = path.join(dir, "src", "app.js");
     const src = readFileSync(appPath, "utf8");
@@ -66,11 +77,11 @@ function makeCookieShop(name) {
   return dir;
 }
 
-function startServer(dir) {
+function startServer(dir, extraEnv = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn("node", ["server.js"], {
       cwd: dir,
-      env: { ...process.env, PORT: "0" },
+      env: { ...process.env, PORT: "0", ...extraEnv },
       stdio: ["ignore", "pipe", "pipe"],
     });
     let out = "";
@@ -107,7 +118,7 @@ function freePort() {
   });
 }
 
-function runBlackbox({ url, project, label, timeoutMs = 120_000 }) {
+function runBlackbox({ url, project, label, timeoutMs = 120_000, extraEnv = {} }) {
   const t0 = Date.now();
   return new Promise((resolve, reject) => {
     const child = spawn(
@@ -119,6 +130,7 @@ function runBlackbox({ url, project, label, timeoutMs = 120_000 }) {
           ...process.env,
           GUARDBUILD_DATA_DIR: path.join(demoDir, "data", label),
           GUARDBUILD_SIDECAR: path.join(repoRoot, "sidecar", "main.mjs"),
+          ...extraEnv,
         },
         stdio: ["ignore", "pipe", "pipe"],
       }
@@ -161,6 +173,27 @@ function readReport(label) {
   }
 }
 
+/** 证据按结论分桶取 caseId 集合：断言「这一探测族真的打过 / 确实没打」，而不是只看 finding 总数。 */
+function caseIdsBy(report, verdict) {
+  return new Set((report?.evidence?.blackbox ?? []).filter((e) => e.verdict === verdict).map((e) => e.caseId));
+}
+
+function hasPrefix(set, prefix) {
+  return [...set].some((id) => String(id ?? "").startsWith(prefix));
+}
+
+function checkCaseSet(title, ids, must = [], mustNot = []) {
+  const shown = [...ids].sort().join(", ") || "（空）";
+  for (const p of must) check(`${title} 含 ${p}*`, hasPrefix(ids, p), `实际：${shown}`);
+  for (const p of mustNot) check(`${title} 不含 ${p}*`, !hasPrefix(ids, p), `实际：${shown}`);
+}
+
+function checkCoverage(title, coverage, must = [], mustNot = []) {
+  const text = (coverage ?? []).join("|");
+  for (const p of must) check(`${title} 覆盖「${p}」`, text.includes(p), `实际覆盖：${text}`);
+  for (const p of mustNot) check(`${title} 未覆盖「${p}」（本轮不该发这类请求）`, !text.includes(p), `实际覆盖：${text}`);
+}
+
 function snapshot(dir) {
   const out = {};
   const walk = (d) => {
@@ -188,7 +221,7 @@ async function main() {
   const fixedShop = makeShop("shop-fixed", { fixed: true });
   const before = snapshot(vulnShop);
 
-  log("1/4 漏洞目标");
+  log("1/8 漏洞目标（legacy-shop 单一 IDOR）");
   const vuln = await startServer(vulnShop);
   try {
     const r = await runBlackbox({
@@ -204,6 +237,7 @@ async function main() {
     check("报告落盘且结论一致", report?.verdict?.outcome === "vulnerable_unfixed" && report?.verdict?.exitCode === 1);
     const ev = report?.evidence?.blackbox ?? [];
     check("证据为 cross-proven（内容归属交叉证明）", ev.some((e) => e.evidenceGrade === "cross-proven" && e.verdict === "vulnerable"));
+    checkCaseSet("漏洞目标 vulnerable 用例", caseIdsBy(report, "vulnerable"), ["blackbox-idor-"]);
     const raw = JSON.stringify(report ?? {});
     check("报告不含真实令牌（仅 vault 占位）", !/Bearer\s+(?!\*\*\*|<)[A-Za-z0-9._-]{16,}/.test(raw), raw.match(/Bearer [^"]{0,24}/)?.[0] ?? "");
     check("原 fixture 未被修改（黑盒不改码）", JSON.stringify(snapshot(vulnShop)) === JSON.stringify(before));
@@ -211,7 +245,7 @@ async function main() {
     vuln.child.kill();
   }
 
-  log("2/4 已修复目标");
+  log("2/8 已修复目标（同一路由加归属校验）");
   const fixed = await startServer(fixedShop);
   try {
     const r = await runBlackbox({
@@ -226,11 +260,12 @@ async function main() {
     check("报告结论一致且无漏洞", report?.verdict?.outcome === "no_findings" && (report?.blackbox?.findings ?? []).length === 0);
     const blocked = (report?.evidence?.blackbox ?? []).some((e) => e.verdict === "blocked");
     check("归属校验生效时记录 blocked 证据（而非仅 404）", blocked);
+    checkCaseSet("已修复目标 blocked 用例", caseIdsBy(report, "blocked"), ["blackbox-idor-"]);
   } finally {
     fixed.child.kill();
   }
 
-  log("3/4 Cookie 会话鉴权目标（form 登录 + 302 Set-Cookie）");
+  log("3/8 Cookie 会话鉴权目标（form 登录 + 302 Set-Cookie）");
   const cookieShop = makeCookieShop("shop-cookie");
   const cookie = await startServer(cookieShop);
   try {
@@ -249,7 +284,123 @@ async function main() {
     cookie.child.kill();
   }
 
-  log("4/4 不可达目标");
+  log("4/8 宽攻击面目标 · 默认探测（只发无副作用请求）");
+  const wideShop = makeShop("shop-wide", { from: wideFixture });
+  const wideBefore = snapshot(wideShop);
+  const wide = await startServer(wideShop);
+  try {
+    const r = await runBlackbox({ url: `http://127.0.0.1:${wide.port}`, project: wideShop, label: "wide" });
+    check("退出码 = 1", r.code === 1, `code=${r.code}`);
+    const report = readReport("wide");
+    const ids = caseIdsBy(report, "vulnerable");
+    checkCaseSet("默认探测 vulnerable 用例", ids, [
+      "blackbox-vertical-",
+      "blackbox-idor-",
+      "blackbox-sqli-numeric-",
+      "blackbox-traversal-",
+    ]);
+    checkCaseSet("默认探测 vulnerable 用例", ids, [], [
+      "blackbox-idor-put-",
+      "blackbox-idor-patch-",
+      "blackbox-idor-delete-",
+      "blackbox-anon-write-",
+    ]);
+    checkCoverage("默认探测", report?.blackbox?.coverage, ["垂直越权（管理端点）", "跨用户读取（IDOR）"], [
+      "跨用户修改（PUT/PATCH）",
+      "未认证写入",
+      "跨用户删除（DELETE）",
+    ]);
+    check("报告标记写探测未开启", report?.blackbox?.allowMutation === false && report?.blackbox?.allowDestructive === false);
+    check("垂直越权有管理身份交叉证明", (report?.evidence?.blackbox ?? []).some((e) => e.caseId?.startsWith("blackbox-vertical-") && e.evidenceGrade === "cross-proven"));
+    check("原 fixture 未被修改", JSON.stringify(snapshot(wideShop)) === JSON.stringify(wideBefore));
+  } finally {
+    wide.child.kill();
+  }
+
+  log("5/8 宽攻击面目标 · allowMutation（放开写/匿名写，仍不删）");
+  const mutShop = makeShop("shop-wide-mutate", { from: wideFixture });
+  const mutate = await startServer(mutShop);
+  try {
+    const r = await runBlackbox({
+      url: `http://127.0.0.1:${mutate.port}`,
+      project: mutShop,
+      label: "mutate",
+      extraEnv: { GUARDBUILD_BLACKBOX_MUTATE: "1" },
+    });
+    check("退出码 = 1", r.code === 1, `code=${r.code}`);
+    const report = readReport("mutate");
+    const ids = caseIdsBy(report, "vulnerable");
+    checkCaseSet("allowMutation vulnerable 用例", ids, [
+      "blackbox-idor-put-",
+      "blackbox-idor-patch-",
+      "blackbox-anon-write-",
+    ]);
+    checkCaseSet("allowMutation vulnerable 用例", ids, [], ["blackbox-idor-delete-"]);
+    checkCoverage("allowMutation", report?.blackbox?.coverage, ["跨用户修改（PUT/PATCH）", "未认证写入"], ["跨用户删除（DELETE）"]);
+    check("匿名写入以 canary 落库复核（cross-proven）", (report?.evidence?.blackbox ?? []).some((e) => e.caseId?.startsWith("blackbox-anon-write-") && e.evidenceGrade === "cross-proven"));
+    check("跨用户修改后已按归属人恢复原值", !(report?.evidence?.blackbox ?? []).some((e) => /恢复未确认/.test(String(e.actual ?? ""))));
+    check("canary 未残留在目标数据面（自清理生效）", !(report?.evidence?.blackbox ?? []).some((e) => /自清理未成功/.test(String(e.actual ?? ""))));
+  } finally {
+    mutate.child.kill();
+  }
+
+  log("6/8 宽攻击面目标 · allowMutation + allowDestructive（DELETE 也上）");
+  const delShop = makeShop("shop-wide-delete", { from: wideFixture });
+  const destructive = await startServer(delShop);
+  try {
+    const r = await runBlackbox({
+      url: `http://127.0.0.1:${destructive.port}`,
+      project: delShop,
+      label: "destructive",
+      extraEnv: { GUARDBUILD_BLACKBOX_MUTATE: "1", GUARDBUILD_BLACKBOX_DELETE: "1" },
+    });
+    check("退出码 = 1", r.code === 1, `code=${r.code}`);
+    const report = readReport("destructive");
+    checkCaseSet(
+      "allowDestructive vulnerable 用例",
+      caseIdsBy(report, "vulnerable"),
+      ["blackbox-idor-delete-"]
+    );
+    checkCoverage("allowDestructive", report?.blackbox?.coverage, ["跨用户删除（DELETE）"]);
+    check("DELETE 结论来自归属人复读（不是状态码）", (report?.evidence?.blackbox ?? []).some((e) => e.caseId?.startsWith("blackbox-idor-delete-") && e.evidenceGrade === "cross-proven"));
+  } finally {
+    destructive.child.kill();
+  }
+
+  log("7/8 宽攻击面目标 · 加固版 + 全部开关（应零 finding，且每类攻击都记 blocked）");
+  const hardShop = makeShop("shop-wide-hardened", { from: wideFixture });
+  const hardened = await startServer(hardShop, { GB_WIDE_HARDENED: "1" });
+  try {
+    const r = await runBlackbox({
+      url: `http://127.0.0.1:${hardened.port}`,
+      project: hardShop,
+      label: "hardened",
+      extraEnv: { GUARDBUILD_BLACKBOX_MUTATE: "1", GUARDBUILD_BLACKBOX_DELETE: "1" },
+    });
+    check("退出码 = 0", r.code === 0, `code=${r.code}`);
+    check("verdict=no_findings", r.gate?.verdict === "no_findings", `verdict=${r.gate?.verdict}`);
+    const report = readReport("hardened");
+    check("finding 为空", (report?.blackbox?.findings ?? []).length === 0, `findings=${(report?.blackbox?.findings ?? []).length}`);
+    const ids = caseIdsBy(report, "blocked");
+    checkCaseSet("加固版 blocked 用例", ids, [
+      "blackbox-vertical-",
+      "blackbox-idor-",
+      "blackbox-idor-put-",
+      "blackbox-idor-patch-",
+      "blackbox-idor-delete-",
+      "blackbox-anon-write-",
+    ]);
+    check(
+      "垂直越权的 blocked 有管理身份交叉证明（拒绝来自角色校验，不是端点不存在）",
+      (report?.evidence?.blackbox ?? []).some(
+        (e) => e.caseId?.startsWith("blackbox-vertical-") && e.evidenceGrade === "cross-proven"
+      )
+    );
+  } finally {
+    hardened.child.kill();
+  }
+
+  log("8/8 不可达目标");
   const deadPort = await freePort();
   const r = await runBlackbox({
     url: `http://127.0.0.1:${deadPort}`,

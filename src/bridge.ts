@@ -79,6 +79,8 @@ export interface BlackboxView {
   } | null;
   rateLimited?: boolean;
   allowMutation?: boolean;
+  allowDestructive?: boolean;
+  coverage?: string[] | null;
   reachable?: boolean | null;
   outcome?: string | null;
   exitCode?: number | null;

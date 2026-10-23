@@ -1,0 +1,10 @@
+{
+  "name": "wide-shop",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "WideShop - 黑盒宽攻击面靶场（垂直越权/写删 IDOR/匿名写入/数字注入/二次编码穿越）",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

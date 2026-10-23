@@ -28,8 +28,14 @@ export function BlackboxPanel({ blackbox }: { blackbox: BlackboxView }) {
             {blackbox.login?.ok
               ? `成功（${blackbox.login.path}；${(blackbox.login.identities ?? []).map((i) => i.name).join("、")}）`
               : "失败或未配置"}
-            {" · "}写操作探测 {blackbox.allowMutation ? "已开启" : "关闭"}
+            {" · "}写操作探测{" "}
+            {blackbox.allowMutation ? (blackbox.allowDestructive ? "已开启（含 DELETE）" : "已开启（不含 DELETE）") : "关闭"}
           </div>
+          {blackbox.coverage?.length ? (
+            <div className="muted" style={{ marginTop: 5 }}>
+              本轮攻击面：{blackbox.coverage.join("、")}
+            </div>
+          ) : null}
           {unreachable && <div style={{ color: "var(--warn)", marginTop: 5 }}>目标不可达，未执行任何攻击探测。</div>}
           <div className="muted" style={{ marginTop: 5 }}>
             黑盒模式只对运行中的目标发起外部 HTTP 请求，不读源码、不启动目标、不生成补丁。

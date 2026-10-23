@@ -1973,6 +1973,9 @@ async function runBlackboxFlow(ctx, rawUrl) {
 
   const allowMutation =
     process.env.GUARDBUILD_BLACKBOX_MUTATE === "1" || cfg.blackbox?.allowMutation === true;
+  // DELETE 类探测不可回滚：除 allowMutation 之外还要显式开关，且只在 allowMutation 成立时生效
+  const allowDestructive =
+    allowMutation && (process.env.GUARDBUILD_BLACKBOX_DELETE === "1" || cfg.blackbox?.allowDestructive === true);
   const configuredMaxRoutes = Number.isFinite(cfg.blackbox?.maxRoutes) ? cfg.blackbox.maxRoutes : null;
   // 先落一份最小视图：扫描（含不可达）失败时报告仍能按黑盒模式渲染。
   ctx.view.blackbox = {
@@ -1989,12 +1992,13 @@ async function runBlackboxFlow(ctx, rawUrl) {
     login: null,
     rateLimited: false,
     allowMutation,
+    allowDestructive,
     maxRoutes: configuredMaxRoutes,
     reachable: null,
     outcome: null,
     exitCode: null,
   };
-  const result = await runBlackbox(ctx, baseUrl, { config: cfg, allowMutation });
+  const result = await runBlackbox(ctx, baseUrl, { config: cfg, allowMutation, allowDestructive });
 
   if (!result.reachable) {
     ctx.view.blackbox.reachable = false;
@@ -2025,6 +2029,8 @@ async function runBlackboxFlow(ctx, rawUrl) {
     login: result.login,
     rateLimited: result.rateLimited,
     allowMutation: result.configuredMutation,
+    allowDestructive: result.configuredDestructive,
+    coverage: result.coverage ?? null,
     maxRoutes: result.maxRoutes ?? configuredMaxRoutes,
     reachable: true,
     outcome,

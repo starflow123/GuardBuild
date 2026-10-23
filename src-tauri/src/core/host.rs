@@ -52,6 +52,22 @@ pub struct HostConfig {
 pub const GATE_DEFAULT_SCOPES: [&str; 4] =
     ["project.read", "worktree.write", "proc.spawn", "net.probe"];
 
+/// 宿主进程 → Sidecar 的环境变量白名单（sidecar 拿到的是 env_clear 后的干净环境）。
+/// 侧车新读一个 GUARDBUILD_* 开关，就必须在这里登记：漏登记的后果不是报错，而是那条
+/// 命令行/环境变量启用路径永远不生效（黑盒 DELETE 探测开关就漏过一次，由 e2e 第 6/7 轮抓到）。
+pub const SIDECAR_ENV_PASSTHROUGH: [&str; 10] = [
+    "DEEPSEEK_API_KEY",
+    "DEEPSEEK_BASE_URL",
+    "DEEPSEEK_MODEL",
+    "GUARDBUILD_LLM_SCOUT",
+    "GUARDBUILD_LLM_PATCH",
+    "GUARDBUILD_LLM_CROSSFILE",
+    "GUARDBUILD_LLM_BOOTSTRAP",
+    "GUARDBUILD_BLACKBOX_URL",
+    "GUARDBUILD_BLACKBOX_MUTATE",
+    "GUARDBUILD_BLACKBOX_DELETE",
+];
+
 impl HostConfig {
     pub fn worktrees_root(&self) -> PathBuf {
         self.data_dir.join("worktrees")
@@ -304,15 +320,7 @@ impl Host {
         ];
         // 接入侦察的可选配置：密钥只从宿主进程环境透传给 Sidecar（侧车再经 net.egress
         // 请求 Host 出站），绝不写入 cfg / 日志 / 报告，也不进入目标进程环境。
-        for key in [
-            "DEEPSEEK_API_KEY",
-            "DEEPSEEK_BASE_URL",
-            "DEEPSEEK_MODEL",
-            "GUARDBUILD_LLM_SCOUT",
-            "GUARDBUILD_LLM_PATCH",
-            "GUARDBUILD_BLACKBOX_URL",
-            "GUARDBUILD_BLACKBOX_MUTATE",
-        ] {
+        for key in SIDECAR_ENV_PASSTHROUGH {
             if let Ok(v) = std::env::var(key) {
                 if !v.trim().is_empty() {
                     extra.push((key.to_string(), v));
@@ -2092,6 +2100,72 @@ mod tests {
         assert!(normalize_blackbox_url(Some("http://example.com")).is_err());
         assert!(normalize_blackbox_url(Some("ftp://example.com")).is_err());
         assert!(normalize_blackbox_url(Some("not a url")).is_err());
+    }
+
+    fn sidecar_env_reads(dir: &std::path::Path) -> Vec<String> {
+        const MARK: &str = "process.env.GUARDBUILD_";
+        let mut names = Vec::new();
+        for sub in ["", "lib"] {
+            let d = if sub.is_empty() { dir.to_path_buf() } else { dir.join(sub) };
+            let entries = match std::fs::read_dir(&d) {
+                Ok(e) => e,
+                Err(err) => panic!("读不到侧车目录 {}：{err}", d.display()),
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.extension().and_then(|e| e.to_str()) != Some("mjs") {
+                    continue;
+                }
+                let text = std::fs::read_to_string(&path).expect("侧车源码应可读");
+                let mut cursor = 0usize;
+                while let Some(i) = text[cursor..].find(MARK) {
+                    let start = cursor + i + MARK.len();
+                    let rest = &text[start..];
+                    let len = rest
+                        .find(|c: char| !(c.is_ascii_uppercase() || c == '_'))
+                        .unwrap_or(rest.len());
+                    names.push(format!("GUARDBUILD_{}", &rest[..len]));
+                    cursor = start + len;
+                }
+            }
+        }
+        names
+    }
+
+    /// 侧车读的每个 GUARDBUILD_* 开关，宿主必须要么自己注入、要么在转发白名单里。
+    /// 漏一条的症状不是崩溃，而是「文档写了、侧车读了、环境变量永远传不到」：
+    /// 黑盒 DELETE 与两个 agentic 开关都中过这一枪，所以用源码扫描钉死契约，不靠人记。
+    #[test]
+    fn every_sidecar_env_switch_is_forwarded_by_host() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("sidecar");
+        let reads = sidecar_env_reads(&dir);
+        assert!(
+            !reads.is_empty(),
+            "没在 {} 扫到任何 process.env.GUARDBUILD_* 读取，测试路径可能失效",
+            dir.display()
+        );
+        // 宿主 spawn 时显式写入的那几个（见 SIDECAR_ENV_PASSTHROUGH 之前的 extra）
+        const HOST_SET: [&str; 4] = [
+            "GUARDBUILD_PROTOCOL_VERSION",
+            "GUARDBUILD_APP_VERSION",
+            "GUARDBUILD_DATA_DIR",
+            "GUARDBUILD_AUTO_CONSENT",
+        ];
+        let mut forwarded: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+        forwarded.extend(HOST_SET);
+        forwarded.extend(SIDECAR_ENV_PASSTHROUGH);
+        let missing: std::collections::BTreeSet<&str> = reads
+            .iter()
+            .map(String::as_str)
+            .filter(|n| !forwarded.contains(n))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "侧车读了但宿主不会转发的环境变量：{:?}（加进 SIDECAR_ENV_PASSTHROUGH，或删掉侧车里的读取）",
+            missing
+        );
     }
 
     #[test]

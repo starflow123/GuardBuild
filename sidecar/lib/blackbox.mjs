@@ -40,6 +40,17 @@ const ATTACK_SURFACE_PATHS = [
   "/api/swagger", "/swagger", "/swagger-ui.html", "/v2/api-docs", "/v3/api-docs",
 ];
 const SENSITIVE_FILE_PATHS = new Set(["/.env", "/.git/config", "/.git/HEAD"]);
+// 管理类路径：黑盒没有源码可判角色，只能按命名形状找候选（垂直越权 = 普通登录身份访问管理端点）。
+// 词表要够宽（不同团队的命名习惯差异大），但只走 GET，且每类探测受 probeCap 预算约束。
+const ADMIN_PATH_GUESSES = [
+  "/api/admin", "/api/admin/users", "/api/admin/orders", "/api/admin/accounts",
+  "/api/admin/tickets", "/api/admin/invoices", "/api/admin/customers", "/api/admin/messages",
+  "/api/admin/stats", "/api/admin/dashboard", "/api/admin/settings",
+  "/api/manage/users", "/api/internal/users", "/api/backoffice/orders", "/api/support/tickets",
+  "/admin/users", "/admin/orders", "/admin/customers", "/admin/api/users",
+  "/api/v1/admin/users", "/api/staff/orders",
+];
+const ADMIN_SEGMENT = /(?:^|\/)(?:admin|backoffice|manage|management|internal|staff|superuser|support)(?:\/|$)/i;
 const LOGIN_PATHS_DEFAULT = ["/api/login", "/login", "/auth", "/api/auth"];
 const DENIED_STATUS = new Set([401, 403, 404]);
 const MAX_ROUTES = 60;
@@ -245,7 +256,10 @@ export function openapiRoutes(found, limit = MAX_ROUTES) {
 /** 目录探测常见 API 路径（401/403 也算路由存在）。 */
 export async function bruteRoutes(ctx, baseUrl) {
   const found = [];
-  for (const p of COMMON_API_PATHS) {
+  // 管理端点命名猜词一并进发现阶段：它们大多需要登录（401/403 也算存在），
+  // 不进路由表就没人知道目标有没有管理面，垂直越权用例也就没有候选。
+  const wordlist = [...COMMON_API_PATHS, ...ADMIN_PATH_GUESSES.filter((p) => !COMMON_API_PATHS.includes(p))];
+  for (const p of wordlist) {
     const res = await httpJson(ctx, { baseUrl, method: "GET", path: p, timeoutMs: 5_000 });
     if (res.ok || isDenied(res.status)) {
       found.push({ method: "GET", path: p, templated: false, status: res.status, source: "brute" });
@@ -657,8 +671,21 @@ async function probeIdor(ctx, baseUrl, routes, { attacker, victim }, limit = MAX
   return records;
 }
 
-/** 写操作 IDOR 会修改目标数据：仅在 blackbox.allowMutation=true 时执行，并尽力恢复。 */
-async function probePutIdor(ctx, baseUrl, routes, { attacker, victim }, limit = MAX_PROBE_ROUTES) {
+/**
+ * 跨用户写（PUT/PATCH）与跨用户删除（DELETE）。整类会修改甚至销毁目标数据，
+ * 默认关闭，只在 blackbox.allowMutation=true 时执行；DELETE 不可回滚，还要再显式 allowDestructive。
+ * 判定不看状态码：PUT/PATCH 以「归属人复核字段值确实被改」为准并在成功后尽力还原（还原结果写进证据），
+ * DELETE 以「归属人复读对象是否消失」为准——请求被接受但数据未动只算 inconclusive，
+ * 既不记漏洞，也不记「已防住」。
+ */
+async function probeWriteIdor(
+  ctx,
+  baseUrl,
+  routes,
+  { attacker, victim },
+  { methods = ["PUT", "PATCH"], destructive = false } = {},
+  limit = MAX_PROBE_ROUTES
+) {
   const records = [];
   for (const route of routes.filter((r) => r.method === "GET").slice(0, limit)) {
     const list = await httpJson(ctx, { baseUrl, method: "GET", path: route.path, identity: victim.name });
@@ -676,28 +703,258 @@ async function probePutIdor(ctx, baseUrl, routes, { attacker, victim }, limit = 
     if (!field) continue;
     const original = victimItem[field];
     const detailPath = `${route.path.replace(/\/+$/, "")}/${encodeURIComponent(victimId)}`;
-    const payload = { [field]: `${original}_gb` };
-    const attack = await httpJson(ctx, { baseUrl, method: "PUT", path: detailPath, identity: attacker.name, body: payload });
-    const changed = attack.ok && attack.json && JSON.stringify(attack.json).includes(`${original}_gb`);
-    if (changed) {
-      await httpJson(ctx, { baseUrl, method: "PUT", path: detailPath, identity: victim.name, body: { [field]: original } });
+
+    for (const method of methods) {
+      if (method === "DELETE" && !destructive) continue;
+      const canary = `${original}_gb`;
+
+      if (method === "DELETE") {
+        const attack = await httpJson(ctx, { baseUrl, method: "DELETE", path: detailPath, identity: attacker.name });
+        const after = await httpJson(ctx, { baseUrl, method: "GET", path: detailPath, identity: victim.name });
+        const gone = after.status === 404 || (after.ok && !extractEntityById(after.json, victimId));
+        const verdict = isDenied(attack.status) ? VERDICT.BLOCKED : gone ? VERDICT.VULNERABLE : VERDICT.INCONCLUSIVE;
+        const rec = makeRecord(ctx, baseUrl, {
+          caseId: `blackbox-idor-delete-${slug(detailPath)}`,
+          name: `黑盒·跨用户删除（IDOR-DELETE）${detailPath}`,
+          method: "DELETE",
+          path: detailPath,
+          identity: attacker.name,
+          res: attack,
+          expectation: "身份 A 不得删除身份 B 的对象",
+          verdict,
+          actual:
+            verdict === VERDICT.VULNERABLE
+              ? `${attacker.name} 发起删除后，${victim.name} 复读 #${victimId} 已不存在（HTTP ${after.status}）`
+              : verdict === VERDICT.BLOCKED
+                ? `HTTP ${attack.status}，服务端拒绝跨用户删除`
+                : `HTTP ${attack.status}，但归属人复读对象仍在（HTTP ${after.status}）——可能是软删除或请求未被处理`,
+          grade: verdict === VERDICT.VULNERABLE ? "cross-proven" : "http-only",
+          crossProof: verdict === VERDICT.VULNERABLE ? `归属人复读确认对象 #${victimId} 消失（销毁不可回滚）` : null,
+          impact: verdict === VERDICT.VULNERABLE ? "可删除他人业务对象（数据销毁不可恢复）" : null,
+        });
+        records.push(rec);
+        emitRecord(ctx, rec);
+        continue;
+      }
+
+      const payload = { [field]: canary };
+      const attack = await httpJson(ctx, {
+        baseUrl,
+        method,
+        path: detailPath,
+        identity: attacker.name,
+        body: payload,
+      });
+      const echoed = attack.ok && attack.json && JSON.stringify(attack.json).includes(canary);
+      // 响应不回显时改用归属人复读，避免「写成功但服务端只返回 {ok:true}」被判成未复现
+      const reread = echoed ? null : await httpJson(ctx, { baseUrl, method: "GET", path: detailPath, identity: victim.name });
+      const changed = echoed || (reread?.ok && JSON.stringify(reread.json ?? "").includes(canary));
+      let restored = null;
+      if (changed) {
+        await httpJson(ctx, { baseUrl, method: "PUT", path: detailPath, identity: victim.name, body: { [field]: original } });
+        const check = await httpJson(ctx, { baseUrl, method: "GET", path: detailPath, identity: victim.name });
+        restored = check.ok && !JSON.stringify(check.json ?? "").includes(canary);
+      }
+      const rec = makeRecord(ctx, baseUrl, {
+        caseId: `blackbox-idor-${method.toLowerCase()}-${slug(detailPath)}`,
+        name: `黑盒·跨用户修改（IDOR-${method}）${detailPath}`,
+        method,
+        path: detailPath,
+        identity: attacker.name,
+        body: payload,
+        res: attack,
+        expectation: "身份 A 不得修改身份 B 的对象",
+        verdict: changed ? VERDICT.VULNERABLE : isDenied(attack.status) ? VERDICT.BLOCKED : VERDICT.INCONCLUSIVE,
+        actual: changed
+          ? `${attacker.name} 修改 ${victim.name} 的对象 #${victimId} 生效（字段 ${field}）${
+              restored === false ? "；原值恢复未确认，需人工回看" : ""
+            }`
+          : `HTTP ${attack.status}，未观察到修改生效`,
+        grade: changed ? "cross-proven" : "http-only",
+        crossProof: changed
+          ? `写后复核响应含新值 ${field}=${canary}；已按归属人身份尝试恢复原值（${restored ? "成功" : "未确认"}）`
+          : null,
+        impact: changed ? "可修改他人业务对象" : null,
+      });
+      records.push(rec);
+      emitRecord(ctx, rec);
+    }
+  }
+  return records;
+}
+
+/**
+ * 垂直越权：用普通登录身份访问管理端点。黑盒没有源码可判角色，只能按路径命名形状找候选。
+ * 关键区分是「端点根本不存在」与「端点存在但正确拒绝」：有管理身份基线时做交叉证明——
+ * 管理身份拿得到数据、普通身份拿不到 = blocked（拒绝成立，值得记一条），两边都拿得到 = vulnerable。
+ * 只发 GET，不改数据。
+ */
+async function probeVerticalEscalation(ctx, baseUrl, routes, { user, admin }, limit = MAX_PROBE_ROUTES) {
+  const paths = [];
+  const seen = new Set();
+  const push = (p) => {
+    if (!p || seen.has(p) || /[{}$]/.test(p)) return;
+    seen.add(p);
+    paths.push(p);
+  };
+  for (const r of routes) if (r.method === "GET" && ADMIN_SEGMENT.test(r.path)) push(r.path);
+  for (const p of ADMIN_PATH_GUESSES) push(p);
+
+  const records = [];
+  for (const path of paths.slice(0, limit)) {
+    const asUser = await httpJson(ctx, { baseUrl, method: "GET", path, identity: user?.name ?? null });
+    if (asUser.status === 0) continue;
+    const asAdmin = admin ? await httpJson(ctx, { baseUrl, method: "GET", path, identity: admin.name }) : null;
+    const adminData = !!asAdmin?.ok && containsSensitiveValue(asAdmin.json);
+    const userData = !!asUser.ok && containsSensitiveValue(asUser.json);
+    const caseId = `blackbox-vertical-${slug(path)}`;
+    const base = {
+      caseId,
+      name: `黑盒·垂直越权（普通身份访问管理端点）${path}`,
+      method: "GET",
+      path,
+      identity: user?.name ?? null,
+      expectation: "管理端点不应对普通登录用户开放",
+      impact: null,
+    };
+
+    if (userData) {
+      const rec = makeRecord(ctx, baseUrl, {
+        ...base,
+        res: asUser,
+        verdict: VERDICT.VULNERABLE,
+        actual: `${user?.name ?? "匿名"} 请求管理端点返回 HTTP ${asUser.status}，响应含归属/敏感字段${
+          adminData ? `；管理身份 ${admin.name} 同样取得数据（越权成立，不是端点不存在）` : ""
+        }`,
+        grade: adminData ? "cross-proven" : "http-only",
+        crossProof: adminData ? `管理身份 ${admin.name} 基线可取得同类数据，普通身份亦取得` : null,
+        impact: "普通用户获得管理面数据",
+      });
+      records.push(rec);
+      emitRecord(ctx, rec);
+      continue;
+    }
+    // 两边都拿不到数据、普通身份又是 404：目标没有这个管理面，不记噪声
+    if (asUser.status === 404 && !adminData) continue;
+
+    const denied = isDenied(asUser.status);
+    const rec = makeRecord(ctx, baseUrl, {
+      ...base,
+      res: asUser,
+      verdict: denied ? VERDICT.BLOCKED : VERDICT.INCONCLUSIVE,
+      actual: denied
+        ? `HTTP ${asUser.status}，普通身份被拒${
+            adminData ? `；管理身份 ${admin.name} 可取得该端点数据（端点确实存在，拒绝来自角色校验）` : ""
+          }`
+        : `HTTP ${asUser.status}，响应未取得可确认的敏感数据`,
+      grade: adminData ? "cross-proven" : "http-only",
+      crossProof: adminData && denied ? `管理身份取得数据、普通身份 HTTP ${asUser.status} 被拒` : null,
+    });
+    records.push(rec);
+    emitRecord(ctx, rec);
+  }
+  return records;
+}
+
+/**
+ * 匿名写入：未登录即可创建业务对象。默认关闭（会留数据），只在 allowMutation 下执行。
+ * 复现要求「canary 真的存下来了」——由归属人复读列表证明，不是 2xx 就算；
+ * 随后立即尝试匿名 DELETE 自清理，清理不确认时在证据里写明遗留对象 ID 交人工。
+ */
+async function probeAnonymousWrite(ctx, baseUrl, routes, { victim }, limit = 8) {
+  const records = [];
+  // 匿名 POST 会真的落到目标业务里，候选范围要窄：
+  // ①只打「匿名读到 401/403 的集合端点」——这类端点的创建口漏鉴权才是漏洞；公开列表（200）本来就欢迎提交；
+  // ②跳过任何带动作/管理语义的路径，避免把 /api/orders/batch-cancel 之类当集合入口 POST；
+  // ③不猜 id 字段，写之前先用受害方会话读出真实字段名。
+  const ACTION_SEGMENT = /(?:^|\/)(?:login|signin|logout|register|signup|auth|token|refresh|password|reset|verify|activate|cancel|refund|pay|checkout|confirm|approve|reject|import|export|sync|flush|clear|seed|exec|run|shell|admin|manage|internal|batch|bulk|search|health|metrics|ping)(?:\/|$)/i;
+  const candidates = routes
+    .filter(
+      (r) =>
+        r.method === "GET" &&
+        !/[{}$]/.test(r.path) &&
+        !ACTION_SEGMENT.test(r.path) &&
+        (r.status === 401 || r.status === 403)
+    )
+    .slice(0, limit);
+  const fieldOf = (items) => {
+    const sample = items.find((o) => typeof o === "object" && o != null);
+    if (!sample) return null;
+    return (
+      Object.keys(sample).find(
+        (k) =>
+          typeof sample[k] === "string" &&
+          !["id", "email", "status", "createdAt", "updatedAt", "token"].includes(k) &&
+          extractOwner(sample)?.field !== k
+      ) ?? null
+    );
+  };
+
+  for (const route of candidates) {
+    const list = await httpJson(ctx, { baseUrl, method: "GET", path: route.path, identity: victim?.name ?? null });
+    const field = fieldOf(extractItems(list.json));
+    if (!field) continue;
+    const canary = `gb-anon-write-${shortId()}`;
+    const post = await httpJson(ctx, {
+      baseUrl,
+      method: "POST",
+      path: route.path,
+      identity: null,
+      body: { [field]: canary },
+    });
+    if (!post.ok) {
+      if (post.status === 401 || post.status === 403) {
+        const rec = makeRecord(ctx, baseUrl, {
+          caseId: `blackbox-anon-write-${slug(route.path)}`,
+          name: `黑盒·未认证写入 ${route.path}`,
+          method: "POST",
+          path: route.path,
+          identity: null,
+          body: { [field]: canary },
+          res: post,
+          expectation: "创建类端点应对匿名请求返回 401/403",
+          verdict: VERDICT.BLOCKED,
+          actual: `HTTP ${post.status}，匿名写入被拒`,
+          grade: "http-only",
+        });
+        records.push(rec);
+        emitRecord(ctx, rec);
+      }
+      continue;
+    }
+    // 归属人复读：canary 真的进了数据面才算复现
+    const after = await httpJson(ctx, { baseUrl, method: "GET", path: route.path, identity: victim?.name ?? null });
+    const stored = after.ok && JSON.stringify(after.json ?? "").includes(canary);
+    const newId = extractId(post.json?.data ?? post.json);
+    let cleaned = null;
+    if (stored && newId != null) {
+      const del = await httpJson(ctx, {
+        baseUrl,
+        method: "DELETE",
+        path: `${route.path.replace(/\/+$/, "")}/${encodeURIComponent(newId)}`,
+        identity: null,
+      });
+      const recheck = await httpJson(ctx, { baseUrl, method: "GET", path: route.path, identity: victim?.name ?? null });
+      cleaned = !JSON.stringify(recheck.json ?? "").includes(canary);
     }
     const rec = makeRecord(ctx, baseUrl, {
-      caseId: `blackbox-idor-put-${detailPath.replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "")}`,
-      name: `黑盒·跨用户修改（IDOR-PUT）${detailPath}`,
-      method: "PUT",
-      path: detailPath,
-      identity: attacker.name,
-      body: payload,
-      res: attack,
-      expectation: "身份 A 不得修改身份 B 的对象",
-      verdict: changed ? VERDICT.VULNERABLE : isDenied(attack.status) ? VERDICT.BLOCKED : VERDICT.INCONCLUSIVE,
-      actual: changed
-        ? `${attacker.name} 修改 ${victim.name} 的对象 #${victimId} 成功（字段 ${field}）`
-        : `HTTP ${attack.status}，未观察到修改生效`,
-      grade: changed ? "cross-proven" : "http-only",
-      crossProof: changed ? `写后响应包含新值 ${field}=${original}_gb；已尝试恢复原值` : null,
-      impact: changed ? "可修改他人业务对象" : null,
+      caseId: `blackbox-anon-write-${slug(route.path)}`,
+      name: `黑盒·未认证写入 ${route.path}`,
+      method: "POST",
+      path: route.path,
+      identity: null,
+      body: { [field]: canary },
+      res: post,
+      expectation: "创建类端点应对匿名请求返回 401/403",
+      verdict: stored ? VERDICT.VULNERABLE : VERDICT.INCONCLUSIVE,
+      actual: stored
+        ? `匿名 POST 返回 HTTP ${post.status}，归属人复读列表可见 canary 记录（#${newId ?? "?"}）${
+            cleaned === false ? "；自清理未成功，遗留 canary 需人工删除" : ""
+          }`
+        : `HTTP ${post.status}，但复读列表未见 canary 落库（可能未持久化或形状不符）`,
+      grade: stored ? "cross-proven" : "http-only",
+      crossProof: stored ? `匿名写入后由 ${victim?.name ?? "归属人"} 列表复读取得 canary=${canary}` : null,
+      impact: stored ? "未认证即可创建业务对象（可被用于灌数据/污染归属）" : null,
     });
     records.push(rec);
     emitRecord(ctx, rec);
@@ -719,6 +976,8 @@ const slug = (s) =>
  *  黑盒请求量必须设预算，否则 14 条路由 × 多参数会把目标打爆。 */
 const MAX_PARAMS_PER_ROUTE = 3;
 const MAX_SQLI_REQUESTS = 140;
+// 数字语境单独配额：与字符串语境共用一份时，先跑的那类会把后一类饿死（漏报）
+const MAX_SQLI_NUMERIC_REQUESTS = 70;
 const MAX_TRAVERSAL_REQUESTS = 120;
 const GUESSED_PARAMS = ["q", "query", "search", "keyword"];
 
@@ -845,18 +1104,92 @@ async function probeSqliOnParam(ctx, baseUrl, route, param, identity, budget, de
   return null;
 }
 
+/** 响应像不像「取到了行」：列表看条目数，详情看是否有非错误字段的对象。 */
+function rowCount(res) {
+  if (!res?.ok) return -1;
+  const items = extractItems(res.json);
+  if (items.length > 0) return items.length;
+  const j = res.json;
+  if (!j || typeof j !== "object") return 0;
+  // extractItems 只认非空数组，所以 {items:[]} 这种「明确零行」的信封要单独认下来，
+  // 否则会被下面的「有键就算命中」判成 1 行，数字注入的基线前置条件永远不成立。
+  let sawEmptyList = false;
+  const walk = (node, depth) => {
+    if (node == null || depth > 3) return;
+    if (Array.isArray(node)) {
+      if (node.length === 0) sawEmptyList = true;
+      return;
+    }
+    if (typeof node !== "object") return;
+    for (const v of Object.values(node)) walk(v, depth + 1);
+  };
+  walk(j, 0);
+  if (sawEmptyList) return 0;
+  const keys = Object.keys(j);
+  if (keys.length > 0 && !keys.every((k) => ["error", "message", "code", "detail"].includes(k))) return 1;
+  return 0;
+}
+
+/**
+ * 数字上下文注入：`WHERE id = ` 直接拼整数时，带引号的 payload 只会让查询报错或一律空手，
+ * 字符串语境的四组用例判不出来——这是纯数字参数（id/页码/年份）常见的漏报面。
+ * 用三段差分：必不存在的 ID 空手 → `1 OR 1=1` 放出数据 → `1 OR 1=2` 仍空手。
+ * 只有条件真被求值才会出现「恒假空手、恒真有数据」；把非数字值当「不过滤」返回全量的实现
+ * 会在恒假那步也返回全量，因此不误报。
+ */
+async function probeSqliNumericOnParam(ctx, baseUrl, route, param, identity, budget) {
+  if (budget.remaining < 3) return null;
+  const basePath = route.path;
+  const sep = basePath.includes("?") ? "&" : "?";
+  const url = (v) => `${basePath}${sep}${encodeURIComponent(param)}=${v}`;
+  const send = async (payload) => {
+    budget.remaining -= 1;
+    return httpJson(ctx, { baseUrl, method: "GET", path: url(encodeURIComponent(payload)), identity });
+  };
+
+  const miss = await send("999999");
+  if (miss.status === 0) return null;
+  if (rowCount(miss) > 0 && isOk(miss.status)) return null; // 基线就有数据：无法把后续差异归因给注入
+
+  const always = await send("1 OR 1=1");
+  const never = await send("1 OR 1=2");
+  const a = rowCount(always);
+  const n = rowCount(never);
+  if (a <= 0 || n > 0) return null;
+  return makeRecord(ctx, baseUrl, {
+    caseId: `blackbox-sqli-numeric-${slug(`${basePath}:${param}`)}`,
+    name: `黑盒·SQL 注入（数字条件绕过）${basePath} 参数 ${param}`,
+    method: "GET",
+    path: url(encodeURIComponent("1 OR 1=1")),
+    identity,
+    res: always,
+    expectation: "数字参数不得作为 SQL 条件片段拼接",
+    verdict: VERDICT.VULNERABLE,
+    actual: `必不存在的 ID 空手（HTTP ${miss.status}），${param}=1 OR 1=1 得 ${a} 条，${param}=1 OR 1=2 得 ${n} 条`,
+    impact: "SQL 注入（数字上下文，可放开 WHERE 条件）",
+  });
+}
+
 async function probeSqli(ctx, baseUrl, routes, identity, limit = MAX_PROBE_ROUTES) {
   const records = [];
   const budget = { remaining: MAX_SQLI_REQUESTS };
-  for (const route of getRoutesForProbing(routes, limit)) {
+  const numericBudget = { remaining: MAX_SQLI_NUMERIC_REQUESTS };
+  const probeRoutes = getRoutesForProbing(routes, limit);
+  const exhausted = (kind, used) => {
+    ctx.emit({
+      kind: "discovery",
+      severity: SEVERITY.INFO,
+      message: `黑盒 SQLi ${kind}请求预算（${used}）已用尽，跳过剩余参数`,
+      data: { budget: used },
+    });
+  };
+
+  // 先跑完字符串语境再跑数字语境：两类判据互不覆盖，若在同一参数上交替进行，
+  // 数字用例会把预算吃在列表前几条路由上，让后面的真实字符串注入点直接漏报。
+  for (const route of probeRoutes) {
     for (const { name, declared } of sqliParams(route)) {
       if (budget.remaining < 3) {
-        ctx.emit({
-          kind: "discovery",
-          severity: SEVERITY.INFO,
-          message: `黑盒 SQLi 注入请求预算（${MAX_SQLI_REQUESTS}）已用尽，跳过剩余参数`,
-          data: { budget: MAX_SQLI_REQUESTS, route: route.path, param: name },
-        });
+        exhausted("字符串语境", MAX_SQLI_REQUESTS);
         return records;
       }
       const rec = await probeSqliOnParam(ctx, baseUrl, route, name, identity, budget, declared);
@@ -866,12 +1199,42 @@ async function probeSqli(ctx, baseUrl, routes, identity, limit = MAX_PROBE_ROUTE
       }
     }
   }
+
+  for (const route of probeRoutes) {
+    const declared = (route.queryParams ?? []).filter((n) => typeof n === "string" && n.length > 0);
+    // 无规格目标补 `id`：真实数字注入点几乎都叫它，而猜词表里的 q/query 打不进它
+    const params = (declared.length ? declared : [...GUESSED_PARAMS, "id"]).slice(0, MAX_PARAMS_PER_ROUTE + 1);
+    for (const name of params) {
+      if (numericBudget.remaining < 3) {
+        exhausted("数字语境", MAX_SQLI_NUMERIC_REQUESTS);
+        return records;
+      }
+      const numeric = await probeSqliNumericOnParam(ctx, baseUrl, route, name, identity, numericBudget);
+      if (numeric) {
+        records.push(numeric);
+        emitRecord(ctx, numeric);
+        break;
+      }
+    }
+  }
   return records;
 }
 
-const TRAVERSAL_PAYLOADS = ["../../../../etc/passwd", "..%2F..%2F..%2F..%2Fetc%2Fpasswd", "..\\..\\..\\..\\windows\\win.ini"];
-const TRAVERSAL_SIGNATURES = ["root:x:", "[fonts]", "[extensions]"];
+// 编码变体不是「多试几个」：只做一遍归一化的过滤器会吃掉明文 `../`，却在二次解码前放过
+// `..%252f`（先解成 `..%2f`，再被应用自己解一次才越界）；`....//` 与过长 UTF-8 同理。
+// 只带明文 payload 的探测面对这类目标是漏报。
+const TRAVERSAL_PAYLOADS = [
+  "../../../../etc/passwd",
+  "..%2F..%2F..%2F..%2Fetc%2Fpasswd",
+  "..\\..\\..\\..\\windows\\win.ini",
+  "..%252f..%252f..%252f..%252fetc%252fpasswd",
+  "....//....//....//....//etc/passwd",
+  "%c0%ae%c0%ae%c0%ae%c0%ae%c0%ae%c0%afetc%c0%afpasswd",
+];
+const TRAVERSAL_SIGNATURES = ["root:x:", "[fonts]", "[extensions]", "/bin/bash"];
 const TRAVERSAL_TEMPLATES = ["/api/files/{p}", "/files/{p}", "/static/{p}", "/download/{p}", "/api/download/{p}"];
+// 无 OpenAPI 声明的目标：文件读取参数几乎都叫这几个名字，按常见命名打一遍才有机会命中
+const GUESSED_FILE_PARAMS = ["file", "path", "name"];
 
 async function probeTraversal(ctx, baseUrl, identity, routes = [], limit = MAX_PROBE_ROUTES) {
   const records = [];
@@ -897,11 +1260,16 @@ async function probeTraversal(ctx, baseUrl, identity, routes = [], limit = MAX_P
     emitRecord(ctx, rec);
   };
 
+  // 模板路径与声明参数共用一份配额：穿越探测的请求量对目标可见，不能各花各的
+  let budget = MAX_TRAVERSAL_REQUESTS;
+
   for (const tpl of TRAVERSAL_TEMPLATES) {
     for (const p of TRAVERSAL_PAYLOADS) {
+      if (budget < 1) return records;
       const path = tpl.replace("{p}", p);
       if (tried.has(path)) continue;
       const res = await httpJson(ctx, { baseUrl, method: "GET", path, identity });
+      budget -= 1;
       const signature = hit(res.body ?? "");
       if (!signature) continue;
       await report(path, res, signature, path);
@@ -910,9 +1278,28 @@ async function probeTraversal(ctx, baseUrl, identity, routes = [], limit = MAX_P
   }
 
   // 已声明的查询参数：文件读取类参数（如 ?datestamp=/?file=）只有把 payload 打到真实参数名上才能复现
-  let budget = MAX_TRAVERSAL_REQUESTS;
-  for (const route of getRoutesForProbing(routes.filter((r) => r.queryParams?.length), limit)) {
-    for (const param of (route.queryParams ?? []).slice(0, MAX_PARAMS_PER_ROUTE)) {
+  const targets = routes.filter((r) => r.method === "GET");
+  const probeList = targets.some((r) => r.queryParams?.length)
+    ? getRoutesForProbing(targets.filter((r) => r.queryParams?.length), limit)
+    : [];
+  // 没有 OpenAPI 声明的目标也要能测：文件读取参数几乎都叫这几个名字，但只对「名字像读文件」
+  // 且真实存在（非 404 占位）的端点猜参，否则预算全花在订单接口上收不回来。
+  const looksLikeFileRead = (p) => (/(file|download|document|attachment|export|template|preview|static|asset|image|read|view)/i.test(p) ? 0 : 1);
+  const fallback = probeList.length
+    ? []
+    : getRoutesForProbing(
+        targets.filter(
+          // 只猜真实存在、且名字像读文件的端点：对 404 占位或订单接口灌穿越串是噪声不是覆盖
+          (r) => r.status !== 404 && looksLikeFileRead(r.path) === 0
+        ),
+        limit
+      ).map((r) => ({ route: r, params: GUESSED_FILE_PARAMS }));
+  const work = [
+    ...probeList.map((r) => ({ route: r, params: (r.queryParams ?? []).slice(0, MAX_PARAMS_PER_ROUTE) })),
+    ...fallback,
+  ];
+  for (const { route, params } of work) {
+    for (const param of params) {
       if (budget < TRAVERSAL_PAYLOADS.length) {
         ctx.emit({
           kind: "discovery",
@@ -993,7 +1380,9 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
       rateLimited: false,
       reachable: false,
       login: null,
+      coverage: [],
       configuredMutation: !!options.allowMutation,
+      configuredDestructive: !!options.allowDestructive,
     };
   }
 
@@ -1007,7 +1396,9 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
   const rateLimited = rate.limited;
 
   const login = await tryLogin(ctx, baseUrl, options.config ?? {});
-  const users = login.identities.filter((i) => i.role !== "admin");
+  const ADMIN_ROLE = /^(?:.*[-_])?(?:admin|administrator|superuser|root|staff|manager|support)$/i;
+  const admins = login.identities.filter((i) => ADMIN_ROLE.test(String(i.role ?? "")));
+  const users = login.identities.filter((i) => !ADMIN_ROLE.test(String(i.role ?? "")));
   const pair = users.length >= 2 ? { attacker: users[0], victim: users[1] } : null;
   if (!pair) {
     ctx.emit({
@@ -1019,19 +1410,37 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
   }
 
   const who = pair ? pair.attacker.name : users[0]?.name ?? null;
+  const allowDestructive = !!options.allowDestructive;
   const probes = [];
+  // 覆盖清单要如实反映「这一轮真的打过什么」，报告与 GUI 直接照它写口径
+  const coverage = ["路由发现", "敏感文件/调试端点", "限流观察", "未认证读取", "SQL 注入（字符串+数字语境）", "路径穿越（含编码绕过）"];
   probes.push(...(await probeUnauthRead(ctx, baseUrl, routes, probeCap)));
-  if (pair) probes.push(...(await probeIdor(ctx, baseUrl, routes, pair, probeCap)));
-  if (who) probes.push(...(await probeSqli(ctx, baseUrl, routes, who, probeCap)));
+  if (pair) {
+    coverage.push("跨用户读取（IDOR）");
+    probes.push(...(await probeIdor(ctx, baseUrl, routes, pair, probeCap)));
+  }
+  // 注入/穿越没有登录身份也要跑：可注入的公开端点不需要会话就能读库
+  probes.push(...(await probeSqli(ctx, baseUrl, routes, who, probeCap)));
   probes.push(...(await probeTraversal(ctx, baseUrl, who, routes)));
+  if (login.ok) {
+    coverage.push("垂直越权（管理端点）");
+    probes.push(
+      ...(await probeVerticalEscalation(ctx, baseUrl, routes, { user: users[0] ?? null, admin: admins[0] ?? null }, probeCap))
+    );
+  }
   if (pair && options.allowMutation) {
-    probes.push(...(await probePutIdor(ctx, baseUrl, routes, pair, probeCap)));
+    const methods = allowDestructive ? ["PUT", "PATCH", "DELETE"] : ["PUT", "PATCH"];
+    coverage.push("跨用户修改（PUT/PATCH）", "未认证写入");
+    if (allowDestructive) coverage.push("跨用户删除（DELETE）");
+    probes.push(...(await probeWriteIdor(ctx, baseUrl, routes, pair, { methods, destructive: allowDestructive }, probeCap)));
+    probes.push(...(await probeAnonymousWrite(ctx, baseUrl, routes, { victim: pair.victim })));
   } else if (pair) {
     ctx.emit({
       kind: "discovery",
       severity: SEVERITY.INFO,
-      message: "写操作类越权探测（PUT IDOR）默认关闭（会修改目标数据）；如需启用，在 guardbuild.json 设 blackbox.allowMutation=true 或环境变量 GUARDBUILD_BLACKBOX_MUTATE=1",
-      data: { allowMutation: false },
+      message:
+        "写操作类越权探测（跨用户 PUT/PATCH/DELETE、匿名写入）默认关闭（会修改甚至销毁目标数据）；如需启用，在 guardbuild.json 设 blackbox.allowMutation=true 或环境变量 GUARDBUILD_BLACKBOX_MUTATE=1（DELETE 还需 blackbox.allowDestructive=true / GUARDBUILD_BLACKBOX_DELETE=1）",
+      data: { allowMutation: false, allowDestructive: false },
     });
   }
 
@@ -1081,7 +1490,9 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
     rateLimited,
     reachable: rate.reachable,
     login: summary.login,
+    coverage,
     configuredMutation: !!options.allowMutation,
+    configuredDestructive: !!options.allowDestructive,
   };
 }
 

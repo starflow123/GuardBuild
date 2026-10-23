@@ -246,7 +246,8 @@ function normalizeDocker(raw) {
 
 /**
  * 黑盒模式配置：只读取登录/身份/黑盒开关，不触发启动探测（不读源码）。
- * allowMutation 默认 false：写操作类探测（PUT/POST）需显式开启。
+ * allowMutation 默认 false：写操作类探测（PUT/PATCH/POST）需显式开启。
+ * allowDestructive 默认 false：DELETE 不可回滚，需在 allowMutation 之外再显式开启。
  */
 function normalizeBlackbox(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
@@ -258,6 +259,7 @@ function normalizeBlackbox(raw) {
     : null;
   return {
     allowMutation: raw.allowMutation === true,
+    allowDestructive: raw.allowDestructive === true,
     loginPaths: loginPaths?.length ? loginPaths : null,
     maxRoutes: Number.isFinite(raw.maxRoutes) ? Math.min(200, Math.max(10, Math.floor(raw.maxRoutes))) : null,
   };

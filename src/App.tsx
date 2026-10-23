@@ -5,6 +5,7 @@ import { WorkflowStepper } from "./components/WorkflowStepper";
 import { ConsentDialog } from "./components/ConsentDialog";
 import { TokenPanel } from "./components/TokenPanel";
 import { ScoutPanel } from "./components/ScoutPanel";
+import { BootstrapPanel } from "./components/BootstrapPanel";
 import { FindingsList } from "./components/FindingsList";
 import { BlackboxPanel } from "./components/BlackboxPanel";
 import { EventLog } from "./components/EventLog";
@@ -270,6 +271,7 @@ export function App() {
           </div>
           <TokenPanel view={view} />
           <ScoutPanel view={view} />
+          <BootstrapPanel view={view} />
           <div className="panel">
             <div className="panel-title">{blackbox ? "黑盒边界" : "隔离与留痕"}</div>
             <div className="panel-body small muted" style={{ padding: "8px 13px" }}>

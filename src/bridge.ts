@@ -225,6 +225,38 @@ export interface LlmView {
   }[];
 }
 
+export interface BootstrapAction {
+  step?: number | null;
+  action?: string | null;
+  subject?: string | null;
+  ok?: boolean;
+  exitCode?: number | null;
+  durationMs?: number | null;
+  note?: string | null;
+}
+
+/** 有界启动代理（S3-full）：动作序列由引擎拼装并实跑，界面只呈现事实不呈现模型原文 */
+export interface BootstrapView {
+  enabled?: boolean;
+  reason?: string | null;
+  model?: string | null;
+  outcome?: string | null;
+  stepsUsed?: number;
+  maxSteps?: number;
+  rejected?: number;
+  durationMs?: number | null;
+  remainingMs?: number | null;
+  budgetStop?: string | null;
+  error?: string | null;
+  note?: string | null;
+  url?: string | null;
+  menuSize?: number;
+  startCandidateSize?: number;
+  budget?: { maxSteps?: number; stepTimeoutMs?: number; totalBudgetMs?: number; maxOutputChars?: number } | null;
+  start?: { cmd?: string; args?: string[]; cwd?: string | null } | null;
+  actions?: BootstrapAction[];
+}
+
 export interface View {
   sessionId?: string;
   projectRoot?: string;
@@ -253,6 +285,7 @@ export interface View {
   patch?: ViewPatch | null;
   acceptance?: AcceptanceView | null;
   llm?: LlmView | null;
+  bootstrap?: BootstrapView | null;
   error?: SessionError | null;
   tokens?: TokenItem[];
   pendingConsent?: ConsentRequest | null;

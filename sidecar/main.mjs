@@ -29,6 +29,7 @@ import { runPhase, ProbeError } from "./lib/probe.mjs";
 import { runSupabasePhase, isLoopbackHostname } from "./lib/supabase.mjs";
 import { runScout, applyScoutResult, recordScoutVerification, MAX_START_CANDIDATES } from "./lib/scout.mjs";
 import { isEnabled as llmEnabled } from "./lib/llm.mjs";
+import { bootstrapEnabled, runBootstrapAgent } from "./lib/bootstrap.mjs";
 import { runBlackbox } from "./lib/blackbox.mjs";
 import { coverageSummary, describeOutcome } from "./lib/coverage.mjs";
 import { createPatch, writebackPatch, rollbackWorkspace, PatchError } from "./lib/patcher.mjs";
@@ -132,6 +133,7 @@ function createCtx(params) {
       patch: null,
       supabase: null,
       llm: null,
+      bootstrap: null,
       acceptance: null,
       error: null,
     },
@@ -1324,6 +1326,84 @@ async function fallbackToDeterministicStart(ctx, error) {
   return spawnTarget(ctx, { cwd: ctx.projectRoot, label: "原始工作区（修复前）", role: "target-pre" });
 }
 
+/** 把启动失败压缩成给代理的一句话：只给诊断码与提示，不给进程输出 */
+function bootstrapReason(e) {
+  if (!e) return "启动候选全部未就绪";
+  const rec = startFailureRecord(e);
+  return [e.code ?? "unknown", e.message, rec.hint].filter(Boolean).join("；").slice(0, 300);
+}
+
+/** 引擎已经登记、可交给启动代理试拉的启动契约（去重后最多 8 条，由菜单自己截断） */
+function bootstrapStartCandidates(ctx) {
+  const list = [
+    ...(Array.isArray(ctx.scoutStartCandidates) ? ctx.scoutStartCandidates : []),
+    ctx.scoutFallbackStart?.start ?? null,
+    ctx.targetConfig?.start ?? null,
+  ].filter((s) => s && typeof s.cmd === "string" && Array.isArray(s.args));
+  const seen = new Set();
+  const out = [];
+  for (const s of list) {
+    const key = [s.cmd, ...(s.args ?? [])].join(" ");
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(s);
+  }
+  return out;
+}
+
+/**
+ * S3-full：目标起不来时，让有界启动代理在「引擎生成的动作菜单」里自主处理接入障碍
+ * （装依赖、跑构建脚本、换启动入口）。成功与否只由 tryStart 的真实拉起判定；
+ * 代理失败一律返回 null，由调用方回落确定性契约，绝不因为模型「觉得起好了」就当就绪。
+ */
+async function runBootstrapStart(ctx, { reason, cwd, label, role }) {
+  if (!llmEnabled()) {
+    emit(ctx, {
+      kind: "bootstrap",
+      severity: SEVERITY.WARN,
+      message: "已启用启动代理，但未设置 DEEPSEEK_API_KEY；跳过代理，回落确定性启动契约",
+      phase: STATE.PROBING,
+      data: {},
+    });
+    return null;
+  }
+  let booted = null;
+  const summary = await runBootstrapAgent(ctx, {
+    reason,
+    starts: bootstrapStartCandidates(ctx),
+    getToken: (url, why) => ensureLlmToken(ctx, url, why),
+    model: ctx.targetConfig?.llm?.model ?? null,
+    tryStart: async (entry) => {
+      ensureAlive(ctx);
+      const prev = { start: ctx.targetConfig.start, startSource: ctx.targetConfig.startSource };
+      const start = normalizeStart(entry);
+      ctx.targetConfig.start = start;
+      ctx.targetConfig.startSource = "bootstrap-agent";
+      try {
+        const target = await spawnTarget(ctx, { cwd, label, role });
+        booted = { target, start };
+        return { ok: true, target, start };
+      } catch (e) {
+        if (e instanceof CancelledError) throw e;
+        // 没起来就还原契约，避免把坏启动方式留给后续阶段
+        ctx.targetConfig.start = prev.start;
+        ctx.targetConfig.startSource = prev.startSource;
+        if (ctx.targetConfig?.docker?.enabled) await cleanupDockerContainers(ctx);
+        return {
+          ok: false,
+          error: e?.message ?? String(e),
+          code: e?.code ?? null,
+          hint: e?.hint ?? null,
+          output: Array.isArray(e?.details?.output) ? e.details.output : null,
+        };
+      }
+    },
+  });
+  ctx.view.bootstrap = summary;
+  pushView(ctx);
+  return booted ? { ...summary, ...booted } : null;
+}
+
 async function stageReproduce(ctx) {
   ensureAlive(ctx);
   setState(ctx, STATE.PROBING);
@@ -1345,6 +1425,7 @@ async function stageReproduce(ctx) {
     if (ctx.scoutApplied?.start) recordScoutVerification(ctx, { start: false });
     let target;
     let verifiedStart = null;
+    let viaBootstrap = false;
     if (ctx.scoutApplied?.start) {
       const res = await tryScoutStartCandidates(ctx, {
         cwd: ctx.projectRoot,
@@ -1353,13 +1434,68 @@ async function stageReproduce(ctx) {
       });
       target = res.target;
       verifiedStart = res.start;
+      if (!target && bootstrapEnabled(ctx)) {
+        const booted = await runBootstrapStart(ctx, {
+          reason: bootstrapReason(res.error),
+          cwd: ctx.projectRoot,
+          label: "原始工作区（修复前，启动代理）",
+          role: "target-pre",
+        });
+        if (booted) {
+          target = booted.target;
+          verifiedStart = booted.start;
+          viaBootstrap = true;
+          // scout 契约没跑通，后面不能再宣称「LLM 启动契约已验证」
+          ctx.scoutApplied.start = false;
+          ctx.scoutFallbackStart = null;
+          recordScoutVerification(ctx, {
+            start: false,
+            rejectedStart: verifiedStart,
+            rejectedStarts: (ctx.view.llm?.startAttempts ?? []).map((a) => ({
+              cmd: a.cmd,
+              args: a.args,
+              ok: a.ok,
+              code: a.code,
+              diagnosisCode: a.diagnosisCode,
+            })),
+          });
+        }
+      }
       if (!target) target = await fallbackToDeterministicStart(ctx, res.error);
+    } else if (bootstrapEnabled(ctx)) {
+      try {
+        target = await spawnTarget(ctx, { cwd: ctx.projectRoot, label: "原始工作区（修复前）", role: "target-pre" });
+      } catch (e) {
+        if (!(e instanceof CancelledError) && RETRYABLE_START_CODES.has(e.code)) {
+          const booted = await runBootstrapStart(ctx, {
+            reason: bootstrapReason(e),
+            cwd: ctx.projectRoot,
+            label: "原始工作区（修复前，启动代理）",
+            role: "target-pre",
+          });
+          if (booted) {
+            target = booted.target;
+            verifiedStart = booted.start;
+            viaBootstrap = true;
+          }
+        }
+        if (!target) throw e;
+      }
     } else {
       target = await spawnTarget(ctx, { cwd: ctx.projectRoot, label: "原始工作区（修复前）", role: "target-pre" });
     }
     ctx.procs.original = target;
     ctx.view.targets.original = { ...target, role: "原始工作区（修复前）" };
     pushView(ctx);
+    if (viaBootstrap) {
+      emit(ctx, {
+        kind: "bootstrap",
+        severity: SEVERITY.SUCCESS,
+        message: `启动代理接管后就绪：按「${ctx.targetConfig.start.cmd} ${(ctx.targetConfig.start.args ?? []).join(" ")}」实跑通过（${target.url}），共用 ${ctx.view.bootstrap?.stepsUsed ?? 0} 步`,
+        phase: STATE.PROBING,
+        data: { start: ctx.targetConfig.start, url: target.url, actions: ctx.view.bootstrap?.actions ?? [] },
+      });
+    }
     if (ctx.scoutApplied?.start) {
       recordScoutVerification(ctx, { start: true, workingStart: verifiedStart ?? ctx.targetConfig.start });
       ctx.view.llm.verified.start = true;

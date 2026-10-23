@@ -165,4 +165,14 @@
 开关与边界（保持 §0）：`llm.patchCrossFile` 默认关，仅 `GUARDBUILD_LLM_CROSSFILE=1` 或契约显式开启；`ctx.gate === true` 时无论配置如何都结构性禁用；
 写入只允许候选的依赖闭包写集，新建文件只能落在已扫描过的源码目录；新建走独立的 `worktree.write(allow_create)` 令牌；上限 4 个跨文件、3 个新建、120 行/12k 字符。
 
-### S3-full（B1→B2）待落地
+### S3-full（B1→B2）已落地 · 2026-10-23
+
+| 批次 | 落点 | 实测证据 |
+| --- | --- | --- |
+| B1 | `sidecar/lib/execmenu.mjs`（闭合动作菜单：有锁文件给 `npm ci`、无锁文件给 `npm install`，scripts 走白名单且排除 `start`/`test:watch`/`seed:check`，Python 走 `pip install -r` / `uv sync`，按命令形状去重，上限 12 动作 / 8 启动候选，启动候选保留 `readyPattern`/`readyTimeoutMs`/`env`）、`sidecar/lib/bootstrap.mjs`（有界循环：`maxSteps` 1..10 默认 6、`stepTimeoutMs` 5s..600s 默认 120s、`totalBudgetMs` 30s..1800s 默认 480s、`maxOutputChars` 5k..200k 默认 60k、重复动作短路；结局 `started`/`budget_exhausted`/`gave_up`/`llm_unavailable`/`agent_error`/`not_started`）、`sidecar/lib/db.mjs`（`agent_actions` 表 + 插入/查询，每行带剩余预算） | `sidecar/tests/execmenu.test.mjs`（10 条）、`sidecar/tests/bootstrap.test.mjs`（11 条） |
+| B2 | `main.mjs::runBootstrapStart`（挂在 `stageReproduce` 的启动失败支路；`bootstrapEnabled(ctx)` 判定；无 LLM 密钥时发 WARN 并返回 null，不冒充代理自救）+ `view.bootstrap` + `report.mjs`（`renderBootstrapSection`/`summarizeBootstrap`）+ `src/bridge.ts`（`BootstrapView`/`BootstrapAction`）+ `src/components/BootstrapPanel.tsx` + `src/App.tsx` | `npm run e2e:bootstrap` → **38/38 断言通过，exit 0**。r1：确定性契约起不来（`ERR_MODULE_NOT_FOUND` → `target_not_ready` + 缺依赖诊断）→ 代理自主 `read scripts/build.js` → 执行菜单编号 2（引擎自己拼的 `npm run build`，构建产物真实落盘）→ 引擎实跑确认就绪（`startSource=bootstrap-agent`）→ 越权证据照旧复现（pre `vulnerable=4`）→ 终态仍按契约 `no_patchable_candidates`（不自动补丁）。r2：模型抗命（编号 99/42 + 自带 `cmd/args/shell`）逐步被拒、引擎一条命令都没执行、诚实失败 `target_not_ready`。r3：gate 即使 `bootstrap.enabled=true` + `GUARDBUILD_LLM_BOOTSTRAP=1` 也结构性禁用（`view.bootstrap` 与报告 `bootstrap` 均为 null、LLM 调用 0 次、被测工作区 `git status` 干净、exit 2 / `failed`） |
+
+成功只能由引擎判定：`outcome=started` 要求 `tryStart` 真的拉起子进程并等到就绪模式命中，模型自陈「起好了」一律不采信；r2 就是这条的实测——模型收手前两步全被拒，会话终态是 `target_not_ready` 而不是「已通过」。
+命令走私的处理走「丢弃 + 只留痕字段名」：审计 `sanitize` 行记录 `cmd,args,shell` 与拒因，模型原文（含哨兵串）不进视图、事件、审计、报告、Markdown 任何一处；菜单本身也只给编号与形状，不给身份密码与契约内容。
+
+一处实测教训（不是测试噪声）：靶场 `fixtures/bootstrap-shop` 第一版把手写守卫写成路由块内只有 `if (!auth) return 401`、不引用 `auth.user`，`AUTH_GUARD` 因此判 `hasAuth=false`，候选归到 `no-auth-suspect`（未认证族），planner 只规划匿名读取与越权提权两条用例，而这两条都被应用正确拒绝 → pre `vulnerable=0`、终态 `attack_not_reproducible`（exit 0），真实的跨用户 IDOR 一次都没被打。已把靶场改成与 `llm-patch-shop` 同形的自描述写法，让「唯一障碍是接入」这个前提成立；但这类「块内不引用会话即漏报」本身是一处真实的检测缺口，另立任务跟进。

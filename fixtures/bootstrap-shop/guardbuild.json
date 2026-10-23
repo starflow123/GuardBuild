@@ -1,0 +1,24 @@
+{
+  "_note": "接入障碍靶场：server.js → src/data.js 静态 import 构建产物 ../build/config.js（由 npm run build 从 config/orders.seed.json 生成）。仓库里只有种子数据，未构建时入口直接 ERR_MODULE_NOT_FOUND，确定性启动契约必然起不来——只有有界启动代理能自主补齐「看清单 → 执行构建 → 再拉起」。漏洞形态（normalizeId + 内存 store）规避确定性归属模板，本靶场不测自动修复，只测接入层。",
+  "start": {
+    "cmd": "node",
+    "args": ["server.js"],
+    "env": { "PORT": "0" },
+    "readyPattern": "已就绪",
+    "readyTimeoutMs": 15000
+  },
+  "login": {
+    "path": "/api/login",
+    "bodyTemplate": { "username": "{username}", "password": "{password}" },
+    "credentialPath": "token"
+  },
+  "responses": { "list": "orders", "entity": "order" },
+  "identities": [
+    { "name": "alice", "username": "alice", "password": "alice123", "role": "user" },
+    { "name": "bob", "username": "bob", "password": "bob123", "role": "user" },
+    { "name": "admin", "username": "admin", "password": "admin123", "role": "admin" }
+  ],
+  "llm": { "enabled": false, "patch": false },
+  "bootstrap": { "enabled": true, "maxSteps": 6, "stepTimeoutMs": 60000, "totalBudgetMs": 240000 },
+  "scopes": ["project.read", "worktree.write", "proc.spawn", "net.probe", "net.egress:api.deepseek.com"]
+}

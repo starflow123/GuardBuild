@@ -42,6 +42,12 @@ function esc(v) {
   return String(v ?? "").replace(/\|/g, "\\|").replace(/\n/g, " ");
 }
 
+/** 报告表格里的定宽字段：动作对象/备注可能很长，截断即可，不做省略号以外的加工 */
+function truncate(v, n) {
+  const s = String(v ?? "");
+  return s.length > n ? `${s.slice(0, n)}…` : s;
+}
+
 /** 归因结论的中文措辞（与 attribution.mjs 的 status 一一对应） */
 const ATTRIBUTION_LABELS = {
   blocked: "已翻转",
@@ -245,6 +251,94 @@ function renderLlmSection(llm) {
     lines.push("\n**侦察备注**\n", ...llm.notes.slice(0, 5).map((n) => `- ${esc(n)}`), "");
   }
   return lines.join("\n");
+}
+
+const BOOTSTRAP_OUTCOME_LABEL = {
+  started: "已把项目拉起来（实跑就绪）",
+  budget_exhausted: "预算用尽，仍未就绪",
+  gave_up: "代理判断无法继续，主动收手",
+  llm_unavailable: "LLM 不可用，未进入代理循环",
+  agent_error: "代理执行出错",
+  not_started: "未拉起",
+};
+
+/** 有界启动代理（S3-full）：动作序列与预算如实呈报，成功只认引擎实跑就绪 */
+function renderBootstrapSection(b) {
+  const label = BOOTSTRAP_OUTCOME_LABEL[b.outcome] ?? b.outcome ?? "—";
+  const lines = [
+    "## 有界启动代理\n",
+    "| 项目 | 值 |",
+    "| --- | --- |",
+    `| 触发原因 | ${esc(b.reason ?? "—")} |`,
+    `| 模型 | ${esc(b.model ?? "—")} |`,
+    `| 结局 | ${esc(label)}${b.outcome === "started" ? "（由真实启动+就绪判定位定，非模型自评）" : ""} |`,
+    `| 步数 | ${b.stepsUsed ?? 0} / ${b.maxSteps ?? "—"} |`,
+    `| 被拒选择 | ${b.rejected ?? 0} 条 |`,
+    `| 动作菜单 | exec ${b.menuSize ?? 0} 条 / start ${b.startMenuSize ?? 0} 条 |`,
+    `| 用时 | ${b.durationMs != null ? `${b.durationMs}ms` : "—"} |`,
+    `| 剩余预算 | ${b.remainingMs != null ? `${Math.round(b.remainingMs / 1000)}s` : "—"} |`,
+    `| 就绪地址 | ${b.url ? `\`${esc(b.url)}\`` : "—"} |`,
+    "",
+  ];
+  if (b.budgetStop) lines.push(`- 预算停止条件：${esc(b.budgetStop)}`);
+  if (b.error) lines.push(`- 代理错误：${esc(b.error)}`);
+  if (b.note) lines.push(`- 代理收手说明：${esc(b.note)}`);
+  if (b.budgetStop || b.error || b.note) lines.push("");
+  if (Array.isArray(b.actions) && b.actions.length) {
+    lines.push(
+      "**动作序列**（命令行一律由引擎按仓库清单拼装，模型只能报编号；下表记录实际执行的那条）\n",
+      "| 步 | 动作 | 对象 | 结果 | 退出码 | 耗时 | 备注 |",
+      "| --- | --- | --- | --- | --- | --- | --- |"
+    );
+    for (const a of b.actions) {
+      lines.push(
+        `| ${a.step ?? "?"} | ${esc(a.action ?? "—")} | \`${esc(truncate(a.subject ?? "—", 80))}\` | ${
+          a.ok ? "成功" : "未成功"
+        } | ${a.exitCode ?? "—"} | ${a.durationMs != null ? `${a.durationMs}ms` : "—"} | ${esc(truncate(a.note ?? "—", 120))} |`
+      );
+    }
+    lines.push("");
+  }
+  if (b.start) {
+    lines.push(
+      `- 最终生效的启动契约：\`${esc(b.start.cmd ?? "?")} ${esc((b.start.args ?? []).join(" "))}\`（startSource = \`bootstrap-agent\`，后续修复验收沿用这一条）`
+    );
+    lines.push("");
+  }
+  return lines.join("\n");
+}
+
+function summarizeBootstrap(b) {
+  if (!b) return null;
+  return {
+    reason: b.reason ?? null,
+    model: b.model ?? null,
+    outcome: b.outcome ?? null,
+    stepsUsed: b.stepsUsed ?? 0,
+    maxSteps: b.maxSteps ?? null,
+    rejected: b.rejected ?? 0,
+    durationMs: b.durationMs ?? null,
+    remainingMs: b.remainingMs ?? null,
+    budgetStop: b.budgetStop ?? null,
+    error: b.error ?? null,
+    note: b.note ?? null,
+    url: b.url ?? null,
+    menuSize: b.menuSize ?? 0,
+    startMenuSize: b.startCandidateSize ?? 0,
+    budget: b.budget ?? null,
+    start: b.start
+      ? { cmd: b.start.cmd, args: b.start.args ?? [], cwd: b.start.cwd ?? null }
+      : null,
+    actions: (b.actions ?? []).slice(0, 12).map((a) => ({
+      step: a.step ?? null,
+      action: a.action ?? null,
+      subject: a.subject ?? null,
+      ok: !!a.ok,
+      exitCode: a.exitCode ?? null,
+      durationMs: a.durationMs ?? null,
+      note: a.note ?? null,
+    })),
+  };
 }
 
 function summarizeLlmPatch(llm) {
@@ -493,10 +587,16 @@ function renderMarkdown(r) {
       `- LLM 接入侦察：${esc(r.llm.model ?? "未知模型")}，应用 ${esc(applied.join("、") || "无")}；启动 ${r.llm.verified?.start ? "已验证" : "未验证"}，登录 ${r.llm.verified?.login ? "已验证" : "未验证"}${r.llm.cached ? `（${r.llm.cacheSource === "disk" ? "磁盘" : "内存"}缓存）` : ""}`
     );
   }
+  if (!bb && r.bootstrap) {
+    summaryLines.push(
+      `- 有界启动代理：${esc(BOOTSTRAP_OUTCOME_LABEL[r.bootstrap.outcome] ?? r.bootstrap.outcome ?? "—")}（${r.bootstrap.stepsUsed ?? 0}/${r.bootstrap.maxSteps ?? "—"} 步，菜单 ${r.bootstrap.menuSize ?? 0} 个动作）`
+    );
+  }
   if (r.error) summaryLines.push(`- 错误：\`${esc(r.error.code)}\` — ${esc(r.error.message)}`);
   parts.push(summaryLines.join("\n") + "\n");
 
   if (!bb && r.llm?.used) parts.push(renderLlmSection(r.llm));
+  if (!bb && r.bootstrap) parts.push(renderBootstrapSection(r.bootstrap), "");
 
   if (!bb && r.summary.findings.length) {
     parts.push(`## 静态发现（${r.summary.findings.length}）\n`);
@@ -750,6 +850,7 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
           warnings: view.llm.warnings ?? [],
         }
       : null,
+    bootstrap: summarizeBootstrap(view.bootstrap),
     supabase,
     blackbox,
     evidence: {

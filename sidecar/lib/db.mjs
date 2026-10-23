@@ -45,8 +45,14 @@ export class EvidenceStore {
         id TEXT PRIMARY KEY, session_id TEXT, case_id TEXT, category TEXT, name TEXT,
         expected TEXT, actual TEXT, pass INTEGER, evidence_id TEXT, created_at INTEGER
       );
+      CREATE TABLE IF NOT EXISTS agent_actions (
+        id TEXT PRIMARY KEY, session_id TEXT, step INTEGER, action TEXT, subject TEXT,
+        ok INTEGER, exit_code INTEGER, duration_ms INTEGER, budget_remaining_ms INTEGER,
+        note TEXT, created_at INTEGER
+      );
       CREATE INDEX IF NOT EXISTS idx_evidence_session ON evidence(session_id, phase);
       CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id, ts);
+      CREATE INDEX IF NOT EXISTS idx_agent_actions_session ON agent_actions(session_id, step);
     `);
     // 存量库补列（CREATE IF NOT EXISTS 不会更新既有表结构）
     const cols = this.db.prepare(`PRAGMA table_info(evidence)`).all().map((c) => c.name);
@@ -135,6 +141,50 @@ export class EvidenceStore {
       .prepare(`INSERT INTO acceptance (id, session_id, case_id, category, name, expected, actual, pass, evidence_id, created_at)
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
       .run(a.id, a.sessionId, a.caseId, a.category, a.name, a.expected, a.actual, a.pass ? 1 : 0, a.evidenceId ?? null, a.createdAt);
+  }
+
+  /**
+   * Agent 动作审计。subject 只允许存「命令形状」（launcher + 固定参数）或路径/菜单编号，
+   * 不落模型原文；这里再兜一层：去换行、限长 200。
+   */
+  insertAgentAction(a) {
+    const subject = String(a.subject ?? "").replace(/[\r\n\0]+/g, " ").slice(0, 200);
+    this.db
+      .prepare(`INSERT INTO agent_actions (id, session_id, step, action, subject,
+                ok, exit_code, duration_ms, budget_remaining_ms, note, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`)
+      .run(
+        a.id,
+        a.sessionId,
+        a.step,
+        a.action,
+        subject,
+        a.ok == null ? null : a.ok ? 1 : 0,
+        a.exitCode ?? null,
+        a.durationMs ?? null,
+        a.budgetRemainingMs ?? null,
+        a.note == null ? null : String(a.note).replace(/[\r\n\0]+/g, " ").slice(0, 200),
+        a.createdAt ?? Date.now()
+      );
+  }
+
+  queryAgentActions(sessionId) {
+    return this.db
+      .prepare(`SELECT * FROM agent_actions WHERE session_id = ? ORDER BY step, created_at`)
+      .all(sessionId)
+      .map((r) => ({
+        id: r.id,
+        sessionId: r.session_id,
+        step: r.step,
+        action: r.action,
+        subject: r.subject,
+        ok: r.ok == null ? null : !!r.ok,
+        exitCode: r.exit_code,
+        durationMs: r.duration_ms,
+        budgetRemainingMs: r.budget_remaining_ms,
+        note: r.note,
+        createdAt: r.created_at,
+      }));
   }
 
   queryEvidence(sessionId, phase = null) {

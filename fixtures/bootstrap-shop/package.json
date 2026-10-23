@@ -1,0 +1,12 @@
+{
+  "name": "bootstrap-shop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "BootstrapShop - 接入障碍靶场：入口依赖构建产物 build/config.js（npm run build 生成），未构建则起不来",
+  "scripts": {
+    "build": "node scripts/build.js",
+    "start": "node server.js",
+    "seed:check": "node scripts/build.js --check"
+  }
+}

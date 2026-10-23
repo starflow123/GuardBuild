@@ -13,11 +13,14 @@
  *   "identities": [{ "name": "alice", "email": "alice@example.com", "password": "alice123", "role": "user" }],
  *   "supabase": { "envFile": ".env", "url": "https://xyz.supabase.co", "anonKey": "eyJ…", "tables": ["profiles"] },
  *   "llm": { "enabled": true, "model": "deepseek-chat" },
+ *   "bootstrap": { "enabled": true, "maxSteps": 6 },
  *   "scopes": ["project.read", "worktree.write", "proc.spawn", "net.probe"]
  * }
  *
  * 身份支持三种形状：username / email / fields（自定义字段映射），至少两项。
  * prepare 步骤在目标进程启动前按序执行（依赖安装、构建等），在 worktree 中同样复跑。
+ * bootstrap 是「有界启动代理」（S3-full）：目标起不来时按引擎生成的动作菜单逐步处理（装依赖/构建/换启动候选）。
+ *   默认关闭、gate 模式结构性禁用；命令行始终由引擎拼装，模型只报编号；预算耗尽即回退确定性契约，不伪造成功。
  * start 的 cmd/args/env 中可使用 `${GB_PORT}` 占位符：宿主每次 spawn 前分配一个空闲端口注入，
  *   使「原始工作区 / 隔离 worktree」多个实例可并存，也让打印字面量端口的项目无需改写。
  * responses 声明列表/单体资源在响应 JSON 中的位置（点路径，如 "data.items"）；
@@ -395,6 +398,25 @@ export function normalizeLlm(raw) {
   return out;
 }
 
+/**
+ * 有界启动代理（S3-full）：目标起不来时让模型在引擎生成的动作菜单里逐步选动作。
+ * 默认关闭，且 gate 模式由代码层结构性禁用（见 bootstrap.mjs::bootstrapEnabled）。
+ * 预算字段都有硬上限，契约写更大也只取上限。
+ */
+export function normalizeBootstrap(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const clamp = (v, lo, hi, dft) => (Number.isFinite(v) ? Math.min(hi, Math.max(lo, Math.floor(v))) : dft);
+  const out = {
+    maxSteps: clamp(raw.maxSteps, 1, 10, 6),
+    stepTimeoutMs: clamp(raw.stepTimeoutMs, 5_000, 600_000, 120_000),
+    totalBudgetMs: clamp(raw.totalBudgetMs, 30_000, 1_800_000, 480_000),
+    maxOutputChars: clamp(raw.maxOutputChars, 5_000, 200_000, 60_000),
+  };
+  // 缺省不写这个键：契约没表态时留给 GUARDBUILD_LLM_BOOTSTRAP 决定（显式 false 才是关）
+  if (typeof raw.enabled === "boolean") out.enabled = raw.enabled;
+  return out;
+}
+
 /** Supabase 覆盖项：显式指定环境文件 / 项目 URL / anon key / 表名（缺省由静态检测自动发现） */
 function normalizeSupabase(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
@@ -425,6 +447,7 @@ function emptyConfig(source, invalid = null) {
     routes: null,
     openapi: null,
     llm: null,
+    bootstrap: null,
     scopes: null,
   };
 }
@@ -518,6 +541,7 @@ export async function loadTargetConfig(ctx) {
     routes: normalizeRoutes(parsed.routes),
     openapi: normalizeOpenapi(parsed.openapi),
     llm: normalizeLlm(parsed.llm),
+    bootstrap: normalizeBootstrap(parsed.bootstrap),
     scopes: Array.isArray(parsed.scopes)
       ? parsed.scopes.filter((x) => typeof x === "string" && x)
       : null,

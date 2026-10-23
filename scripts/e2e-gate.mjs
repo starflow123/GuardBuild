@@ -69,7 +69,7 @@ function makeWorkspace(name, { mutate, fixtureDir = fixture } = {}) {
 }
 
 /** 运行一轮 gate：空 stdin、收集 stdout/stderr、返回 { code, gate, stdout, stderr } */
-function runGate(project, label, timeoutMs = 300_000) {
+function runGate(project, label, timeoutMs = 120_000) {
   return new Promise((resolve, reject) => {
     const child = spawn(exe, ["--gate", "--project", project, "--report", path.join(demoDir, "reports", label)], {
       cwd: repoRoot,
@@ -86,7 +86,9 @@ function runGate(project, label, timeoutMs = 300_000) {
     child.stderr.on("data", (b) => { stderr += b.toString(); });
     const timer = setTimeout(() => {
       child.kill();
-      reject(new Error(`[gate:${label}] 超时 ${timeoutMs}ms`));
+      const last = lastStates(stdout).at(-1)?.state ?? "?";
+      const tail = stderr.replace(/\s+/g, " ").slice(-280) || "无";
+      reject(new Error(`[gate:${label}] 超时 ${timeoutMs}ms（最后状态=${last}；stderr 尾部：${tail}）`));
     }, timeoutMs);
     child.on("exit", (code) => {
       clearTimeout(timer);
@@ -467,14 +469,20 @@ async function main() {
   console.log(`\n[GATE] 断言: ${passed}/${checks.length} 通过`);
   const failed = checks.filter((c) => !c.pass);
   if (failed.length > 0) {
-    console.error(`[GATE] 未通过: ${failed.map((c) => c.name).join("、")}`);
+    annotate(`[GATE] 未通过: ${failed.map((c) => c.name).join("、")}`);
     process.exit(1);
   }
   console.log("[GATE] 全部通过 ✅");
 }
 
+/** 同时输出到 stderr 与 GitHub Actions annotation：CI 日志需认证，注解可通过公开 API 读取 */
+function annotate(message) {
+  console.error(message);
+  if (process.env.GITHUB_ACTIONS) console.log(`::error::${String(message).replace(/\r?\n/g, " ")}`);
+}
+
 main().catch((e) => {
-  console.error(`\n[GATE] 失败: ${e.message}`);
+  annotate(`\n[GATE] 失败: ${e.message}`);
   const passed = checks.filter((c) => c.pass).length;
   console.log(`[GATE] 断言: ${passed}/${checks.length} 通过`);
   process.exit(1);

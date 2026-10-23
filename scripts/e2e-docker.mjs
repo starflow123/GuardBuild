@@ -43,8 +43,14 @@ function git(args, cwd) {
 }
 
 function dockerAvailable() {
-  const r = spawnSync("docker", ["version", "--format", "{{.Server.Version}}"], { encoding: "utf8" });
-  return r.status === 0 ? r.stdout.trim() : null;
+  const r = spawnSync("docker", ["info", "--format", "{{.ServerVersion}}|{{.OSType}}"], {
+    encoding: "utf8",
+    timeout: 20_000,
+  });
+  if (r.status !== 0) return null;
+  const [version, osType] = r.stdout.trim().split("|");
+  if (!version) return null;
+  return { version, osType: (osType ?? "").toLowerCase() || "unknown" };
 }
 
 function dockerContainerNames() {
@@ -161,16 +167,20 @@ function readReport(label) {
 }
 
 async function main() {
-  const version = dockerAvailable();
-  if (!version) {
-    console.log("[DOCKER] 未检测到可用 Docker，跳过（本用例需要 Linux 容器）");
+  const docker = dockerAvailable();
+  if (!docker || docker.osType !== "linux") {
+    console.log(
+      docker
+        ? `[DOCKER] 当前 Docker 运行时 OS=${docker.osType}，无法运行 linux 镜像，跳过`
+        : "[DOCKER] 未检测到可用 Docker，跳过（本用例需要 Linux 容器）"
+    );
     process.exit(0);
   }
   if (!existsSync(exe)) throw new Error(`headless 可执行文件不存在: ${exe}（先 cargo build --bin guardbuild-headless）`);
   rmSync(demoDir, { recursive: true, force: true });
   mkdirSync(demoDir, { recursive: true });
 
-  console.log(`[DOCKER] Docker ${version}；镜像 ${IMAGE}`);
+  console.log(`[DOCKER] Docker ${docker.version}；镜像 ${IMAGE}`);
   const beforeContainers = dockerContainerNames();
 
   console.log("\n[DOCKER] 1/2 合法容器契约：完整 gate 流程");
@@ -214,8 +224,10 @@ async function main() {
   const passed = checks.filter((c) => c.pass).length;
   console.log(`[DOCKER] 断言: ${passed}/${checks.length} 通过`);
   if (passed !== checks.length) {
+    const failedNames = checks.filter((x) => !x.pass).map((c) => c.name);
     console.error("[DOCKER] 失败清单：");
     for (const c of checks.filter((x) => !x.pass)) console.error(`  - ${c.name}`);
+    if (process.env.GITHUB_ACTIONS) console.log(`::error::[DOCKER] 未通过: ${failedNames.join("、")}`);
     process.exit(1);
   }
   console.log("[DOCKER] 全部通过 ✅");
@@ -224,5 +236,6 @@ async function main() {
 
 main().catch((e) => {
   console.error(e);
+  if (process.env.GITHUB_ACTIONS) console.log(`::error::[DOCKER] 失败: ${String(e.message).replace(/\r?\n/g, " ")}`);
   process.exit(1);
 });

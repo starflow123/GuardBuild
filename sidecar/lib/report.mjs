@@ -116,6 +116,18 @@ function suggestions(r) {
   }
   if (r.blackbox) {
     const bb = r.blackbox;
+    if (bb.attackPlan?.rounds?.length) {
+      const picked = (bb.attackPlan.appliedPicks ?? []).length;
+      lines.push(
+        picked
+          ? `- 攻击规划代理：${bb.attackPlan.llmCalls ?? 0} 次调用把 ${picked} 条「按引擎原序拿不到预算」的路由提进探测队列（模型只挑路由编号，攻击内容与判据由引擎生成）。`
+          : `- 攻击规划代理：本轮未改动探测预算（${bb.attackPlan.rounds.map((x) => x.fallback ?? "未挑选").join("、")}），按引擎原序探测。`
+      );
+    } else if ((bb.routeCount ?? 0) > (bb.probeCap ?? 14)) {
+      lines.push(
+        `- 路由 ${bb.routeCount} 条、每类探测预算 ${bb.probeCap ?? 14} 条：预算外的路由本轮未被打。可用 blackbox.attackPlan=true 或 GUARDBUILD_LLM_ATTACKPLAN=1 让规划代理按线索重排预算（仅交互模式，gate 不启用）。`
+      );
+    }
     if (outcome === "vulnerable_unfixed") {
       for (const f of (bb.findings ?? []).slice(0, 8)) {
         lines.push(`- 已复现：${f.type}（${f.method} ${f.path}）—— ${f.detail}`);
@@ -316,6 +328,39 @@ function renderBootstrapSection(b) {
     );
     lines.push("");
   }
+  return lines.join("\n");
+}
+
+/** 攻击规划（M2）：呈报「模型挑了哪些路由」，不呈报模型原文；是否算漏洞仍由实测证据决定 */
+function renderAttackPlanSection(p) {
+  if (!p || !Array.isArray(p.rounds) || !p.rounds.length) return "";
+  const lines = [
+    "## 攻击规划代理（仅分配探测预算）\n",
+    "| 项目 | 值 |",
+    "| --- | --- |",
+    `| 模型 | ${esc(p.model ?? "—")} |`,
+    `| LLM 调用 | ${p.llmCalls ?? 0} 次（每类探测预算 ${p.probeCap ?? "—"} 条路由） |`,
+    `| 提进预算的路由 | ${(p.appliedPicks ?? []).length} 条 |`,
+    `| 丢弃的模型自带字段 | ${(p.ignoredFields ?? []).length ? p.ignoredFields.map((f) => `\`${esc(f)}\``).join("、") : "无"} |`,
+    "",
+    "| 轮 | 待排路由 | 采纳的选择 | 非法编号 | 丢弃字段 | 未采纳原因 | 耗时 |",
+    "| --- | --- | --- | --- | --- | --- | --- |",
+  ];
+  for (const r of p.rounds) {
+    lines.push(
+      `| ${r.round} | ${r.menuSize ?? 0} 条 | ${
+        (r.picks ?? []).length ? (r.picks ?? []).map((x) => `\`${esc(x.path)}\``).join("<br>") : "—"
+      } | ${(r.invalid ?? []).length} | ${(r.ignored ?? []).length ? (r.ignored ?? []).map((f) => esc(f)).join(",") : "—"} | ${
+        r.fallback ? esc(r.fallback) : "—"
+      } | ${r.durationMs != null ? `${r.durationMs}ms` : "—"} |`
+    );
+  }
+  lines.push(
+    "",
+    "- 模型只能从引擎已发现的路由里挑编号；载荷、方法、请求内容与判据全部由引擎生成，漏洞结论只来自实测证据（**非模型自评**）。",
+    "- 该能力默认关闭，且 gate/CI 结构性禁用（`blackbox.attackPlan` 或 `GUARDBUILD_LLM_ATTACKPLAN=1`，仅交互模式生效）。",
+    ""
+  );
   return lines.join("\n");
 }
 
@@ -649,6 +694,8 @@ function renderMarkdown(r) {
     }
     const fix = renderFixBriefs(r.summary.fixBriefs);
     if (fix) parts.push(fix);
+    const planMd = renderAttackPlanSection(bb.attackPlan);
+    if (planMd) parts.push(planMd);
     parts.push(`## 黑盒探测证据（${bbEvidence.length} 条）\n`);
     parts.push(evidenceTable(bbEvidence));
   } else {
@@ -827,6 +874,7 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
             allowMutation: !!blackbox.allowMutation,
             allowDestructive: !!blackbox.allowDestructive,
             coverage: blackbox.coverage ?? null,
+            attackPlan: blackbox.attackPlan ?? null,
           }
         : null,
       start: start

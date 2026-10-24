@@ -1993,12 +1993,20 @@ async function runBlackboxFlow(ctx, rawUrl) {
     rateLimited: false,
     allowMutation,
     allowDestructive,
+    attackPlan: null,
     maxRoutes: configuredMaxRoutes,
+    probeCap: null,
     reachable: null,
     outcome: null,
     exitCode: null,
   };
-  const result = await runBlackbox(ctx, baseUrl, { config: cfg, allowMutation, allowDestructive });
+  const result = await runBlackbox(ctx, baseUrl, {
+    config: cfg,
+    allowMutation,
+    allowDestructive,
+    // 攻击规划（M2）只借用出站令牌；密钥仍只从环境变量读，Sidecar 不见明文
+    llm: { getToken: (url, why) => ensureLlmToken(ctx, url, why) },
+  });
 
   if (!result.reachable) {
     ctx.view.blackbox.reachable = false;
@@ -2031,7 +2039,9 @@ async function runBlackboxFlow(ctx, rawUrl) {
     allowMutation: result.configuredMutation,
     allowDestructive: result.configuredDestructive,
     coverage: result.coverage ?? null,
+    attackPlan: result.attackPlan ?? null,
     maxRoutes: result.maxRoutes ?? configuredMaxRoutes,
+    probeCap: result.probeCap ?? null,
     reachable: true,
     outcome,
     exitCode,

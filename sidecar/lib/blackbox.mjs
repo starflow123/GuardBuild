@@ -8,6 +8,7 @@
 import { CASE_CATEGORY, RPC_TO_HOST, SEVERITY, VERDICT, shortId } from "../../shared/protocol.mjs";
 import { loginAll } from "./probe.mjs";
 import { followRedirects } from "./http-follow.mjs";
+import { attackPlanEnabled, planBudget, recordPlan, runAttackPlanner } from "./attackplan.mjs";
 
 const OPENAPI_PATHS = ["/swagger.json", "/openapi.json", "/v3/api-docs", "/api-docs", "/swagger-ui.json"];
 const COMMON_API_PATHS = [
@@ -1370,6 +1371,7 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
     return {
       routes: [],
       maxRoutes: routeCap,
+      probeCap,
       openapiFound: false,
       openapiRouteCount: 0,
       frontendRouteCount: 0,
@@ -1381,6 +1383,7 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
       reachable: false,
       login: null,
       coverage: [],
+      attackPlan: null,
       configuredMutation: !!options.allowMutation,
       configuredDestructive: !!options.allowDestructive,
     };
@@ -1414,26 +1417,66 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
   const probes = [];
   // 覆盖清单要如实反映「这一轮真的打过什么」，报告与 GUI 直接照它写口径
   const coverage = ["路由发现", "敏感文件/调试端点", "限流观察", "未认证读取", "SQL 注入（字符串+数字语境）", "路径穿越（含编码绕过）"];
-  probes.push(...(await probeUnauthRead(ctx, baseUrl, routes, probeCap)));
+
+  // 攻击规划（M2）：预算只够打前 probeCap 条路由时，让模型在「引擎已发现但未获预算」的
+  // 路由里挑编号。模型不参与怎么打、也不参与判定，载荷与判据仍是引擎生成。
+  const planCfg = planBudget({ config: options.config });
+  const planning = attackPlanEnabled(ctx, options);
+  const planRounds = [];
+  let attackRoutes = routes;
+  if (planning) {
+    const r1 = await runAttackPlanner(ctx, {
+      routes,
+      probeCap,
+      round: 1,
+      budget: planCfg,
+      getToken: options.llm?.getToken,
+      model: options.llm?.model ?? null,
+      chatImpl: options.llm?.chatImpl,
+    });
+    planRounds.push(r1);
+    recordPlan(ctx, r1);
+    if (!r1.fallback && r1.picks.length) attackRoutes = r1.ordered;
+  }
+
+  probes.push(...(await probeUnauthRead(ctx, baseUrl, attackRoutes, probeCap)));
   if (pair) {
     coverage.push("跨用户读取（IDOR）");
-    probes.push(...(await probeIdor(ctx, baseUrl, routes, pair, probeCap)));
+    probes.push(...(await probeIdor(ctx, baseUrl, attackRoutes, pair, probeCap)));
   }
+
+  // 第二轮复排：读类证据已经落地，让模型据此把剩下的预算分给还没打过的路由
+  if (planning && planCfg.rounds >= 2) {
+    const r2 = await runAttackPlanner(ctx, {
+      routes: attackRoutes,
+      probeCap,
+      round: 2,
+      records: probes,
+      budget: planCfg,
+      getToken: options.llm?.getToken,
+      model: options.llm?.model ?? null,
+      chatImpl: options.llm?.chatImpl,
+    });
+    planRounds.push(r2);
+    recordPlan(ctx, r2);
+    if (!r2.fallback && r2.picks.length) attackRoutes = r2.ordered;
+  }
+
   // 注入/穿越没有登录身份也要跑：可注入的公开端点不需要会话就能读库
-  probes.push(...(await probeSqli(ctx, baseUrl, routes, who, probeCap)));
-  probes.push(...(await probeTraversal(ctx, baseUrl, who, routes)));
+  probes.push(...(await probeSqli(ctx, baseUrl, attackRoutes, who, probeCap)));
+  probes.push(...(await probeTraversal(ctx, baseUrl, who, attackRoutes)));
   if (login.ok) {
     coverage.push("垂直越权（管理端点）");
     probes.push(
-      ...(await probeVerticalEscalation(ctx, baseUrl, routes, { user: users[0] ?? null, admin: admins[0] ?? null }, probeCap))
+      ...(await probeVerticalEscalation(ctx, baseUrl, attackRoutes, { user: users[0] ?? null, admin: admins[0] ?? null }, probeCap))
     );
   }
   if (pair && options.allowMutation) {
     const methods = allowDestructive ? ["PUT", "PATCH", "DELETE"] : ["PUT", "PATCH"];
     coverage.push("跨用户修改（PUT/PATCH）", "未认证写入");
     if (allowDestructive) coverage.push("跨用户删除（DELETE）");
-    probes.push(...(await probeWriteIdor(ctx, baseUrl, routes, pair, { methods, destructive: allowDestructive }, probeCap)));
-    probes.push(...(await probeAnonymousWrite(ctx, baseUrl, routes, { victim: pair.victim })));
+    probes.push(...(await probeWriteIdor(ctx, baseUrl, attackRoutes, pair, { methods, destructive: allowDestructive }, probeCap)));
+    probes.push(...(await probeAnonymousWrite(ctx, baseUrl, attackRoutes, { victim: pair.victim })));
   } else if (pair) {
     ctx.emit({
       kind: "discovery",
@@ -1443,6 +1486,30 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
       data: { allowMutation: false, allowDestructive: false },
     });
   }
+
+  const attackPlan = planRounds.length
+    ? {
+        enabled: true,
+        model: planRounds.map((r) => r.model).find(Boolean) ?? null,
+        llmCalls: planRounds.filter((r) => r.asked).length,
+        probeCap,
+        rounds: planRounds.map((r) => ({
+          round: r.round,
+          asked: !!r.asked,
+          menuSize: r.menuSize,
+          coveredCount: r.coveredCount,
+          picks: r.picks ?? [],
+          ignored: r.ignored ?? [],
+          invalid: r.invalid ?? [],
+          fallback: r.fallback ?? null,
+          rejected: r.rejected ? String(r.rejected).slice(0, 200) : null,
+          durationMs: r.durationMs,
+          usage: r.usage ?? null,
+        })),
+        appliedPicks: planRounds.flatMap((r) => r.picks ?? []),
+        ignoredFields: [...new Set(planRounds.flatMap((r) => r.ignored ?? []))],
+      }
+    : null;
 
   const records = [...surface, ...probes];
   for (const rec of records) {
@@ -1479,6 +1546,7 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
   return {
     routes,
     maxRoutes: routeCap,
+    probeCap,
     openapiFound: !!openapiFound,
     openapiRouteCount: openapi.length,
     frontendRouteCount: frontend.routes.length,
@@ -1491,6 +1559,7 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
     reachable: rate.reachable,
     login: summary.login,
     coverage,
+    attackPlan,
     configuredMutation: !!options.allowMutation,
     configuredDestructive: !!options.allowDestructive,
   };

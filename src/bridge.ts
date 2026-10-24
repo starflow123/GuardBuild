@@ -62,6 +62,37 @@ export interface BlackboxFinding {
   curl: string;
 }
 
+export interface BlackboxPlanPick {
+  id: number;
+  method: string;
+  path: string;
+}
+
+export interface BlackboxAttackPlanRound {
+  round: number;
+  asked: boolean;
+  menuSize: number;
+  coveredCount: number;
+  picks: BlackboxPlanPick[];
+  ignored: string[];
+  invalid: (string | number)[];
+  fallback: string | null;
+  rejected: string | null;
+  durationMs?: number | null;
+  usage?: { prompt_tokens?: number; completion_tokens?: number; total_tokens?: number } | null;
+}
+
+/** 攻击规划代理（M2）：模型只挑路由编号，载荷与判据由引擎生成 */
+export interface BlackboxAttackPlan {
+  enabled: boolean;
+  model?: string | null;
+  llmCalls: number;
+  probeCap?: number | null;
+  rounds: BlackboxAttackPlanRound[];
+  appliedPicks: BlackboxPlanPick[];
+  ignoredFields: string[];
+}
+
 export interface BlackboxView {
   mode: string;
   url: string;
@@ -81,6 +112,9 @@ export interface BlackboxView {
   allowMutation?: boolean;
   allowDestructive?: boolean;
   coverage?: string[] | null;
+  attackPlan?: BlackboxAttackPlan | null;
+  probeCap?: number | null;
+  maxRoutes?: number | null;
   reachable?: boolean | null;
   outcome?: string | null;
   exitCode?: number | null;

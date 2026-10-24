@@ -262,7 +262,25 @@ function normalizeBlackbox(raw) {
     allowDestructive: raw.allowDestructive === true,
     loginPaths: loginPaths?.length ? loginPaths : null,
     maxRoutes: Number.isFinite(raw.maxRoutes) ? Math.min(200, Math.max(10, Math.floor(raw.maxRoutes))) : null,
+    // 攻击规划（M2）：true/false 或 {enabled, maxPicks, rounds}；缺省不写留给环境变量决定
+    attackPlan: normalizeAttackPlan(raw.attackPlan),
   };
+}
+
+function normalizeAttackPlan(raw) {
+  if (raw === true) return { enabled: true };
+  if (raw === false) return { enabled: false };
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const clamp = (v, lo, hi) => (Number.isFinite(v) ? Math.min(hi, Math.max(lo, Math.floor(v))) : null);
+  const out = {};
+  if (typeof raw.enabled === "boolean") out.enabled = raw.enabled;
+  const maxPicks = clamp(raw.maxPicks, 1, 16);
+  if (maxPicks) out.maxPicks = maxPicks;
+  const maxMenu = clamp(raw.maxMenu, 5, 40);
+  if (maxMenu) out.maxMenu = maxMenu;
+  const rounds = clamp(raw.rounds, 1, 2);
+  if (rounds) out.rounds = rounds;
+  return Object.keys(out).length ? out : null;
 }
 
 /** 纯黑盒模式：仅加载契约中的登录/身份信息（KB 级读取，不做源码分析/自动探测）。 */

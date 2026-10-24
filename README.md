@@ -65,7 +65,8 @@ npm run app:build      # 构建（--no-bundle）
 npm run host:headless  # 构建无头宿主（--no-default-features）
 npm run e2e            # 主工作流 E2E（36 断言，自动生成 .demo 演示目标；含写回冲突不半写入回归）
 npm run e2e:gate       # CI gate 演练（53 断言，7 轮裁决 + 报告产物）
-npm run e2e:blackbox   # 纯黑盒外部扫描演练（22 断言：漏洞/已修复/Cookie 会话/不可达）
+npm run e2e:blackbox   # 纯黑盒外部扫描演练（66 断言：漏洞/已修复/Cookie 会话/不可达/写探测分级）
+npm run e2e:attackplan # 攻击规划代理演练（40 断言，本机 mock DeepSeek：预算重排 + 只认编号 + gate 结构性禁用）
 npm run e2e:llm        # LLM 接入侦察演练（50 断言，本机 mock DeepSeek，含候选逐个启动、全灭回退与无密钥磁盘缓存复用）
 npm run e2e:llm-patch  # LLM 编码代理补丁演练（73 断言，本机 mock：守规矩 / 不守规矩 / 无密钥 / 先只读自查四轮）
 npm run e2e:fix-agent  # 本地修复循环演练（21 断言：首轮漏修 → 失败证据+运行日志回传 → 第二轮通过）
@@ -217,6 +218,8 @@ guardbuild-headless --url https://staging.example.com --project ./my-project --g
   - 两类判定都不看状态码：写类以「归属人复核字段值确实被改」为准，DELETE 以「归属人复读对象是否消失」为准；请求被接受但数据未动只记 `inconclusive`，既不记漏洞也不记「已防住」。匿名写入的 canary 由归属人复读证明落库，随后尽力匿名删除自清理。
 - 登录/身份来自 `guardbuild.json` 的 `login` / `identities`；可加 `blackbox.loginPaths` 补充登录端点候选。表单登录（`login.encoding: "form"`）与 Cookie 会话（`login.cookieAuth: true`，兼容 302 + `Set-Cookie`）同样适用于黑盒模式。
 - `blackbox.maxRoutes`（10–200，缺省 60）控制 OpenAPI/目录探测合并后的路由上限；每类攻击的探测候选默认最多 14 条，调低 `maxRoutes` 时同步收紧。注入/穿越各有独立请求预算（字符串 140 / 数字 70 / 穿越 120），预算用尽在报告里明说而不是静默漏跑。
+- **攻击规划代理（M2，默认关闭）**：路由数超过每类探测预算时才启用，把「谁先进预算」交给模型。开关为 `blackbox.attackPlan: true`（或对象形式 `{enabled, maxPicks, rounds}`，`rounds` 1–2、`maxPicks` 1–16）或环境变量 `GUARDBUILD_LLM_ATTACKPLAN=1`；**gate/CI 结构性禁用**，只能在交互模式用。硬边界：模型只能从引擎给出的「预算外 GET 路由菜单」里挑编号，不能指定 URL/方法/参数/载荷/请求头（出现即丢弃，只在审计里留字段名）；第二轮只回灌上轮的「路由 + 用例 + 裁决」压缩视图，不回传响应体；模型原文不入视图、事件与报告；漏洞判定仍只由实跑证据给出。
+- 回归：`npm run e2e:attackplan`（40 断言 / 6 轮：默认关闭时诚实漏报、开启后把预算外的 `/api/contracts` 与 `/api/audit` 提进队列并复现 IDOR + SQLi、`rounds=1` 归因、走私字段丢弃、非法编号回退、gate 下零调用零事件），靶场为 `fixtures/queue-shop`。
 - 桌面端入口：左侧「黑盒外部目标」面板填写已运行目标 URL、选择契约目录后点击「扫描外部目标」；白盒启动流程不受影响。
 - 裁决：发现可复现漏洞 → `completed` + `vulnerable_unfixed`，exit 1；无可复现漏洞 → `completed` + `no_findings`，exit 0；目标不可达/执行错误 → `failed`，exit 2（不可达会在一次短超时预检后立即失败，不做整轮探测）。
 - 报告：`report.json` / `report.md` 为黑盒版式，含路由发现、登录结果、证据级别与复现 curl；证据中令牌一律为 `***vault:<identity>***` 占位。

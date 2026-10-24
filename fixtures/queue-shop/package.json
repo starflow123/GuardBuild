@@ -1,0 +1,10 @@
+{
+  "name": "queue-shop",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "QueueShop - 攻击规划靶场（高价值路由排在探测预算之外：合同越权 / 审计日志注入）",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

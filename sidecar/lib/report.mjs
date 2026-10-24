@@ -56,6 +56,15 @@ const ATTRIBUTION_LABELS = {
   not_reproduced: "修复前未复现",
 };
 
+/** 补丁落盘状态的中文措辞（view.patch.status） */
+const PATCH_STATUS_LABELS = {
+  pending_review: "待人工审查（隔离 worktree，未写回）",
+  written_back: "已写回真实工作区",
+  writeback_recheck_failed: "已写回真实工作区，但写回后复核未通过",
+  writeback_recheck_incomplete: "已写回真实工作区，但写回后复核未完成",
+  rolled_back: "已回滚（工作区恢复写回前）",
+};
+
 function headline(outcome, patchStatus, supabase, blackbox = null) {
   if (blackbox) {
     if (outcome === "vulnerable_unfixed") {
@@ -70,9 +79,22 @@ function headline(outcome, patchStatus, supabase, blackbox = null) {
   const supaCritical = supabase && ((supabase.leaks ?? 0) > 0 || supabase.serviceRoleLeak);
   switch (outcome) {
     case "vulnerable":
-      return patchStatus === "verify_failed"
-        ? "发现可利用的对象级越权（IDOR）漏洞；修复补丁未通过双重验收，需人工审查证据"
-        : "发现可利用的对象级越权（IDOR）漏洞，已生成双重验收通过的修复补丁（gate 未写回工作区）";
+      if (patchStatus === "verify_failed") {
+        return "发现可利用的对象级越权（IDOR）漏洞；修复补丁未通过双重验收，需人工审查证据";
+      }
+      if (patchStatus === "written_back") {
+        return "发现可利用的对象级越权（IDOR）漏洞；修复补丁已写回真实工作区，写回后复攻通过";
+      }
+      if (patchStatus === "writeback_recheck_failed") {
+        return "发现可利用的对象级越权（IDOR）漏洞；修复补丁已写回真实工作区，但写回后复攻未通过，建议回滚";
+      }
+      if (patchStatus === "writeback_recheck_incomplete") {
+        return "发现可利用的对象级越权（IDOR）漏洞；修复补丁已写回真实工作区，但写回后复攻未能完成，需人工复测";
+      }
+      if (patchStatus === "rolled_back") {
+        return "发现可利用的对象级越权（IDOR）漏洞；修复补丁曾写回真实工作区，现已回滚，工作区恢复原状";
+      }
+      return "发现可利用的对象级越权（IDOR）漏洞，已生成双重验收通过的修复补丁（gate 未写回工作区）";
     case "no_candidates":
       return "未命中当前覆盖范围（exit 0，非执行失败）：静态分析未发现可探测的安全候选端点。项目形态不在适配器覆盖内时属正常结果；未识别框架可在 guardbuild.json 用 routes / openapi.file 声明路由，或开启 llm.enabled 做接入侦察";
     case "vulnerable_unfixed":
@@ -149,7 +171,33 @@ function suggestions(r) {
     }
     return lines.join("\n");
   }
-  if (outcome === "vulnerable" && patchStatus === "verified") {
+  if (outcome === "vulnerable" && patchStatus === "written_back") {
+    const re = r.acceptance?.writebackRecheck;
+    const backup = r.rollback?.backupId;
+    lines.push(
+      `- 补丁已写回真实工作区并通过写回后复攻${
+        re ? `（攻击阻断 ${re.attackBlocked}/${re.attackTotal}，业务保持 ${re.businessPassed}/${re.businessTotal}）` : ""
+      }。`
+    );
+    lines.push("- 写回只改工作区文件、不自动提交：请用 `git diff` 审查后按你的发布流程提交。");
+    if (backup) lines.push(`- 写回前原文件已备份（backupId \`${backup}\`），如需撤销可在会话中点「回滚写回」。`);
+  } else if (outcome === "vulnerable" && patchStatus === "writeback_recheck_failed") {
+    const re = r.acceptance?.writebackRecheck;
+    lines.push(
+      `- 写回后复攻未通过：真实工作区状态与隔离验收不一致${
+        re ? `（攻击阻断 ${re.attackBlocked}/${re.attackTotal}，业务保持 ${re.businessPassed}/${re.businessTotal}）` : ""
+      }。`
+    );
+    lines.push("- 建议立即执行「回滚写回」恢复原文件，再回到隔离副本排查差异（环境变量、构建产物、运行配置等）。");
+    if (r.rollback?.backupId) lines.push(`- 回滚备份：\`${r.rollback.backupId}\`。`);
+  } else if (outcome === "vulnerable" && patchStatus === "writeback_recheck_incomplete") {
+    lines.push("- 补丁已写回，但写回后复攻未能完成（目标未启动或探测异常），当前工作区状态未经实测确认。");
+    lines.push("- 请手动重启项目并复测；如结果不符合预期可执行「回滚写回」。");
+    if (r.rollback?.backupId) lines.push(`- 回滚备份：\`${r.rollback.backupId}\`。`);
+  } else if (outcome === "vulnerable" && patchStatus === "rolled_back") {
+    lines.push("- 补丁已回滚：真实工作区恢复到写回前状态，漏洞仍然存在。");
+    lines.push("- 请基于 post 证据调整修复方案后重跑；原文件备份仍保留在数据目录。");
+  } else if (outcome === "vulnerable" && patchStatus === "verified") {
     lines.push(`- 隔离 worktree 中已存在通过双重验收的修复补丁（\`${r.patch?.hash?.slice(0, 12)}…\`），gate 未写回原工作区。`);
     lines.push(`- 补丁位置：\`${r.patch?.worktree}\`；可将修改应用到工作区后提交。`);
     lines.push("- 修复落地后重跑 GuardBuild gate，应得到 exit 0（no_candidates / not_reproducible）。");
@@ -213,6 +261,40 @@ function evidenceTable(rows) {
     .join("\n");
   const rest = rows.length > shown.length ? `\n\n_其余 ${rows.length - shown.length} 条见 report.json。_\n` : "\n";
   return `${head}\n${body}\n${rest}`;
+}
+
+/** 逐候选归因：总体计数变好不算修复，只有候选自身的用例翻转才计入 */
+function renderAttributionSection(at) {
+  if (!at || (!at.claimedCount && !at.rows?.length)) return null;
+  const lines = [
+    `**逐候选归因**：补丁点名 ${at.claimedCount} 个入口，其中 ${at.blockedCount} 个完成了自己的「修复前打穿 → 修复后阻断」翻转${
+      at.unverifiedCount ? `；${at.unverifiedCount} 个归因不成立` : ""
+    }${
+      at.stillVulnerableCount ? `；${at.stillVulnerableCount} 个修复后仍可越权` : ""
+    }。总体计数变好不算修复——只有该候选自身的用例翻转才计入「已修复」。`,
+    "",
+  ];
+  const rows = (at.rows ?? []).filter((x) => x.claimed);
+  if (rows.length) {
+    lines.push(
+      `| 补丁点名的入口 | 修复前复现用例 | 修复后判定 | 源码位置 | 补丁命中 | 结论 |`,
+      `| --- | --- | --- | --- | --- | --- |`,
+      ...rows.map(
+        (x) =>
+          `| \`${esc(x.candidate)}\` | ${x.preReproCases} | ${x.postCases}/${x.preReproCases} 阻断 | ${
+            x.file ? `\`${esc(x.file)}${Number.isFinite(x.line) ? `:${x.line}` : ""}\`` : "—"
+          } | ${
+            x.locality === "same_file"
+              ? `同文件 ${x.hunksInFile} 处${Number.isFinite(x.hunkDistance) ? `（距漏洞行 ${x.hunkDistance}）` : ""}`
+              : x.locality === "other_file"
+                ? "改动未落在该文件"
+                : "—"
+          } | ${ATTRIBUTION_LABELS[x.status] ?? x.status}${x.reason ? `：${esc(x.reason)}` : ""} |`
+      ),
+      ""
+    );
+  }
+  return lines.join("\n");
 }
 
 function renderLlmSection(llm) {
@@ -614,13 +696,21 @@ function renderMarkdown(r) {
         }`
       );
     }
+    const re = acc.writebackRecheck;
+    if (re) {
+      summaryLines.push(
+        `- 写回后复核（真实工作区）：攻击阻断 ${re.attackBlocked ?? 0}/${re.attackTotal ?? 0}，业务保持 ${re.businessPassed ?? 0}/${re.businessTotal ?? 0} → ${
+          re.pass ? "通过" : "未通过"
+        }`
+      );
+    }
   }
   if (r.patch) {
     const llmBits = r.patch.llm
       ? `；LLM 编码代理采纳 ${r.patch.llm.appliedOps} 处、拒绝 ${r.patch.llm.rejected?.length ?? 0} 条`
       : "";
     summaryLines.push(
-      `- 补丁：\`${r.patch.hash?.slice(0, 12)}…\`（${r.patch.files?.length ?? 0} 个文件，${esc(r.patch.status)}；策略 ${esc(r.patch.strategy ?? "—")}${llmBits}）`
+      `- 补丁：\`${r.patch.hash?.slice(0, 12)}…\`（${r.patch.files?.length ?? 0} 个文件，${esc(PATCH_STATUS_LABELS[r.patch.status] ?? r.patch.status)}；策略 ${esc(r.patch.strategy ?? "—")}${llmBits}）`
     );
     if (r.patch.fixLoop?.rounds?.length) {
       summaryLines.push(
@@ -725,7 +815,7 @@ function renderMarkdown(r) {
         `- 文件：${fileDesc || "—"}`,
         ...renderScopeLines(r.patch.scope),
         `- 隔离位置：\`${esc(r.patch.worktree)}\``,
-        `- 状态：${esc(r.patch.status)}（${r.patch.lineCount ?? 0} 行改动）`,
+        `- 状态：${esc(PATCH_STATUS_LABELS[r.patch.status] ?? r.patch.status)}（${r.patch.lineCount ?? 0} 行改动）`,
         ...(r.patch.fixLoop?.rounds?.length
           ? [
               `- 修复循环：共 ${r.patch.fixLoop.attempts} 轮（重试上限 ${r.patch.fixLoop.maxRounds}；${
@@ -773,38 +863,57 @@ function renderMarkdown(r) {
         }。正向断言：本人读取仍返回完整对象且字段不少于修复前基线，防止用「整端点拒绝」或「删字段」冒充修复。\n`
       );
     }
-    const at = acc.attribution;
-    if (at && (at.claimedCount || at.rows?.length)) {
-      parts.push(
-        `**逐候选归因**：补丁点名 ${at.claimedCount} 个入口，其中 ${at.blockedCount} 个完成了自己的「修复前打穿 → 修复后阻断」翻转${
-          at.unverifiedCount ? `；${at.unverifiedCount} 个归因不成立` : ""
-        }${at.stillVulnerableCount ? `；${at.stillVulnerableCount} 个修复后仍可越权` : ""}。总体计数变好不算修复——只有该候选自身的用例翻转才计入「已修复」。\n`
-      );
-      const rows = (at.rows ?? []).filter((x) => x.claimed);
-      if (rows.length) {
-        parts.push(
-          `| 补丁点名的入口 | 修复前复现用例 | 修复后判定 | 源码位置 | 补丁命中 | 结论 |\n| --- | --- | --- | --- | --- | --- |\n` +
-            rows
-              .map((x) =>
-                `| \`${esc(x.candidate)}\` | ${x.preReproCases} | ${x.postCases}/${x.preReproCases} 阻断 | ${
-                  x.file ? `\`${esc(x.file)}${Number.isFinite(x.line) ? `:${x.line}` : ""}\`` : "—"
-                } | ${
-                  x.locality === "same_file"
-                    ? `同文件 ${x.hunksInFile} 处${Number.isFinite(x.hunkDistance) ? `（距漏洞行 ${x.hunkDistance}）` : ""}`
-                    : x.locality === "other_file"
-                      ? "改动未落在该文件"
-                      : "—"
-                } | ${ATTRIBUTION_LABELS[x.status] ?? x.status}${x.reason ? `：${esc(x.reason)}` : ""} |`
-              )
-              .join("\n") +
-            "\n"
-        );
-      }
-    }
+    const attributionMd = renderAttributionSection(acc.attribution);
+    if (attributionMd) parts.push(attributionMd);
     parts.push(evidenceTable(post));
   } else if (post.length) {
     parts.push(`## 修复后证据（post，${post.length} 条）\n`);
     parts.push(evidenceTable(post));
+  }
+
+  const recheck = acc?.writebackRecheck ?? null;
+  const postWriteback = r.evidence.postWriteback ?? [];
+  if (recheck) {
+    parts.push(`## 写回后复核（真实工作区）\n`);
+    parts.push(
+      `攻击阻断 ${recheck.attackBlocked ?? 0}/${recheck.attackTotal ?? 0}，业务保持 ${recheck.businessPassed ?? 0}/${recheck.businessTotal ?? 0} → **${
+        recheck.pass ? "通过" : "未通过"
+      }**${recheck.at ? `（复核时间 ${fmtTime(recheck.at)}）` : ""}\n`
+    );
+    parts.push(
+      "隔离 worktree 的验收只代表补丁本身；这一节把同一组攻击与业务用例重新打到**实际工作区**启动的实例上，两者一致才算修复真正落地。\n"
+    );
+    const recheckAttribution = renderAttributionSection(recheck.attribution);
+    if (recheckAttribution) parts.push(recheckAttribution);
+    parts.push(`### 写回后证据（post_writeback，${postWriteback.length} 条）\n`);
+    parts.push(evidenceTable(postWriteback));
+  } else if (postWriteback.length) {
+    parts.push(`## 写回后证据（post_writeback，${postWriteback.length} 条）\n`);
+    parts.push(evidenceTable(postWriteback));
+  }
+
+  const wbStatus = r.patch?.status;
+  const writtenBackStatuses = new Set(["written_back", "writeback_recheck_failed", "writeback_recheck_incomplete", "rolled_back"]);
+  if (writtenBackStatuses.has(wbStatus)) {
+    const backup = r.rollback?.backupId ?? null;
+    const backupFiles = r.rollback?.files ?? [];
+    parts.push(`## 写回与回滚\n`);
+    parts.push(
+      [
+        `- 写回状态：${PATCH_STATUS_LABELS[wbStatus] ?? wbStatus}`,
+        ...(backup ? [`- 回滚备份：\`${esc(backup)}\`${backupFiles.length ? `（${backupFiles.map((f) => `\`${esc(f)}\``).join("、")}）` : ""}`] : []),
+        ...(wbStatus === "rolled_back" && r.rollback?.restored?.length
+          ? [`- 已恢复文件：${r.rollback.restored.map((f) => `\`${esc(f)}\``).join("、")}`]
+          : []),
+        ...(wbStatus === "rolled_back" && r.rollback?.conflicts?.length
+          ? [`- 回滚冲突（写回后文件又被改过，未覆盖）：${r.rollback.conflicts.map((f) => `\`${esc(f)}\``).join("、")}`]
+          : []),
+        wbStatus === "rolled_back"
+          ? "- 回滚已把工作区文件恢复到写回前状态（内容有变动的文件不会被覆盖，会作为冲突上报）；漏洞仍然存在，需重新修复。"
+          : "- 写回只改工作区文件、不自动提交：请用 `git diff` 审查后按发布流程提交；如需撤销，在会话中点「回滚写回」。",
+        "",
+      ].join("\n")
+    );
   }
 
   parts.push(`## 结论与建议\n\n${suggestions(r)}\n`);
@@ -960,6 +1069,7 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
       : null,
     acceptance: view.acceptance ?? null,
     targets: view.targets ?? {},
+    rollback: view.rollback ?? null,
     error,
   };
   r.summary.fixBriefs = buildFixBriefs(r);

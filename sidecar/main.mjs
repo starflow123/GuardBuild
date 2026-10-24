@@ -1893,6 +1893,7 @@ async function recheckAfterWriteback(ctx) {
     recordAcceptanceRows(ctx, "post_writeback", re.evidence);
     const verdict = acceptanceVerdictWithAttribution(ctx, re.summary, re.evidence);
     ctx.view.acceptance = { ...ctx.view.acceptance, writebackRecheck: { ...verdict, phase: "post_writeback", at: Date.now() } };
+    if (ctx.view.patch) ctx.view.patch.status = verdict.pass ? "written_back" : "writeback_recheck_failed";
     pushView(ctx);
     emit(ctx, {
       kind: "verify",
@@ -1903,13 +1904,27 @@ async function recheckAfterWriteback(ctx) {
       phase: "post_writeback",
       data: verdict,
     });
+    // 报告快照要跟上终态：否则 artifact 永远停在「等待写回」，看不到真实工作区的复核结果
+    await emitReport(ctx, {
+      outcome: "vulnerable",
+      patchStatus: verdict.pass ? "written_back" : "writeback_recheck_failed",
+      exitCode: 1,
+      state: STATE.APPLIED,
+    });
   } catch (e) {
+    if (ctx.view.patch) ctx.view.patch.status = "writeback_recheck_incomplete";
     emit(ctx, {
       kind: "verify",
       severity: SEVERITY.WARN,
       message: `写回后复核未能完成：${e.message}`,
       phase: "post_writeback",
       data: { code: e.code ?? null },
+    });
+    await emitReport(ctx, {
+      outcome: "vulnerable",
+      patchStatus: "writeback_recheck_incomplete",
+      exitCode: 1,
+      state: STATE.APPLIED,
     });
   } finally {
     await shutdownProcs(ctx);
@@ -2377,6 +2392,8 @@ peer.onRequest(RPC_TO_SIDECAR.WRITEBACK_APPROVED, async ({ token, patchHash } = 
       diff: ctx.view.patch?.diff,
     });
     if (ctx.view.patch) ctx.view.patch.status = "written_back";
+    // Host 只在对外视图中注入回滚信息，sidecar 自己也要留一份，报告才能写上 backupId
+    ctx.view.rollback = { available: true, backupId: res.backupId, files: res.files ?? [] };
     await removeWorktree(ctx);
     setState(ctx, STATE.APPLIED);
     emit(ctx, {
@@ -2402,6 +2419,13 @@ peer.onRequest(RPC_TO_SIDECAR.ROLLBACK_APPROVED, async ({ token, backupId } = {}
   try {
     const res = await rollbackWorkspace(ctx, { token, backupId });
     if (ctx.view.patch) ctx.view.patch.status = "rolled_back";
+    ctx.view.rollback = {
+      ...(ctx.view.rollback ?? {}),
+      available: false,
+      backupId,
+      restored: res.restored ?? [],
+      conflicts: res.conflicts ?? [],
+    };
     await removeWorktree(ctx);
     setState(ctx, STATE.ROLLED_BACK);
     emit(ctx, {
@@ -2410,6 +2434,13 @@ peer.onRequest(RPC_TO_SIDECAR.ROLLBACK_APPROVED, async ({ token, backupId } = {}
       message: `已回滚 ${(res.restored ?? []).length} 个文件${(res.conflicts ?? []).length > 0 ? `（${res.conflicts.length} 个文件存在冲突，未覆盖）` : ""}`,
       phase: STATE.ROLLED_BACK,
       data: res,
+    });
+    // 回滚也是终态：报告要如实反映「补丁已撤销」，不能停留在 written_back
+    await emitReport(ctx, {
+      outcome: "vulnerable",
+      patchStatus: "rolled_back",
+      exitCode: 1,
+      state: STATE.ROLLED_BACK,
     });
     await shutdownProcs(ctx);
     endSession(ctx);

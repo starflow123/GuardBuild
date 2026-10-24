@@ -24,6 +24,7 @@ const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."
 const demoDir = path.join(repoRoot, ".demo");
 const workspace = path.join(demoDir, "vibeshop");
 const dataDir = path.join(demoDir, "data");
+const reportDir = path.join(demoDir, "reports");
 
 /** 无头宿主可执行文件：GUARDBUILD_HEADLESS_BIN > target/debug > target/release（跨平台） */
 function resolveHeadlessBin() {
@@ -77,7 +78,7 @@ if (!existsSync(exe)) await fail(`未找到无头宿主可执行文件: ${exe}�
 
 // ---------- 2. 启动无头宿主 ----------
 console.log("\n[E2E] 2/6 启动无头宿主与 Sidecar…");
-const child = spawn(exe, [], {
+const child = spawn(exe, ["--report", reportDir], {
   cwd: repoRoot,
   env: {
     ...process.env,
@@ -160,6 +161,25 @@ function waitFor(viewPredicate, label, timeoutMs = 180_000) {
 }
 const waitState = (state, timeoutMs) => waitFor((v) => v.state === state, `状态 ${state}`, timeoutMs);
 
+/** 等报告刷新到指定终态：写回后复核/回滚都会重发 report.json，这里按内容判定而不是 mtime */
+async function waitReport(predicate, label, timeoutMs = 30_000) {
+  const file = path.join(reportDir, "report.json");
+  const deadline = Date.now() + timeoutMs;
+  let last = null;
+  while (Date.now() < deadline) {
+    if (existsSync(file)) {
+      try {
+        last = JSON.parse(readFileSync(file, "utf8"));
+      } catch {
+        /* 宿主正在写，稍后重试 */
+      }
+      if (last && predicate(last)) return last;
+    }
+    await new Promise((r) => setTimeout(r, 250));
+  }
+  throw new Error(`等待报告「${label}」超时（当前 patchStatus=${last?.verdict?.patchStatus ?? "未生成"}）`);
+}
+
 const workspaceAppJs = path.join(workspace, "src", "app.js");
 const LOCAL_MARK = "本地未提交改动";
 
@@ -231,6 +251,32 @@ try {
   );
   check("写回授权已绑定补丁哈希", view.writebackAuthorized === true && view.tokens?.some((t) => (t.kinds ?? t.scopes ?? []).includes("workspace.write")));
 
+  // ---------- 报告快照必须跟上写回终态 ----------
+  console.log("\n[E2E] 校验 report.json / report.md 写回终态…");
+  const wbReport = await waitReport((r) => r.verdict?.patchStatus === "written_back", "写回后报告");
+  const wbMarkdown = readFileSync(path.join(reportDir, "report.md"), "utf8");
+  check(
+    "report.json 跟上写回终态（不再停在等待写回）",
+    wbReport.session?.state === "applied" && wbReport.patch?.status === "written_back",
+    `state=${wbReport.session?.state} patchStatus=${wbReport.verdict?.patchStatus}`
+  );
+  check(
+    "report.json 含写回后复核结论",
+    wbReport.summary?.acceptance?.writebackRecheck?.pass === true,
+    `recheck=${JSON.stringify(wbReport.summary?.acceptance?.writebackRecheck?.pass)}`
+  );
+  check(
+    "report.json 含 post_writeback 证据",
+    (wbReport.summary?.evidence?.postWriteback ?? 0) > 0,
+    `postWriteback=${wbReport.summary?.evidence?.postWriteback}`
+  );
+  check("report.json 含回滚备份信息", !!wbReport.rollback?.backupId, `backupId=${wbReport.rollback?.backupId}`);
+  check(
+    "report.md 渲染写回后复核段",
+    wbMarkdown.includes("写回后复核（真实工作区）") && wbMarkdown.includes("写回后证据（post_writeback"),
+    ""
+  );
+
   // ---------- SQLite 留痕校验（回滚前读取） ----------
   console.log("\n[E2E] 6/6 校验 SQLite 证据库与回滚…");
   const dbPath = path.join(dataDir, "guardbuild.db");
@@ -260,6 +306,16 @@ try {
   const wsRolled = readFileSync(workspaceAppJs, "utf8");
   check("回滚后修复已撤销", wsRolled.includes('checks: ["authenticated"], decision: "no-check"'));
   check("回滚后本地改动仍在", wsRolled.includes(LOCAL_MARK));
+
+  const rolledReport = await waitReport((r) => r.verdict?.patchStatus === "rolled_back", "回滚后报告");
+  const rolledMarkdown = readFileSync(path.join(reportDir, "report.md"), "utf8");
+  check(
+    "report.json 跟上回滚终态",
+    rolledReport.patch?.status === "rolled_back" && rolledReport.session?.state === "rolled_back",
+    `state=${rolledReport.session?.state} patchStatus=${rolledReport.verdict?.patchStatus}`
+  );
+  check("回滚后报告标题如实说明补丁已撤销", /现已回滚/.test(rolledReport.verdict?.headline ?? ""), rolledReport.verdict?.headline);
+  check("report.md 标注已回滚", rolledMarkdown.includes("已回滚（工作区恢复写回前）"), "");
 
   // ---------- 7/6 回归：终态会话槽位释放（曾因残留会话卡在 starting） ----------
   console.log("\n[E2E] 回归：会话结束后可立即开启新会话…");

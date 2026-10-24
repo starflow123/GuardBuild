@@ -98,9 +98,11 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
   const sqliCandidates = topK((c) => c.kind === "sqli-suspect");
   const cmdiCandidates = topK((c) => c.kind === "cmdi-suspect");
   const ssrfCandidates = topK((c) => c.kind === "ssrf-suspect");
+  const uploadCandidates = topK((c) => c.kind === "upload-suspect");
   const sqliCandidate = sqliCandidates[0] ?? null;
   const cmdiCandidate = cmdiCandidates[0] ?? null;
   const ssrfCandidate = ssrfCandidates[0] ?? null;
+  const uploadCandidate = uploadCandidates[0] ?? null;
 
   const resource =
     readCandidate?.resource ??
@@ -110,6 +112,7 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
     sqliCandidate?.resource ??
     cmdiCandidate?.resource ??
     ssrfCandidate?.resource ??
+    uploadCandidate?.resource ??
     "resource";
 
   // 列表/管理端点优先选择与资源名匹配的路径（避免把别的资源列表当作探测目标）
@@ -168,6 +171,7 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
     sqliCandidate,
     cmdiCandidate,
     ssrfCandidate,
+    uploadCandidate,
     readCandidates,
     cancelCandidates,
     unauthReadCandidates,
@@ -175,6 +179,7 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
     sqliCandidates,
     cmdiCandidates,
     ssrfCandidates,
+    uploadCandidates,
     listEndpoint: epSlot(list),
     adminListEndpoint: epSlot(adminList),
     adminCancelEndpoint: epSlot(adminCancel),

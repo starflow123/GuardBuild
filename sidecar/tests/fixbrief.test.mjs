@@ -13,6 +13,7 @@ test("detectFamily: 静态 kind 与黑盒用例名都映射到正确家族", () 
   assert.equal(detectFamily({ kind: "cmdi-suspect" }), "cmdi");
   assert.equal(detectFamily({ kind: "traversal-suspect" }), "traversal");
   assert.equal(detectFamily({ kind: "ssrf-suspect" }), "ssrf");
+  assert.equal(detectFamily({ kind: "upload-suspect" }), "upload");
   assert.equal(detectFamily({ kind: "idor-suspect" }), "idor");
   assert.equal(detectFamily({ kind: "no-auth-suspect" }), "unauth");
   assert.equal(detectFamily({ kind: "supabase-table" }), "supabase_rls");
@@ -29,6 +30,7 @@ test("detectFamily: 静态 kind 与黑盒用例名都映射到正确家族", () 
   assert.equal(detectFamily({ type: "黑盒·SQL 注入（错误回显）/api/items 参数 id" }), "sqli");
   assert.equal(detectFamily({ type: "黑盒·路径穿越 /download" }), "traversal");
   assert.equal(detectFamily({ type: "黑盒·SSRF /api/preview" }), "ssrf");
+  assert.equal(detectFamily({ type: "黑盒·文件上传（主动内容）/api/avatar" }), "upload");
   assert.equal(detectFamily({ type: "黑盒·敏感文件暴露 /.env" }), "sensitive_file");
   assert.equal(detectFamily({ type: "黑盒·管理/调试面暴露 /actuator/env" }), "debug_surface");
   assert.equal(detectFamily({ type: "未知问题" }), "generic");

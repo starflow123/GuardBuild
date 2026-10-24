@@ -312,6 +312,7 @@ export interface View {
     sqliPath?: string | null;
     cmdiPath?: string | null;
     ssrfPath?: string | null;
+    uploadPath?: string | null;
     listPath: string | null;
   };
   evidence?: EvidenceItem[];

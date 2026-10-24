@@ -98,6 +98,15 @@
       ]
     },
     {
+      "id": "upload-shop",
+      "fixture": "fixtures/upload-shop",
+      "expectedExit": 1,
+      "expectedVulnerableCases": ["attack-upload"],
+      "expectedStatic": [
+        { "kind": "upload-suspect", "method": "POST", "path": "/api/avatar" }
+      ]
+    },
+    {
       "id": "clean-shop",
       "fixture": "fixtures/clean-shop",
       "expectedExit": 0,

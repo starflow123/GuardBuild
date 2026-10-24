@@ -7,6 +7,7 @@ const FAMILY_BY_KIND = {
   "sqli-suspect": "sqli",
   "cmdi-suspect": "cmdi",
   "ssrf-suspect": "ssrf",
+  "upload-suspect": "upload",
   "traversal-suspect": "traversal",
   "idor-suspect": "idor",
   "no-auth-suspect": "unauth",
@@ -18,6 +19,7 @@ export const KIND_LABELS = {
   "sqli-suspect": "SQL 注入静态线索",
   "cmdi-suspect": "命令注入静态线索",
   "ssrf-suspect": "SSRF 静态线索",
+  "upload-suspect": "文件上传静态线索",
   "traversal-suspect": "路径穿越静态线索",
   "idor-suspect": "对象级越权（IDOR）静态线索",
   "no-auth-suspect": "无鉴权静态线索",
@@ -65,6 +67,16 @@ const TEMPLATES = {
       "是否允许用户控制重定向目标，或通过 DNS 重绑定/十进制 IP/短链绕过主机校验。",
     ],
     fix: "对目标 URL 做解析后校验：协议白名单（仅 http/https）+ 主机白名单/公网地址校验，拒绝环回、私有网段与链路本地地址；禁止或逐跳校验重定向；必要时经固定出口代理发起请求；补内网回连回归测试。",
+  },
+  upload: {
+    label: "文件上传",
+    risk: "上传接口接受 HTML/SVG 等主动内容，并以可渲染类型同源回读，攻击者可构造存储型 XSS、钓鱼页面或恶意下载（本轮已上传仅含令牌的文件并回读复现）。",
+    inspect: [
+      "是否校验扩展名与 MIME，并进一步校验文件魔数/内容（不能只看客户端 Content-Type）。",
+      "存储文件名是否重写（随机名 + 固定安全扩展名），是否阻止 `../` 与控制字符。",
+      "上传目录是否位于可执行/可渲染的 Web 根目录；响应是否带 `Content-Disposition: attachment` 与 `X-Content-Type-Options: nosniff`。",
+    ],
+    fix: "采用扩展名 + MIME + 魔数三重白名单，只允许业务需要的类型；用随机文件名和固定扩展名落盘；上传目录禁止脚本执行，回读时强制 `Content-Disposition: attachment` 与 `X-Content-Type-Options: nosniff`；补主动内容上传应被拒绝的回归测试。",
   },
   idor: {
     label: "对象级越权（IDOR）",
@@ -143,6 +155,7 @@ export function detectFamily(finding) {
   if (/SQL\s*注入/i.test(text)) return "sqli";
   if (/命令注入|command\s*injection/i.test(text)) return "cmdi";
   if (/SSRF|服务端请求伪造|server[-\s]*side\s*request\s*forgery/i.test(text)) return "ssrf";
+  if (/文件上传|任意文件|主动内容|unrestricted\s*file\s*upload/i.test(text)) return "upload";
   if (/穿越|traversal/i.test(text)) return "traversal";
   if (/RLS|Supabase|行级安全/i.test(text)) return "supabase_rls";
   // 「未认证」优先于「归属」：未认证读取的详情常附带归属类敏感字段说明

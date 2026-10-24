@@ -1,0 +1,21 @@
+{
+  "_note": "文件上传靶场：POST /api/avatar 接受任意文件并按原始类型同源回读；设置 GB_UPLOAD_HARDENED=1 后只允许 PNG/JPEG 并以附件回读（用于验证 exit 0）。",
+  "start": {
+    "cmd": "node",
+    "args": ["server.js"],
+    "env": { "PORT": "0" },
+    "readyPattern": "已就绪",
+    "readyTimeoutMs": 20000
+  },
+  "login": {
+    "path": "/api/login",
+    "bodyTemplate": { "username": "{username}", "password": "{password}" },
+    "credentialPath": "token"
+  },
+  "identities": [
+    { "name": "alice", "username": "alice", "password": "alice123", "role": "user" },
+    { "name": "bob", "username": "bob", "password": "bob123", "role": "user" }
+  ],
+  "llm": { "enabled": false },
+  "scopes": ["project.read", "worktree.write", "proc.spawn", "net.probe"]
+}

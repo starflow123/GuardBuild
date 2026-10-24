@@ -66,6 +66,21 @@ export const XSS_REFLECTION =
 export const SSRF_SINK =
   /\b(?:fetch|axios(?:\s*\.\s*(?:get|post|put|patch|head|delete|request))?|got(?:\s*\.\s*(?:get|post|put|patch|head|delete))?|ky(?:\s*\.\s*(?:get|post|put|patch|head|delete))?|needle(?:\s*\.\s*(?:get|post|put|patch|head|delete))?|superagent(?:\s*\.\s*(?:get|post|put|patch|head|delete))?|undici\s*\.\s*request|(?:http|https)\s*\.\s*(?:get|request)|request)\s*\(|\b(?:requests|httpx)\s*\.\s*(?:get|post|put|patch|head|delete|request|stream)\s*\(|\burllib\d?\s*\.\s*request\s*\.\s*urlopen\s*\(|\burlopen\s*\(|\baiohttp\s*\.\s*ClientSession\s*\(/;
 
+// —— 文件上传线索：服务端接收 multipart/form-data 的上传入口 ——
+// 覆盖 Express(multer/express-fileupload/formidable/busboy)、Fastify multipart、
+// NestJS FileInterceptor、Next.js request.formData()、Python UploadFile/Django request.FILES。
+export const UPLOAD_SINK =
+  /(?:\bmulter\s*\(|\.\s*(?:single|array|fields)\s*\(\s*["'`]|express-fileupload|\bformidable\b|\bbusboy\b|@fastify\/multipart|@UploadedFiles?\b|FileInterceptor\s*\(|FilesInterceptor\s*\(|UploadFile\b|request\s*\.\s*(?:files|FILES)\b|req\s*\.\s*files\b|(?:req|request)\s*\.\s*formData\s*\(\s*\))/;
+
+// 上传侧防护信号（存在不等于有效，动态复现负责给出真结论）
+const UPLOAD_VALIDATION = [
+  { name: "文件过滤（fileFilter）", re: /\bfileFilter\s*(?:[:=]|[,}])/ },
+  { name: "MIME / 内容类型校验", re: /\bmimetype\b|\bcontent[-_]?type\b|\bcontent_type\b/i },
+  { name: "扩展名白名单", re: /\bextname\s*\(|\.\s*(?:ext|extension)\b|allowed(?:Types|Extensions)|\/\\?\.\((?:png|jpe?g|gif|webp|svg)|\.(?:png|jpe?g|gif|webp)\b/i },
+  { name: "安全文件名", re: /\bbasename\s*\(|secure_filename|randomUUID|nanoid/ },
+  { name: "大小限制", re: /\blimits\b|maxFileSize|max_file_size/i },
+];
+
 // 现代框架的查询串读取：searchParams.get("x")（Next.js req.nextUrl / URL 解析形态）
 export const SP_GET = /\bsearchParams\s*\.\s*get\s*\(\s*["'`]([^"'`]+)["'`]\s*\)/;
 
@@ -512,6 +527,40 @@ function ssrfTaint(expr, vars) {
     if (new RegExp(`\\b${escRe(name)}\\b`).test(expr)) return { ...info, form: "variable" };
   }
   return null;
+}
+
+/** 上传字段名：multer .single/.array/.fields、NestJS FileInterceptor、Python UploadFile、Django request.FILES */
+function uploadFieldName(text) {
+  const patterns = [
+    /\.\s*(?:single|array)\s*\(\s*["'`]([^"'`]+)["'`]/,
+    /\.\s*fields\s*\(\s*\[\s*\{[^}]*\bname\s*:\s*["'`]([^"'`]+)["'`]/,
+    /File(?:s)?Interceptor\s*\(\s*["'`]([^"'`]+)["'`]/,
+    /@UploadedFiles?\s*\(\s*["'`]([^"'`]+)["'`]/,
+    /([A-Za-z_]\w*)\s*:\s*(?:List\s*\[\s*)?UploadFile\b/,
+    /request\s*\.\s*(?:files|FILES)\s*(?:\.\s*get\s*\(|\[)\s*["'`]([^"'`]+)["'`]/,
+    /req\s*\.\s*files\s*(?:\.\s*([A-Za-z_]\w*)|\[\s*["'`]([^"'`]+)["'`])/,
+  ];
+  for (const re of patterns) {
+    const m = text.match(re);
+    const name = m?.[1] ?? m?.[2];
+    if (name) return name;
+  }
+  return null;
+}
+
+/**
+ * 文件上传线索：路由块内出现服务端 multipart 接收入口。
+ * 同时收集该块的防护信号，供报告说明「看起来有校验」；是否真的挡住由动态上传用例判定。
+ * 返回 { field, validations, sink } 或 null。
+ */
+export function findUploadSignal(text) {
+  const m = text.match(UPLOAD_SINK);
+  if (!m) return null;
+  return {
+    field: uploadFieldName(text),
+    validations: UPLOAD_VALIDATION.filter((v) => v.re.test(text)).map((v) => v.name),
+    sink: m[0].replace(/\s+/g, " ").slice(0, 60),
+  };
 }
 
 /** 从开括号 openIdx（须为 {）找到配平闭括号位置；跳过字符串/模板/注释；未配平返回 -1 */

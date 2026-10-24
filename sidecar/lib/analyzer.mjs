@@ -27,6 +27,7 @@ import {
   findSqlInjectionSignal,
   findCommandInjectionSignal,
   findSsrfSignal,
+  findUploadSignal,
   callArgsSpan,
   braceSpan,
   findBodyOpen,
@@ -731,6 +732,17 @@ export async function analyzeProject(ctx) {
         kind: "ssrf-suspect",
         resource: ssrf.param ?? guessResource(fullPath ?? path, s.text),
         ssrf,
+      });
+    }
+
+    // 可疑「文件上传」：服务端接收 multipart 文件；是否可上传主动内容由动态用例取证
+    const upload = s.graphql ? null : findUploadSignal(s.text);
+    if (upload && path && ep.method && ep.method !== "GET") {
+      candidates.push({
+        ...ep,
+        kind: "upload-suspect",
+        resource: upload.field ?? guessResource(fullPath ?? path, s.text),
+        upload,
       });
     }
   }

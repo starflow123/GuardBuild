@@ -516,7 +516,8 @@ async function discoverResources(ctx, baseUrl, loggedIn) {
       ctx.plan.traversalCandidate ||
       planCandidates(ctx, "sqli").length > 0 ||
       planCandidates(ctx, "cmdi").length > 0 ||
-      planCandidates(ctx, "ssrf").length > 0
+      planCandidates(ctx, "ssrf").length > 0 ||
+      planCandidates(ctx, "upload").length > 0
     ) {
       ctx.emit({
         kind: "discovery",
@@ -1014,6 +1015,82 @@ async function waitForCanaryHit(canary, timeoutMs = SSRF_CANARY_WAIT_MS) {
     await new Promise((r) => setTimeout(r, 50));
   }
   return matched();
+}
+
+// —— 文件上传用例辅助 ——
+
+// 主动内容类型：以这些类型同源回读，浏览器会按 HTML/SVG/脚本解析
+const UPLOAD_ACTIVE_TYPES = new Set(["text/html", "application/xhtml+xml", "image/svg+xml", "application/javascript", "text/javascript"]);
+const UPLOAD_VARIANTS = [
+  { ext: "html", type: "text/html", render: (t) => `<div data-gb-upload="${t}">${t}</div>` },
+  { ext: "svg", type: "image/svg+xml", render: (t) => `<svg xmlns="http://www.w3.org/2000/svg"><text>${t}</text></svg>` },
+];
+const UPLOAD_REJECT_RE = /file|upload|type|ext|mime|invalid|unsupported|not\s*allowed|不允许|文件|类型|扩展名/i;
+
+function headerOf(res, name) {
+  const want = name.toLowerCase();
+  for (const [k, v] of Object.entries(res?.headers ?? {})) {
+    if (k.toLowerCase() === want) return v;
+  }
+  return null;
+}
+
+/** 构造 multipart 上传体；字段名来自静态分析，仍做字符白名单避免头注入 */
+function multipartUpload(field, filename, contentType, content, token) {
+  const safeField = String(field ?? "file").replace(/[^A-Za-z0-9_.-]/g, "") || "file";
+  const boundary = `----GuardBuild${token}`;
+  const body = [
+    `--${boundary}`,
+    `Content-Disposition: form-data; name="${safeField}"; filename="${filename}"`,
+    `Content-Type: ${contentType}`,
+    "",
+    content,
+    `--${boundary}--`,
+    "",
+  ].join("\r\n");
+  return { body, contentType: `multipart/form-data; boundary=${boundary}`, field: safeField };
+}
+
+const UPLOAD_LOCATION_KEYS = ["url", "href", "path", "location", "fileUrl", "file_url", "src"];
+
+/** 从上传响应提取可回读地址（仅同源相对/绝对路径；裸 filename 不算） */
+function uploadLocationFrom(res, baseUrl) {
+  const direct = headerOf(res, "location") ?? headerOf(res, "x-file-url") ?? headerOf(res, "x-upload-url");
+  const candidates = [direct];
+  for (const obj of [res?.json, res?.json?.data, res?.json?.file, res?.json?.result, res?.json?.data?.file]) {
+    if (!obj || typeof obj !== "object") continue;
+    for (const key of UPLOAD_LOCATION_KEYS) {
+      if (typeof obj[key] === "string") candidates.push(obj[key]);
+    }
+  }
+  for (const loc of candidates) {
+    if (!loc || typeof loc !== "string" || loc.length > 500) continue;
+    try {
+      const abs = new URL(loc, baseUrl);
+      const base = new URL(baseUrl);
+      if (abs.host !== base.host) continue;
+      return { path: `${abs.pathname}${abs.search}`, raw: loc };
+    } catch {
+      /* 非法地址忽略 */
+    }
+  }
+  return null;
+}
+
+/** 上传成功但未返回地址时，按常见静态目录尝试回读（命中仍须内容与主动类型双重校验） */
+function uploadGuessPaths(filename) {
+  return ["/uploads", "/files", "/static/uploads", "/upload", "/public/uploads"].map(
+    (dir) => `${dir}/${encodeURIComponent(filename)}`
+  );
+}
+
+/** 回读上传文件：先匿名，拒绝时用上传身份复读 */
+async function fetchUploaded(c, baseUrl, path, identity) {
+  let res = await httpJson(c, { baseUrl, method: "GET", path });
+  if (DENIED_STATUS.has(res.status) && identity) {
+    res = await httpJson(c, { baseUrl, method: "GET", path, identity });
+  }
+  return res;
 }
 
 // —— 注入类用例辅助 ——
@@ -1597,6 +1674,191 @@ export function buildCases(ctx, targets) {
     });
   }
 
+  // —— 文件上传用例：上传仅含随机令牌的主动内容文件，再同源回读（无修复模板，仅取证）——
+  for (const [i, cand] of planCandidates(ctx, "upload").entries()) {
+    const upload = cand.upload;
+    const routePath = candPath(cand);
+    if (!routePath || !upload) continue;
+    const suffix = i === 0 ? "" : `-${i + 1}`;
+    const method = cand.method ?? "POST";
+    const uploadIdentity = attacker?.name ?? victim?.name ?? null;
+    cases.push({
+      id: `attack-upload${suffix}`,
+      candidateKey: candKey(cand),
+      category: CASE_CATEGORY.ATTACK,
+      unfixable: true,
+      name: `文件上传（${routePath}${upload.field ? ` · 字段 ${upload.field}` : ""}）`,
+      identity: uploadIdentity,
+      method,
+      path: routePath,
+      routeKey: cand.routeKeys?.[0] ?? null,
+      expect: "上传接口应校验扩展名/内容类型与文件内容，拒绝 HTML/SVG/脚本等主动内容，且不得以可渲染类型同源回读",
+      send: async (c, baseUrl) => {
+        const attempts = [];
+        let accepted = null;
+        let last = null;
+        let firstErr = null;
+        for (const variant of UPLOAD_VARIANTS) {
+          const token = shortId("up").replace(/_/g, "");
+          const filename = `gb-${token}.${variant.ext}`;
+          const form = multipartUpload(upload.field, filename, variant.type, variant.render(token), token);
+          try {
+            const res = await httpJson(c, {
+              baseUrl,
+              method,
+              path: routePath,
+              identity: uploadIdentity,
+              body: form.body,
+              contentType: form.contentType,
+            });
+            last = res;
+            attempts.push({ ext: variant.ext, status: res.status, contentType: headerOf(res, "content-type") ?? "" });
+            if (okStatus(res.status)) {
+              accepted = { res, variant, token, filename };
+              break;
+            }
+          } catch (e) {
+            if (!firstErr) firstErr = e;
+            attempts.push({ ext: variant.ext, status: 0, error: String(e?.message ?? e).slice(0, 160) });
+          }
+        }
+        if (!accepted) {
+          if (!last) {
+            throw firstErr ?? new ProbeError(`文件上传探测请求全部失败（${routePath}）`, { code: "probe_request_failed" });
+          }
+          last._uploadProof = { accepted: false, attempts };
+          return { res: last, path: routePath, method };
+        }
+        const loc = uploadLocationFrom(accepted.res, baseUrl);
+        const readPaths = loc ? [loc.path] : uploadGuessPaths(accepted.filename);
+        let fetched = null;
+        let fetchedPath = null;
+        for (const p of readPaths) {
+          try {
+            const r = await fetchUploaded(c, baseUrl, p, uploadIdentity);
+            if (!fetched) {
+              fetched = r;
+              fetchedPath = p;
+            }
+            if (okStatus(r.status)) {
+              fetched = r;
+              fetchedPath = p;
+              break;
+            }
+          } catch {
+            /* 单个回读路径失败不影响其余尝试 */
+          }
+        }
+        const ct = (headerOf(fetched, "content-type") ?? "").split(";")[0].trim().toLowerCase();
+        const disposition = headerOf(fetched, "content-disposition") ?? "";
+        const markerMatched = !!fetched && String(fetched.body ?? "").includes(accepted.token);
+        const activeType = UPLOAD_ACTIVE_TYPES.has(ct);
+        const attachment = /attachment/i.test(disposition);
+        const proof = {
+          accepted: true,
+          attempts,
+          ext: accepted.variant.ext,
+          filename: accepted.filename,
+          token: accepted.token,
+          location: loc?.path ?? null,
+          fetchedPath,
+          fetchedStatus: fetched?.status ?? null,
+          contentType: ct,
+          disposition,
+          markerMatched,
+          activeType,
+          attachment,
+          exploitable: markerMatched && activeType && !attachment,
+        };
+        accepted.res._uploadProof = proof;
+        return { res: accepted.res, path: routePath, method };
+      },
+      verify: (res, phase) => {
+        const p = res._uploadProof ?? {};
+        const attempted = (p.attempts ?? [])
+          .map((a) => `${a.ext}:${a.status || "ERR"}`)
+          .join("、");
+        if (phase === "pre") {
+          if (p.exploitable) {
+            return {
+              verdict: VERDICT.VULNERABLE,
+              actual: `HTTP ${res.status}，上传 ${p.filename} 成功；同源 ${p.fetchedPath} 以 ${p.contentType} 回读上传内容（令牌 ${p.token}）`,
+            };
+          }
+          if (!p.accepted) {
+            const body = String(res.body ?? "");
+            if (res.status === 401 || res.status === 403) {
+              return {
+                verdict: VERDICT.BLOCKED,
+                actual: `HTTP ${res.status}，上传接口在修复前即拒绝该身份（静态分析误报，无需修复）`,
+              };
+            }
+            if ((res.status === 400 || res.status === 415) && UPLOAD_REJECT_RE.test(body)) {
+              return {
+                verdict: VERDICT.BLOCKED,
+                actual: `HTTP ${res.status}，主动内容文件被拒绝（尝试：${attempted}）`,
+              };
+            }
+            return {
+              verdict: VERDICT.INCONCLUSIVE,
+              actual: `HTTP ${res.status}，上传未成功且无法确认是类型校验（尝试：${attempted}）`,
+            };
+          }
+          if (!p.fetchedStatus) {
+            return {
+              verdict: VERDICT.INCONCLUSIVE,
+              actual: `上传被接受（${p.ext}），但响应未给出可回读地址，无法证明文件可被同源读取`,
+            };
+          }
+          if (!p.markerMatched) {
+            return {
+              verdict: VERDICT.INCONCLUSIVE,
+              actual: `上传被接受，但回读 HTTP ${p.fetchedStatus} 未包含上传令牌（可能重命名/转码或未公开存储）`,
+            };
+          }
+          if (p.attachment || !p.activeType) {
+            return {
+              verdict: VERDICT.BLOCKED,
+              actual: `上传被接受，但回读为 ${
+                p.attachment ? "附件下载" : `惰性类型 ${p.contentType || "未知"}`
+              }，主动内容不会同源渲染`,
+            };
+          }
+          return { verdict: VERDICT.INCONCLUSIVE, actual: `HTTP ${res.status}，上传结果无法判定` };
+        }
+        if (p.exploitable) {
+          return {
+            verdict: VERDICT.REGRESSED,
+            actual: `HTTP ${res.status}，修复后仍可上传主动内容并同源回读（令牌 ${p.token}）`,
+          };
+        }
+        if (!p.accepted) {
+          if (res.status === 401 || res.status === 403 || res.status === 400 || res.status === 415) {
+            return { verdict: VERDICT.BLOCKED, actual: `HTTP ${res.status}，主动内容文件已被拒绝（尝试：${attempted}）` };
+          }
+          return { verdict: VERDICT.INCONCLUSIVE, actual: `HTTP ${res.status}，上传结果无法判定` };
+        }
+        if (p.markerMatched && (p.attachment || !p.activeType)) {
+          return {
+            verdict: VERDICT.BLOCKED,
+            actual: `上传仍被接受，但回读为 ${p.attachment ? "附件下载" : `惰性类型 ${p.contentType}`}，主动内容已被中和`,
+          };
+        }
+        return { verdict: VERDICT.INCONCLUSIVE, actual: "修复后上传结果无法作出一致判定" };
+      },
+      crossProof: (res) =>
+        res._uploadProof?.exploitable
+          ? {
+              note: `上传文件 ${res._uploadProof.filename} 以 ${res._uploadProof.contentType} 同源回读（令牌 ${res._uploadProof.token}）：服务端接受并公开提供攻击者控制的主动内容`,
+            }
+          : null,
+      impact: (res) =>
+        res._uploadProof?.exploitable
+          ? "可上传任意 HTML/SVG 主动内容并在同源回读，构造存储型 XSS、钓鱼页面或恶意下载；若服务器按扩展名执行脚本，可能进一步导致远程代码执行"
+          : null,
+    });
+  }
+
   // —— SQL 注入用例：随机基线 vs 布尔/报错载荷（无修复模板，仅取证）——
   for (const [i, cand] of planCandidates(ctx, "sqli").entries()) {
     const injection = cand.sqli;
@@ -2047,7 +2309,7 @@ export async function runPhase(ctx, { phase, baseUrl }) {
   // 个别实现会同步阻塞事件循环。排在最后，避免一条挂起的用例拖掉整轮注入取证。
   const isSlow = (c) =>
     c.category === CASE_CATEGORY.ATTACK &&
-    (c.id.startsWith("attack-path-traversal") || c.id.startsWith("attack-ssrf"));
+    (c.id.startsWith("attack-path-traversal") || c.id.startsWith("attack-ssrf") || c.id.startsWith("attack-upload"));
   const orderedCases = [...allCases.filter((c) => !isSlow(c)), ...allCases.filter(isSlow)];
   // 外部攻击面扫描：发常见管理路径/敏感文件，记录暴露面（pre 阶段才跑）
   if (phase === "pre") {
@@ -2080,7 +2342,7 @@ export async function runPhase(ctx, { phase, baseUrl }) {
     ctx.emit({
       kind: "phase",
       severity: SEVERITY.INFO,
-      message: `修复后验收跳过 ${skippedUnfixable.length} 条无自动修复模板的攻击用例（注入/穿越/SSRF 类仅取证）`,
+      message: `修复后验收跳过 ${skippedUnfixable.length} 条无自动修复模板的攻击用例（注入/穿越/SSRF/上传类仅取证）`,
       phase,
       data: { skipped: skippedUnfixable.map((c) => c.id) },
     });
@@ -2101,6 +2363,7 @@ export async function runPhase(ctx, { phase, baseUrl }) {
     { slot: "sqliCandidate", prefix: "attack-sql-injection", count: planCandidates(ctx, "sqli").length },
     { slot: "cmdiCandidate", prefix: "attack-command-injection", count: planCandidates(ctx, "cmdi").length },
     { slot: "ssrfCandidate", prefix: "attack-ssrf", count: planCandidates(ctx, "ssrf").length },
+    { slot: "uploadCandidate", prefix: "attack-upload", count: planCandidates(ctx, "upload").length },
   ].filter((s) => s.count > 0);
   const skipped = plannedSlots.filter(
     (s) => !allCases.some((c) => c.id === s.prefix || c.id.startsWith(`${s.prefix}-`))

@@ -25,6 +25,7 @@ guardbuild-data/
 .demo-cross-file/
 .demo-crossfile/
 .demo-bootstrap/
+.demo-ssrf/
 .benchmark/
 guardbuild.db*
 *.tsbuildinfo

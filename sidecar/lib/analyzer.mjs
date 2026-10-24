@@ -22,11 +22,11 @@ import {
   OWNER_FILTER,
   FS_READ_SINK,
   XSS_REFLECTION,
-  SSRF_SINK,
   findTraversalSignal,
   findQueryParamSink,
   findSqlInjectionSignal,
   findCommandInjectionSignal,
+  findSsrfSignal,
   callArgsSpan,
   braceSpan,
   findBodyOpen,
@@ -723,11 +723,16 @@ export async function analyzeProject(ctx) {
     //   candidates.push({ ...ep, kind: "xss-suspect", resource: guessResource(fullPath ?? path, s.text) });
     // }
 
-    // 可疑「SSRF」：HTTP 客户端参数直接来自请求输入
-    // 暂时禁用：动态 oracle 未实现（需要 net.egress + 外部回调检测）。待实现后再开。
-    // if (!s.graphql && SSRF_SINK.test(s.text)) {
-    //   candidates.push({ ...ep, kind: "ssrf-suspect", resource: guessResource(fullPath ?? path, s.text) });
-    // }
+    // 可疑「SSRF」：请求输入直接作为 HTTP 客户端的 URL（本地 canary 回连复现）
+    const ssrf = s.graphql ? null : findSsrfSignal(s.text);
+    if (ssrf && path) {
+      candidates.push({
+        ...ep,
+        kind: "ssrf-suspect",
+        resource: ssrf.param ?? guessResource(fullPath ?? path, s.text),
+        ssrf,
+      });
+    }
   }
 
   // Supabase / PostgREST 适配器：静态检测（失败不阻塞主流程，密钥值不进入返回值以外展示面）

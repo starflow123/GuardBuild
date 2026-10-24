@@ -1,0 +1,11 @@
+{
+  "name": "ssrf-shop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "SSRFShop - 示例预览服务（GuardBuild 诊断靶场：服务端请求伪造）",
+  "type": "module",
+  "dependencies": {},
+  "scripts": {
+    "start": "node server.js"
+  }
+}

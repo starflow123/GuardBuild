@@ -65,6 +65,9 @@ jobs:
       - name: NestJS 适配器 E2E（装饰器路由解析 + 越权/穿越复现，本机垫片）
         run: node scripts/e2e-nest.mjs
 
+      - name: SSRF E2E（本机 canary 回连取证 + 主机白名单对照）
+        run: node scripts/e2e-ssrf.mjs
+
       - name: tRPC 适配器 E2E（过程路径组装 + input 编码协商，本机垫片）
         run: node scripts/e2e-trpc.mjs
 
@@ -123,6 +126,8 @@ jobs:
             .demo-next/data/guardbuild.db
             .demo-nest/reports
             .demo-nest/data/guardbuild.db
+            .demo-ssrf/reports
+            .demo-ssrf/data/guardbuild.db
             .demo-trpc/reports
             .demo-trpc/data/guardbuild.db
             .demo-graphql/reports

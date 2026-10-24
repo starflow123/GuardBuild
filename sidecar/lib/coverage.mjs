@@ -14,6 +14,7 @@ export const COVERAGE = {
     "路径穿越",
     "SQL 注入（数据库报错 / 布尔盲注双证据）",
     "命令注入（shell 展开令牌回显）",
+    "SSRF（本机 canary 回连取证）",
     "Supabase / PostgREST 数据暴露与 service_role 密钥泄露",
   ],
   /** 已实现的路由适配器形态 */

@@ -97,8 +97,10 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
   // 注入类候选：无自动修复模板，仅复现取证
   const sqliCandidates = topK((c) => c.kind === "sqli-suspect");
   const cmdiCandidates = topK((c) => c.kind === "cmdi-suspect");
+  const ssrfCandidates = topK((c) => c.kind === "ssrf-suspect");
   const sqliCandidate = sqliCandidates[0] ?? null;
   const cmdiCandidate = cmdiCandidates[0] ?? null;
+  const ssrfCandidate = ssrfCandidates[0] ?? null;
 
   const resource =
     readCandidate?.resource ??
@@ -107,6 +109,7 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
     traversalCandidate?.resource ??
     sqliCandidate?.resource ??
     cmdiCandidate?.resource ??
+    ssrfCandidate?.resource ??
     "resource";
 
   // 列表/管理端点优先选择与资源名匹配的路径（避免把别的资源列表当作探测目标）
@@ -164,12 +167,14 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
     traversalCandidate,
     sqliCandidate,
     cmdiCandidate,
+    ssrfCandidate,
     readCandidates,
     cancelCandidates,
     unauthReadCandidates,
     traversalCandidates,
     sqliCandidates,
     cmdiCandidates,
+    ssrfCandidates,
     listEndpoint: epSlot(list),
     adminListEndpoint: epSlot(adminList),
     adminCancelEndpoint: epSlot(adminCancel),

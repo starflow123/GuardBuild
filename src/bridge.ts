@@ -309,6 +309,9 @@ export interface View {
     cancelPath: string | null;
     unauthReadPath?: string | null;
     traversalPath?: string | null;
+    sqliPath?: string | null;
+    cmdiPath?: string | null;
+    ssrfPath?: string | null;
     listPath: string | null;
   };
   evidence?: EvidenceItem[];

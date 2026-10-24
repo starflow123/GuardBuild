@@ -12,6 +12,7 @@
  *  - 身份凭证由 Host 保险库注入（Sidecar 只见 identityRef，不见令牌明文）
  *  - 响应体经 Host 脱敏后才返回给 Sidecar（写入证据的仍是掩码形式）
  */
+import { createServer } from "node:http";
 import { RPC_TO_HOST, VERDICT, CASE_CATEGORY, SEVERITY, shortId } from "../../shared/protocol.mjs";
 import { followRedirects } from "./http-follow.mjs";
 import {
@@ -514,7 +515,8 @@ async function discoverResources(ctx, baseUrl, loggedIn) {
     if (
       ctx.plan.traversalCandidate ||
       planCandidates(ctx, "sqli").length > 0 ||
-      planCandidates(ctx, "cmdi").length > 0
+      planCandidates(ctx, "cmdi").length > 0 ||
+      planCandidates(ctx, "ssrf").length > 0
     ) {
       ctx.emit({
         kind: "discovery",
@@ -974,6 +976,44 @@ function traversalAttemptPath(routePath, trav, payload, encoded) {
   const value = encoded ? encodeURIComponent(payload) : payload;
   const sep = routePath.includes("?") ? "&" : "?";
   return `${routePath}${sep}${param}=${value}`;
+}
+
+// —— SSRF 用例辅助：本地回连 canary ——
+// 用例把可被攻击者控制的 URL 指向本进程监听的 127.0.0.1 随机端口；
+// 只有目标服务真的发起连接，canary 才会收到带随机令牌的请求。
+const SSRF_CANARY_PATH = "/gb-ssrf/";
+const SSRF_CANARY_WAIT_MS = 800;
+
+function startSsrfCanary() {
+  return new Promise((resolve, reject) => {
+    const token = shortId("ssrf");
+    const hits = [];
+    const server = createServer((req, res) => {
+      hits.push({ url: req.url ?? "", at: Date.now() });
+      res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+      res.end(`guardbuild-ssrf-canary:${token}`);
+    });
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      const port = server.address().port;
+      resolve({
+        token,
+        hits,
+        url: `http://127.0.0.1:${port}${SSRF_CANARY_PATH}${token}`,
+        close: () => new Promise((r) => server.close(() => r())),
+      });
+    });
+  });
+}
+
+async function waitForCanaryHit(canary, timeoutMs = SSRF_CANARY_WAIT_MS) {
+  const until = Date.now() + timeoutMs;
+  const matched = () => canary.hits.filter((h) => h.url.includes(canary.token)).length;
+  while (Date.now() < until) {
+    if (matched() > 0) break;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return matched();
 }
 
 // —— 注入类用例辅助 ——
@@ -1461,6 +1501,102 @@ export function buildCases(ctx, targets) {
     });
   }
 
+  // —— SSRF 攻击用例：把 HTTP 客户端的 URL 指向本机 canary，命中回连即成立（无修复模板，仅取证）——
+  for (const [i, cand] of planCandidates(ctx, "ssrf").entries()) {
+    const ssrf = cand.ssrf;
+    const routePath = candPath(cand);
+    if (!routePath || !ssrf) continue;
+    const suffix = i === 0 ? "" : `-${i + 1}`;
+    const placeholder = "http://127.0.0.1:1/gb-ssrf/placeholder";
+    const firstReq = injectionReq(cand, ssrf, placeholder);
+    if (!firstReq) continue;
+    const ssrfIdentity = attacker?.name ?? victim?.name ?? null;
+    cases.push({
+      id: `attack-ssrf${suffix}`,
+      candidateKey: candKey(cand),
+      category: CASE_CATEGORY.ATTACK,
+      unfixable: true,
+      name: `SSRF 服务端请求伪造（${routePath}${ssrf.param ? ` · 参数 ${ssrf.param}` : ""}）`,
+      identity: ssrfIdentity,
+      method: firstReq.method,
+      path: firstReq.path,
+      body: firstReq.body,
+      routeKey: cand.routeKeys?.[0] ?? null,
+      expect: "请求中的 URL 不得由服务端直接发起（应校验协议与主机白名单），不得回连内网地址",
+      send: async (c, baseUrl) => {
+        const canary = await startSsrfCanary();
+        try {
+          const req = injectionReq(cand, ssrf, canary.url);
+          let res = null;
+          let err = null;
+          try {
+            res = await httpJson(c, { baseUrl, ...req, identity: ssrfIdentity });
+          } catch (e) {
+            err = e;
+          }
+          const hits = await waitForCanaryHit(canary);
+          if (!res && hits === 0) {
+            throw err ?? new ProbeError(`SSRF 探测请求失败（${routePath}）`, { code: "probe_request_failed" });
+          }
+          const chosen = res ?? { status: 0, statusText: "", body: "", json: null };
+          chosen._ssrfProof = {
+            hit: hits > 0,
+            canaryUrl: canary.url,
+            requestPath: req.path,
+            hits,
+            fetchError: res ? null : String(err?.message ?? err ?? "").slice(0, 180),
+          };
+          return { res: chosen, path: req.path, method: req.method };
+        } finally {
+          await canary.close();
+        }
+      },
+      verify: (res, phase) => {
+        const proof = res._ssrfProof ?? {};
+        const detail = proof.hit
+          ? `证据：服务端回连本机 canary（${proof.canaryUrl}，命中 ${proof.hits} 次）`
+          : "";
+        if (phase === "pre") {
+          if (proof.hit) {
+            return { verdict: VERDICT.VULNERABLE, actual: `HTTP ${res.status}，服务端按请求参数发起了请求。${detail}` };
+          }
+          if (DENIED_STATUS.has(res.status)) {
+            return {
+              verdict: VERDICT.BLOCKED,
+              actual: `HTTP ${res.status}，请求中的 URL 在修复前即被拦截（静态分析误报，无需修复）`,
+            };
+          }
+          return {
+            verdict: VERDICT.INCONCLUSIVE,
+            actual: `HTTP ${res.status}，未观测到 canary 回连${
+              proof.fetchError ? `（目标侧请求失败：${proof.fetchError}）` : "（可能已有主机/协议白名单）"
+            }`,
+          };
+        }
+        if (proof.hit) {
+          return { verdict: VERDICT.REGRESSED, actual: `HTTP ${res.status}，修复后仍回连攻击者指定的地址。${detail}` };
+        }
+        if (DENIED_STATUS.has(res.status)) {
+          return { verdict: VERDICT.BLOCKED, actual: `HTTP ${res.status}，请求中的 URL 被拒绝。${detail}` };
+        }
+        if (res.status === 0) {
+          return { verdict: VERDICT.INCONCLUSIVE, actual: "修复后目标未返回响应，且未观测到回连，结果无法判定" };
+        }
+        return { verdict: VERDICT.BLOCKED, actual: `HTTP ${res.status}，未再观测到 canary 回连（URL 已受限）` };
+      },
+      crossProof: (res) =>
+        res._ssrfProof?.hit
+          ? {
+              note: `服务端回连本机 canary（${res._ssrfProof.canaryUrl}，命中 ${res._ssrfProof.hits} 次）：请求 URL 由攻击者完全控制`,
+            }
+          : null,
+      impact: (res) =>
+        res._ssrfProof?.hit
+          ? "可由服务端发起任意内网/外部请求（探测内网服务、访问云元数据、绕过网络边界）"
+          : null,
+    });
+  }
+
   // —— SQL 注入用例：随机基线 vs 布尔/报错载荷（无修复模板，仅取证）——
   for (const [i, cand] of planCandidates(ctx, "sqli").entries()) {
     const injection = cand.sqli;
@@ -1907,10 +2043,12 @@ export async function runPhase(ctx, { phase, baseUrl }) {
     }
   }
   const allCases = buildCases(ctx, targets);
-  // 路径穿越会把不存在的路径打到文件读取接口，个别实现会同步请求外部依赖并阻塞事件循环；
-  // 排在最后，避免一条挂起的用例拖掉整轮注入取证（后续请求仍返回 inconclusive）。
-  const isTraversal = (c) => c.category === CASE_CATEGORY.ATTACK && c.id.startsWith("attack-path-traversal");
-  const orderedCases = [...allCases.filter((c) => !isTraversal(c)), ...allCases.filter(isTraversal)];
+  // 路径穿越会把不存在的路径打到文件读取接口，SSRF 会让目标主动发起外部请求；
+  // 个别实现会同步阻塞事件循环。排在最后，避免一条挂起的用例拖掉整轮注入取证。
+  const isSlow = (c) =>
+    c.category === CASE_CATEGORY.ATTACK &&
+    (c.id.startsWith("attack-path-traversal") || c.id.startsWith("attack-ssrf"));
+  const orderedCases = [...allCases.filter((c) => !isSlow(c)), ...allCases.filter(isSlow)];
   // 外部攻击面扫描：发常见管理路径/敏感文件，记录暴露面（pre 阶段才跑）
   if (phase === "pre") {
     await scanAttackSurface(ctx, baseUrl, loggedIn);
@@ -1942,7 +2080,7 @@ export async function runPhase(ctx, { phase, baseUrl }) {
     ctx.emit({
       kind: "phase",
       severity: SEVERITY.INFO,
-      message: `修复后验收跳过 ${skippedUnfixable.length} 条无自动修复模板的攻击用例（注入/穿越类仅取证）`,
+      message: `修复后验收跳过 ${skippedUnfixable.length} 条无自动修复模板的攻击用例（注入/穿越/SSRF 类仅取证）`,
       phase,
       data: { skipped: skippedUnfixable.map((c) => c.id) },
     });
@@ -1962,6 +2100,7 @@ export async function runPhase(ctx, { phase, baseUrl }) {
     { slot: "traversalCandidate", prefix: "attack-path-traversal", count: planCandidates(ctx, "traversal").length },
     { slot: "sqliCandidate", prefix: "attack-sql-injection", count: planCandidates(ctx, "sqli").length },
     { slot: "cmdiCandidate", prefix: "attack-command-injection", count: planCandidates(ctx, "cmdi").length },
+    { slot: "ssrfCandidate", prefix: "attack-ssrf", count: planCandidates(ctx, "ssrf").length },
   ].filter((s) => s.count > 0);
   const skipped = plannedSlots.filter(
     (s) => !allCases.some((c) => c.id === s.prefix || c.id.startsWith(`${s.prefix}-`))

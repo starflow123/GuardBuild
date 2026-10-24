@@ -6,6 +6,7 @@
 const FAMILY_BY_KIND = {
   "sqli-suspect": "sqli",
   "cmdi-suspect": "cmdi",
+  "ssrf-suspect": "ssrf",
   "traversal-suspect": "traversal",
   "idor-suspect": "idor",
   "no-auth-suspect": "unauth",
@@ -16,6 +17,7 @@ const FAMILY_BY_KIND = {
 export const KIND_LABELS = {
   "sqli-suspect": "SQL 注入静态线索",
   "cmdi-suspect": "命令注入静态线索",
+  "ssrf-suspect": "SSRF 静态线索",
   "traversal-suspect": "路径穿越静态线索",
   "idor-suspect": "对象级越权（IDOR）静态线索",
   "no-auth-suspect": "无鉴权静态线索",
@@ -53,6 +55,16 @@ const TEMPLATES = {
       "是否只过滤 `..` 而漏掉 URL 编码、Windows 分隔符与绝对路径。",
     ],
     fix: "用固定根目录 + `path.resolve` 后做前缀校验；只允许白名单文件/`path.basename`；拒绝绝对路径与 `..`；补穿越载荷回归测试。",
+  },
+  ssrf: {
+    label: "SSRF（服务端请求伪造）",
+    risk: "请求参数直接作为服务端 HTTP 客户端的 URL，攻击者可让服务器访问内网服务、云元数据或任意外部地址（本轮已用本机 canary 回连复现）。",
+    inspect: [
+      "`fetch/axios/got/http(s).request/requests/httpx` 的 URL 实参是否直接来自请求（query/body/params）。",
+      "是否只校验字符串前缀（如必须 `https://`）而未解析主机名、未限制内网网段与重定向。",
+      "是否允许用户控制重定向目标，或通过 DNS 重绑定/十进制 IP/短链绕过主机校验。",
+    ],
+    fix: "对目标 URL 做解析后校验：协议白名单（仅 http/https）+ 主机白名单/公网地址校验，拒绝环回、私有网段与链路本地地址；禁止或逐跳校验重定向；必要时经固定出口代理发起请求；补内网回连回归测试。",
   },
   idor: {
     label: "对象级越权（IDOR）",
@@ -130,6 +142,7 @@ export function detectFamily(finding) {
   if (/管理.{0,2}调试|调试面|actuator|pprof|debug\s*surface/i.test(text)) return "debug_surface";
   if (/SQL\s*注入/i.test(text)) return "sqli";
   if (/命令注入|command\s*injection/i.test(text)) return "cmdi";
+  if (/SSRF|服务端请求伪造|server[-\s]*side\s*request\s*forgery/i.test(text)) return "ssrf";
   if (/穿越|traversal/i.test(text)) return "traversal";
   if (/RLS|Supabase|行级安全/i.test(text)) return "supabase_rls";
   // 「未认证」优先于「归属」：未认证读取的详情常附带归属类敏感字段说明

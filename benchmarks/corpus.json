@@ -89,6 +89,15 @@
       ]
     },
     {
+      "id": "ssrf-shop",
+      "fixture": "fixtures/ssrf-shop",
+      "expectedExit": 1,
+      "expectedVulnerableCases": ["attack-ssrf"],
+      "expectedStatic": [
+        { "kind": "ssrf-suspect", "method": "GET", "path": "/api/preview" }
+      ]
+    },
+    {
       "id": "clean-shop",
       "fixture": "fixtures/clean-shop",
       "expectedExit": 0,

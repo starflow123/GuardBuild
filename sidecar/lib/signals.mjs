@@ -60,10 +60,11 @@ export const REQ_INPUT = /\breq\s*\.\s*(query|params|body)\b(?:\s*\.\s*([A-Za-z_
 export const XSS_REFLECTION =
   /\b(?:res|response|ctx)\s*\.\s*(?:send|end|write|json)\s*\(\s*[`'"][^`'"]*\$\{\s*req\s*\.\s*(?:query|params|body)|res\s*\.\s*(?:send|end)\s*\(\s*req\s*\.\s*(?:query|params|body)/;
 
-// —— SSRF 线索：HTTP 客户端 sink 的参数直接来自请求输入 ——
-// fetch(url) / axios.get(req.query.url) / http.get(req.params.url)
+// —— SSRF 线索：HTTP 客户端的 URL 实参来自请求输入 ——
+// Node 侧覆盖 fetch/axios/got/ky/needle/superagent/undici/http(s)/request，
+// Python 侧覆盖 requests/httpx/urllib/urlopen/aiohttp.ClientSession。
 export const SSRF_SINK =
-  /\b(?:fetch|axios\s*\.\s*get|axios\s*\.\s*post|http\s*\.\s*get|https\s*\.\s*get|request)\s*\(\s*[^)]*req\s*\.\s*(?:query|params|body)/;
+  /\b(?:fetch|axios(?:\s*\.\s*(?:get|post|put|patch|head|delete|request))?|got(?:\s*\.\s*(?:get|post|put|patch|head|delete))?|ky(?:\s*\.\s*(?:get|post|put|patch|head|delete))?|needle(?:\s*\.\s*(?:get|post|put|patch|head|delete))?|superagent(?:\s*\.\s*(?:get|post|put|patch|head|delete))?|undici\s*\.\s*request|(?:http|https)\s*\.\s*(?:get|request)|request)\s*\(|\b(?:requests|httpx)\s*\.\s*(?:get|post|put|patch|head|delete|request|stream)\s*\(|\burllib\d?\s*\.\s*request\s*\.\s*urlopen\s*\(|\burlopen\s*\(|\baiohttp\s*\.\s*ClientSession\s*\(/;
 
 // 现代框架的查询串读取：searchParams.get("x")（Next.js req.nextUrl / URL 解析形态）
 export const SP_GET = /\bsearchParams\s*\.\s*get\s*\(\s*["'`]([^"'`]+)["'`]\s*\)/;
@@ -374,7 +375,15 @@ function collectRequestVars(text) {
             break;
           }
         }
-        if (!hit) continue;
+        if (!hit) {
+          // 赋值右侧直接出现请求输入（常见于模板串内的第一跳）也应继承污点
+          const direct = directInputIn(rhs);
+          if (!direct) continue;
+          const built = /`[^`]*\$\{|\+\s*["'`]|["'`]\s*\+|\br?f["']|\.format\s*\(|%\s*\(/.test(rhs);
+          vars.set(name, { ...direct, built });
+          changed = true;
+          continue;
+        }
         // Python f-string 本身就是构造串（引号内再出现引号时无法用 [^"']* 界定），一律判为 built
         const built = /`[^`]*\$\{|\+\s*["'`]|["'`]\s*\+|\br?f["']|\.format\s*\(|%\s*\(/.test(rhs);
         vars.set(name, { ...hit, built: hit.built || built });
@@ -458,6 +467,49 @@ export function findCommandInjectionSignal(text) {
         return { source: info.channel, param: info.param, sink: sinkName(raw, "exec"), form: "variable" };
       }
     }
+  }
+  return null;
+}
+
+/**
+ * SSRF 线索：请求输入进入 HTTP 客户端的 URL 实参。
+ * 与注入类不同，URL 无需「拼接」才算可控——`const target = req.query.url; fetch(target)`
+ * 本身就是完整可控 URL，因此接受任何已确认的请求变量（含未参与字符串构造的）。
+ * 返回 { source, param, sink, form } 或 null。
+ */
+export function findSsrfSignal(text) {
+  const vars = collectRequestVars(text);
+  for (const m of text.matchAll(new RegExp(SSRF_SINK.source, "g"))) {
+    const raw = m[0];
+    const openRel = raw.lastIndexOf("(");
+    const argsText = callArgsSpan(text, m.index + openRel, 800);
+    if (!argsText) continue;
+    const first = firstArgText(argsText);
+    const hit = ssrfTaint(first, vars);
+    if (!hit) continue;
+    return { source: hit.channel, param: hit.param, sink: sinkName(raw, "fetch"), form: hit.form };
+  }
+  return null;
+}
+
+function ssrfTaint(expr, vars) {
+  const direct = directInputIn(expr);
+  if (direct) return { ...direct, form: "direct" };
+  for (const m of expr.matchAll(/\$\{([^{}]*)\}/g)) {
+    for (const [name, info] of vars) {
+      if (new RegExp(`\\b${escRe(name)}\\b`).test(m[1])) return { ...info, form: "interpolation" };
+    }
+  }
+  for (const m of expr.matchAll(/\bf(["'])([^\n]*?)\1/gi)) {
+    for (const im of m[2].matchAll(/\{([^{}]+)\}/g)) {
+      for (const [name, info] of vars) {
+        if (new RegExp(`\\b${escRe(name)}\\b`).test(im[1])) return { ...info, form: "f-string" };
+      }
+    }
+  }
+  // 完整 URL 常直接以变量传入（或包在 { url: target } 配置对象里），不要求字符串拼接
+  for (const [name, info] of vars) {
+    if (new RegExp(`\\b${escRe(name)}\\b`).test(expr)) return { ...info, form: "variable" };
   }
   return null;
 }

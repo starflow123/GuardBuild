@@ -8,7 +8,11 @@
  *   - /api/messages        读要登录、写与删不校验身份（未认证写入 + 匿名删除）
  *   - /api/invoices?year=  数字语境拼 SQL（字符串型 payload 一律 400，只有布尔表达式能进）
  *   - /api/documents?name= 安全过滤器只看第一次解码的结果，应用自己再解一次（二次编码穿越）
- *   - /openapi.json        声明 year/name 两个查询参数（探测按声明参数打，而不是靠猜）
+ *   - /api/orders/:id      改/删同时接受 form 编码（跨站简单请求形态，用于 CSRF 用例）
+ *   - /api/search?q=       把查询参数原样写进 HTML（反射型 XSS）
+ *   - /session/login       表单登录 + Set-Cookie（CSRF/XSS 的会话形态）
+ *   - 所有响应带 CORS 头：漏洞版回显请求 Origin 且允许凭证，加固版只放行白名单
+ *   - /openapi.json        声明 year/name/q 三个查询参数（探测按声明参数打，而不是靠猜）
  *
  * 注入/穿越两端都要求登录：匿名可读会让「未认证读取」与「参数注入」两类证据混在一起，
  * 加固轮的「不应有任何 finding」也就无法断言。
@@ -18,6 +22,7 @@
 import { createServer } from "node:http";
 
 const hardened = process.env.GB_WIDE_HARDENED === "1";
+const ALLOWED_ORIGIN = "https://app.wide.shop";
 
 const accounts = {
   "alice@wide.shop": { id: 1, email: "alice@wide.shop", password: "alice123", role: "user" },
@@ -25,6 +30,7 @@ const accounts = {
   "carol@wide.shop": { id: 3, email: "carol@wide.shop", password: "carol123", role: "admin" },
 };
 const tokens = new Map();
+const sessions = new Map();
 const orders = [
   { id: 101, userId: 1, note: "alice-note" },
   { id: 102, userId: 2, note: "bob-note" },
@@ -37,8 +43,19 @@ const invoices = [
   { id: 3, year: 2025, total: 340 },
 ];
 
+function cookieOf(req, name) {
+  for (const part of String(req.headers.cookie ?? "").split(";")) {
+    const [k, ...rest] = part.trim().split("=");
+    if (k === name) return rest.join("=");
+  }
+  return null;
+}
+
 function authUser(req) {
-  return tokens.get((req.headers.authorization ?? "").replace(/^Bearer\s+/, "")) ?? null;
+  const byToken = tokens.get((req.headers.authorization ?? "").replace(/^Bearer\s+/, ""));
+  if (byToken) return byToken;
+  const sid = cookieOf(req, "sid");
+  return sid ? sessions.get(sid) ?? null : null;
 }
 
 function readBody(req) {
@@ -46,8 +63,13 @@ function readBody(req) {
     const chunks = [];
     req.on("data", (c) => chunks.push(c));
     req.on("end", () => {
+      const raw = Buffer.concat(chunks).toString("utf8") || "";
+      if ((req.headers["content-type"] ?? "").includes("application/x-www-form-urlencoded")) {
+        resolve(Object.fromEntries(new URLSearchParams(raw)));
+        return;
+      }
       try {
-        resolve(JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}"));
+        resolve(JSON.parse(raw || "{}"));
       } catch {
         resolve({});
       }
@@ -55,13 +77,38 @@ function readBody(req) {
   });
 }
 
+function escapeHtml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+let serverOrigin = "";
+
 const server = createServer(async (req, res) => {
   const url = new URL(req.url, "http://127.0.0.1");
-  const send = (status, body) => {
-    res.writeHead(status, { "Content-Type": "application/json" });
+  const cors =
+    hardened || !req.headers.origin
+      ? hardened
+        ? { "Access-Control-Allow-Origin": ALLOWED_ORIGIN, "Access-Control-Allow-Credentials": "true" }
+        : {}
+      : { "Access-Control-Allow-Origin": req.headers.origin, "Access-Control-Allow-Credentials": "true" };
+  const send = (status, body, extra = {}) => {
+    res.writeHead(status, { "Content-Type": "application/json", ...cors, ...extra });
     res.end(JSON.stringify(body));
   };
+  const sendHtml = (status, html) => {
+    res.writeHead(status, { "Content-Type": "text/html; charset=utf-8", ...cors });
+    res.end(html);
+  };
   const user = authUser(req);
+
+  // 加固版：跨站写请求必须来自同源（Origin 校验）；GET 不受影响，避免与 CORS 判定混在一起
+  if (hardened && req.method !== "GET" && req.headers.origin && req.headers.origin !== serverOrigin) {
+    return send(403, { error: "cross-site request blocked" });
+  }
 
   if (req.method === "POST" && url.pathname === "/api/login") {
     const body = await readBody(req);
@@ -72,6 +119,15 @@ const server = createServer(async (req, res) => {
     return send(200, { authentication: { token, user: { id: u.id, role: u.role, email: u.email } } });
   }
 
+  if (req.method === "POST" && url.pathname === "/session/login") {
+    const body = await readBody(req);
+    const u = accounts[body.email];
+    if (!u || u.password !== body.password) return send(401, { error: "bad credentials" });
+    const sid = `sess-${u.id}-${Math.random().toString(36).slice(2, 8)}`;
+    sessions.set(sid, u);
+    return send(200, { user: { id: u.id, role: u.role, email: u.email } }, { "Set-Cookie": `sid=${sid}; Path=/; HttpOnly` });
+  }
+
   if (req.method === "GET" && url.pathname === "/openapi.json") {
     return send(200, {
       openapi: "3.0.0",
@@ -79,11 +135,19 @@ const server = createServer(async (req, res) => {
       paths: {
         "/api/invoices": { get: { parameters: [{ name: "year", in: "query" }] } },
         "/api/documents": { get: { parameters: [{ name: "name", in: "query" }] } },
+        "/api/search": { get: { parameters: [{ name: "q", in: "query" }] } },
       },
     });
   }
 
   if (req.method === "GET" && url.pathname === "/") return send(200, { service: "wide-shop", hardened });
+
+  // 反射型 XSS：漏洞版把参数原样拼进 HTML，加固版做上下文转义
+  if (req.method === "GET" && url.pathname === "/api/search") {
+    const q = url.searchParams.get("q") ?? "";
+    const shown = hardened ? escapeHtml(q) : q;
+    return sendHtml(200, `<!doctype html><html><body><h1>Search</h1><p>${shown}</p></body></html>`);
+  }
 
   if (req.method === "GET" && url.pathname === "/api/admin/users") {
     if (!user) return send(401, { error: "unauthorized" });
@@ -176,5 +240,6 @@ const server = createServer(async (req, res) => {
 });
 
 server.listen(Number(process.env.PORT ?? 0), "127.0.0.1", () => {
+  serverOrigin = `http://127.0.0.1:${server.address().port}`;
   console.log(`[wide-shop] listening on port ${server.address().port}${hardened ? " (hardened)" : ""}`);
 });

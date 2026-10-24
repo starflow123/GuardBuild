@@ -18,6 +18,9 @@ export const COVERAGE = {
     "文件上传（主动内容同源回读取证）",
     "JWT 伪造令牌（alg=none / 无效签名 / 源码密钥）",
     "业务逻辑跳步与并发双花（状态回读 / 并发副作用标识）",
+    "CORS 配置错误（伪造 Origin + 允许凭证）",
+    "CSRF（Cookie 会话下的跨站表单改写，仅 allowMutation）",
+    "反射型 XSS（HTML 上下文无害 canary 反射）",
     "Supabase / PostgREST 数据暴露与 service_role 密钥泄露",
   ],
   /** 已实现的路由适配器形态 */

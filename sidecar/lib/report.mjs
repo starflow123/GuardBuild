@@ -228,7 +228,7 @@ function suggestions(r) {
       lines.push("- 加固后重跑 GuardBuild gate，应转为 exit 0（not_reproducible / no_candidates）。");
     } else {
       lines.push("- 漏洞证据已建立（修复前攻击成功），但静态候选中没有可自动修复的对象级越权端点（自动修复仅覆盖带认证的 IDOR 场景）。");
-      lines.push("- 请对照 report.json 中各攻击用例（如纵向越权、无鉴权读取、路径穿越、SQL/命令注入）定位端点并人工加固，再重跑 GuardBuild gate 验证。");
+      lines.push("- 请对照 report.json 中各攻击用例（如纵向越权、无鉴权读取、路径穿越、SQL/命令注入、CORS、CSRF、反射型 XSS）定位端点并人工加固，再重跑 GuardBuild gate 验证。");
     }
   } else if (outcome === "not_reproducible") {
     if (supabase) {

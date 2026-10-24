@@ -77,6 +77,20 @@ function makeCookieShop(name) {
   return dir;
 }
 
+function makeWideCookieShop(name) {
+  const dir = makeShop(name, { from: wideFixture });
+  const cfgPath = path.join(dir, "guardbuild.json");
+  const cfg = JSON.parse(readFileSync(cfgPath, "utf8"));
+  cfg.login = {
+    path: "/session/login",
+    bodyTemplate: { email: "{email}", password: "{password}" },
+    cookieAuth: true,
+    encoding: "form",
+  };
+  writeFileSync(cfgPath, `${JSON.stringify(cfg, null, 2)}\n`);
+  return dir;
+}
+
 function startServer(dir, extraEnv = {}) {
   return new Promise((resolve, reject) => {
     const child = spawn("node", ["server.js"], {
@@ -221,7 +235,7 @@ async function main() {
   const fixedShop = makeShop("shop-fixed", { fixed: true });
   const before = snapshot(vulnShop);
 
-  log("1/8 漏洞目标（legacy-shop 单一 IDOR）");
+  log("1/10 漏洞目标（legacy-shop 单一 IDOR）");
   const vuln = await startServer(vulnShop);
   try {
     const r = await runBlackbox({
@@ -245,7 +259,7 @@ async function main() {
     vuln.child.kill();
   }
 
-  log("2/8 已修复目标（同一路由加归属校验）");
+  log("2/10 已修复目标（同一路由加归属校验）");
   const fixed = await startServer(fixedShop);
   try {
     const r = await runBlackbox({
@@ -265,7 +279,7 @@ async function main() {
     fixed.child.kill();
   }
 
-  log("3/8 Cookie 会话鉴权目标（form 登录 + 302 Set-Cookie）");
+  log("3/10 Cookie 会话鉴权目标（form 登录 + 302 Set-Cookie）");
   const cookieShop = makeCookieShop("shop-cookie");
   const cookie = await startServer(cookieShop);
   try {
@@ -284,7 +298,7 @@ async function main() {
     cookie.child.kill();
   }
 
-  log("4/8 宽攻击面目标 · 默认探测（只发无副作用请求）");
+  log("4/10 宽攻击面目标 · 默认探测（只发无副作用请求）");
   const wideShop = makeShop("shop-wide", { from: wideFixture });
   const wideBefore = snapshot(wideShop);
   const wide = await startServer(wideShop);
@@ -298,18 +312,24 @@ async function main() {
       "blackbox-idor-",
       "blackbox-sqli-numeric-",
       "blackbox-traversal-",
+      "blackbox-cors-",
+      "blackbox-xss-",
     ]);
     checkCaseSet("默认探测 vulnerable 用例", ids, [], [
       "blackbox-idor-put-",
       "blackbox-idor-patch-",
       "blackbox-idor-delete-",
       "blackbox-anon-write-",
+      "blackbox-csrf-",
     ]);
-    checkCoverage("默认探测", report?.blackbox?.coverage, ["垂直越权（管理端点）", "跨用户读取（IDOR）"], [
+    checkCoverage("默认探测", report?.blackbox?.coverage, ["垂直越权（管理端点）", "跨用户读取（IDOR）", "CORS 配置（跨源读取）", "反射型 XSS（HTML 上下文）"], [
       "跨用户修改（PUT/PATCH）",
       "未认证写入",
       "跨用户删除（DELETE）",
+      "CSRF（Cookie 会话）",
     ]);
+    check("CORS 证据记录了伪造 Origin", (report?.evidence?.blackbox ?? []).some((e) => e.caseId?.startsWith("blackbox-cors-") && e.request?.headers?.Origin === "https://gb-cors-canary.invalid"));
+    check("XSS 证据是无害 canary（不含可执行标签）", (report?.evidence?.blackbox ?? []).some((e) => e.caseId?.startsWith("blackbox-xss-") && String(e.endpoint).includes("gbx") && !/<script|onerror=/i.test(String(e.endpoint))));
     check("报告标记写探测未开启", report?.blackbox?.allowMutation === false && report?.blackbox?.allowDestructive === false);
     check("垂直越权有管理身份交叉证明", (report?.evidence?.blackbox ?? []).some((e) => e.caseId?.startsWith("blackbox-vertical-") && e.evidenceGrade === "cross-proven"));
     check("原 fixture 未被修改", JSON.stringify(snapshot(wideShop)) === JSON.stringify(wideBefore));
@@ -317,7 +337,7 @@ async function main() {
     wide.child.kill();
   }
 
-  log("5/8 宽攻击面目标 · allowMutation（放开写/匿名写，仍不删）");
+  log("5/10 宽攻击面目标 · allowMutation（放开写/匿名写，仍不删）");
   const mutShop = makeShop("shop-wide-mutate", { from: wideFixture });
   const mutate = await startServer(mutShop);
   try {
@@ -344,7 +364,7 @@ async function main() {
     mutate.child.kill();
   }
 
-  log("6/8 宽攻击面目标 · allowMutation + allowDestructive（DELETE 也上）");
+  log("6/10 宽攻击面目标 · allowMutation + allowDestructive（DELETE 也上）");
   const delShop = makeShop("shop-wide-delete", { from: wideFixture });
   const destructive = await startServer(delShop);
   try {
@@ -367,7 +387,7 @@ async function main() {
     destructive.child.kill();
   }
 
-  log("7/8 宽攻击面目标 · 加固版 + 全部开关（应零 finding，且每类攻击都记 blocked）");
+  log("7/10 宽攻击面目标 · 加固版 + 全部开关（应零 finding，且每类攻击都记 blocked）");
   const hardShop = makeShop("shop-wide-hardened", { from: wideFixture });
   const hardened = await startServer(hardShop, { GB_WIDE_HARDENED: "1" });
   try {
@@ -389,6 +409,8 @@ async function main() {
       "blackbox-idor-patch-",
       "blackbox-idor-delete-",
       "blackbox-anon-write-",
+      "blackbox-cors-",
+      "blackbox-xss-",
     ]);
     check(
       "垂直越权的 blocked 有管理身份交叉证明（拒绝来自角色校验，不是端点不存在）",
@@ -400,7 +422,50 @@ async function main() {
     hardened.child.kill();
   }
 
-  log("8/8 不可达目标");
+  log("8/10 宽攻击面目标 · Cookie 会话 + allowMutation（CSRF 只在 Cookie 会话下探测）");
+  const csrfShop = makeWideCookieShop("shop-wide-cookie");
+  const csrf = await startServer(csrfShop);
+  try {
+    const r = await runBlackbox({
+      url: `http://127.0.0.1:${csrf.port}`,
+      project: csrfShop,
+      label: "csrf",
+      extraEnv: { GUARDBUILD_BLACKBOX_MUTATE: "1" },
+    });
+    check("退出码 = 1", r.code === 1, `code=${r.code}`);
+    check("Host Cookie 登录成功（alice/bob）", r.gate?.blackbox?.login?.ok === true, `path=${r.gate?.blackbox?.login?.path}`);
+    const report = readReport("csrf");
+    const ids = caseIdsBy(report, "vulnerable");
+    checkCaseSet("Cookie 会话 vulnerable 用例", ids, ["blackbox-csrf-"]);
+    checkCoverage("Cookie 会话", report?.blackbox?.coverage, ["CSRF（Cookie 会话）"]);
+    const csrfCase = (report?.evidence?.blackbox ?? []).find((e) => e.caseId?.startsWith("blackbox-csrf-"));
+    check("CSRF 用外部 Origin + form 简单请求取证", csrfCase?.request?.headers?.Origin === "https://gb-csrf-canary.invalid" && /x-www-form-urlencoded/.test(csrfCase?.request?.headers?.["Content-Type"] ?? ""));
+    check("CSRF 改写有归属人复读交叉证明", csrfCase?.evidenceGrade === "cross-proven");
+    check("CSRF canary 已恢复原值", !(report?.evidence?.blackbox ?? []).some((e) => /恢复未确认/.test(String(e.actual ?? ""))));
+  } finally {
+    csrf.child.kill();
+  }
+
+  log("9/10 Cookie 会话 + 加固版 + 全部开关（应零 finding，CSRF/CORS/XSS 都记 blocked）");
+  const csrfHardShop = makeWideCookieShop("shop-wide-cookie-hardened");
+  const csrfHard = await startServer(csrfHardShop, { GB_WIDE_HARDENED: "1" });
+  try {
+    const r = await runBlackbox({
+      url: `http://127.0.0.1:${csrfHard.port}`,
+      project: csrfHardShop,
+      label: "csrf-hardened",
+      extraEnv: { GUARDBUILD_BLACKBOX_MUTATE: "1", GUARDBUILD_BLACKBOX_DELETE: "1" },
+    });
+    check("退出码 = 0", r.code === 0, `code=${r.code}`);
+    const report = readReport("csrf-hardened");
+    check("finding 为空", (report?.blackbox?.findings ?? []).length === 0, `findings=${(report?.blackbox?.findings ?? []).length}`);
+    const ids = caseIdsBy(report, "blocked");
+    checkCaseSet("Cookie 加固版 blocked 用例", ids, ["blackbox-csrf-", "blackbox-cors-", "blackbox-xss-"]);
+  } finally {
+    csrfHard.child.kill();
+  }
+
+  log("10/10 不可达目标");
   const deadPort = await freePort();
   const r = await runBlackbox({
     url: `http://127.0.0.1:${deadPort}`,

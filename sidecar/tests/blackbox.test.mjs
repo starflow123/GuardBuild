@@ -122,6 +122,13 @@ function makeCtx(vault) {
         const res = await fetch(params.url, { method: params.method, headers, body: params.body });
         const body = await res.text();
         let storedIdentity;
+        if (params.storeCookieAs) {
+          const cookies = (res.headers.getSetCookie?.() ?? []).map((c) => c.split(";")[0]);
+          if (cookies.length) {
+            vault.set(params.storeCookieAs, { header: "Cookie", value: cookies.join("; ") });
+            storedIdentity = params.storeCookieAs;
+          }
+        }
         if (params.storeCredentialAs) {
           let parsed = null;
           try {
@@ -142,7 +149,7 @@ function makeCtx(vault) {
           status: res.status,
           statusText: res.statusText,
           body,
-          headers: {},
+          headers: Object.fromEntries([...res.headers.entries()].filter(([k]) => k.toLowerCase() !== "set-cookie")),
           redacted: false,
           durationMs: 1,
           storedIdentity,
@@ -526,6 +533,7 @@ function wideServer({ hardened = false } = {}) {
     "carol@test.com": { id: 3, email: "carol@test.com", password: "carol123", role: "admin" },
   };
   const tokens = new Map();
+  const sessions = new Map();
   const orders = [
     { id: 101, userId: 1, note: "alice-note" },
     { id: 102, userId: 2, note: "bob-note" },
@@ -537,23 +545,47 @@ function wideServer({ hardened = false } = {}) {
     { id: 2, year: 2024, total: 220 },
     { id: 3, year: 2025, total: 340 },
   ];
+  let serverOrigin = "";
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, "http://127.0.0.1");
-    const send = (status, body) => {
-      res.writeHead(status, { "Content-Type": "application/json" });
+    const cors =
+      hardened || !req.headers.origin
+        ? hardened
+          ? { "Access-Control-Allow-Origin": "https://app.wide.shop", "Access-Control-Allow-Credentials": "true" }
+          : {}
+        : { "Access-Control-Allow-Origin": req.headers.origin, "Access-Control-Allow-Credentials": "true" };
+    const send = (status, body, extra = {}) => {
+      res.writeHead(status, { "Content-Type": "application/json", ...cors, ...extra });
       res.end(JSON.stringify(body));
     };
-    const user = tokens.get((req.headers.authorization ?? "").replace(/^Bearer\s+/, "")) ?? null;
+    const sendHtml = (status, html) => {
+      res.writeHead(status, { "Content-Type": "text/html; charset=utf-8", ...cors });
+      res.end(html);
+    };
+    const cookie = String(req.headers.cookie ?? "");
+    const sid = cookie.match(/(?:^|;\s*)sid=([^;]+)/)?.[1];
+    const user =
+      tokens.get((req.headers.authorization ?? "").replace(/^Bearer\s+/, "")) ?? (sid ? sessions.get(sid) : null) ?? null;
     const readBody = async () => {
       const chunks = [];
       for await (const c of req) chunks.push(c);
+      const raw = Buffer.concat(chunks).toString("utf8") || "";
+      if ((req.headers["content-type"] ?? "").includes("application/x-www-form-urlencoded")) {
+        return Object.fromEntries(new URLSearchParams(raw));
+      }
       try {
-        return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+        return JSON.parse(raw || "{}");
       } catch {
         return {};
       }
     };
+    const escapeHtml = (v) =>
+      String(v).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
+
+    if (hardened && req.method !== "GET" && req.headers.origin && req.headers.origin !== serverOrigin) {
+      return send(403, { error: "cross-site request blocked" });
+    }
 
     if (req.method === "POST" && url.pathname === "/api/login") {
       const body = await readBody();
@@ -564,17 +596,33 @@ function wideServer({ hardened = false } = {}) {
       return send(200, { authentication: { token: t, user: { id: u.id, role: u.role, email: u.email } } });
     }
 
+    if (req.method === "POST" && url.pathname === "/session/login") {
+      const body = await readBody();
+      const u = accounts[body.email];
+      if (!u || u.password !== body.password) return send(401, { error: "bad credentials" });
+      const sessionId = `sess-${u.id}`;
+      sessions.set(sessionId, u);
+      return send(200, { user: { id: u.id, role: u.role, email: u.email } }, { "Set-Cookie": `sid=${sessionId}; Path=/; HttpOnly` });
+    }
+
     if (req.method === "GET" && url.pathname === "/openapi.json") {
       return send(200, {
         openapi: "3.0.0",
         paths: {
           "/api/invoices": { get: { parameters: [{ name: "year", in: "query" }] } },
           "/api/documents": { get: { parameters: [{ name: "name", in: "query" }] } },
+          "/api/search": { get: { parameters: [{ name: "q", in: "query" }] } },
         },
       });
     }
 
     if (req.method === "GET" && url.pathname === "/") return send(200, { service: "wide-shop" });
+
+    if (req.method === "GET" && url.pathname === "/api/search") {
+      const q = url.searchParams.get("q") ?? "";
+      const shown = hardened ? escapeHtml(q) : q;
+      return sendHtml(200, `<!doctype html><html><body><p>${shown}</p></body></html>`);
+    }
 
     // 管理端点：非 hardened 只校验「登录了」，角色形同虚设
     if (req.method === "GET" && url.pathname === "/api/admin/users") {
@@ -663,6 +711,7 @@ function wideServer({ hardened = false } = {}) {
 
   return new Promise((resolve) => {
     server.listen(0, "127.0.0.1", () => {
+      serverOrigin = `http://127.0.0.1:${server.address().port}`;
       resolve({
         url: `http://127.0.0.1:${server.address().port}`,
         close: () => new Promise((r) => server.close(r)),
@@ -827,6 +876,140 @@ test("runBlackbox: 未认证写入以「归属人复读见 canary」为准，而
     assert.ok(!target.messages.some((m) => String(m.body).startsWith("gb-anon-write-")), JSON.stringify(target.messages));
   } finally {
     await target.close();
+  }
+});
+
+test("runBlackbox: 伪造 Origin 被回显且允许凭证 → CORS 漏洞；加固版按白名单拒绝", async () => {
+  const vuln = await wideServer();
+  const ctx = makeWideCtx(new Map());
+  try {
+    const result = await runBlackbox(ctx, vuln.url, {
+      config: { login: ctx.loginConfig, identities: ctx.identities, blackbox: null },
+      allowMutation: false,
+    });
+    const cors = byCase(result, "blackbox-cors-");
+    assert.ok(cors.length, JSON.stringify(result.evidence.map((e) => e.caseId)));
+    assert.equal(cors[0].verdict, "vulnerable");
+    assert.match(cors[0].actual, /回显攻击者 Origin/);
+    assert.equal(cors[0].request.headers.Origin, "https://gb-cors-canary.invalid");
+    assert.ok(result.coverage.includes("CORS 配置（跨源读取）"));
+    assert.ok(result.findings.some((f) => /CORS/.test(f.type)));
+  } finally {
+    await vuln.close();
+  }
+
+  const hard = await wideServer({ hardened: true });
+  const ctxHard = makeWideCtx(new Map());
+  try {
+    const result = await runBlackbox(ctxHard, hard.url, {
+      config: { login: ctxHard.loginConfig, identities: ctxHard.identities, blackbox: null },
+      allowMutation: true,
+    });
+    const cors = byCase(result, "blackbox-cors-");
+    assert.equal(cors.length, 1);
+    assert.equal(cors[0].verdict, "blocked");
+    assert.match(cors[0].actual, /白名单/);
+  } finally {
+    await hard.close();
+  }
+});
+
+test("runBlackbox: HTML 原样反射无害 canary → XSS 漏洞；加固版编码反射 → blocked", async () => {
+  const vuln = await wideServer();
+  const ctx = makeWideCtx(new Map());
+  try {
+    const result = await runBlackbox(ctx, vuln.url, {
+      config: { login: ctx.loginConfig, identities: ctx.identities, blackbox: null },
+      allowMutation: false,
+    });
+    const xss = byCase(result, "blackbox-xss-").find((e) => e.caseId.includes("api-search"));
+    assert.ok(xss, JSON.stringify(result.evidence.map((e) => e.caseId)));
+    assert.equal(xss.verdict, "vulnerable");
+    assert.match(xss.endpoint, /q=/);
+    assert.match(xss.actual, /未转义载荷/);
+    assert.ok(result.coverage.includes("反射型 XSS（HTML 上下文）"));
+    assert.ok(result.findings.some((f) => /XSS/.test(f.type)));
+  } finally {
+    await vuln.close();
+  }
+
+  const hard = await wideServer({ hardened: true });
+  const ctxHard = makeWideCtx(new Map());
+  try {
+    const result = await runBlackbox(ctxHard, hard.url, {
+      config: { login: ctxHard.loginConfig, identities: ctxHard.identities, blackbox: null },
+      allowMutation: false,
+    });
+    const xss = byCase(result, "blackbox-xss-").find((e) => e.caseId.includes("api-search"));
+    assert.ok(xss);
+    assert.equal(xss.verdict, "blocked");
+    assert.match(xss.actual, /编码/);
+    assert.equal(result.findings.length, 0);
+  } finally {
+    await hard.close();
+  }
+});
+
+function makeCookieCtx(vault) {
+  const ctx = makeWideCtx(vault);
+  ctx.loginConfig = {
+    path: "/session/login",
+    bodyTemplate: { email: "{email}", password: "{password}" },
+    cookieAuth: true,
+    encoding: "form",
+    extraHeaders: {},
+  };
+  return ctx;
+}
+
+test("runBlackbox: CSRF 只在 Cookie 会话 + allowMutation 下探测，改写有复读证明并恢复", async () => {
+  const off = await wideServer();
+  const ctxOff = makeCookieCtx(new Map());
+  try {
+    const result = await runBlackbox(ctxOff, off.url, {
+      config: { login: ctxOff.loginConfig, identities: ctxOff.identities, blackbox: null },
+      allowMutation: false,
+    });
+    assert.equal(byCase(result, "blackbox-csrf-").length, 0);
+    assert.ok(!result.coverage.includes("CSRF（Cookie 会话）"));
+  } finally {
+    await off.close();
+  }
+
+  const vuln = await wideServer();
+  const ctx = makeCookieCtx(new Map());
+  try {
+    const result = await runBlackbox(ctx, vuln.url, {
+      config: { login: ctx.loginConfig, identities: ctx.identities, blackbox: null },
+      allowMutation: true,
+    });
+    assert.equal(result.login.ok, true);
+    const csrf = byCase(result, "blackbox-csrf-").find((e) => e.caseId.includes("api-orders-102"));
+    assert.ok(csrf, JSON.stringify(result.evidence.map((e) => e.caseId)));
+    assert.equal(csrf.verdict, "vulnerable");
+    assert.equal(csrf.evidenceGrade, "cross-proven");
+    assert.equal(csrf.request.headers.Origin, "https://gb-csrf-canary.invalid");
+    assert.match(csrf.request.headers["Content-Type"], /x-www-form-urlencoded/);
+    assert.ok(result.coverage.includes("CSRF（Cookie 会话）"));
+    assert.ok(result.findings.some((f) => /CSRF/.test(f.type)));
+    assert.equal(vuln.orders.find((o) => o.id === 102).note, "bob-note", "canary 必须被恢复");
+  } finally {
+    await vuln.close();
+  }
+
+  const hard = await wideServer({ hardened: true });
+  const ctxHard = makeCookieCtx(new Map());
+  try {
+    const result = await runBlackbox(ctxHard, hard.url, {
+      config: { login: ctxHard.loginConfig, identities: ctxHard.identities, blackbox: null },
+      allowMutation: true,
+    });
+    const csrf = byCase(result, "blackbox-csrf-");
+    assert.ok(csrf.length, "加固版应记录 blocked 而非静默");
+    assert.ok(csrf.every((e) => e.verdict === "blocked"));
+    assert.equal(result.findings.length, 0);
+  } finally {
+    await hard.close();
   }
 });
 

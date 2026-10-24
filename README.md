@@ -26,7 +26,7 @@
 | 6 | 双重验收 | 修复后：攻击用例（含引擎同源生成的攻击变体）必须全部不再复现，且业务用例（含本人可见性的正向断言）必须全部保持通过 |
 | 7 | 产物 | `report.json` / `report.md` 报告 + SQLite 证据链（7 张表）；桌面模式可经用户授权写回原工作区 |
 
-**攻击类别**：对象级越权（IDOR）、无鉴权读取、路径穿越、SQL 注入（布尔绕过 / 数据库报错双证据）、命令注入（shell 展开令牌回显，避免输入反射误报）、SSRF（本机 canary 回连取证）、文件上传（主动内容同源回读取证）、JWT 伪造令牌（alg=none / 无效签名 / 源码密钥，身份回显取证）、业务逻辑与竞态（状态跳步状态回读 / 并发双花副作用标识）、Supabase 匿名读取与 service_role 暴露。自动修复边界：确定性模板只修「带认证但缺归属校验」的 IDOR；开启 LLM 编码代理（`llm.patch`）后，IDOR / 无鉴权 / 穿越 / SQLi / 命令注入五类候选都可尝试生成补丁，仍须通过严格校验与双重验收才计为 `verified`；黑盒模式无源码、Supabase 属平台策略、SSRF / 文件上传 / JWT / 业务逻辑与竞态不提供自动补丁，均只取证并给人工修复指引（`vulnerable_unfixed`）。
+**攻击类别**：对象级越权（IDOR）、无鉴权读取、路径穿越、SQL 注入（布尔绕过 / 数据库报错双证据）、命令注入（shell 展开令牌回显，避免输入反射误报）、SSRF（本机 canary 回连取证）、文件上传（主动内容同源回读取证）、JWT 伪造令牌（alg=none / 无效签名 / 源码密钥，身份回显取证）、业务逻辑与竞态（状态跳步状态回读 / 并发双花副作用标识）、CORS 配置错误（伪造 Origin 回显 + 允许凭证）、CSRF（Cookie 会话下的跨站表单改写，仅写开关开启时）、反射型 XSS（HTML 上下文无害 canary）、Supabase 匿名读取与 service_role 暴露。自动修复边界：确定性模板只修「带认证但缺归属校验」的 IDOR；开启 LLM 编码代理（`llm.patch`）后，IDOR / 无鉴权 / 穿越 / SQLi / 命令注入五类候选都可尝试生成补丁，仍须通过严格校验与双重验收才计为 `verified`；黑盒模式无源码、Supabase 属平台策略、SSRF / 文件上传 / JWT / 业务逻辑与竞态 / CORS / CSRF / XSS 不提供自动补丁，均只取证并给人工修复指引（`vulnerable_unfixed`）。
 
 **SSRF 取证方式**：静态识别「请求输入 → 服务端 HTTP 客户端 URL」（fetch / axios / got / ky / requests / httpx / urlopen 等，含变量、模板字符串与 f-string 传播），复现时由 Sidecar 在 `127.0.0.1` 随机端口起一次性 canary，把攻击者可控的 URL 参数替换成 canary 地址后发起真实请求。只有目标服务**真的回连 canary** 才判 `vulnerable`（内容级交叉证明，报告保留命中次数）；未回连一律 `inconclusive`，不拿状态码猜。副作用为零、无需外部回调服务；局限：Docker 容器或远程目标访问不到宿主回环地址，这类目标的 SSRF 只能如实记 inconclusive。
 
@@ -223,9 +223,10 @@ guardbuild-headless --url http://127.0.0.1:3000 \
 guardbuild-headless --url https://staging.example.com --project ./my-project --gate
 ```
 
-- 探测面（每个开关都会写进报告的「本轮攻击面」，GUI 同词）：OpenAPI 发现 + 常见路由目录探测（含管理端点命名猜测）；未认证读取、跨用户读取（IDOR，需 ≥2 个普通测试身份）、垂直越权（普通登录身份访问管理端点，有管理身份时做交叉证明，用于区分「端点不存在」与「正确拒绝」）、SQL 注入（错误回显 / 恒真恒假差分 / **数字语境** `1 OR 1=1` 三段差分 / 单对象条件绕过）、路径穿越（明文 + 二次编码 / 变形编码绕过）、敏感文件与 actuator 暴露、限流观察。
+- 探测面（每个开关都会写进报告的「本轮攻击面」，GUI 同词）：OpenAPI 发现 + 常见路由目录探测（含管理端点命名猜测）；未认证读取、跨用户读取（IDOR，需 ≥2 个普通测试身份）、垂直越权（普通登录身份访问管理端点，有管理身份时做交叉证明，用于区分「端点不存在」与「正确拒绝」）、SQL 注入（错误回显 / 恒真恒假差分 / **数字语境** `1 OR 1=1` 三段差分 / 单对象条件绕过）、路径穿越（明文 + 二次编码 / 变形编码绕过）、CORS（伪造 Origin，回显且允许凭证才判漏洞；白名单拒绝记 blocked）、反射型 XSS（HTML 上下文注入**不含脚本**的无害 canary，原样反射判漏洞、编码反射记 blocked）、敏感文件与 actuator 暴露、限流观察。
 - 写操作越权默认关闭，避免修改甚至销毁目标数据，分两级显式开启：
   - 跨用户 PUT/PATCH 与匿名写入：`blackbox.allowMutation: true` 或 `GUARDBUILD_BLACKBOX_MUTATE=1`（修改后按归属人身份尽力恢复原值，恢复未确认会写进证据）。
+  - Cookie 会话下的 CSRF 改写同属写操作，只在 `allowMutation` 开启且契约声明 `login.cookieAuth: true` 时探测；Bearer 令牌不会被浏览器跨站自动携带，因此该形态不适用 CSRF。
   - 跨用户 DELETE 不可回滚，需在上一级之外再加 `blackbox.allowDestructive: true` 或 `GUARDBUILD_BLACKBOX_DELETE=1`。
   - 两类判定都不看状态码：写类以「归属人复核字段值确实被改」为准，DELETE 以「归属人复读对象是否消失」为准；请求被接受但数据未动只记 `inconclusive`，既不记漏洞也不记「已防住」。匿名写入的 canary 由归属人复读证明落库，随后尽力匿名删除自清理。
 - 登录/身份来自 `guardbuild.json` 的 `login` / `identities`；可加 `blackbox.loginPaths` 补充登录端点候选。表单登录（`login.encoding: "form"`）与 Cookie 会话（`login.cookieAuth: true`，兼容 302 + `Set-Cookie`）同样适用于黑盒模式。

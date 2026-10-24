@@ -102,6 +102,36 @@ const TEMPLATES = {
     ],
     fix: "服务端强制状态机校验并在同一条更新语句里完成条件判断；一次性动作使用幂等键/唯一约束/行锁，先原子置位再执行副作用；金额与数量服务端重算并做范围校验；补状态跳步与并发重复提交回归测试。",
   },
+  cors: {
+    label: "CORS 配置错误",
+    risk: "服务端把请求里的任意 Origin 回显进 `Access-Control-Allow-Origin` 并允许凭证，任意站点都能带着用户会话跨源读取接口数据（本轮已用伪造 Origin 复现）。",
+    inspect: [
+      "CORS 中间件是否直接 `origin: true` 或 `Access-Control-Allow-Origin: <请求 Origin>`，而不是固定白名单。",
+      "是否同时返回 `Access-Control-Allow-Credentials: true`；是否把 `*` 与凭证组合使用。",
+      "预检是否放行了任意来源与任意方法/头，响应是否缺少 `Vary: Origin` 导致缓存串源。",
+    ],
+    fix: "改为精确 Origin 白名单（按环境配置），白名单不匹配时不返回 CORS 头；允许凭证时禁止 `*`；补齐 `Vary: Origin` 与预检方法/头白名单；补「陌生 Origin 不得获得 ACAO 回显」的回归测试。",
+  },
+  csrf: {
+    label: "CSRF（跨站请求伪造）",
+    risk: "Cookie 会话下的写接口既不校验 CSRF token 也不校验 Origin，跨站 form 简单请求可直接改写已登录用户的数据（本轮已用外部 Origin + form 请求复现并回读确认）。",
+    inspect: [
+      "会话 Cookie 是否缺少 `SameSite=Lax/Strict`（`None` 且无其他防护时风险最高）。",
+      "写接口是否校验 CSRF token（double-submit / synchronizer token），或至少校验 `Origin`/`Referer` 与允许来源一致。",
+      "是否把 JSON-only 当作防护：若同时接受 `application/x-www-form-urlencoded` 或 `text/plain`，跨站简单请求可绕过预检。",
+    ],
+    fix: "会话 Cookie 设为 `SameSite=Lax`（跨站 POST 场景可考虑 `Strict`）；写接口强制 CSRF token 校验或 Origin/Referer 白名单；拒绝非预期 Content-Type；补「外部 Origin 写请求应 403」的回归测试。",
+  },
+  xss: {
+    label: "反射型 XSS",
+    risk: "请求参数被原样拼进 HTML 响应，攻击者可构造链接让受害者在页面上下文中执行任意脚本（本轮已用不含脚本的无害 canary 证明尖括号/引号未被转义）。",
+    inspect: [
+      "HTML 输出点的拼接：模板字符串、`res.send`/`innerHTML`、服务端模板未转义变量。",
+      "是否按上下文转义（HTML 文本 / 属性 / URL / JS），而不是只过滤 `<script>`。",
+      "是否缺少 `Content-Security-Policy` 与 `X-Content-Type-Options: nosniff` 作为纵深防御。",
+    ],
+    fix: "用框架的自带转义或成熟转义库按输出上下文编码；禁止把请求值直接拼进 HTML/属性/JS；补充 CSP 与 `nosniff`；补「尖括号与引号必须被编码」的回归测试。",
+  },
   idor: {
     label: "对象级越权（IDOR）",
     risk: "按客户端提供的对象 ID 取数但未校验归属，其他登录用户可读写不属于自己的对象（本轮已用跨身份请求复现）。",
@@ -182,6 +212,9 @@ export function detectFamily(finding) {
   if (/文件上传|任意文件|主动内容|unrestricted\s*file\s*upload/i.test(text)) return "upload";
   if (/JWT|令牌伪造|token\s*forge|alg\s*=\s*none|签发/i.test(text)) return "jwt";
   if (/业务逻辑|状态跳步|状态机|并发|双花|竞态|重复退款|幂等|race|double[-\s]*spend/i.test(text)) return "bizlogic";
+  if (/\bCORS\b|跨源/i.test(text)) return "cors";
+  if (/CSRF|跨站请求伪造|跨站表单/i.test(text)) return "csrf";
+  if (/反射型\s*XSS|XSS|跨站脚本/i.test(text)) return "xss";
   if (/穿越|traversal/i.test(text)) return "traversal";
   if (/RLS|Supabase|行级安全/i.test(text)) return "supabase_rls";
   // 「未认证」优先于「归属」：未认证读取的详情常附带归属类敏感字段说明

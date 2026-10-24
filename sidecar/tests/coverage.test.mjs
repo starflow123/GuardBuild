@@ -47,13 +47,16 @@ test("describeOutcome: 终态语义与退出码映射（README 退出码表的�
 
 test("coverageSummary: 讲清覆盖与不覆盖，并点名 Java/Spring 边界", () => {
   const text = coverageSummary();
-  assert.equal(COVERAGE.kinds.length, 10);
+  assert.equal(COVERAGE.kinds.length, 13);
   assert.ok(COVERAGE.stacks.length >= 7);
   assert.match(text, /对象级越权/);
   assert.match(text, /SSRF/);
   assert.match(text, /文件上传/);
   assert.match(text, /JWT/);
   assert.match(text, /业务逻辑/);
+  assert.match(text, /CORS/);
+  assert.match(text, /CSRF/);
+  assert.match(text, /XSS/);
   assert.match(text, /FastAPI/);
   assert.match(text, /Java \/ Spring Boot/);
   assert.match(text, /routes/);

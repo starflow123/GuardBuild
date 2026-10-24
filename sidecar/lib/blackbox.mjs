@@ -90,10 +90,15 @@ function isDenied(status) {
   return DENIED_STATUS.has(status);
 }
 
-/** 经 Host 发起一次 HTTP 请求；identity 为保险库身份名（令牌由 Host 注入）。 */
-async function httpJson(ctx, { baseUrl, method, path, identity = null, body = null, timeoutMs = 15_000 }) {
+/** 经 Host 发起一次 HTTP 请求；identity 为保险库身份名（令牌由 Host 注入）。
+ *  extraHeaders 只用于探测本身需要的头（Origin / Content-Type），仍由 Host 发出，不绕过边界。 */
+async function httpJson(
+  ctx,
+  { baseUrl, method, path, identity = null, body = null, timeoutMs = 15_000, headers: extraHeaders = null, contentType = null }
+) {
   const headers = { ...(ctx.loginConfig?.extraHeaders ?? {}) };
-  if (body != null) headers["Content-Type"] = "application/json";
+  if (body != null) headers["Content-Type"] = contentType ?? "application/json";
+  if (extraHeaders && typeof extraHeaders === "object") Object.assign(headers, extraHeaders);
   const params = {
     token: ctx.tokens.http ?? ctx.tokens.net,
     method,
@@ -435,7 +440,16 @@ async function tryLogin(ctx, baseUrl, cfg) {
 
 // ---------- 证据 ----------
 
-function makeRecord(ctx, baseUrl, { caseId, name, method, path, identity, body, res, expectation, verdict, actual, grade = "http-only", crossProof = null, impact = null }) {
+function makeRecord(
+  ctx,
+  baseUrl,
+  { caseId, name, method, path, identity, body, res, expectation, verdict, actual, grade = "http-only", crossProof = null, impact = null, reqHeaders = null }
+) {
+  const authHeader = identity
+    ? ctx.loginConfig?.cookieAuth === true
+      ? { Cookie: `***vault:${identity}***` }
+      : { Authorization: `Bearer ***vault:${identity}***` }
+    : {};
   return {
     id: shortId("ev"),
     sessionId: ctx.sessionId,
@@ -445,9 +459,11 @@ function makeRecord(ctx, baseUrl, { caseId, name, method, path, identity, body, 
     endpoint: path,
     request: {
       url: `${baseUrl.replace(/\/+$/, "")}${path}`,
-      headers: identity
-        ? { Authorization: `Bearer ***vault:${identity}***`, "Content-Type": "application/json" }
-        : { "Content-Type": "application/json" },
+      headers: {
+        ...authHeader,
+        "Content-Type": "application/json",
+        ...(reqHeaders ?? {}),
+      },
       body: body ?? null,
     },
     response: {
@@ -963,8 +979,275 @@ async function probeAnonymousWrite(ctx, baseUrl, routes, { victim }, limit = 8) 
   return records;
 }
 
-const SQL_ERROR_SIGNATURES = [
-  "SQL syntax", "MySQL server", "SQLite3::query", "ORA-", "PostgreSQL",
+// ---------- CORS / CSRF / XSS ----------
+
+const CORS_PROBE_ORIGIN = "https://gb-cors-canary.invalid";
+const CSRF_PROBE_ORIGIN = "https://gb-csrf-canary.invalid";
+const MAX_CORS_PROBES = 10;
+const MAX_CSRF_PROBES = 10;
+const MAX_XSS_REQUESTS = 16;
+const XSS_PARAM_GUESSES = ["q", "query", "search", "keyword", "name", "message", "title"];
+
+/** 响应头大小写不敏感读取（Host 原样返回服务端大小写）。 */
+function headerOf(res, name) {
+  const target = name.toLowerCase();
+  for (const [k, v] of Object.entries(res?.headers ?? {})) {
+    if (k.toLowerCase() === target) return Array.isArray(v) ? String(v[0] ?? "") : String(v ?? "");
+  }
+  return null;
+}
+
+function hasTemplate(path) {
+  return /[{}$]/.test(String(path ?? ""));
+}
+
+/** 只对真实存在的 GET 路由做浏览器类探测：404 占位不产生 Cookie/CORS/反射语义。 */
+function browserCandidates(routes, limit) {
+  return getRoutesForProbing(
+    routes.filter((r) => r.method === "GET" && !hasTemplate(r.path) && r.status !== 404),
+    limit
+  );
+}
+
+/**
+ * CORS：带伪造 Origin 读一次，只看响应头，不发写请求。
+ * 判定口径与浏览器一致：`Access-Control-Allow-Origin` 必须精确回显攻击者 Origin，
+ * 且同时 `Access-Control-Allow-Credentials: true`，恶意站点才能带上用户会话读取响应。
+ * 通配 `*`（无凭证）是公开接口常态，不记；`*`+凭证是规范无效组合，记不确定。
+ * 全站通常共用一份 CORS 中间件，命中一条即代表根因；没有命中时保留一条「白名单拒绝」证据。
+ */
+async function probeCors(ctx, baseUrl, routes, identity, limit = MAX_PROBE_ROUTES) {
+  const records = [];
+  const candidates = browserCandidates(routes, Math.min(limit, MAX_CORS_PROBES));
+  let fallback = null;
+
+  for (const route of candidates) {
+    const res = await httpJson(ctx, {
+      baseUrl,
+      method: "GET",
+      path: route.path,
+      identity,
+      headers: { Origin: CORS_PROBE_ORIGIN },
+    });
+    if (res.status === 0) continue;
+    const acao = (headerOf(res, "access-control-allow-origin") ?? "").trim();
+    const credentials = (headerOf(res, "access-control-allow-credentials") ?? "").trim().toLowerCase() === "true";
+    if (!acao) continue; // 没有 CORS 头 = 浏览器默认拒绝跨源读取，不记噪声
+
+    const echo = acao === CORS_PROBE_ORIGIN;
+    const wildcard = acao === "*";
+    const base = {
+      caseId: `blackbox-cors-${slug(route.path)}`,
+      name: `黑盒·CORS 配置 ${route.path}`,
+      method: "GET",
+      path: route.path,
+      identity,
+      res,
+      expectation: "跨源读取不应把攻击者 Origin 放进凭证允许列表",
+      reqHeaders: { Origin: CORS_PROBE_ORIGIN },
+    };
+
+    if (echo && credentials) {
+      const rec = makeRecord(ctx, baseUrl, {
+        ...base,
+        verdict: VERDICT.VULNERABLE,
+        actual: `响应回显攻击者 Origin（ACAO=${acao}）且允许凭证（Access-Control-Allow-Credentials: true）`,
+        impact: "任意站点可携带用户会话跨源读取该端点数据（CORS 反射 Origin + 允许凭证）",
+      });
+      records.push(rec);
+      emitRecord(ctx, rec);
+      break;
+    }
+
+    let verdict = null;
+    let actual = null;
+    if (echo) {
+      verdict = VERDICT.INCONCLUSIVE;
+      actual = `回显攻击者 Origin（ACAO=${acao}），但未允许凭证；无法携带用户会话跨源读取`;
+    } else if (wildcard && credentials) {
+      verdict = VERDICT.INCONCLUSIVE;
+      actual = "ACAO=* 且允许凭证（该组合按 CORS 规范会被浏览器拒绝，配置无效但未构成可利用的凭证读取）";
+    } else if (!wildcard) {
+      verdict = VERDICT.BLOCKED;
+      actual = `未回显攻击者 Origin（ACAO=${acao}），跨源读取按白名单被拒`;
+    }
+    if (verdict && (!fallback || (verdict === VERDICT.INCONCLUSIVE && fallback.verdict === VERDICT.BLOCKED))) {
+      fallback = { ...base, verdict, actual };
+    }
+  }
+
+  if (fallback) {
+    const rec = makeRecord(ctx, baseUrl, fallback);
+    records.push(rec);
+    emitRecord(ctx, rec);
+  }
+  return records;
+}
+
+/**
+ * CSRF：仅对 Cookie 会话有意义（Bearer 令牌不会被浏览器跨站自动携带）。
+ * 复刻「跨站简单请求」形态——form-urlencoded、不带任何 CSRF token、带外部 Origin，
+ * 且只用受害身份的**自己名下**对象（与写越权区分：这里不跨用户，只证明服务端没校验来源）。
+ * 判定不看状态码：以归属人复读确认字段真的被改写为准，随后尽力恢复原值并写进证据。
+ */
+async function probeCsrf(ctx, baseUrl, routes, { victim }, limit = MAX_PROBE_ROUTES) {
+  const records = [];
+  const candidates = browserCandidates(routes, Math.min(limit, MAX_CSRF_PROBES));
+  for (const route of candidates) {
+    const list = await httpJson(ctx, { baseUrl, method: "GET", path: route.path, identity: victim.name });
+    if (!list.ok) continue;
+    const items = extractItems(list.json);
+    const victimItem = items.find((o) => extractId(o) != null);
+    if (!victimItem) continue;
+    const victimId = extractId(victimItem);
+    const owner = extractOwner(victimItem);
+    const field = Object.keys(victimItem).find(
+      (k) =>
+        typeof victimItem[k] === "string" &&
+        !["id", "email", "status", "createdAt", "updatedAt", "token"].includes(k) &&
+        owner?.field !== k
+    );
+    if (!field) continue;
+    const original = victimItem[field];
+    const detailPath = `${route.path.replace(/\/+$/, "")}/${encodeURIComponent(victimId)}`;
+    const canary = `${original}_csrf`;
+
+    for (const method of ["PATCH", "PUT"]) {
+      const form = new URLSearchParams({ [field]: canary }).toString();
+      const attack = await httpJson(ctx, {
+        baseUrl,
+        method,
+        path: detailPath,
+        identity: victim.name,
+        body: form,
+        contentType: "application/x-www-form-urlencoded",
+        headers: { Origin: CSRF_PROBE_ORIGIN },
+      });
+      if (attack.status === 404 || attack.status === 405) continue; // 端点不接这个方法，不是 CSRF 结论
+      const base = {
+        caseId: `blackbox-csrf-${method.toLowerCase()}-${slug(detailPath)}`,
+        name: `黑盒·CSRF（跨站表单改写）${detailPath}`,
+        method,
+        path: detailPath,
+        identity: victim.name,
+        body: { [field]: canary },
+        res: attack,
+        expectation: "改写用户数据的请求应校验 Origin 或 CSRF token",
+        reqHeaders: { Origin: CSRF_PROBE_ORIGIN, "Content-Type": "application/x-www-form-urlencoded" },
+      };
+      if (isDenied(attack.status)) {
+        const rec = makeRecord(ctx, baseUrl, {
+          ...base,
+          verdict: VERDICT.BLOCKED,
+          actual: `HTTP ${attack.status}，带外部 Origin 的跨站表单改写被拒`,
+        });
+        records.push(rec);
+        emitRecord(ctx, rec);
+        break;
+      }
+      const reread = await httpJson(ctx, { baseUrl, method: "GET", path: detailPath, identity: victim.name });
+      const changed = reread.ok && String(reread.json ? JSON.stringify(reread.json) : reread.body ?? "").includes(canary);
+      let restored = null;
+      if (changed) {
+        await httpJson(ctx, {
+          baseUrl,
+          method: "PUT",
+          path: detailPath,
+          identity: victim.name,
+          body: { [field]: original },
+        });
+        const check = await httpJson(ctx, { baseUrl, method: "GET", path: detailPath, identity: victim.name });
+        restored = check.ok && !JSON.stringify(check.json ?? "").includes(canary);
+      }
+      const rec = makeRecord(ctx, baseUrl, {
+        ...base,
+        verdict: changed ? VERDICT.VULNERABLE : VERDICT.INCONCLUSIVE,
+        actual: changed
+          ? `外部 Origin 的 form 请求未带 CSRF token 却改写了 ${victim.name} 自己的对象 #${victimId}（字段 ${field}）${
+              restored === false ? "；原值恢复未确认，需人工回看" : ""
+            }（未判定会话 Cookie 的 SameSite 属性）`
+          : `HTTP ${attack.status}，但归属人复读未见字段 ${field} 被改写`,
+        grade: changed ? "cross-proven" : "http-only",
+        crossProof: changed
+          ? `外部 Origin 写后由 ${victim.name} 复读确认 ${field}=${canary}；已尝试恢复原值（${restored ? "成功" : "未确认"}）`
+          : null,
+        impact: changed ? "缺少 CSRF 防护：跨站表单可改写已登录用户的数据" : null,
+      });
+      records.push(rec);
+      emitRecord(ctx, rec);
+      break;
+    }
+  }
+  return records;
+}
+
+/**
+ * 反射型 XSS：只做无害 canary 反射，不注入可执行脚本。
+ * 载荷是 `<随机串>"><gbx>`：尖括号与引号足以证明 HTML 上下文未转义，`<gbx>` 是未知标签、
+ * 浏览器不会执行任何代码。只有响应确为 HTML 且**原样**包含完整载荷才判漏洞；
+ * 反射了 canary 但尖括号/引号被编码则记 blocked；JSON 响应不参与判定（避免把普通回显算成 XSS）。
+ */
+async function probeXss(ctx, baseUrl, routes, identity, limit = MAX_PROBE_ROUTES) {
+  const records = [];
+  let budget = MAX_XSS_REQUESTS;
+  const candidates = browserCandidates(routes, Math.min(limit, 8));
+
+  for (const route of candidates) {
+    const declared = (route.queryParams ?? []).filter((n) => typeof n === "string" && n.length > 0);
+    const params = (declared.length ? declared : XSS_PARAM_GUESSES).slice(0, 2);
+    let reported = false;
+    for (const param of params) {
+      if (budget < 1) return records;
+      budget -= 1;
+      const canary = `gbx${shortId("").replace(/^_/, "")}`;
+      const payload = `${canary}"><gbx>`;
+      const sep = route.path.includes("?") ? "&" : "?";
+      const path = `${route.path}${sep}${encodeURIComponent(param)}=${encodeURIComponent(payload)}`;
+      const res = await httpJson(ctx, { baseUrl, method: "GET", path, identity });
+      if (!isOk(res.status)) continue;
+      const body = res.body ?? "";
+      const type = headerOf(res, "content-type") ?? "";
+      const isHtml = /text\/html|application\/xhtml\+xml/i.test(type) || (!type && /^\s*(?:<!doctype html|<html)/i.test(body));
+      if (!isHtml) continue;
+      const base = {
+        caseId: `blackbox-xss-${slug(route.path)}`,
+        name: `黑盒·反射型 XSS ${route.path} 参数 ${param}`,
+        method: "GET",
+        path,
+        identity,
+        res,
+        expectation: "HTML 输出必须对请求参数做上下文转义",
+      };
+      if (body.includes(payload)) {
+        const rec = makeRecord(ctx, baseUrl, {
+          ...base,
+          verdict: VERDICT.VULNERABLE,
+          actual: `HTML 响应原样包含未转义载荷 ${payload}（Content-Type: ${type || "未声明"}）`,
+          impact: "反射型 XSS（HTML 上下文未转义，可执行任意脚本）",
+        });
+        records.push(rec);
+        emitRecord(ctx, rec);
+        reported = true;
+        break;
+      }
+      if (body.includes(canary) && /&lt;gbx|&#60;gbx|&#x3c;gbx/i.test(body)) {
+        const rec = makeRecord(ctx, baseUrl, {
+          ...base,
+          verdict: VERDICT.BLOCKED,
+          actual: "响应反射了 canary，但尖括号/引号已被 HTML 编码（如 &lt;gbx）",
+        });
+        records.push(rec);
+        emitRecord(ctx, rec);
+        reported = true;
+        break;
+      }
+    }
+    if (reported) continue;
+  }
+  return records;
+}
+
+const SQL_ERROR_SIGNATURES = [  "SQL syntax", "MySQL server", "SQLite3::query", "ORA-", "PostgreSQL",
   "Microsoft SQL Server", "Unclosed quotation mark", "near \"", "syntax error",
 ];
 
@@ -1416,7 +1699,16 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
   const allowDestructive = !!options.allowDestructive;
   const probes = [];
   // 覆盖清单要如实反映「这一轮真的打过什么」，报告与 GUI 直接照它写口径
-  const coverage = ["路由发现", "敏感文件/调试端点", "限流观察", "未认证读取", "SQL 注入（字符串+数字语境）", "路径穿越（含编码绕过）"];
+  const coverage = [
+    "路由发现",
+    "敏感文件/调试端点",
+    "限流观察",
+    "未认证读取",
+    "SQL 注入（字符串+数字语境）",
+    "路径穿越（含编码绕过）",
+    "CORS 配置（跨源读取）",
+    "反射型 XSS（HTML 上下文）",
+  ];
 
   // 攻击规划（M2）：预算只够打前 probeCap 条路由时，让模型在「引擎已发现但未获预算」的
   // 路由里挑编号。模型不参与怎么打、也不参与判定，载荷与判据仍是引擎生成。
@@ -1463,6 +1755,8 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
   }
 
   // 注入/穿越没有登录身份也要跑：可注入的公开端点不需要会话就能读库
+  probes.push(...(await probeCors(ctx, baseUrl, attackRoutes, who, probeCap)));
+  probes.push(...(await probeXss(ctx, baseUrl, attackRoutes, who, probeCap)));
   probes.push(...(await probeSqli(ctx, baseUrl, attackRoutes, who, probeCap)));
   probes.push(...(await probeTraversal(ctx, baseUrl, who, attackRoutes)));
   if (login.ok) {
@@ -1477,6 +1771,17 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
     if (allowDestructive) coverage.push("跨用户删除（DELETE）");
     probes.push(...(await probeWriteIdor(ctx, baseUrl, attackRoutes, pair, { methods, destructive: allowDestructive }, probeCap)));
     probes.push(...(await probeAnonymousWrite(ctx, baseUrl, attackRoutes, { victim: pair.victim })));
+    if (ctx.loginConfig?.cookieAuth === true) {
+      coverage.push("CSRF（Cookie 会话）");
+      probes.push(...(await probeCsrf(ctx, baseUrl, attackRoutes, { victim: pair.victim }, probeCap)));
+    } else {
+      ctx.emit({
+        kind: "discovery",
+        severity: SEVERITY.INFO,
+        message: "CSRF 探测跳过：本轮登录使用 Bearer 令牌（浏览器不会跨站自动携带），CSRF 只对 Cookie 会话有意义",
+        data: { cookieAuth: false },
+      });
+    }
   } else if (pair) {
     ctx.emit({
       kind: "discovery",

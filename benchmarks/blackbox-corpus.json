@@ -150,6 +150,55 @@
       "expectedVulnerable": ["blackbox-idor-api-v2-orders-5002"]
     },
     {
+      "id": "seo-shop",
+      "fixture": "fixtures/seo-shop",
+      "_note": "无 OpenAPI、路径不在词表：/api/accounts/export 只在 robots.txt 的 Disallow 里，/api/invoices/archive 只在 sitemap.xml 的 <loc> 里。",
+      "expectedExit": 1,
+      "expectedOutcomes": ["vulnerable_unfixed"],
+      "expectedVulnerable": ["blackbox-unauth-api-accounts-export", "blackbox-unauth-api-invoices-archive"]
+    },
+    {
+      "id": "seo-shop-hardened",
+      "fixture": "fixtures/seo-shop",
+      "_note": "同一份 robots/sitemap 声明，两端点改为需登录：声明本身不是漏洞判据。",
+      "serverEnv": { "GB_SEO_HARDENED": "1" },
+      "expectedExit": 0,
+      "expectedOutcomes": ["no_findings"],
+      "expectedVulnerable": []
+    },
+    {
+      "id": "nextbuild-shop",
+      "fixture": "fixtures/nextbuild-shop",
+      "_note": "接口字面量只在 _buildManifest.js 列出的二级 chunk 里；入口 chunk 只有 __NEXT_DATA__，不做清单遍历必然漏报。",
+      "expectedExit": 1,
+      "expectedOutcomes": ["vulnerable_unfixed"],
+      "expectedVulnerable": ["blackbox-unauth-api-accounts-ledger"]
+    },
+    {
+      "id": "nextbuild-shop-hardened",
+      "fixture": "fixtures/nextbuild-shop",
+      "serverEnv": { "GB_NEXT_HARDENED": "1" },
+      "expectedExit": 0,
+      "expectedOutcomes": ["no_findings"],
+      "expectedVulnerable": []
+    },
+    {
+      "id": "swaggerui-shop",
+      "fixture": "fixtures/swaggerui-shop",
+      "_note": "常规 JSON 文档路径全 404，规格地址只写在 /swagger-ui.html 的 url 字段里；拿到规格才有 year 参数声明。",
+      "expectedExit": 1,
+      "expectedOutcomes": ["vulnerable_unfixed"],
+      "expectedVulnerable": ["blackbox-sqli-numeric-api-invoices-year"]
+    },
+    {
+      "id": "swaggerui-shop-hardened",
+      "fixture": "fixtures/swaggerui-shop",
+      "serverEnv": { "GB_SWAGGER_HARDENED": "1" },
+      "expectedExit": 0,
+      "expectedOutcomes": ["no_findings"],
+      "expectedVulnerable": []
+    },
+    {
       "id": "ssrf-shop",
       "fixture": "fixtures/ssrf-shop",
       "_note": "GET /api/preview?url=… 把参数交给 fetch；黑盒把 URL 指向本机 canary，只有真实回连才判漏洞。",

@@ -16,7 +16,14 @@ const OPENAPI_PATHS = [
   "/api/swagger.json", "/api/openapi.json", "/api/v3/api-docs", "/docs/openapi.json", "/openapi/v1.json",
 ];
 const OPENAPI_CONFIG_PATHS = ["/v3/api-docs/swagger-config", "/swagger-config"];
+// Swagger UI / Redoc 一类只给 HTML 页面，真正的文档地址写在页面里；固定路径探不到文档时才探它们。
+const DOC_UI_PATHS = ["/swagger-ui.html", "/swagger-ui/index.html", "/swagger/index.html", "/api-docs", "/docs"];
 const MANIFEST_PATHS = ["/asset-manifest.json", "/.vite/manifest.json", "/manifest.json", "/build/asset-manifest.json"];
+const SITEMAP_PATHS = ["/sitemap.xml", "/sitemap_index.xml", "/sitemap-index.xml"];
+const MAX_SEO_ROUTES = 24;
+const MAX_SITEMAPS = 3;
+const MAX_OPENAPI_REFS = 3;
+const MAX_NEXT_MANIFEST_SCRIPTS = 12;
 const COMMON_API_PATHS = [
   "/api/users", "/api/user", "/api/account", "/api/accounts",
   "/api/orders", "/api/order", "/api/products", "/api/posts",
@@ -42,6 +49,8 @@ const MAX_FRONTEND_ROUTES = 80;
 const MAX_SOURCE_MAPS = 3;
 // 无前缀资源路由：只认「一眼是业务资源」的首段，避免把 /assets、/static 之类当接口。
 const RESOURCE_SEGMENT = /^\/(?:users?|accounts?|orders?|products?|posts?|projects?|tickets?|invoices?|messages?|notifications?|comments?|items?|customers?|payments?|carts?|documents?|reports?|tasks?|events?|profiles?|files?|downloads?|uploads?|admin|search)(?:\/|$)/;
+// sitemap 是公开页面清单，只有接口/内部形状的地址才值得进路由表。
+const SEO_API_SEGMENT = /^\/(?:api|rest|v\d+|graphql|internal|private|backend|admin|manage|staff|support)(?:\/|$)/;
 const ASSET_EXT = /\.(?:js|mjs|css|map|png|jpe?g|gif|svg|ico|webp|woff2?|ttf|eot|mp4|webm)$/i;
 const ATTACK_SURFACE_PATHS = [
   "/admin", "/admin/", "/admin/login",
@@ -212,8 +221,42 @@ function looksSensitivePath(path) {
 
 // ---------- 发现 ----------
 
+/** 把文档/清单里给出的引用解析成同源可请求路径；外链、非法 URL、跨源都返回 null。 */
+function sameOriginPath(ref, baseUrl, fromPath = "/") {
+  if (typeof ref !== "string" || !ref || ref.length > 500) return null;
+  try {
+    const origin = new URL(baseUrl).origin;
+    const url = new URL(ref, `${baseUrl.replace(/\/+$/, "")}${fromPath.startsWith("/") ? fromPath : `/${fromPath}`}`);
+    if (url.origin !== origin) return null;
+    return `${url.pathname}${url.search}`;
+  } catch {
+    return null;
+  }
+}
+
+/** Swagger UI / Redoc 的 HTML 内嵌文档地址：`url: "/v3/api-docs"`、`"url": "..."`、`data-url="..."`。
+ *  只取字面量字符串，不执行脚本；顺带过滤明显的静态资源与锚点。 */
+export function extractOpenapiRefsFromHtml(html) {
+  const raw = String(html ?? "").replace(/&amp;/g, "&");
+  const out = [];
+  const patterns = [
+    /\burl["']?\s*[:=]\s*["']([^"']+)["']/gi,
+    /\b(?:specUrl|spec_url|swaggerUrl|swagger_url|openApiUrl|openapi-url|apiDocUrl|docsUrl)["']?\s*[:=]\s*["']([^"']+)["']/gi,
+    /\bdata-(?:url|spec-url|spec)["']?\s*=\s*["']([^"']+)["']/gi,
+  ];
+  for (const re of patterns) {
+    let m;
+    while ((m = re.exec(raw)) && out.length < 8) {
+      const ref = m[1].trim();
+      if (!ref || ref.startsWith("#")) continue;
+      if (/\.(?:js|css|png|jpe?g|gif|svg|ico|woff2?|map)$/i.test(ref)) continue;
+      if (!out.includes(ref)) out.push(ref);
+    }
+  }
+  return out;
+}
+
 export async function discoverOpenapi(ctx, baseUrl) {
-  const origin = new URL(baseUrl).origin;
   const tried = new Set();
   const fetchDoc = async (p) => {
     if (tried.has(p)) return null;
@@ -226,18 +269,12 @@ export async function discoverOpenapi(ctx, baseUrl) {
   const followConfig = async (found) => {
     const refs = [];
     if (Array.isArray(found.doc?.urls)) {
-      for (const u of found.doc.urls.slice(0, 3)) if (typeof u?.url === "string") refs.push(u.url);
+      for (const u of found.doc.urls.slice(0, MAX_OPENAPI_REFS)) if (typeof u?.url === "string") refs.push(u.url);
     }
     if (typeof found.doc?.configUrl === "string") refs.push(found.doc.configUrl);
     for (const ref of refs) {
-      let path;
-      try {
-        const url = new URL(ref, `${baseUrl.replace(/\/+$/, "")}${found.path}`);
-        if (url.origin !== origin) continue;
-        path = `${url.pathname}${url.search}`;
-      } catch {
-        continue;
-      }
+      const path = sameOriginPath(ref, baseUrl, found.path);
+      if (!path) continue;
       const next = await fetchDoc(path);
       if (next?.doc?.paths) return next;
     }
@@ -265,6 +302,21 @@ export async function discoverOpenapi(ctx, baseUrl) {
     if (!found) continue;
     const indirect = await followConfig(found);
     if (indirect) return report(indirect);
+  }
+  // 第三跳：文档页面只渲染 HTML，接口地址写在页面里（Swagger UI 的 `url:` / Redoc 的 `data-url`）。
+  // 固定 JSON 路径全部落空时才走，避免给已有规格的目标加无谓请求。
+  for (const p of DOC_UI_PATHS) {
+    const res = await httpJson(ctx, { baseUrl, method: "GET", path: p, timeoutMs: 6_000 });
+    if (!res.ok || !res.body || !/<\s*(?:html|script|div)/i.test(res.body)) continue;
+    for (const ref of extractOpenapiRefsFromHtml(res.body).slice(0, MAX_OPENAPI_REFS)) {
+      const path = sameOriginPath(ref, baseUrl, p);
+      if (!path) continue;
+      const found = await fetchDoc(path);
+      if (!found) continue;
+      if (found.doc.paths) return report(found);
+      const indirect = await followConfig(found);
+      if (indirect) return report(indirect);
+    }
   }
   ctx.emit({ kind: "discovery", severity: SEVERITY.WARN, message: "未发现 OpenAPI 文档，回落到目录探测" });
   return null;
@@ -331,6 +383,101 @@ export async function bruteRoutes(ctx, baseUrl) {
     });
   }
   return found;
+}
+
+/** robots.txt 的 Disallow/Allow：这些路径是「刻意不给爬虫」的区域，正是黑盒最该看的候选。
+ *  通配符与结束符之后是匹配模式而不是路径，只取字面量前缀；根路径与非法值跳过。 */
+export function extractRobotsDirectives(text) {
+  const out = [];
+  for (const line of String(text ?? "").split(/\r?\n/)) {
+    const m = line.match(/^\s*(?:disallow|allow)\s*:\s*(\S+)/i);
+    if (!m) continue;
+    const literal = m[1].split(/[*$]/)[0];
+    if (!literal || literal === "/") continue;
+    const route = normalizeFrontendRoute(literal);
+    if (route && !out.includes(route)) out.push(route);
+  }
+  return out;
+}
+
+/** robots.txt 里声明的 Sitemap 地址（可以是绝对 URL，也可能指向别的源，由调用方判同源）。 */
+export function extractSitemapRefs(text) {
+  const out = [];
+  for (const line of String(text ?? "").split(/\r?\n/)) {
+    const m = line.match(/^\s*sitemap\s*:\s*(\S+)/i);
+    if (m && !out.includes(m[1])) out.push(m[1]);
+  }
+  return out;
+}
+
+/** sitemap.xml 的 <loc>：既可能是页面地址，也可能是 sitemapindex 指向的子图。 */
+export function extractSitemapLocs(xml) {
+  const out = [];
+  const re = /<loc>\s*([\s\S]*?)\s*<\/loc>/gi;
+  let m;
+  while ((m = re.exec(String(xml ?? ""))) && out.length < 200) {
+    const raw = m[1].trim().replace(/<!\[CDATA\[([\s\S]*?)\]\]>/g, "$1");
+    if (raw && raw.length <= 500 && !out.includes(raw)) out.push(raw);
+  }
+  return out;
+}
+
+/** 抓 robots.txt 与 sitemap（含 sitemapindex 一跳），提取声明出来的路由。
+ *  只走同源 GET：robots 的路径全收（它们本来就是隐藏区），sitemap 只收接口形状的地址，
+ *  否则几百个营销页会把路由表挤满并稀释真正的攻击面。 */
+export async function discoverSeoRoutes(ctx, baseUrl) {
+  const routes = [];
+  const seen = new Set();
+  const add = (path, source) => {
+    if (!path || seen.has(path) || routes.length >= MAX_SEO_ROUTES) return;
+    seen.add(path);
+    routes.push({ method: "GET", path, templated: false, source });
+  };
+
+  const visited = new Set();
+  const queue = [];
+  let sitemaps = 0;
+
+  const robotsRes = await httpJson(ctx, { baseUrl, method: "GET", path: "/robots.txt", timeoutMs: 6_000 });
+  if (robotsRes.ok && robotsRes.body) {
+    for (const p of extractRobotsDirectives(robotsRes.body)) add(p, "robots");
+    for (const ref of extractSitemapRefs(robotsRes.body).slice(0, MAX_SITEMAPS)) {
+      const path = sameOriginPath(ref, baseUrl, "/robots.txt");
+      if (path && !queue.includes(path)) queue.push(path);
+    }
+  }
+  for (const p of SITEMAP_PATHS) if (!queue.includes(p) && !visited.has(p)) queue.push(p);
+
+  while (queue.length && sitemaps < MAX_SITEMAPS) {
+    const p = queue.shift();
+    if (visited.has(p)) continue;
+    visited.add(p);
+    const res = await httpJson(ctx, { baseUrl, method: "GET", path: p, timeoutMs: 6_000 });
+    if (!res.ok || !res.body || !/<\s*(?:urlset|sitemapindex|loc)/i.test(res.body)) continue;
+    sitemaps += 1;
+    for (const loc of extractSitemapLocs(res.body)) {
+      const path = sameOriginPath(loc, baseUrl, p);
+      if (!path) continue;
+      if (/sitemap(?:[-_]index)?\.xml$/i.test(path) || /<sitemapindex/i.test(res.body)) {
+        if (/\.xml$/i.test(path) && !visited.has(path) && !queue.includes(path)) queue.push(path);
+        continue;
+      }
+      const route = normalizeFrontendRoute(path);
+      if (!route) continue;
+      if (!(SEO_API_SEGMENT.test(route) || RESOURCE_SEGMENT.test(route))) continue;
+      add(route, "sitemap");
+    }
+  }
+
+  if (routes.length) {
+    ctx.emit({
+      kind: "discovery",
+      severity: SEVERITY.INFO,
+      message: `robots/sitemap 发现 ${routes.length} 条声明路由（sitemap 文件 ${sitemaps} 份）`,
+      data: { routes: routes.map((r) => r.path), sitemaps },
+    });
+  }
+  return { routes, sitemaps, robots: Boolean(robotsRes.ok && robotsRes.body) };
 }
 
 /** 从 HTML/JS 文本里提取字面量 API 路径；动态片段/静态资源路径一律跳过。
@@ -497,6 +644,30 @@ function inlineScripts(html, limit = 4) {
   return out;
 }
 
+/** Next.js 的构建号：优先看 __NEXT_DATA__ 里的 buildId 字段，其次看 chunk 地址。 */
+export function extractNextBuildId(text) {
+  const raw = String(text ?? "");
+  const inline = raw.match(/["']buildId["']\s*[:=]\s*["']([A-Za-z0-9._~-]{4,80})["']/);
+  if (inline) return inline[1];
+  const m = raw.match(/\/_next\/static\/([A-Za-z0-9._~-]{4,80})\/(?:chunks|_buildManifest\.js|_ssgManifest\.js)/);
+  return m ? m[1] : null;
+}
+
+/** _buildManifest.js 按页面列出二级 chunk（`static/chunks/…` 或 `/_next/static/chunks/…`）。
+ *  这些 chunk 不出现在首页 script 标签里，而接口字面量常常正好在其中。 */
+export function extractNextManifestScripts(text) {
+  const out = [];
+  const re = /["'`]((?:\/?_next\/)?static\/[^"'`\s\\]+\.js)["'`]/g;
+  let m;
+  while ((m = re.exec(String(text ?? ""))) && out.length < MAX_NEXT_MANIFEST_SCRIPTS) {
+    const rel = m[1].replace(/^\/+/, "").replace(/^_next\//, "");
+    const path = `/_next/${rel}`;
+    if (!/^\/_next\/[A-Za-z0-9._~\-/]+\.js$/.test(path) || out.includes(path)) continue;
+    out.push(path);
+  }
+  return out;
+}
+
 /** 抓首页、构建清单、同源 JS 模块图与 source map，提取前端实际调用的字面量路由。
  *  预算固定（脚本 24 份 / source map 3 份 / 清单 4 份），只走同源 GET，不执行任何脚本。 */
 export async function discoverFrontendRoutes(ctx, baseUrl, { html = null } = {}) {
@@ -540,6 +711,30 @@ export async function discoverFrontendRoutes(ctx, baseUrl, { html = null } = {})
 
   let fetched = 0;
   let sourceMaps = 0;
+  // Next.js 首页只挂入口 chunk，接口字面量常在 _buildManifest.js 列出的二级 chunk 里。
+  // 构建号从首页/已抓脚本的地址反推，拿到后只抓一次清单。
+  let nextManifestTried = false;
+  let nextManifests = 0;
+  const queueNextManifest = async (text) => {
+    if (nextManifestTried || !text) return;
+    const buildId = extractNextBuildId(text);
+    if (!buildId) return;
+    nextManifestTried = true;
+    const mp = `/_next/static/${buildId}/_buildManifest.js`;
+    if (seen.has(mp) || fetched + queue.length >= MAX_FRONTEND_FETCHES) return;
+    seen.add(mp);
+    const res = await httpJson(ctx, { baseUrl, method: "GET", path: mp, timeoutMs: 8_000 });
+    if (!res.ok || !res.body) return;
+    nextManifests = 1;
+    collect(res.body.slice(0, MAX_FRONTEND_SCRIPT_CHARS));
+    for (const ref of extractNextManifestScripts(res.body)) {
+      if (seen.has(ref) || fetched + queue.length >= MAX_FRONTEND_FETCHES) continue;
+      seen.add(ref);
+      queue.push(ref);
+    }
+  };
+  await queueNextManifest(page);
+
   while (queue.length && fetched < MAX_FRONTEND_FETCHES) {
     const src = queue.shift();
     const res = await httpJson(ctx, { baseUrl, method: "GET", path: src, timeoutMs: 8_000 });
@@ -547,6 +742,7 @@ export async function discoverFrontendRoutes(ctx, baseUrl, { html = null } = {})
     fetched += 1;
     const body = res.body.slice(0, MAX_FRONTEND_SCRIPT_CHARS);
     collect(body);
+    await queueNextManifest(body);
 
     // 动态 import 的二级 chunk 往往才是接口所在，必须按模块图继续爬。
     for (const ref of extractModuleRefs(body, baseUrl, src)) {
@@ -590,18 +786,18 @@ export async function discoverFrontendRoutes(ctx, baseUrl, { html = null } = {})
     ctx.emit({
       kind: "discovery",
       severity: SEVERITY.INFO,
-      message: `前端资源提取 ${list.length} 条字面量路由（同源脚本 ${fetched} 份，source map ${sourceMaps} 份，构建清单 ${manifests} 份）`,
-      data: { routes: list.map((r) => r.path), scripts: scripts.length, fetched, sourceMaps, manifests },
+      message: `前端资源提取 ${list.length} 条字面量路由（同源脚本 ${fetched} 份，source map ${sourceMaps} 份，构建清单 ${manifests + nextManifests} 份）`,
+      data: { routes: list.map((r) => r.path), scripts: scripts.length, fetched, sourceMaps, manifests, nextManifests },
     });
-  } else if (scripts.length || manifests) {
+  } else if (scripts.length || manifests || nextManifests) {
     ctx.emit({
       kind: "discovery",
       severity: SEVERITY.INFO,
-      message: `已抓取前端资源（首页脚本 ${scripts.length} 个，构建清单 ${manifests} 份），未提取到字面量 API 路由`,
-      data: { scripts: scripts.length, fetched, sourceMaps, manifests },
+      message: `已抓取前端资源（首页脚本 ${scripts.length} 个，构建清单 ${manifests + nextManifests} 份），未提取到字面量 API 路由`,
+      data: { scripts: scripts.length, fetched, sourceMaps, manifests, nextManifests },
     });
   }
-  return { routes: list, scripts: scripts.length, fetched, sourceMaps, manifests };
+  return { routes: list, scripts: scripts.length, fetched, sourceMaps, manifests, nextManifests };
 }
 
 function mergeRoutes(limit, ...lists) {
@@ -2455,6 +2651,9 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
       openapiRouteCount: 0,
       frontendRouteCount: 0,
       frontendScripts: 0,
+      frontendNextManifest: 0,
+      seoRouteCount: 0,
+      sitemaps: 0,
       findings: [],
       evidence: [],
       summary: summarize([], [], { attempted: false, ok: false, path: null, identities: [] }),
@@ -2472,7 +2671,8 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
   const openapi = openapiRoutes(openapiFound, routeCap);
   const brute = await bruteRoutes(ctx, baseUrl);
   const frontend = await discoverFrontendRoutes(ctx, baseUrl, { html: health.body });
-  const routes = mergeRoutes(routeCap, openapi, frontend.routes, brute);
+  const seo = await discoverSeoRoutes(ctx, baseUrl);
+  const routes = mergeRoutes(routeCap, openapi, frontend.routes, seo.routes, brute);
   const surface = await probeAttackSurface(ctx, baseUrl);
   const rate = await checkRateLimit(ctx, baseUrl);
   const rateLimited = rate.limited;
@@ -2659,6 +2859,9 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
     frontendRouteCount: frontend.routes.length,
     frontendScripts: frontend.scripts,
     frontendScriptsFetched: frontend.fetched,
+    frontendNextManifest: frontend.nextManifests,
+    seoRouteCount: seo.routes.length,
+    sitemaps: seo.sitemaps,
     findings,
     evidence: records,
     summary,

@@ -15,6 +15,13 @@ import {
   extractRoutesFromSourceMap,
   discoverOpenapi,
   discoverFrontendRoutes,
+  discoverSeoRoutes,
+  extractRobotsDirectives,
+  extractSitemapRefs,
+  extractSitemapLocs,
+  extractNextBuildId,
+  extractNextManifestScripts,
+  extractOpenapiRefsFromHtml,
 } from "../lib/blackbox.mjs";
 
 function jsonPath(obj, path) {
@@ -1505,6 +1512,257 @@ test("runBlackbox: 主机白名单 + HMAC 验签 + 类型白名单 + 前置状�
     assert.equal(race.verdict, "blocked");
     assert.match(race.actual, /仅 1 次成功/);
     assert.equal(target.refunds(), 1, "加固版只落账一次");
+  } finally {
+    await target.close();
+  }
+});
+
+
+// ---------- 补充3：路由发现（robots/sitemap 声明、Next.js buildManifest、Swagger UI 内嵌地址）----------
+
+test("extractRobotsDirectives: 取 Disallow/Allow 的字面量路径，跳过根路径与通配尾部", () => {
+  const found = extractRobotsDirectives(
+    [
+      "User-agent: *",
+      "Disallow: /api/accounts/export",
+      "Disallow: /private/tools?*",
+      "Allow: /admin/panel$",
+      "Disallow: /",
+      "Sitemap: http://127.0.0.1:1/sitemap.xml",
+      "Crawl-delay: 5",
+    ].join("\n")
+  );
+  assert.deepEqual(found, ["/api/accounts/export", "/private/tools", "/admin/panel"]);
+});
+
+test("extractSitemapRefs / extractSitemapLocs: 解析声明地址与 <loc>（含 CDATA）", () => {
+  assert.deepEqual(extractSitemapRefs("Sitemap: http://a/sitemap.xml\nsitemap: http://a/s2.xml\n"), [
+    "http://a/sitemap.xml",
+    "http://a/s2.xml",
+  ]);
+  assert.deepEqual(
+    extractSitemapLocs('<urlset><url><loc>http://a/</loc><loc><![CDATA[http://a/api/x?y=1]]></loc></url></urlset>'),
+    ["http://a/", "http://a/api/x?y=1"]
+  );
+});
+
+test("extractNextBuildId / extractNextManifestScripts: 首页反推构建号，清单列出二级 chunk", () => {
+  assert.equal(extractNextBuildId('<script src="/_next/static/NhB7xk2pQ/chunks/main-1.js"></script>'), "NhB7xk2pQ");
+  assert.equal(extractNextBuildId('<script src="/assets/app.js"></script>'), null);
+  assert.equal(extractNextBuildId('<link href="/_next/static/media/logo.svg" />'), null);
+  assert.deepEqual(
+    extractNextManifestScripts(
+      'self.__BUILD_MANIFEST={"/":["static/chunks/pages/a.js"],"/b":["/_next/static/chunks/pages/b.js","static/chunks/fallback.js"]};'
+    ),
+    ["/_next/static/chunks/pages/a.js", "/_next/static/chunks/pages/b.js", "/_next/static/chunks/fallback.js"]
+  );
+});
+
+test("extractOpenapiRefsFromHtml: 取页面内嵌的文档地址，丢掉静态资源与锚点", () => {
+  const refs = extractOpenapiRefsFromHtml(
+    [
+      '<script src="/swagger-ui/swagger-ui-bundle.js"></script>',
+      'SwaggerUIBundle({ url: "/internal/spec.json", dom_id: "#swagger-ui" });',
+      '<script id="cfg">{"specUrl": "/cfg-spec.json"}</script>',
+      '<redoc spec-url="/redoc-spec.json"></redoc>',
+      'var anchor = "#/section";',
+    ].join("\n")
+  );
+  assert.ok(refs.includes("/internal/spec.json"), JSON.stringify(refs));
+  assert.ok(refs.includes("/cfg-spec.json"), JSON.stringify(refs));
+  assert.ok(refs.includes("/redoc-spec.json"), JSON.stringify(refs));
+  assert.ok(!refs.some((r) => /\.(?:js|css)$/i.test(r)), "静态资源不该被当文档地址");
+});
+
+function seoTargetServer({ harden = false } = {}) {
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, "http://127.0.0.1");
+    const host = req.headers.host ?? "127.0.0.1";
+    const send = (status, body, type = "application/json") => {
+      res.writeHead(status, { "Content-Type": type });
+      res.end(typeof body === "string" ? body : JSON.stringify(body));
+    };
+    if (url.pathname === "/robots.txt") {
+      return send(
+        200,
+        `User-agent: *\nDisallow: /api/accounts/export\nDisallow: /private/tools\nSitemap: http://${host}/sitemap.xml\n`,
+        "text/plain"
+      );
+    }
+    if (url.pathname === "/sitemap.xml") {
+      return send(
+        200,
+        `<urlset><url><loc>http://${host}/pricing</loc></url><url><loc>http://${host}/blog/release</loc></url><url><loc>http://${host}/api/invoices/archive</loc></url></urlset>`,
+        "application/xml"
+      );
+    }
+    if (url.pathname === "/api/accounts/export") {
+      return harden ? send(401, { error: "unauthorized" }) : send(200, { items: [{ id: 1, email: "a@x.io", balance: 10 }] });
+    }
+    if (url.pathname === "/api/invoices/archive") {
+      return harden ? send(401, { error: "unauthorized" }) : send(200, { items: [{ id: 7, ownerId: 2, iban: "DE0000" }] });
+    }
+    return send(404, { error: "not found" });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({ url: `http://127.0.0.1:${server.address().port}`, close: () => new Promise((r) => server.close(r)) });
+    });
+  });
+}
+
+test("discoverSeoRoutes: robots 声明的路径全收，sitemap 只收接口形状", async () => {
+  const target = await seoTargetServer();
+  const ctx = makeCtx(new Map());
+  try {
+    const found = await discoverSeoRoutes(ctx, target.url);
+    assert.deepEqual(
+      found.routes.map((r) => `${r.source}:${r.path}`).sort(),
+      ["robots:/api/accounts/export", "robots:/private/tools", "sitemap:/api/invoices/archive"].sort()
+    );
+    assert.equal(found.sitemaps, 1, "robots 声明的 sitemap 与内建候选去重后只抓一次");
+  } finally {
+    await target.close();
+  }
+});
+
+test("runBlackbox: 仅靠 robots/sitemap 声明的端点能判出未认证读取", async () => {
+  const target = await seoTargetServer();
+  const ctx = makeCtx(new Map());
+  try {
+    const result = await runBlackbox(ctx, target.url, {
+      config: { login: ctx.loginConfig, identities: ctx.identities, blackbox: null },
+      allowMutation: false,
+    });
+    const byPath = new Map(result.routes.map((r) => [r.path, r.source]));
+    assert.equal(byPath.get("/api/accounts/export"), "robots", JSON.stringify([...byPath]));
+    assert.equal(byPath.get("/api/invoices/archive"), "sitemap", JSON.stringify([...byPath]));
+    assert.ok(!byPath.has("/pricing") && !byPath.has("/blog/release"), "公开营销页不该进路由表");
+    assert.ok(result.seoRouteCount >= 3);
+    for (const p of ["/api/accounts/export", "/api/invoices/archive"]) {
+      const finding = result.findings.find((f) => f.path === p);
+      assert.ok(finding, `缺少 ${p} 的未认证读取结论：${JSON.stringify(result.findings.map((f) => f.path))}`);
+      assert.match(finding.type, /未认证读取/);
+    }
+  } finally {
+    await target.close();
+  }
+});
+
+test("runBlackbox: 声明出来的端点要求登录时不判漏洞（sitemap 不是免死金牌）", async () => {
+  const target = await seoTargetServer({ harden: true });
+  const ctx = makeCtx(new Map());
+  try {
+    const result = await runBlackbox(ctx, target.url, {
+      config: { login: ctx.loginConfig, identities: ctx.identities, blackbox: null },
+      allowMutation: false,
+    });
+    assert.equal(result.findings.length, 0, JSON.stringify(result.findings.map((f) => [f.path, f.type])));
+    const unauth = result.evidence.filter((e) => e.caseId.startsWith("blackbox-unauth-"));
+    assert.deepEqual(unauth.map((e) => e.caseId), [], "401 端点不该产生未认证读取证据");
+  } finally {
+    await target.close();
+  }
+});
+
+function nextTargetServer() {
+  const chunks = {
+    "/_next/static/chunks/main-1.js": "self.__WEBPACK_RUNTIME__=1;\n",
+    "/_next/static/chunks/pages/index-2.js": 'export const BANNER = "welcome";\n',
+    "/_next/static/chunks/pages/accounts-3.js":
+      'export const LEDGER = "/api/accounts/ledger";\nexport const load = () => fetch(LEDGER + "?full=1");\n',
+  };
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, "http://127.0.0.1");
+    const send = (status, body, type = "application/json") => {
+      res.writeHead(status, { "Content-Type": type });
+      res.end(typeof body === "string" ? body : JSON.stringify(body));
+    };
+    if (url.pathname === "/") {
+      return send(
+        200,
+        '<!doctype html><html><head><script src="/_next/static/chunks/main-1.js" async></script></head>' +
+          '<body><div id="__next"></div><script>self.__NEXT_DATA__={"buildId":"NhB7xk2pQ","page":"/","props":{}}</script></body></html>',
+        "text/html"
+      );
+    }
+    if (url.pathname === "/_next/static/NhB7xk2pQ/_buildManifest.js") {
+      return send(
+        200,
+        'self.__BUILD_MANIFEST={"/":["static/chunks/pages/index-2.js"],"/accounts":["static/chunks/pages/accounts-3.js"]};\n',
+        "application/javascript"
+      );
+    }
+    if (chunks[url.pathname]) return send(200, chunks[url.pathname], "application/javascript");
+    if (url.pathname === "/api/accounts/ledger") return send(200, { items: [{ id: 1, email: "a@x.io", balance: 42 }] });
+    return send(404, { error: "404 not found" });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({ url: `http://127.0.0.1:${server.address().port}`, close: () => new Promise((r) => server.close(r)) });
+    });
+  });
+}
+
+test("discoverFrontendRoutes: 顺 _buildManifest.js 爬到二级 chunk 里的接口字面量", async () => {
+  const target = await nextTargetServer();
+  const ctx = makeCtx(new Map());
+  try {
+    const found = await discoverFrontendRoutes(ctx, target.url);
+    assert.equal(found.nextManifests, 1);
+    assert.ok(found.routes.some((r) => r.path === "/api/accounts/ledger"), JSON.stringify(found.routes.map((r) => r.path)));
+    assert.ok(found.fetched >= 3, `入口 chunk 里没有接口字面量，必须按清单继续爬：fetched=${found.fetched}`);
+  } finally {
+    await target.close();
+  }
+});
+
+function swaggerUiTargetServer() {
+  const spec = {
+    openapi: "3.0.0",
+    paths: {
+      "/api/invoices": { get: { parameters: [{ name: "year", in: "query" }] } },
+      "/api/invoices/{id}": { get: { parameters: [{ name: "id", in: "path" }] } },
+    },
+  };
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, "http://127.0.0.1");
+    const send = (status, body, type = "application/json") => {
+      res.writeHead(status, { "Content-Type": type });
+      res.end(typeof body === "string" ? body : JSON.stringify(body));
+    };
+    if (url.pathname === "/swagger-ui.html") {
+      return send(
+        200,
+        [
+          '<!doctype html><html><head><link rel="stylesheet" href="/swagger-ui/swagger-ui.css"></head><body>',
+          '<script src="/swagger-ui/swagger-ui-bundle.js"></script>',
+          "<script>window.ui = SwaggerUIBundle({ url: \"/internal/openapi-spec.json\", dom_id: \"#swagger-ui\" });</script>",
+          "</body></html>",
+        ].join("\n"),
+        "text/html"
+      );
+    }
+    if (url.pathname === "/internal/openapi-spec.json") return send(200, spec);
+    return send(404, { error: "not found" });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({ url: `http://127.0.0.1:${server.address().port}`, close: () => new Promise((r) => server.close(r)) });
+    });
+  });
+}
+
+test("discoverOpenapi: 规格只写在 /swagger-ui.html 页面里也能找到（含声明的查询参数）", async () => {
+  const target = await swaggerUiTargetServer();
+  const ctx = makeCtx(new Map());
+  try {
+    const found = await discoverOpenapi(ctx, target.url);
+    assert.ok(found, "应顺着页面内嵌地址取到规格");
+    assert.equal(found.path, "/internal/openapi-spec.json");
+    const routes = openapiRoutes(found);
+    assert.deepEqual(routes.find((r) => r.path === "/api/invoices").queryParams, ["year"]);
+    assert.ok(ctx.events.some((e) => e.kind === "discovery" && /发现 OpenAPI 文档/.test(e.message)));
   } finally {
     await target.close();
   }

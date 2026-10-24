@@ -1,0 +1,22 @@
+{
+  "_note": "黑盒 SEO 声明发现靶场：接口只在 robots.txt / sitemap.xml 里声明，无 OpenAPI 也不在词表。GB_SEO_HARDENED=1 后两端点都要登录。",
+  "start": {
+    "cmd": "node",
+    "args": ["server.js"],
+    "env": { "PORT": "0" },
+    "readyPattern": "listening on port",
+    "readyTimeoutMs": 20000
+  },
+  "login": {
+    "path": "/api/login",
+    "bodyTemplate": { "email": "{email}", "password": "{password}" },
+    "credentialPath": "authentication.token"
+  },
+  "identities": [
+    { "name": "alice", "email": "alice@seo.shop", "password": "alice123", "role": "user" },
+    { "name": "bob", "email": "bob@seo.shop", "password": "bob123", "role": "user" }
+  ],
+  "blackbox": { "maxRoutes": 60 },
+  "llm": { "enabled": false },
+  "scopes": ["project.read", "net.probe"]
+}

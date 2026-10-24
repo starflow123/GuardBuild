@@ -218,8 +218,11 @@ function evaluate(target, run) {
       return acc;
     }, {}),
     openapiFound: run.report?.blackbox?.openapiFound ?? false,
+    openapiRouteCount: run.report?.blackbox?.openapiRouteCount ?? 0,
     frontendRouteCount: run.report?.blackbox?.frontendRouteCount ?? 0,
     frontendScripts: run.report?.blackbox?.frontendScripts ?? 0,
+    frontendNextManifest: run.report?.blackbox?.frontendNextManifest ?? 0,
+    seoRouteCount: run.report?.blackbox?.seoRouteCount ?? 0,
   };
 
   return {
@@ -265,11 +268,11 @@ function buildMarkdown(meta, results, metrics) {
   lines.push("");
   lines.push("## 靶场明细");
   lines.push("");
-  lines.push("| 靶场 | 退出码（实际/期望） | 命中/标注 | 漏报 | 误报 | blocked | 路由（openapi/frontend/brute） | 用时 | 结论 |");
+  lines.push("| 靶场 | 退出码（实际/期望） | 命中/标注 | 漏报 | 误报 | blocked | 路由（openapi/frontend/robots/sitemap/brute） | 用时 | 结论 |");
   lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
   for (const r of results) {
     const d = r.discovery;
-    const src = `${d.bySource.openapi ?? 0}/${d.bySource.frontend ?? 0}/${d.bySource.brute ?? 0}`;
+    const src = `${d.bySource.openapi ?? 0}/${d.bySource.frontend ?? 0}/${d.bySource.robots ?? 0}/${d.bySource.sitemap ?? 0}/${d.bySource.brute ?? 0}`;
     lines.push(
       `| ${r.id} | ${r.exit.actual ?? "—"}/${r.exit.expected} | ${r.cases.matched.length}/${r.cases.expected.length} | ${r.cases.missed.length} | ${r.cases.falsePositives.length} | ${r.verdicts.blocked.length} | ${d.routeCount}（${src}） | ${(r.durationMs / 1000).toFixed(1)}s | ${r.pass ? "通过" : "失败"} |`
     );
@@ -294,7 +297,7 @@ function buildMarkdown(meta, results, metrics) {
   lines.push("- 漏洞用例召回：语料标注的 caseId 规则（支持尾部 * 前缀）在报告证据中判为 vulnerable 的比例。");
   lines.push("- 误报：判为 vulnerable 但未命中任何标注规则，或命中 forbiddenVulnerable 的用例；干净靶场出现任何 vulnerable 都属误报。");
   lines.push("- blocked 列只作诊断：它反映「攻击确实打到了、但被拒绝」，不参与通过判定。");
-  lines.push("- 路由列展示发现来源（openapi/frontend/brute），用于回归前端 JS 深挖、source map、框架清单等发现能力。");
+  lines.push("- 路由列展示发现来源（openapi/frontend/robots/sitemap/brute），用于回归前端 JS 深挖、source map、框架清单（含 Next `_buildManifest.js`）、robots/sitemap 声明与 Swagger UI 内嵌地址等发现能力。");
   lines.push("- 本基准要求零模型调用：运行时清空 LLM 密钥与环境开关，确保结果可复现、无外发。");
   lines.push("");
   return lines.join("\n");
@@ -345,7 +348,7 @@ async function main() {
         findingsCount: 0,
         cases: { expected: target.expectedVulnerable ?? [], actual: [], matched: [], missed: [], falsePositives: [], forbiddenHits: [], unannotated: [] },
         verdicts: { blocked: [], inconclusive: [] },
-        discovery: { routeCount: 0, bySource: {}, openapiFound: false, frontendRouteCount: 0, frontendScripts: 0 },
+        discovery: { routeCount: 0, bySource: {}, openapiFound: false, openapiRouteCount: 0, frontendRouteCount: 0, frontendScripts: 0, frontendNextManifest: 0, seoRouteCount: 0 },
         reportPath: null,
         stderrTail: "",
       });

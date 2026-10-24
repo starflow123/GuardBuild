@@ -1,0 +1,22 @@
+{
+  "_note": "黑盒 Swagger UI 内嵌地址发现靶场：规格只在 /swagger-ui.html 的 url 字段里，year 参数由规格声明。GB_SWAGGER_HARDENED=1 后严格取整。",
+  "start": {
+    "cmd": "node",
+    "args": ["server.js"],
+    "env": { "PORT": "0" },
+    "readyPattern": "listening on port",
+    "readyTimeoutMs": 20000
+  },
+  "login": {
+    "path": "/api/login",
+    "bodyTemplate": { "email": "{email}", "password": "{password}" },
+    "credentialPath": "authentication.token"
+  },
+  "identities": [
+    { "name": "alice", "email": "alice@ui.shop", "password": "alice123", "role": "user" },
+    { "name": "bob", "email": "bob@ui.shop", "password": "bob123", "role": "user" }
+  ],
+  "blackbox": { "maxRoutes": 60 },
+  "llm": { "enabled": false },
+  "scopes": ["project.read", "net.probe"]
+}

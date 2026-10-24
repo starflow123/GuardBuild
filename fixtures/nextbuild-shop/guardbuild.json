@@ -1,0 +1,22 @@
+{
+  "_note": "黑盒 Next.js buildManifest 发现靶场：/api/accounts/ledger 只在 _buildManifest.js 列出的二级 chunk 中出现。GB_NEXT_HARDENED=1 后要登录。",
+  "start": {
+    "cmd": "node",
+    "args": ["server.js"],
+    "env": { "PORT": "0" },
+    "readyPattern": "listening on port",
+    "readyTimeoutMs": 20000
+  },
+  "login": {
+    "path": "/api/login",
+    "bodyTemplate": { "email": "{email}", "password": "{password}" },
+    "credentialPath": "authentication.token"
+  },
+  "identities": [
+    { "name": "alice", "email": "alice@next.shop", "password": "alice123", "role": "user" },
+    { "name": "bob", "email": "bob@next.shop", "password": "bob123", "role": "user" }
+  ],
+  "blackbox": { "maxRoutes": 60 },
+  "llm": { "enabled": false },
+  "scopes": ["project.read", "net.probe"]
+}

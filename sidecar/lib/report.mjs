@@ -653,10 +653,12 @@ function renderMarkdown(r) {
 
   parts.push(`## 摘要\n`);
   const bruteRouteCount = (bb?.routes ?? []).filter((x) => x.source === "brute").length;
+  const robotsRouteCount = (bb?.routes ?? []).filter((x) => x.source === "robots").length;
+  const sitemapRouteCount = (bb?.routes ?? []).filter((x) => x.source === "sitemap").length;
   const summaryLines = bb
     ? [
         `- 扫描目标：\`${esc(bb.url)}\``,
-        `- 路由发现：${bb.routeCount ?? 0} 条（OpenAPI ${bb.openapiRouteCount ?? 0} 条 / 前端提取 ${bb.frontendRouteCount ?? 0} 条 / 目录探测 ${bruteRouteCount} 条）`,
+        `- 路由发现：${bb.routeCount ?? 0} 条（OpenAPI ${bb.openapiRouteCount ?? 0} 条 / 前端提取 ${bb.frontendRouteCount ?? 0} 条 / robots ${robotsRouteCount} 条 / sitemap ${sitemapRouteCount} 条 / 目录探测 ${bruteRouteCount} 条）`,
         `- 黑盒证据：${bbEvidence.length} 条，其中 vulnerable ${bbEvidence.filter((e) => e.verdict === "vulnerable").length} 条`,
         `- 登录：${
           bb.login?.ok
@@ -972,6 +974,8 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
             openapiRouteCount: blackbox.openapiRouteCount ?? 0,
             frontendRouteCount: blackbox.frontendRouteCount ?? 0,
             frontendScripts: blackbox.frontendScripts ?? 0,
+            frontendNextManifest: blackbox.frontendNextManifest ?? 0,
+            seoRouteCount: blackbox.seoRouteCount ?? 0,
             routeSources: (blackbox.routes ?? []).reduce((acc, r) => {
               const key = r.source ?? "unknown";
               acc[key] = (acc[key] ?? 0) + 1;

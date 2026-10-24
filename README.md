@@ -83,7 +83,7 @@ npm run e2e:llm        # LLM 接入侦察演练（50 断言，本机 mock DeepSe
 npm run e2e:llm-patch  # LLM 编码代理补丁演练（73 断言，本机 mock：守规矩 / 不守规矩 / 无密钥 / 先只读自查四轮）
 npm run e2e:fix-agent  # 本地修复循环演练（21 断言：首轮漏修 → 失败证据+运行日志回传 → 第二轮通过）
 npm run benchmark      # 精度基准（12 个标注靶场：漏报 / 误报 / 退出码一致性）
-npm run benchmark:blackbox  # 黑盒精度基准（19 个标注靶场：用例族召回 / 误报 / 写与破坏性探测开关 / 退出码）
+npm run benchmark:blackbox  # 黑盒精度基准（25 个标注靶场：用例族召回 / 误报 / 写与破坏性探测开关 / 退出码）
 npm run seed-demo      # 单独生成演示工作区 .demo/vibeshop（供桌面端手动演练）
 
 # 单元测试
@@ -212,13 +212,13 @@ npm run e2e:llm-patch          # 本机 mock DeepSeek 四轮演练，无需真�
 
 ### 黑盒精度基准
 
-`npm run benchmark:blackbox` 对 `benchmarks/blackbox-corpus.json` 中的 19 个已运行靶场逐个发起真实黑盒扫描（本机回环，零模型调用）：
+`npm run benchmark:blackbox` 对 `benchmarks/blackbox-corpus.json` 中的 25 个已运行靶场逐个发起真实黑盒扫描（本机回环，零模型调用）：
 
 - 语料字段：`expectedExit` / `expectedVulnerable`（caseId 精确值或 `前缀*`）/ `forbiddenVulnerable`（明令禁止出现的用例族，优先于 expected，避免 `blackbox-idor-*` 把写/删/CSRF 变体一起放过）/ `patches`（源码插入）/ `configPatch` / `configReplace`（登录形态）/ `serverEnv` / `env`（写探测开关）
-- 覆盖：legacy-shop 漏洞与修复对照、wide-shop 默认/`allowMutation`/`allowDestructive`/加固四档、Cookie 会话 CSRF 与加固对照、`fixtures/spa-shop`（无 OpenAPI、路径不在词表，接口只在动态 import 的二级 chunk 里）、SSRF 与主机白名单对照、上传三档（漏洞 / 开关默认关闭 / 类型白名单）、JWT 伪造与 HMAC 验签对照、业务逻辑三档（状态跳步 + 并发双花 / 开关默认关闭 / 前置状态校验 + 幂等锁）
-- 指标：用例召回、误报（未标注 + 明令禁止）、退出码一致、终态一致；报告同时列出每条靶场的路由发现来源（openapi / frontend / brute），作为发现能力回归
+- 覆盖：legacy-shop 漏洞与修复对照、wide-shop 默认/`allowMutation`/`allowDestructive`/加固四档、Cookie 会话 CSRF 与加固对照、发现能力四路（`fixtures/spa-shop` 接口只在动态 import 的二级 chunk、`fixtures/seo-shop` 只在 robots.txt/sitemap 声明、`fixtures/nextbuild-shop` 只在 Next `_buildManifest.js` 列出的 chunk、`fixtures/swaggerui-shop` 规格只在 `/swagger-ui.html` 内嵌地址）、SSRF 与主机白名单对照、上传三档（漏洞 / 开关默认关闭 / 类型白名单）、JWT 伪造与 HMAC 验签对照、业务逻辑三档（状态跳步 + 并发双花 / 开关默认关闭 / 前置状态校验 + 幂等锁）；每条发现类靶场都配一个加固对照，证明「声明得出门」不等于「有漏洞」
+- 指标：用例召回、误报（未标注 + 明令禁止）、退出码一致、终态一致；报告同时列出每条靶场的路由发现来源（openapi / frontend / robots / sitemap / brute），作为发现能力回归
 - 开关语义：SSRF 与 JWT 伪造无副作用，默认执行；上传与状态跳步要 `allowMutation`；跨用户删除与退款类并发双花要 `allowDestructive`——`upload-shop-default`、`bizlogic-shop-default` 两条标注专门锁住「默认不打」
-- 当前基线（2026-10-24）：19 个靶场 · 用例召回 42/42 · 误报 0/42 · 退出码一致 19/19 · 终态一致 19/19
+- 当前基线（2026-10-24）：25 个靶场 · 用例召回 46/46 · 误报 0/46 · 退出码一致 25/25 · 终态一致 25/25
 - 产物：`.benchmark-blackbox/benchmark-report.json` / `.benchmark-blackbox/benchmark-report.md`；CI 每次自测都会执行并上传
 
 ## 纯黑盒外部扫描（已运行 / 沙箱中的目标）
@@ -236,7 +236,7 @@ guardbuild-headless --url https://staging.example.com --project ./my-project --g
 ```
 
 - 探测面（每个开关都会写进报告的「本轮攻击面」，GUI 同词）：路由发现 + 未认证读取、跨用户读取（IDOR，需 ≥2 个普通测试身份）、垂直越权（普通登录身份访问管理端点，有管理身份时做交叉证明，用于区分「端点不存在」与「正确拒绝」）、SQL 注入（错误回显 / 恒真恒假差分 / **数字语境** `1 OR 1=1` 三段差分 / 单对象条件绕过）、路径穿越（明文 + 二次编码 / 变形编码绕过）、CORS（伪造 Origin，回显且允许凭证才判漏洞；白名单拒绝记 blocked）、反射型 XSS（HTML 上下文注入**不含脚本**的无害 canary，原样反射判漏洞、编码反射记 blocked）、SSRF（把本机一次性监听地址交给 `url`/`target` 这类参数，**服务端真的回连**才判漏洞）、JWT 伪造（只打匿名被拒的受保护端点，`alg=none` 与无效 HS256 令牌都要「响应回显伪造身份」才判漏洞，证据只留 `Bearer <forged-jwt>` 占位符）、敏感文件与 actuator 暴露、限流观察；开启写开关后追加文件上传（只传含随机令牌的无害 HTML，以「同源回读命中同一令牌且按主动内容类型返回」为准）与业务逻辑（状态跳步以归属人复读状态变化为准；并发双花要 5 个并发请求产生 ≥2 个不同副作用标识）。
-- 路由发现（全部同源只读，不执行脚本）：OpenAPI（含 Springdoc `swagger-config` 的 `urls[]` / `configUrl` 间接地址）、常见路径词表（含管理端点命名猜测）、前端模块图（首页脚本 + 静态/动态 `import` 递归，最多 24 份）、构建清单（CRA `asset-manifest.json` / Vite `.vite/manifest.json`）、source map 的 `sourcesContent`，并接受同源绝对 URL 与 `/orders` 这类无前缀业务资源字面量。四路合并后受 `blackbox.maxRoutes` 上限约束。
+- 路由发现（全部同源只读，不执行脚本）：OpenAPI（固定路径 → Springdoc `swagger-config` 的 `urls[]` / `configUrl` → Swagger UI / Redoc **页面内嵌的文档地址**三跳）、常见路径词表（含管理端点命名猜测）、前端模块图（首页脚本 + 静态/动态 `import` 递归，最多 24 份）、构建清单（CRA `asset-manifest.json` / Vite `.vite/manifest.json` / **Next.js `_next/static/<buildId>/_buildManifest.js`** 列出的二级 chunk）、source map 的 `sourcesContent`、**robots.txt 的 `Disallow`/`Allow` 与 `sitemap.xml` 的 `<loc>`**（sitemap 是公开页面清单，只收接口/业务资源形状的地址，营销页不进路由表），并接受同源绝对 URL 与 `/orders` 这类无前缀业务资源字面量。多路合并后受 `blackbox.maxRoutes` 上限约束，报告逐条标注来源（openapi / frontend / robots / sitemap / brute）。
 - 写操作越权默认关闭，避免修改甚至销毁目标数据，分两级显式开启：
   - 跨用户 PUT/PATCH 与匿名写入：`blackbox.allowMutation: true` 或 `GUARDBUILD_BLACKBOX_MUTATE=1`（修改后按归属人身份尽力恢复原值，恢复未确认会写进证据）。
   - 文件上传（落一个只含随机令牌的无害 HTML）与业务状态跳步（对待处理对象试 `ship`/`approve` 等动作）同属写操作，只在 `allowMutation` 开启时执行；SSRF 与 JWT 伪造不改动数据，因此默认就测。

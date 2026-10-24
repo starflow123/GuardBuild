@@ -191,6 +191,57 @@ test("重复动作短路：同一条 exec 不会二次实跑", async () => {
   assert.ok(sc.prompts[2].includes("已经执行过"), sc.prompts[2].slice(0, 200));
 });
 
+test("构建成功后允许重试启动：去重不把「状态已改变」一起否掉", async () => {
+  const { ctx, calls } = fakeCtx();
+  const sc = scripter([
+    { action: "start", candidate: 1 },
+    { action: "exec", id: 2 },
+    { action: "start", candidate: 1 },
+  ]);
+  let tried = 0;
+  const summary = await runBootstrapAgent(ctx, {
+    starts: STARTS,
+    getToken: async () => "t",
+    readManifestsImpl: async () => MANIFESTS,
+    chatImpl: sc.chatImpl,
+    tryStart: async () => {
+      const n = (tried += 1);
+      return n === 1 ? { ok: false, error: "缺少构建产物" } : { ok: true, target: { url: "http://127.0.0.1:3000" } };
+    },
+  });
+  assert.equal(tried, 2, "构建后重试应当真实拉起，而不是被去重短路");
+  assert.equal(calls.filter((c) => c.method === RPC_TO_HOST.PROC_SPAWN).length, 1, "构建只跑一次");
+  assert.equal(summary.outcome, "started");
+  assert.equal(summary.url, "http://127.0.0.1:3000");
+});
+
+test("重试有上限：没有新的成功 exec 时仍短路，最多实跑 2 次", async () => {
+  const { ctx } = fakeCtx({ targetConfig: { bootstrap: { maxSteps: 5 } } });
+  const sc = scripter([
+    { action: "start", candidate: 1 },
+    { action: "start", candidate: 1 },
+    { action: "exec", id: 1 },
+    { action: "start", candidate: 1 },
+    { action: "start", candidate: 1 },
+  ]);
+  let tried = 0;
+  const summary = await runBootstrapAgent(ctx, {
+    starts: STARTS,
+    getToken: async () => "t",
+    readManifestsImpl: async () => MANIFESTS,
+    chatImpl: sc.chatImpl,
+    tryStart: async () => {
+      tried += 1;
+      return { ok: false, error: "未就绪" };
+    },
+  });
+  assert.equal(tried, 2, "第 2 次无状态变化被短路，第 4 次是重试，第 5 次到达上限");
+  assert.equal(summary.outcome, "budget_exhausted");
+  const shorted = summary.actions.filter((a) => a.note === "重复动作短路");
+  assert.equal(shorted.length, 2);
+  assert.ok(sc.prompts[2].includes("没有成功的安装/构建"), sc.prompts[2].slice(0, 300));
+});
+
 test("预算：步数上限到点收手，状态是 budget_exhausted 而不是成功", async () => {
   const { ctx } = fakeCtx({ targetConfig: { bootstrap: { maxSteps: 2 } } });
   const sc = scripter([{ action: "read", path: "a.js" }]);

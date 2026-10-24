@@ -141,6 +141,27 @@ export async function runBootstrapAgent(
   const history = [];
   let lastFailure = { text: summary.reason, diagnosis: null };
 
+  // 去重不是「一票否决」：安装/构建成功后，目标状态可能已经变了。
+  // 同一动作最多实跑 2 次，且重试必须发生在「最近一次成功 exec」之后，否则仍然短路。
+  const MAX_ATTEMPTS_PER_KEY = 2;
+  const attempts = new Map(); // dedupeKey -> { count, lastStep }
+  let lastExecOkStep = 0;
+  const repeatGate = (key) => {
+    const prior = attempts.get(key);
+    if (!prior) return { run: true };
+    if (prior.count >= MAX_ATTEMPTS_PER_KEY) return { run: false, why: "cap" };
+    if (lastExecOkStep > prior.lastStep) return { run: true };
+    return { run: false, why: "no_state_change" };
+  };
+  const markAttempt = (key) => {
+    const prior = attempts.get(key);
+    attempts.set(key, { count: (prior?.count ?? 0) + 1, lastStep: summary.stepsUsed });
+  };
+  const repeatNote = (why) =>
+    why === "cap"
+      ? `已达到重试上限（${MAX_ATTEMPTS_PER_KEY} 次），不再重复`
+      : "已经执行过，且之后没有成功的安装/构建改变状态，重复执行不解决问题";
+
   const elapsed = () => Date.now() - summary.startedAt;
   const outOfBudget = () => {
     if (summary.stepsUsed >= budget.maxSteps) return `步数上限（${budget.maxSteps}）已用尽`;
@@ -233,12 +254,15 @@ export async function runBootstrapAgent(
 
     if (step.action === "exec") {
       const key = `exec:${step.entry.id}`;
-      if (history.some((h) => h.dedupeKey === key)) {
-        lastFailure = { text: `${step.entry.shape} 本轮已经执行过，重复执行不解决问题`, diagnosis: "repeat_short_circuit" };
-        emitStep({ action: "exec", subject: step.entry.shape, ok: false, dedupeKey: key, note: "重复动作短路" }, `启动代理重复选择「${step.entry.shape}」，已短路`, SEVERITY.WARN);
+      const gate = repeatGate(key);
+      if (!gate.run) {
+        lastFailure = { text: `${step.entry.shape} ${repeatNote(gate.why)}`, diagnosis: "repeat_short_circuit" };
+        emitStep({ action: "exec", subject: step.entry.shape, ok: false, dedupeKey: key, note: "重复动作短路" }, `启动代理重复选择「${step.entry.shape}」，已短路：${repeatNote(gate.why)}`, SEVERITY.WARN);
         continue;
       }
+      markAttempt(key);
       const run = await execAction(ctx, step.entry, budget);
+      if (run.exited && run.exitCode === 0) lastExecOkStep = summary.stepsUsed;
       summary.usedOutputChars += run.chars;
       history.push({ step: summary.stepsUsed, exec: step.entry.shape, exitCode: run.exitCode, output: run.tail, dedupeKey: key });
       lastFailure =
@@ -262,11 +286,19 @@ export async function runBootstrapAgent(
 
     // start：真实拉起由调用方判定，代理不参与结论
     const key = `start:${step.entry.id}`;
-    if (history.some((h) => h.dedupeKey === key)) {
-      lastFailure = { text: `启动候选 ${step.entry.shape} 已试过且未就绪`, diagnosis: "repeat_short_circuit" };
-      emitStep({ action: "start", subject: step.entry.shape, ok: false, dedupeKey: key, note: "重复动作短路" }, `启动代理重复选择启动候选「${step.entry.shape}」，已短路`, SEVERITY.WARN);
+    const gate = repeatGate(key);
+    if (!gate.run) {
+      lastFailure = {
+        text:
+          gate.why === "cap"
+            ? `启动候选 ${step.entry.shape} ${repeatNote(gate.why)}`
+            : `启动候选 ${step.entry.shape} 已试过且未就绪；之后没有成功的安装/构建改变状态，重复试启动没有意义`,
+        diagnosis: "repeat_short_circuit",
+      };
+      emitStep({ action: "start", subject: step.entry.shape, ok: false, dedupeKey: key, note: "重复动作短路" }, `启动代理重复选择启动候选「${step.entry.shape}」，已短路：${repeatNote(gate.why)}`, SEVERITY.WARN);
       continue;
     }
+    markAttempt(key);
     const t0 = Date.now();
     let res = null;
     let err = null;

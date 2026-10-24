@@ -2090,6 +2090,22 @@ test("diagnoseStartFailure: 常见启动错误翻译为可操作建议", () => {
   assert.equal(dep.code, "missing_dependency");
   assert.match(dep.hint, /npm install|prepare/);
 
+  const artifact = diagnoseStartFailure({
+    output: [
+      "Error [ERR_MODULE_NOT_FOUND]: Cannot find module 'C:\\proj\\build\\config.js' imported from C:\\proj\\src\\data.js",
+      "  code: 'ERR_MODULE_NOT_FOUND',",
+    ],
+    exitCode: 1,
+  });
+  assert.equal(artifact.code, "missing_build_artifact", "项目内缺失文件是「没构建」，不是「没装依赖」");
+  assert.match(artifact.hint, /构建|npm run build/);
+
+  const inModules = diagnoseStartFailure({
+    output: ["Cannot find module 'C:\\proj\\node_modules\\foo\\index.js'"],
+    exitCode: 1,
+  });
+  assert.equal(inModules.code, "missing_dependency", "node_modules 里的缺失仍归依赖问题");
+
   const pyDep = diagnoseStartFailure({ output: ["ModuleNotFoundError: No module named 'fastapi'"] });
   assert.equal(pyDep.code, "python_missing_dependency");
 

@@ -109,7 +109,7 @@
   → Sidecar 执行（Host 令牌与白名单照旧）→ 记录审计 → 再观察
 ```
 
-预算：步数默认 6、上限 10；单步超时 120s；总墙钟 8 分钟；累计输出字符 60000；同一 `action+id` 重复即短路。任一预算耗尽不伪造成功，终态 `not_started` 并回退到确定性探测/缺省契约（S3-lite 的 `fallbackToDeterministicStart`）。
+预算：步数默认 6、上限 10；单步超时 120s；总墙钟 8 分钟；累计输出字符 60000。同一 `action+id` 不是一票否决：只有「上一次尝试之后没有任何成功的安装/构建」才短路，且每个动作最多实跑 2 次（真实模型实测踩过：构建成功后想重试启动，被旧的一票否决直接判死）。任一预算耗尽不伪造成功，终态 `not_started` 并回退到确定性探测/缺省契约（S3-lite 的 `fallbackToDeterministicStart`）。
 
 产出仍是 scout 契约对象（`starts`/`login`/`routes`），必须过同一套 `sanitizeStart` 与四道验证关，且**由引擎实际启动+实际登录判定**；代理的自评不进结论。成功后沿用 scout 磁盘缓存（键含模型与证据内容），并写 `workingStart`。
 
@@ -169,7 +169,7 @@
 
 | 批次 | 落点 | 实测证据 |
 | --- | --- | --- |
-| B1 | `sidecar/lib/execmenu.mjs`（闭合动作菜单：有锁文件给 `npm ci`、无锁文件给 `npm install`，scripts 走白名单且排除 `start`/`test:watch`/`seed:check`，Python 走 `pip install -r` / `uv sync`，按命令形状去重，上限 12 动作 / 8 启动候选，启动候选保留 `readyPattern`/`readyTimeoutMs`/`env`）、`sidecar/lib/bootstrap.mjs`（有界循环：`maxSteps` 1..10 默认 6、`stepTimeoutMs` 5s..600s 默认 120s、`totalBudgetMs` 30s..1800s 默认 480s、`maxOutputChars` 5k..200k 默认 60k、重复动作短路；结局 `started`/`budget_exhausted`/`gave_up`/`llm_unavailable`/`agent_error`/`not_started`）、`sidecar/lib/db.mjs`（`agent_actions` 表 + 插入/查询，每行带剩余预算） | `sidecar/tests/execmenu.test.mjs`（10 条）、`sidecar/tests/bootstrap.test.mjs`（11 条） |
+| B1 | `sidecar/lib/execmenu.mjs`（闭合动作菜单：有锁文件给 `npm ci`、无锁文件给 `npm install`，scripts 走白名单且排除 `start`/`test:watch`/`seed:check`，Python 走 `pip install -r` / `uv sync`，按命令形状去重，上限 12 动作 / 8 启动候选，启动候选保留 `readyPattern`/`readyTimeoutMs`/`env`）、`sidecar/lib/bootstrap.mjs`（有界循环：`maxSteps` 1..10 默认 6、`stepTimeoutMs` 5s..600s 默认 120s、`totalBudgetMs` 30s..1800s 默认 480s、`maxOutputChars` 5k..200k 默认 60k、重复动作短路；结局 `started`/`budget_exhausted`/`gave_up`/`llm_unavailable`/`agent_error`/`not_started`）、`sidecar/lib/db.mjs`（`agent_actions` 表 + 插入/查询，每行带剩余预算） | `sidecar/tests/execmenu.test.mjs`（10 条）、`sidecar/tests/bootstrap.test.mjs`（13 条） |
 | B2 | `main.mjs::runBootstrapStart`（挂在 `stageReproduce` 的启动失败支路；`bootstrapEnabled(ctx)` 判定；无 LLM 密钥时发 WARN 并返回 null，不冒充代理自救）+ `view.bootstrap` + `report.mjs`（`renderBootstrapSection`/`summarizeBootstrap`）+ `src/bridge.ts`（`BootstrapView`/`BootstrapAction`）+ `src/components/BootstrapPanel.tsx` + `src/App.tsx` | `npm run e2e:bootstrap` → **38/38 断言通过，exit 0**。r1：确定性契约起不来（`ERR_MODULE_NOT_FOUND` → `target_not_ready` + 缺依赖诊断）→ 代理自主 `read scripts/build.js` → 执行菜单编号 2（引擎自己拼的 `npm run build`，构建产物真实落盘）→ 引擎实跑确认就绪（`startSource=bootstrap-agent`）→ 越权证据照旧复现（pre `vulnerable=4`）→ 终态仍按契约 `no_patchable_candidates`（不自动补丁）。r2：模型抗命（编号 99/42 + 自带 `cmd/args/shell`）逐步被拒、引擎一条命令都没执行、诚实失败 `target_not_ready`。r3：gate 即使 `bootstrap.enabled=true` + `GUARDBUILD_LLM_BOOTSTRAP=1` 也结构性禁用（`view.bootstrap` 与报告 `bootstrap` 均为 null、LLM 调用 0 次、被测工作区 `git status` 干净、exit 2 / `failed`） |
 
 成功只能由引擎判定：`outcome=started` 要求 `tryStart` 真的拉起子进程并等到就绪模式命中，模型自陈「起好了」一律不采信；r2 就是这条的实测——模型收手前两步全被拒，会话终态是 `target_not_ready` 而不是「已通过」。

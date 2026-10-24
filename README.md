@@ -315,8 +315,20 @@ guardbuild-headless --url https://staging.example.com --project ./my-project --g
 ├─ scripts/                seed-demo / e2e-headless / e2e-gate
 ├─ fixtures/vibeshop/      内置演示目标（含订单 IDOR 缺陷）
 ├─ action.yml              GitHub Action（composite）
-└─ .github/workflows/      自测矩阵（ubuntu-latest + windows-latest）
+└─ .github/workflows/      自测矩阵（ubuntu / windows / macos latest）
 ```
+
+## 分发打包（本地构建 NSIS 安装器）
+
+```bash
+npm run runtime:prepare   # 把当前 Node（>= 22.5）复制到 src-tauri/runtime
+npm run app:dist          # 构建带资源映射的 NSIS 安装器
+npm run e2e:package       # 分发布局演练：PATH 中没有 node 也能跑通 gate
+```
+
+- 产物：`src-tauri/target/release/bundle/nsis/GuardBuild_<version>_x64-setup.exe`（currentUser 安装、中英双语）。安装目录含 `guardbuild.exe`、`guardbuild-headless.exe`、`runtime/node.exe`、`sidecar/`、`shared/`；Host 优先使用随包 node，缺失时才回退 PATH。
+- **默认未签名**：会触发 SmartScreen。设置 `GUARDBUILD_SIGN_CERT_THUMBPRINT`（signtool 证书指纹）或 `GUARDBUILD_SIGN_COMMAND`（必须含 `%1`）后重新构建即可接入签名；时间戳默认 `http://timestamp.digicert.com`。
+- 首次构建需要 Tauri 下载 NSIS 工具链（缓存于 `%LOCALAPPDATA%\tauri\NSIS`）；受限网络可预先放置 `Bin/makensis.exe` 与 `Plugins/x86-unicode/additional/nsis_tauri_utils.dll`，之后可离线构建。
 
 ## 已知边界
 
@@ -324,7 +336,8 @@ guardbuild-headless --url https://staging.example.com --project ./my-project --g
 - 取数形态覆盖：`findById`/`findOne`/`findUnique` 等 ORM 单查、Drizzle 链、`dbGet`/`db.get`/`pool.query`、`db.prepare(...).get(...)`、Prisma `$queryRaw`/`$queryRawUnsafe`、Knex `.first()`、`db.raw(...)`；Prisma 标签模板（`$queryRaw` 后接模板字符串）自动参数化，不误报为 SQL 注入
 - 注入静态识别基于「请求输入 → 模板/拼接 → SQL或 shell 首实参」的轻量污点传播；动态复现要求目标返回列表行数变化、数据库报错特征或 shell 展开令牌，无法确证时记为 inconclusive 而非漏洞
 - Flask/Django 的自定义路由注册、异步视图与中间件级鉴权等边缘形态仍可能漏检；动态复现要求项目能按 `guardbuild.json` 启动，并具备可登录的测试身份
-- Windows 全链路已实测；Linux 由 CI 矩阵持续验证（ubuntu-latest + windows-latest），macOS 尚未覆盖
+- Windows 全链路已实测；Linux / macOS 由 CI 矩阵持续验证（ubuntu-latest + windows-latest + macos-latest）
+- 完整支持矩阵、适用场景与不支持项见 [`docs/support-matrix.md`](docs/support-matrix.md)；对外介绍/简历文案先按其中的「不可说」四项自查
 - 已在 OWASP Juice Shop v20.3.0 上完成全链路 dogfood（Windows，真实依赖与启动链）：静态分析 → email 登录 → 越权复现 → 隔离修复 → 双重验收 `patchStatus=verified`；靶点为注入式 IDOR 样例（非 Juice Shop 自身漏洞），据此修复 10 项真实项目接入失败点
 
 ## 开发备注

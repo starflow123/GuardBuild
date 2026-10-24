@@ -219,18 +219,23 @@ fn main() {
     let data_dir = std::env::var("GUARDBUILD_DATA_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(|_| std::env::temp_dir().join("guardbuild-headless-data"));
-    let sidecar_path = std::env::var("GUARDBUILD_SIDECAR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("sidecar/main.mjs"));
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let sidecar_path = guardbuild_lib::core::runtime::resolve_sidecar_path(
+        std::env::var("GUARDBUILD_SIDECAR").ok().map(PathBuf::from),
+        guardbuild_lib::core::runtime::current_exe_dir().as_deref(),
+        &cwd,
+    );
     // host 以 sidecar 所在目录作为子进程 cwd，相对路径会在此基础上被二次拼接
     let sidecar_path = if sidecar_path.is_relative() {
-        std::env::current_dir()
-            .map(|d| d.join(&sidecar_path))
-            .unwrap_or(sidecar_path)
+        cwd.join(&sidecar_path)
     } else {
         sidecar_path
     };
-    let node_bin = std::env::var("GUARDBUILD_NODE").unwrap_or_else(|_| "node".to_string());
+    let node_bin = guardbuild_lib::core::runtime::resolve_node_bin(
+        std::env::var("GUARDBUILD_NODE").ok(),
+        guardbuild_lib::core::runtime::current_exe_dir().as_deref(),
+    );
+    eprintln!("[runtime] node={} sidecar={}", node_bin, sidecar_path.display());
     let auto_consent = !args.gate
         && std::env::var("GUARDBUILD_AUTO_CONSENT")
             .map(|v| v != "0")

@@ -107,6 +107,9 @@ jobs:
       - name: S3-full 有界启动代理 E2E（本机 mock：引擎拼装菜单 + 抗命拒绝 + gate 结构性禁用）
         run: node scripts/e2e-bootstrap.mjs
 
+      - name: 分发布局 E2E（随包 node 在 PATH 无 node 时跑通 gate）
+        run: node scripts/e2e-package.mjs
+
       - name: 精度基准（12 个标注靶场：漏报 / 误报 / 退出码一致性）
         run: node scripts/benchmark.mjs
 

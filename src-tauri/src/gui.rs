@@ -30,29 +30,12 @@ pub struct AppState {
 }
 
 fn resolve_sidecar_path() -> PathBuf {
-    if let Ok(p) = std::env::var("GUARDBUILD_SIDECAR") {
-        return PathBuf::from(p);
-    }
-    let exe_dir = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-        .unwrap_or_else(|| PathBuf::from("."));
-    let candidates = vec![
-        // 开发布局: src-tauri/target/{debug,release}/guardbuild.exe -> 仓库根/sidecar
-        exe_dir.join("../../../sidecar/main.mjs"),
-        // 安装布局: exe 同级的 sidecar 目录
-        exe_dir.join("sidecar/main.mjs"),
-        exe_dir.join("../sidecar/main.mjs"),
-        // 从仓库根运行时
-        PathBuf::from("sidecar/main.mjs"),
-        PathBuf::from("../sidecar/main.mjs"),
-    ];
-    for c in candidates {
-        if c.exists() {
-            return c;
-        }
-    }
-    PathBuf::from("sidecar/main.mjs")
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    crate::core::runtime::resolve_sidecar_path(
+        std::env::var("GUARDBUILD_SIDECAR").ok().map(PathBuf::from),
+        crate::core::runtime::current_exe_dir().as_deref(),
+        &cwd,
+    )
 }
 
 pub fn resolve_data_dir() -> PathBuf {
@@ -70,7 +53,10 @@ pub fn build_host() -> Arc<Host> {
     let cfg = HostConfig {
         data_dir: resolve_data_dir(),
         sidecar_path: resolve_sidecar_path(),
-        node_bin: std::env::var("GUARDBUILD_NODE").unwrap_or_else(|_| "node".to_string()),
+        node_bin: crate::core::runtime::resolve_node_bin(
+            std::env::var("GUARDBUILD_NODE").ok(),
+            crate::core::runtime::current_exe_dir().as_deref(),
+        ),
         auto_consent: std::env::var("GUARDBUILD_AUTO_CONSENT").map(|v| v == "1").unwrap_or(false),
         headless: false,
         app_version: env!("CARGO_PKG_VERSION").to_string(),

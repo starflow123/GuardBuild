@@ -13,6 +13,7 @@ pub mod httpclient;
 pub mod procops;
 pub mod redact;
 pub mod rpc;
+pub mod runtime;
 pub mod token;
 pub mod vault;
 

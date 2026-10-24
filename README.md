@@ -73,7 +73,7 @@ npm run app:build      # 构建（--no-bundle）
 npm run host:headless  # 构建无头宿主（--no-default-features）
 npm run e2e            # 主工作流 E2E（36 断言，自动生成 .demo 演示目标；含写回冲突不半写入回归）
 npm run e2e:gate       # CI gate 演练（53 断言，7 轮裁决 + 报告产物）
-npm run e2e:blackbox   # 纯黑盒外部扫描演练（66 断言：漏洞/已修复/Cookie 会话/不可达/写探测分级）
+npm run e2e:blackbox   # 纯黑盒外部扫描演练（88 断言：漏洞/已修复/Cookie 会话/不可达/写探测分级）
 npm run e2e:ssrf       # SSRF 演练（23 断言：本机 canary 回连取证 + 主机白名单对照）
 npm run e2e:upload     # 文件上传演练（23 断言：主动内容同源回读取证 + 类型白名单对照）
 npm run e2e:jwt        # JWT 演练（24 断言：alg=none / 无效签名伪造放行取证 + 固定算法强密钥对照）
@@ -83,6 +83,7 @@ npm run e2e:llm        # LLM 接入侦察演练（50 断言，本机 mock DeepSe
 npm run e2e:llm-patch  # LLM 编码代理补丁演练（73 断言，本机 mock：守规矩 / 不守规矩 / 无密钥 / 先只读自查四轮）
 npm run e2e:fix-agent  # 本地修复循环演练（21 断言：首轮漏修 → 失败证据+运行日志回传 → 第二轮通过）
 npm run benchmark      # 精度基准（12 个标注靶场：漏报 / 误报 / 退出码一致性）
+npm run benchmark:blackbox  # 黑盒精度基准（9 个标注靶场：用例族召回 / 误报 / 写探测开关 / 退出码）
 npm run seed-demo      # 单独生成演示工作区 .demo/vibeshop（供桌面端手动演练）
 
 # 单元测试
@@ -209,6 +210,16 @@ npm run e2e:llm-patch          # 本机 mock DeepSeek 四轮演练，无需真�
 - 产物：`.benchmark/benchmark-report.json` / `.benchmark/benchmark-report.md`（逐靶场漏报、误报、静态命中与裁决）；CI 每次自测都会执行并上传
 - 当前基线（2026-10-24）：12 个靶场 · 动态召回 23/23 · 误报 0/23 · 退出码一致 12/12 · 静态召回 23/23 · 零模型调用
 
+### 黑盒精度基准
+
+`npm run benchmark:blackbox` 对 `benchmarks/blackbox-corpus.json` 中的 9 个已运行靶场逐个发起真实黑盒扫描（本机回环，零模型调用）：
+
+- 语料字段：`expectedExit` / `expectedVulnerable`（caseId 精确值或 `前缀*`）/ `forbiddenVulnerable`（明令禁止出现的用例族，优先于 expected，避免 `blackbox-idor-*` 把写/删/CSRF 变体一起放过）/ `patches`（源码插入）/ `configPatch` / `configReplace`（登录形态）/ `serverEnv` / `env`（写探测开关）
+- 覆盖：legacy-shop 漏洞与修复对照、wide-shop 默认/`allowMutation`/`allowDestructive`/加固四档、Cookie 会话 CSRF 与加固对照、`fixtures/spa-shop`（无 OpenAPI、路径不在词表，接口只在动态 import 的二级 chunk 里）
+- 指标：用例召回、误报（未标注 + 明令禁止）、退出码一致、终态一致；报告同时列出每条靶场的路由发现来源（openapi / frontend / brute），作为发现能力回归
+- 当前基线（2026-10-24）：9 个靶场 · 用例召回 37/37 · 误报 0/37 · 退出码一致 9/9 · 终态一致 9/9
+- 产物：`.benchmark-blackbox/benchmark-report.json` / `.benchmark-blackbox/benchmark-report.md`；CI 每次自测都会执行并上传
+
 ## 纯黑盒外部扫描（已运行 / 沙箱中的目标）
 
 不读源码、不启动本地服务、不生成补丁：只对**已运行**的目标发起外部 HTTP 请求并取证。所有请求仍经 Host（回环走 `net.probe`，远程仅 HTTPS 走 `net.egress`），登录令牌由 Host 保险库注入，Sidecar 不见明文。
@@ -223,7 +234,8 @@ guardbuild-headless --url http://127.0.0.1:3000 \
 guardbuild-headless --url https://staging.example.com --project ./my-project --gate
 ```
 
-- 探测面（每个开关都会写进报告的「本轮攻击面」，GUI 同词）：OpenAPI 发现 + 常见路由目录探测（含管理端点命名猜测）；未认证读取、跨用户读取（IDOR，需 ≥2 个普通测试身份）、垂直越权（普通登录身份访问管理端点，有管理身份时做交叉证明，用于区分「端点不存在」与「正确拒绝」）、SQL 注入（错误回显 / 恒真恒假差分 / **数字语境** `1 OR 1=1` 三段差分 / 单对象条件绕过）、路径穿越（明文 + 二次编码 / 变形编码绕过）、CORS（伪造 Origin，回显且允许凭证才判漏洞；白名单拒绝记 blocked）、反射型 XSS（HTML 上下文注入**不含脚本**的无害 canary，原样反射判漏洞、编码反射记 blocked）、敏感文件与 actuator 暴露、限流观察。
+- 探测面（每个开关都会写进报告的「本轮攻击面」，GUI 同词）：路由发现 + 未认证读取、跨用户读取（IDOR，需 ≥2 个普通测试身份）、垂直越权（普通登录身份访问管理端点，有管理身份时做交叉证明，用于区分「端点不存在」与「正确拒绝」）、SQL 注入（错误回显 / 恒真恒假差分 / **数字语境** `1 OR 1=1` 三段差分 / 单对象条件绕过）、路径穿越（明文 + 二次编码 / 变形编码绕过）、CORS（伪造 Origin，回显且允许凭证才判漏洞；白名单拒绝记 blocked）、反射型 XSS（HTML 上下文注入**不含脚本**的无害 canary，原样反射判漏洞、编码反射记 blocked）、敏感文件与 actuator 暴露、限流观察。
+- 路由发现（全部同源只读，不执行脚本）：OpenAPI（含 Springdoc `swagger-config` 的 `urls[]` / `configUrl` 间接地址）、常见路径词表（含管理端点命名猜测）、前端模块图（首页脚本 + 静态/动态 `import` 递归，最多 24 份）、构建清单（CRA `asset-manifest.json` / Vite `.vite/manifest.json`）、source map 的 `sourcesContent`，并接受同源绝对 URL 与 `/orders` 这类无前缀业务资源字面量。四路合并后受 `blackbox.maxRoutes` 上限约束。
 - 写操作越权默认关闭，避免修改甚至销毁目标数据，分两级显式开启：
   - 跨用户 PUT/PATCH 与匿名写入：`blackbox.allowMutation: true` 或 `GUARDBUILD_BLACKBOX_MUTATE=1`（修改后按归属人身份尽力恢复原值，恢复未确认会写进证据）。
   - Cookie 会话下的 CSRF 改写同属写操作，只在 `allowMutation` 开启且契约声明 `login.cookieAuth: true` 时探测；Bearer 令牌不会被浏览器跨站自动携带，因此该形态不适用 CSRF。
@@ -236,8 +248,8 @@ guardbuild-headless --url https://staging.example.com --project ./my-project --g
 - 桌面端入口：左侧「黑盒外部目标」面板填写已运行目标 URL、选择契约目录后点击「扫描外部目标」；白盒启动流程不受影响。
 - 裁决：发现可复现漏洞 → `completed` + `vulnerable_unfixed`，exit 1；无可复现漏洞 → `completed` + `no_findings`，exit 0；目标不可达/执行错误 → `failed`，exit 2（不可达会在一次短超时预检后立即失败，不做整轮探测）。
 - 报告：`report.json` / `report.md` 为黑盒版式，含路由发现、登录结果、证据级别与复现 curl；证据中令牌一律为 `***vault:<identity>***` 占位。
-- 靶场：`fixtures/wide-shop`（管理端点只校验登录、订单读写删无归属校验、留言板匿名写删、`?year=` 数字拼 SQL、`?name=` 二次编码穿越），`GB_WIDE_HARDENED=1` 为整体加固版，用于「不该报」那一轮。
-- 回归：`npm run e2e:blackbox`（66 断言 / 8 轮：legacy-shop 漏洞 exit 1、已修复 exit 0、Cookie 会话复现 IDOR、不可达 exit 2 + 快速短路；wide-shop 默认探测只见无副作用族、`allowMutation` 补出 PUT/PATCH + 匿名写、再加 `allowDestructive` 补出 DELETE、加固版零 finding 且四类攻击全记 blocked）。断言按 caseId 用例集合而不是 finding 条数，新增探测族漏跑会被抓住。
+- 靶场：`fixtures/wide-shop`（管理端点只校验登录、订单读写删无归属校验、留言板匿名写删、`?year=` 数字拼 SQL、`?name=` 二次编码穿越），`GB_WIDE_HARDENED=1` 为整体加固版，用于「不该报」那一轮；`fixtures/spa-shop` 无 OpenAPI 且接口只在动态 import 的二级 chunk 中，用于验证前端模块图发现。
+- 回归：`npm run e2e:blackbox`（88 断言 / 10 轮：legacy-shop 漏洞 exit 1、已修复 exit 0、Cookie 会话复现 IDOR、不可达 exit 2 + 快速短路；wide-shop 默认探测只见无副作用族、`allowMutation` 补出 PUT/PATCH + 匿名写、再加 `allowDestructive` 补出 DELETE、加固版零 finding 且四类攻击全记 blocked；Cookie 会话 CSRF 与加固对照）。断言按 caseId 用例集合而不是 finding 条数，新增探测族漏跑会被抓住。
 
 ## Docker 容器沙箱（目标进程隔离）
 

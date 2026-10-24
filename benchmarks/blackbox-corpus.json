@@ -1,0 +1,153 @@
+{
+  "version": 1,
+  "_note": "黑盒精度基准语料：每个靶场标注「期望退出码 + 期望 vulnerable 用例 + 禁止出现的用例族」。带 * 的规则按前缀匹配；forbidden 优先于 expected，避免 blackbox-idor-* 把写/删变体一起放过。",
+  "targets": [
+    {
+      "id": "legacy-shop",
+      "fixture": "fixtures/legacy-shop",
+      "expectedExit": 1,
+      "expectedOutcomes": ["vulnerable_unfixed"],
+      "expectedVulnerable": ["blackbox-idor-api-orders-5002"]
+    },
+    {
+      "id": "legacy-shop-fixed",
+      "fixture": "fixtures/legacy-shop",
+      "_note": "与 e2e:blackbox 的 fixed 变体同源：只在订单详情路由补归属校验。",
+      "patches": [
+        {
+          "file": "src/app.js",
+          "search": "const order = findOrderById(orderId);",
+          "insertAfter": "\n    if (order && order.userId !== auth.user.id) return json(res, 403, { error: \"无权访问该订单\" });"
+        }
+      ],
+      "expectedExit": 0,
+      "expectedOutcomes": ["no_findings"],
+      "expectedVulnerable": []
+    },
+    {
+      "id": "wide-shop",
+      "fixture": "fixtures/wide-shop",
+      "expectedExit": 1,
+      "expectedOutcomes": ["vulnerable_unfixed"],
+      "expectedVulnerable": [
+        "blackbox-vertical-*",
+        "blackbox-idor-*",
+        "blackbox-sqli-numeric-*",
+        "blackbox-traversal-*",
+        "blackbox-cors-*",
+        "blackbox-xss-*"
+      ],
+      "forbiddenVulnerable": [
+        "blackbox-idor-put-*",
+        "blackbox-idor-patch-*",
+        "blackbox-idor-delete-*",
+        "blackbox-anon-write-*",
+        "blackbox-csrf-*"
+      ]
+    },
+    {
+      "id": "wide-shop-mutate",
+      "fixture": "fixtures/wide-shop",
+      "_note": "allowMutation：写与匿名写应出现，DELETE 仍禁止。",
+      "env": { "GUARDBUILD_BLACKBOX_MUTATE": "1" },
+      "expectedExit": 1,
+      "expectedOutcomes": ["vulnerable_unfixed"],
+      "expectedVulnerable": [
+        "blackbox-vertical-*",
+        "blackbox-idor-*",
+        "blackbox-sqli-numeric-*",
+        "blackbox-traversal-*",
+        "blackbox-cors-*",
+        "blackbox-xss-*",
+        "blackbox-idor-put-*",
+        "blackbox-idor-patch-*",
+        "blackbox-anon-write-*"
+      ],
+      "forbiddenVulnerable": ["blackbox-idor-delete-*", "blackbox-csrf-*"]
+    },
+    {
+      "id": "wide-shop-destructive",
+      "fixture": "fixtures/wide-shop",
+      "_note": "allowDestructive：DELETE 才允许出现。",
+      "env": { "GUARDBUILD_BLACKBOX_MUTATE": "1", "GUARDBUILD_BLACKBOX_DELETE": "1" },
+      "expectedExit": 1,
+      "expectedOutcomes": ["vulnerable_unfixed"],
+      "expectedVulnerable": [
+        "blackbox-vertical-*",
+        "blackbox-idor-*",
+        "blackbox-sqli-numeric-*",
+        "blackbox-traversal-*",
+        "blackbox-cors-*",
+        "blackbox-xss-*",
+        "blackbox-idor-put-*",
+        "blackbox-idor-patch-*",
+        "blackbox-idor-delete-*",
+        "blackbox-anon-write-*"
+      ],
+      "forbiddenVulnerable": ["blackbox-csrf-*"]
+    },
+    {
+      "id": "wide-shop-hardened",
+      "fixture": "fixtures/wide-shop",
+      "serverEnv": { "GB_WIDE_HARDENED": "1" },
+      "env": { "GUARDBUILD_BLACKBOX_MUTATE": "1", "GUARDBUILD_BLACKBOX_DELETE": "1" },
+      "expectedExit": 0,
+      "expectedOutcomes": ["no_findings"],
+      "expectedVulnerable": []
+    },
+    {
+      "id": "wide-shop-cookie",
+      "fixture": "fixtures/wide-shop",
+      "_note": "Cookie 会话 + allowMutation：CSRF 只在这种鉴权形态下有意义。",
+      "configReplace": {
+        "login": {
+          "path": "/session/login",
+          "bodyTemplate": { "email": "{email}", "password": "{password}" },
+          "cookieAuth": true,
+          "encoding": "form"
+        }
+      },
+      "env": { "GUARDBUILD_BLACKBOX_MUTATE": "1" },
+      "expectedExit": 1,
+      "expectedOutcomes": ["vulnerable_unfixed"],
+      "expectedVulnerable": [
+        "blackbox-vertical-*",
+        "blackbox-idor-*",
+        "blackbox-sqli-numeric-*",
+        "blackbox-traversal-*",
+        "blackbox-cors-*",
+        "blackbox-xss-*",
+        "blackbox-idor-put-*",
+        "blackbox-idor-patch-*",
+        "blackbox-anon-write-*",
+        "blackbox-csrf-*"
+      ],
+      "forbiddenVulnerable": ["blackbox-idor-delete-*"]
+    },
+    {
+      "id": "wide-shop-cookie-hardened",
+      "fixture": "fixtures/wide-shop",
+      "configReplace": {
+        "login": {
+          "path": "/session/login",
+          "bodyTemplate": { "email": "{email}", "password": "{password}" },
+          "cookieAuth": true,
+          "encoding": "form"
+        }
+      },
+      "serverEnv": { "GB_WIDE_HARDENED": "1" },
+      "env": { "GUARDBUILD_BLACKBOX_MUTATE": "1", "GUARDBUILD_BLACKBOX_DELETE": "1" },
+      "expectedExit": 0,
+      "expectedOutcomes": ["no_findings"],
+      "expectedVulnerable": []
+    },
+    {
+      "id": "spa-shop",
+      "fixture": "fixtures/spa-shop",
+      "_note": "无 OpenAPI、路径不在词表，/api/v2/orders 只出现在动态 import 的二级 chunk：靠前端模块图发现。",
+      "expectedExit": 1,
+      "expectedOutcomes": ["vulnerable_unfixed"],
+      "expectedVulnerable": ["blackbox-idor-api-v2-orders-5002"]
+    }
+  ]
+}

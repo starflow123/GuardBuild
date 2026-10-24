@@ -10,7 +10,12 @@ import { loginAll } from "./probe.mjs";
 import { followRedirects } from "./http-follow.mjs";
 import { attackPlanEnabled, planBudget, recordPlan, runAttackPlanner } from "./attackplan.mjs";
 
-const OPENAPI_PATHS = ["/swagger.json", "/openapi.json", "/v3/api-docs", "/api-docs", "/swagger-ui.json"];
+const OPENAPI_PATHS = [
+  "/swagger.json", "/openapi.json", "/v3/api-docs", "/api-docs", "/swagger-ui.json",
+  "/api/swagger.json", "/api/openapi.json", "/api/v3/api-docs", "/docs/openapi.json", "/openapi/v1.json",
+];
+const OPENAPI_CONFIG_PATHS = ["/v3/api-docs/swagger-config", "/swagger-config"];
+const MANIFEST_PATHS = ["/asset-manifest.json", "/.vite/manifest.json", "/manifest.json", "/build/asset-manifest.json"];
 const COMMON_API_PATHS = [
   "/api/users", "/api/user", "/api/account", "/api/accounts",
   "/api/orders", "/api/order", "/api/products", "/api/posts",
@@ -30,8 +35,12 @@ const COMMON_API_PATHS = [
   "/graphql",
 ];
 const MAX_FRONTEND_SCRIPTS = 8;
+const MAX_FRONTEND_FETCHES = 24;
 const MAX_FRONTEND_SCRIPT_CHARS = 500_000;
 const MAX_FRONTEND_ROUTES = 80;
+const MAX_SOURCE_MAPS = 3;
+// 无前缀资源路由：只认「一眼是业务资源」的首段，避免把 /assets、/static 之类当接口。
+const RESOURCE_SEGMENT = /^\/(?:users?|accounts?|orders?|products?|posts?|projects?|tickets?|invoices?|messages?|notifications?|comments?|items?|customers?|payments?|carts?|documents?|reports?|tasks?|events?|profiles?|files?|downloads?|uploads?|admin|search)(?:\/|$)/;
 const ASSET_EXT = /\.(?:js|mjs|css|map|png|jpe?g|gif|svg|ico|webp|woff2?|ttf|eot|mp4|webm)$/i;
 const ATTACK_SURFACE_PATHS = [
   "/admin", "/admin/", "/admin/login",
@@ -203,17 +212,58 @@ function looksSensitivePath(path) {
 // ---------- 发现 ----------
 
 export async function discoverOpenapi(ctx, baseUrl) {
-  for (const p of OPENAPI_PATHS) {
-    const res = await httpJson(ctx, { baseUrl, method: "GET", path: p });
-    if (res.ok && res.json && (res.json.paths || res.json.openapi)) {
-      ctx.emit({
-        kind: "discovery",
-        severity: SEVERITY.INFO,
-        message: `发现 OpenAPI 文档：${p}（${Object.keys(res.json.paths ?? {}).length} 条路径）`,
-        data: { path: p },
-      });
-      return { doc: res.json, path: p };
+  const origin = new URL(baseUrl).origin;
+  const tried = new Set();
+  const fetchDoc = async (p) => {
+    if (tried.has(p)) return null;
+    tried.add(p);
+    const res = await httpJson(ctx, { baseUrl, method: "GET", path: p, timeoutMs: 8_000 });
+    return res.ok && res.json ? { doc: res.json, path: p } : null;
+  };
+  // Springdoc 等框架把真正的文档地址放在 swagger-config 里（urls[] 或 configUrl），
+  // 只探测固定候选路径会直接漏掉整份 OpenAPI——这里按文档声明继续一跳。
+  const followConfig = async (found) => {
+    const refs = [];
+    if (Array.isArray(found.doc?.urls)) {
+      for (const u of found.doc.urls.slice(0, 3)) if (typeof u?.url === "string") refs.push(u.url);
     }
+    if (typeof found.doc?.configUrl === "string") refs.push(found.doc.configUrl);
+    for (const ref of refs) {
+      let path;
+      try {
+        const url = new URL(ref, `${baseUrl.replace(/\/+$/, "")}${found.path}`);
+        if (url.origin !== origin) continue;
+        path = `${url.pathname}${url.search}`;
+      } catch {
+        continue;
+      }
+      const next = await fetchDoc(path);
+      if (next?.doc?.paths) return next;
+    }
+    return null;
+  };
+  const report = (found) => {
+    ctx.emit({
+      kind: "discovery",
+      severity: SEVERITY.INFO,
+      message: `发现 OpenAPI 文档：${found.path}（${Object.keys(found.doc?.paths ?? {}).length} 条路径）`,
+      data: { path: found.path },
+    });
+    return found;
+  };
+
+  for (const p of OPENAPI_PATHS) {
+    const found = await fetchDoc(p);
+    if (!found) continue;
+    if (found.doc.paths) return report(found);
+    const indirect = await followConfig(found);
+    if (indirect) return report(indirect);
+  }
+  for (const p of OPENAPI_CONFIG_PATHS) {
+    const found = await fetchDoc(p);
+    if (!found) continue;
+    const indirect = await followConfig(found);
+    if (indirect) return report(indirect);
   }
   ctx.emit({ kind: "discovery", severity: SEVERITY.WARN, message: "未发现 OpenAPI 文档，回落到目录探测" });
   return null;
@@ -282,15 +332,121 @@ export async function bruteRoutes(ctx, baseUrl) {
   return found;
 }
 
-/** 从 HTML/JS 文本里提取字面量 API 路径；动态片段/静态资源路径一律跳过。 */
-export function extractRoutesFromText(text) {
+/** 从 HTML/JS 文本里提取字面量 API 路径；动态片段/静态资源路径一律跳过。
+ *  baseUrl 传入时额外接受同源绝对 URL 与无前缀业务资源路径（"/orders"），
+ *  两者都只在同源前提下才收，避免把外链或静态目录当接口。 */
+export function extractRoutesFromText(text, baseUrl = null) {
   const raw = String(text ?? "").replace(/\\\//g, "/");
   const out = new Set();
+  const add = (value) => {
+    const route = normalizeFrontendRoute(value);
+    if (route) out.add(route);
+  };
   const re = /["'`]((?:\/api|\/rest|\/graphql|\/v\d+)[^"'`\s\\]*)["'`]/g;
   let m;
-  while ((m = re.exec(raw))) {
-    const route = normalizeFrontendRoute(m[1]);
-    if (route) out.add(route);
+  while ((m = re.exec(raw)) && out.size < MAX_FRONTEND_ROUTES) add(m[1]);
+
+  if (baseUrl) {
+    let origin;
+    try {
+      origin = new URL(baseUrl).origin;
+    } catch {
+      origin = null;
+    }
+    const absRe = /https?:\/\/[A-Za-z0-9._~:\-[\]]+(?::\d+)?\/[^"'`\s<>\\]*/g;
+    while ((m = absRe.exec(raw)) && out.size < MAX_FRONTEND_ROUTES) {
+      try {
+        const url = new URL(m[0]);
+        if (!origin || url.origin !== origin) continue;
+        add(`${url.pathname}${url.search}`);
+      } catch {
+        /* 非法 URL 忽略 */
+      }
+    }
+  }
+
+  const bareRe = /["'`](\/[A-Za-z0-9._~\-/]*)["'`]/g;
+  while ((m = bareRe.exec(raw)) && out.size < MAX_FRONTEND_ROUTES) {
+    if (RESOURCE_SEGMENT.test(m[1])) add(m[1]);
+  }
+  return [...out];
+}
+
+/** 同源 JS 模块引用：静态 import/export from 与动态 import()。 */
+export function extractModuleRefs(text, baseUrl, currentPath = "/") {
+  const raw = String(text ?? "");
+  const origin = new URL(baseUrl).origin;
+  const base = new URL(currentPath, `${baseUrl.replace(/\/+$/, "")}/`);
+  const out = [];
+  const push = (spec) => {
+    if (!spec || spec.length > 300 || out.length >= MAX_FRONTEND_FETCHES) return;
+    if (!/\.m?js(?:[?#].*)?$/i.test(spec)) return;
+    try {
+      const url = new URL(spec, base);
+      if (url.origin !== origin) return;
+      const p = `${url.pathname}${url.search}`;
+      if (!out.includes(p)) out.push(p);
+    } catch {
+      /* 非法引用忽略 */
+    }
+  };
+  const patterns = [
+    /\bimport\s+(?:[^"'();]*?\s+from\s+)?["']([^"']+)["']/g,
+    /\bexport\s+(?:\*|\{[^}]*\})\s+from\s*["']([^"']+)["']/g,
+    /\bimport\s*\(\s*["']([^"']+)["']\s*\)/g,
+  ];
+  for (const re of patterns) {
+    let m;
+    while ((m = re.exec(raw)) && out.length < MAX_FRONTEND_FETCHES) push(m[1]);
+  }
+  return out;
+}
+
+/** 构建清单（CRA asset-manifest / Vite manifest）里的同源 JS 资源。 */
+export function extractManifestScripts(json, baseUrl, fromPath = "/") {
+  const origin = new URL(baseUrl).origin;
+  const base = new URL(fromPath, `${baseUrl.replace(/\/+$/, "")}/`);
+  // Vite 的 manifest 位于 /.vite/manifest.json，但 file 字段相对构建根目录；其余清单相对自身目录。
+  const resolveBase = base.pathname.includes("/.vite/") ? new URL("/", origin) : new URL("./", base);
+  const out = [];
+  const push = (value) => {
+    if (typeof value !== "string" || out.length >= MAX_FRONTEND_SCRIPTS) return;
+    const raw = value.trim();
+    if (!raw || raw.length > 300 || !/\.m?js(?:[?#].*)?$/i.test(raw)) return;
+    try {
+      const url = new URL(raw, resolveBase);
+      if (url.origin !== origin) return;
+      const p = `${url.pathname}${url.search}`;
+      if (!out.includes(p)) out.push(p);
+    } catch {
+      /* 非法值忽略 */
+    }
+  };
+  const walk = (node, depth) => {
+    if (depth > 4 || out.length >= MAX_FRONTEND_SCRIPTS) return;
+    if (typeof node === "string") return push(node);
+    if (Array.isArray(node)) {
+      for (const v of node) walk(v, depth + 1);
+      return;
+    }
+    if (node && typeof node === "object") for (const v of Object.values(node)) walk(v, depth + 1);
+  };
+  walk(json, 0);
+  return out;
+}
+
+export function extractSourceMapUrl(text) {
+  const m = String(text ?? "").match(/\/\/[#@]\s*sourceMappingURL=([^\s'"]+)|(?:\/\*[#@]\s*sourceMappingURL=([^\s*]+)\s*\*\/)/);
+  return m ? (m[1] ?? m[2]) : null;
+}
+
+/** 从 source map 的 sourcesContent 里提取路由：打包前的源码会把接口写成字符串字面量。 */
+export function extractRoutesFromSourceMap(json, baseUrl = null) {
+  const out = new Set();
+  const contents = Array.isArray(json?.sourcesContent) ? json.sourcesContent : [];
+  for (const text of contents) {
+    if (typeof text !== "string") continue;
+    for (const p of extractRoutesFromText(text.slice(0, MAX_FRONTEND_SCRIPT_CHARS), baseUrl)) out.add(p);
     if (out.size >= MAX_FRONTEND_ROUTES) break;
   }
   return [...out];
@@ -340,26 +496,89 @@ function inlineScripts(html, limit = 4) {
   return out;
 }
 
-/** 抓首页与同源 JS，提取前端实际调用的字面量路由（SPA/无 OpenAPI 项目的补充发现手段）。 */
+/** 抓首页、构建清单、同源 JS 模块图与 source map，提取前端实际调用的字面量路由。
+ *  预算固定（脚本 24 份 / source map 3 份 / 清单 4 份），只走同源 GET，不执行任何脚本。 */
 export async function discoverFrontendRoutes(ctx, baseUrl, { html = null } = {}) {
   let page = html;
   if (page == null) {
     const res = await httpJson(ctx, { baseUrl, method: "GET", path: "/", timeoutMs: 8_000 });
     page = res.body ?? "";
   }
+  const origin = new URL(baseUrl).origin;
   const scripts = extractScriptPaths(page, baseUrl);
   const routes = new Map();
-  const collect = (text) => {
-    for (const p of extractRoutesFromText(text)) if (!routes.has(p)) routes.set(p, true);
+  const merge = (list) => {
+    for (const p of list) if (!routes.has(p)) routes.set(p, true);
   };
+  const collect = (text) => merge(extractRoutesFromText(text, baseUrl));
   for (const snippet of inlineScripts(page)) collect(snippet);
+
+  // 框架构建清单里常直接列出所有 chunk（CRA asset-manifest / Vite manifest），
+  // 比只解析首页 script 标签覆盖更全。
+  const queue = [...scripts];
+  const seen = new Set(queue);
+  let manifests = 0;
+  for (const mp of MANIFEST_PATHS) {
+    if (queue.length >= MAX_FRONTEND_FETCHES) break;
+    const res = await httpJson(ctx, { baseUrl, method: "GET", path: mp, timeoutMs: 6_000 });
+    if (!res.ok || !res.body) continue;
+    let json = null;
+    try {
+      json = JSON.parse(res.body.slice(0, MAX_FRONTEND_SCRIPT_CHARS));
+    } catch {
+      continue;
+    }
+    manifests += 1;
+    for (const p of extractManifestScripts(json, baseUrl, mp)) {
+      if (!seen.has(p)) {
+        seen.add(p);
+        queue.push(p);
+      }
+    }
+  }
+
   let fetched = 0;
-  for (const src of scripts) {
+  let sourceMaps = 0;
+  while (queue.length && fetched < MAX_FRONTEND_FETCHES) {
+    const src = queue.shift();
     const res = await httpJson(ctx, { baseUrl, method: "GET", path: src, timeoutMs: 8_000 });
     if (!res.ok || !res.body) continue;
     fetched += 1;
-    collect(res.body.slice(0, MAX_FRONTEND_SCRIPT_CHARS));
+    const body = res.body.slice(0, MAX_FRONTEND_SCRIPT_CHARS);
+    collect(body);
+
+    // 动态 import 的二级 chunk 往往才是接口所在，必须按模块图继续爬。
+    for (const ref of extractModuleRefs(body, baseUrl, src)) {
+      if (seen.has(ref) || fetched + queue.length >= MAX_FRONTEND_FETCHES) continue;
+      seen.add(ref);
+      queue.push(ref);
+    }
+
+    const mapRef = extractSourceMapUrl(body);
+    if (mapRef && sourceMaps < MAX_SOURCE_MAPS) {
+      let mapPath = null;
+      try {
+        const url = new URL(mapRef, new URL(src, `${baseUrl.replace(/\/+$/, "")}/`));
+        if (url.origin === origin) mapPath = `${url.pathname}${url.search}`;
+      } catch {
+        mapPath = null;
+      }
+      if (mapPath && !seen.has(mapPath)) {
+        seen.add(mapPath);
+        const mapRes = await httpJson(ctx, { baseUrl, method: "GET", path: mapPath, timeoutMs: 8_000 });
+        if (mapRes.ok && mapRes.body) {
+          sourceMaps += 1;
+          try {
+            const map = JSON.parse(mapRes.body.slice(0, MAX_FRONTEND_SCRIPT_CHARS * 4));
+            merge(extractRoutesFromSourceMap(map, baseUrl));
+          } catch {
+            /* 非法 source map 忽略 */
+          }
+        }
+      }
+    }
   }
+
   const list = [...routes.keys()].slice(0, MAX_FRONTEND_ROUTES).map((p) => ({
     method: "GET",
     path: p,
@@ -370,18 +589,18 @@ export async function discoverFrontendRoutes(ctx, baseUrl, { html = null } = {})
     ctx.emit({
       kind: "discovery",
       severity: SEVERITY.INFO,
-      message: `前端资源提取 ${list.length} 条字面量路由（扫描同源脚本 ${fetched}/${scripts.length} 个）`,
-      data: { routes: list.map((r) => r.path), scripts: scripts.length, fetched },
+      message: `前端资源提取 ${list.length} 条字面量路由（同源脚本 ${fetched} 份，source map ${sourceMaps} 份，构建清单 ${manifests} 份）`,
+      data: { routes: list.map((r) => r.path), scripts: scripts.length, fetched, sourceMaps, manifests },
     });
-  } else if (scripts.length) {
+  } else if (scripts.length || manifests) {
     ctx.emit({
       kind: "discovery",
       severity: SEVERITY.INFO,
-      message: `首页引用 ${scripts.length} 个同源脚本，未提取到字面量 API 路由`,
-      data: { scripts: scripts.length, fetched },
+      message: `已抓取前端资源（首页脚本 ${scripts.length} 个，构建清单 ${manifests} 份），未提取到字面量 API 路由`,
+      data: { scripts: scripts.length, fetched, sourceMaps, manifests },
     });
   }
-  return { routes: list, scripts: scripts.length, fetched };
+  return { routes: list, scripts: scripts.length, fetched, sourceMaps, manifests };
 }
 
 function mergeRoutes(limit, ...lists) {

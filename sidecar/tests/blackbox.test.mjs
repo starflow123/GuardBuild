@@ -1,7 +1,20 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
-import { runBlackbox, openapiRoutes, extractItems, extractEntityById, extractOwner, extractRoutesFromText } from "../lib/blackbox.mjs";
+import {
+  runBlackbox,
+  openapiRoutes,
+  extractItems,
+  extractEntityById,
+  extractOwner,
+  extractRoutesFromText,
+  extractModuleRefs,
+  extractManifestScripts,
+  extractSourceMapUrl,
+  extractRoutesFromSourceMap,
+  discoverOpenapi,
+  discoverFrontendRoutes,
+} from "../lib/blackbox.mjs";
 
 function jsonPath(obj, path) {
   return String(path)
@@ -1034,6 +1047,155 @@ test("runBlackbox: hardened 靶场（角色校验 + 参数校验 + 归属校验 
     assert.ok(blocked.some((c) => c.startsWith("blackbox-anon-write-")), "匿名写入被拒要记 blocked");
     const vertical = result.evidence.find((e) => e.caseId.startsWith("blackbox-vertical-") && e.caseId.includes("api-admin-users"));
     assert.equal(vertical.evidenceGrade, "cross-proven", "管理身份有数据 + 普通身份被拒 = 交叉证明拒绝成立");
+  } finally {
+    await target.close();
+  }
+});
+
+test("extractRoutesFromText: 额外接受同源绝对 URL 与无前缀业务资源路径", () => {
+  const base = "http://127.0.0.1:3210";
+  const routes = extractRoutesFromText(
+    [
+      `fetch("http://127.0.0.1:3210/api/absolute?x=1");`,
+      `fetch("https://cdn.example.com/api/remote");`,
+      `fetch("/orders");`,
+      `fetch("/assets/logo.png");`,
+      `fetch("/static/chunk.js");`,
+      `fetch("/users/\${id}");`,
+    ].join("\n"),
+    base
+  );
+  assert.ok(routes.includes("/api/absolute"));
+  assert.ok(routes.includes("/orders"));
+  assert.ok(!routes.includes("/api/remote"), "跨源 URL 不应进入路由表");
+  assert.ok(!routes.some((p) => /\.(?:png|js)$/.test(p)));
+  assert.ok(!routes.some((p) => p.includes("${")));
+});
+
+test("extractModuleRefs: 静态/动态 import 与相对路径，跨源与非 JS 忽略", () => {
+  const text = [
+    `import { a } from "./dep.js";`,
+    `export * from "/static/js/shared.mjs";`,
+    `const lazy = () => import("./chunk-orders.js");`,
+    `import "https://cdn.example.com/remote.js";`,
+    `const css = "/assets/app.css";`,
+  ].join("\n");
+  const refs = extractModuleRefs(text, "http://127.0.0.1:8080", "/static/js/main.js");
+  assert.deepEqual(refs.sort(), ["/static/js/chunk-orders.js", "/static/js/dep.js", "/static/js/shared.mjs"].sort());
+});
+
+test("extractManifestScripts: 兼容 CRA asset-manifest 与 Vite manifest", () => {
+  const cra = { files: { "main.js": "/static/js/main.abc123.js", "main.css": "/static/css/main.css" } };
+  assert.deepEqual(extractManifestScripts(cra, "http://127.0.0.1:8080", "/asset-manifest.json"), [
+    "/static/js/main.abc123.js",
+  ]);
+  const vite = {
+    "src/main.jsx": { file: "assets/index-xyz.js", src: "src/main.jsx" },
+    "src/lazy.js": { file: "assets/lazy-abc.js", isDynamicEntry: true },
+  };
+  assert.deepEqual(
+    extractManifestScripts(vite, "http://127.0.0.1:8080", "/.vite/manifest.json").sort(),
+    ["/assets/index-xyz.js", "/assets/lazy-abc.js"].sort()
+  );
+  assert.deepEqual(extractManifestScripts({ x: "https://cdn.example.com/x.js" }, "http://127.0.0.1:8080"), []);
+});
+
+test("source map: 识别 sourceMappingURL 并从 sourcesContent 提取路由", () => {
+  assert.equal(
+    extractSourceMapUrl(`console.log(1);\n//# sourceMappingURL=main.js.map`),
+    "main.js.map"
+  );
+  assert.equal(extractSourceMapUrl(`/*# sourceMappingURL=main.js.map */`), "main.js.map");
+  const routes = extractRoutesFromSourceMap({
+    sourcesContent: [`fetch("/api/from-source");`, null, `const x = "/orders/1";`],
+  });
+  assert.deepEqual(routes.sort(), ["/api/from-source", "/orders/1"].sort());
+});
+
+function discoveryServer() {
+  const originRef = { value: "" };
+  const server = http.createServer((req, res) => {
+    const url = new URL(req.url, "http://127.0.0.1");
+    const send = (status, body, type = "application/json") => {
+      res.writeHead(status, { "Content-Type": type });
+      res.end(typeof body === "string" ? body : JSON.stringify(body));
+    };
+    if (url.pathname === "/") {
+      return send(
+        200,
+        `<!doctype html><html><head><script type="module" src="/static/js/main.js"></script></head></html>`,
+        "text/html"
+      );
+    }
+    if (url.pathname === "/static/js/main.js") {
+      return send(
+        200,
+        `const load = () => import("./chunk-a.js");\n//# sourceMappingURL=main.js.map`,
+        "application/javascript"
+      );
+    }
+    if (url.pathname === "/static/js/main.js.map") {
+      return send(200, { version: 3, sourcesContent: [`fetch("/api/map-only");`] });
+    }
+    if (url.pathname === "/asset-manifest.json") {
+      return send(200, { files: { "main.js": "/static/js/main.js", "chunk-b.js": "/static/js/chunk-b.js" } });
+    }
+    if (url.pathname === "/static/js/chunk-a.js") {
+      return send(200, `export const x = "/api/chunk-only";`, "application/javascript");
+    }
+    if (url.pathname === "/static/js/chunk-b.js") {
+      return send(
+        200,
+        `fetch("${originRef.value}/api/absolute?x=1");\nfetch("https://cdn.example.com/api/remote");\nfetch("/orders");`,
+        "application/javascript"
+      );
+    }
+    if (url.pathname === "/v3/api-docs/swagger-config") {
+      return send(200, { urls: [{ url: "/v3/api-docs/default" }] });
+    }
+    if (url.pathname === "/v3/api-docs/default") {
+      return send(200, { openapi: "3.0.0", paths: { "/api/widgets": { get: {} } } });
+    }
+    return send(404, { error: "not found" });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      originRef.value = `http://127.0.0.1:${server.address().port}`;
+      resolve({
+        url: originRef.value,
+        close: () => new Promise((r) => server.close(r)),
+      });
+    });
+  });
+}
+
+test("discoverFrontendRoutes: 动态 import 二级 chunk + source map + 构建清单一起发现", async () => {
+  const target = await discoveryServer();
+  const ctx = makeCtx(new Map());
+  try {
+    const result = await discoverFrontendRoutes(ctx, target.url, {});
+    const paths = result.routes.map((r) => r.path);
+    assert.ok(paths.includes("/api/chunk-only"), JSON.stringify(paths));
+    assert.ok(paths.includes("/api/map-only"), JSON.stringify(paths));
+    assert.ok(paths.includes("/api/absolute"), JSON.stringify(paths));
+    assert.ok(paths.includes("/orders"), JSON.stringify(paths));
+    assert.ok(!paths.some((p) => p.includes("/api/remote")), "跨源路由不应进入结果");
+    assert.equal(result.sourceMaps, 1);
+    assert.equal(result.manifests, 1);
+    assert.ok(result.fetched >= 3);
+  } finally {
+    await target.close();
+  }
+});
+
+test("discoverOpenapi: 跟随 swagger-config 声明的间接文档地址", async () => {
+  const target = await discoveryServer();
+  const ctx = makeCtx(new Map());
+  try {
+    const found = await discoverOpenapi(ctx, target.url);
+    assert.ok(found, "应通过 swagger-config 找到文档");
+    assert.equal(found.path, "/v3/api-docs/default");
+    assert.deepEqual(openapiRoutes(found).map((r) => r.path), ["/api/widgets"]);
   } finally {
     await target.close();
   }

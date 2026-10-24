@@ -1,0 +1,21 @@
+{
+  "_note": "黑盒路由发现靶场：无 OpenAPI，/api/v2/orders 只在二级 JS chunk 中出现。",
+  "start": {
+    "cmd": "node",
+    "args": ["server.js"],
+    "env": { "PORT": "0" },
+    "readyPattern": "listening on port",
+    "readyTimeoutMs": 20000
+  },
+  "login": {
+    "path": "/api/login",
+    "bodyTemplate": { "email": "{email}", "password": "{password}" },
+    "credentialPath": "authentication.token"
+  },
+  "identities": [
+    { "name": "alice", "email": "alice@spa.shop", "password": "alice123", "role": "user" },
+    { "name": "bob", "email": "bob@spa.shop", "password": "bob123", "role": "user" }
+  ],
+  "blackbox": { "maxRoutes": 60 },
+  "scopes": ["project.read", "net.probe"]
+}

@@ -383,7 +383,7 @@ async function main() {
       attempts[0].index === 1 &&
       attempts[0].ok === false &&
       attempts[0].code === "target_not_ready" &&
-      attempts[0].diagnosisCode === "missing_dependency" &&
+      attempts[0].diagnosisCode === "missing_local_file" &&
       attempts[1].index === 2 &&
       attempts[1].ok === true &&
       attempts[1].cmd === "node" &&
@@ -439,13 +439,13 @@ async function main() {
     Array.isArray(rep?.llm?.startAttempts) &&
       rep.llm.startAttempts.length === 2 &&
       rep.llm.startAttempts[0].ok === false &&
-      rep.llm.startAttempts[0].diagnosisCode === "missing_dependency" &&
+      rep.llm.startAttempts[0].diagnosisCode === "missing_local_file" &&
       rep.llm.startAttempts[1].ok === true,
     JSON.stringify((rep?.llm?.startAttempts ?? []).map((a) => `${a.index}:${a.ok}`))
   );
   check(
     "报告 Markdown 呈现启动候选表",
-    md.includes("启动候选实际验证") && md.includes("missing_dependency") && md.includes("boot.mjs"),
+    md.includes("启动候选实际验证") && md.includes("missing_local_file") && md.includes("boot.mjs"),
     ""
   );
   const findingPaths = (rep?.summary?.findings ?? []).map((f) => f.path);
@@ -488,7 +488,7 @@ async function main() {
   check(
     "r3 逐个尝试所有 LLM 候选后才放弃（2 个候选均缺入口）",
     attempts3.length === 2 &&
-      attempts3.every((a) => a.ok === false && a.diagnosisCode === "missing_dependency"),
+      attempts3.every((a) => a.ok === false && a.diagnosisCode === "missing_local_file"),
     JSON.stringify(attempts3.map((a) => `${a.index}:${a.ok}:${a.diagnosisCode}`))
   );
   check(

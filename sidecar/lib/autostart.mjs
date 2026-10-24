@@ -576,14 +576,14 @@ export function matchDiagnostics(lines, { limit = 4 } = {}) {
 export function diagnoseStartFailure({ output = [], exitCode = null, start = null } = {}) {
   const lines = (Array.isArray(output) ? output : []).map((l) => String(l ?? ""));
   const text = lines.join("\n");
-  // 缺失模块若是项目内路径（绝对/相对、且不在 node_modules），是构建产物或源文件没生成，
+  // 缺失模块若是项目内路径（绝对/相对、且不在 node_modules），是项目文件/构建产物没生成，
   // 不是「依赖没装」——两者的修法完全不同，别把 npm install 当万能建议。
   const missing = text.match(/Cannot find module [`'"]([^`'"]+)[`'"]/i)?.[1] ?? null;
   if (missing && /^(?:[A-Za-z]:[\\/]|\.{1,2}[\\/]|\/)/.test(missing) && !missing.includes("node_modules")) {
     return {
-      code: "missing_build_artifact",
+      code: "missing_local_file",
       exitCode,
-      hint: `缺少项目内的文件或构建产物（${missing}）。请先执行构建（如 npm run build），或补齐被引用的文件后重试启动`,
+      hint: `项目内缺少该文件（${missing}）。若它是构建产物，请先执行构建（如 npm run build）；若它是启动入口，请修正 start.args 或补齐文件`,
       matched: `Cannot find module '${missing}'`.slice(0, 200),
       excerpt: tailLines(lines),
     };

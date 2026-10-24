@@ -7,7 +7,7 @@
  *   靶场 fixtures/bootstrap-shop：入口 src/data.js 静态 import 构建产物 build/config.js
  *   （由 npm run build 从 config/orders.seed.json 生成）。仓库里只有种子数据，所以
  *   guardbuild.json 里人类声明的启动契约「node server.js」在接入这一步注定失败
- *   （ERR_MODULE_NOT_FOUND，诊断码 missing_dependency）——只有启动代理能把项目拉起来。
+ *   （ERR_MODULE_NOT_FOUND，诊断码 missing_local_file）——只有启动代理能把项目拉起来。
  *
  *   r1 正常协作的模型：read scripts/build.js → exec 编号 2（npm run build）→ start 候选 1。
  *      其中 exec 那一步同时 smuggle 了自带的 cmd/args：引擎必须丢掉这些字段、
@@ -429,7 +429,7 @@ async function main() {
       actionSeq(acts1) === "read→sanitize→exec→start",
       `序列=${actionSeq(acts1)}（视图 ${actionSeq((b1.actions ?? []).map((a) => ({ action: a.action })))}）`
     );
-    check("r1 触发原因是确定性启动契约的真实失败（缺 Node 依赖诊断）", /target_not_ready|missing_dependency|缺少 Node 依赖/.test(String(b1.reason ?? "")), `reason=${String(b1.reason ?? "").slice(0, 80)}`);
+    check("r1 触发原因是确定性启动契约的真实失败（缺构建产物诊断）", /target_not_ready|missing_local_file|项目内缺少该文件/.test(String(b1.reason ?? "")), `reason=${String(b1.reason ?? "").slice(0, 80)}`);
     check(
       "r1 只读自查为决策提供了构建脚本内容（回灌进下一轮观察）",
       (b1.actions ?? []).some((a) => a.action === "read" && a.subject === "scripts/build.js" && a.ok) &&

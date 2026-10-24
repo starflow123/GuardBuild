@@ -2097,8 +2097,15 @@ test("diagnoseStartFailure: 常见启动错误翻译为可操作建议", () => {
     ],
     exitCode: 1,
   });
-  assert.equal(artifact.code, "missing_build_artifact", "项目内缺失文件是「没构建」，不是「没装依赖」");
+  assert.equal(artifact.code, "missing_local_file", "项目内缺失文件是「没构建/缺文件」，不是「没装依赖」");
   assert.match(artifact.hint, /构建|npm run build/);
+
+  const entry = diagnoseStartFailure({
+    output: ["Error: Cannot find module 'D:\\proj\\boot.mjs'"],
+    exitCode: 1,
+  });
+  assert.equal(entry.code, "missing_local_file", "缺失的启动入口同样不是依赖问题");
+  assert.match(entry.hint, /start\.args|补齐/);
 
   const inModules = diagnoseStartFailure({
     output: ["Cannot find module 'C:\\proj\\node_modules\\foo\\index.js'"],

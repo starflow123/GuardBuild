@@ -113,7 +113,7 @@ jobs:
       - name: 精度基准（12 个标注靶场：漏报 / 误报 / 退出码一致性）
         run: node scripts/benchmark.mjs
 
-      - name: 黑盒精度基准（9 个标注靶场：用例族召回 / 误报 / 写探测开关 / 退出码）
+      - name: 黑盒精度基准（19 个标注靶场：用例族召回 / 误报 / 写与破坏性探测开关 / 退出码）
         run: node scripts/benchmark-blackbox.mjs
 
       - name: Docker 沙箱 E2E（无可用 Docker 时自动跳过）

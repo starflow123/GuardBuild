@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
+import crypto from "node:crypto";
 import {
   runBlackbox,
   openapiRoutes,
@@ -224,7 +225,12 @@ test("runBlackbox: 有归属校验时标记 blocked，且无漏洞结论", async
     const idor = result.evidence.find((e) => e.caseId.startsWith("blackbox-idor-"));
     assert.ok(idor);
     assert.equal(idor.verdict, "blocked");
-    assert.equal(result.summary.attackBlocked, 1);
+    const blocked = result.evidence.filter((e) => e.verdict === "blocked");
+    assert.equal(result.summary.attackBlocked, blocked.length, "blocked 计数要与证据条数一致");
+    assert.ok(
+      blocked.some((e) => e.caseId === "blackbox-jwt-api-me"),
+      `该目标会验签，伪造令牌要记 blocked 而不是静默：${blocked.map((e) => e.caseId).join("、")}`
+    );
   } finally {
     await target.close();
   }
@@ -1196,6 +1202,309 @@ test("discoverOpenapi: 跟随 swagger-config 声明的间接文档地址", async
     assert.ok(found, "应通过 swagger-config 找到文档");
     assert.equal(found.path, "/v3/api-docs/default");
     assert.deepEqual(openapiRoutes(found).map((r) => r.path), ["/api/widgets"]);
+  } finally {
+    await target.close();
+  }
+});
+
+/**
+ * 动态取证四族靶场：一个服务同时埋 SSRF（按参数回连）、JWT 只解码不验签、
+ * 上传后按声明类型同源回读、状态跳步 + 并发退款双花。
+ * hardened=true 时同一批端点全部做对（主机白名单 / HMAC 验签 / 类型白名单 / 前置状态校验 / 幂等锁），
+ * 用来证明「拿不到外部证据就不下结论」的判据不会把防住了的报成漏洞。
+ */
+function familyTargetServer({ hardened = false } = {}) {
+  const secret = "gb-family-test-secret";
+  const accounts = {
+    "alice@test.com": { id: 1, username: "alice", role: "user" },
+    "bob@test.com": { id: 2, username: "bob", role: "user" },
+  };
+  const orders = [
+    { id: 101, ownerId: 1, status: "pending" },
+    { id: 102, ownerId: 1, status: "paid" },
+    { id: 201, ownerId: 2, status: "pending" },
+  ];
+  const uploads = new Map();
+  const ledger = [];
+  const delay = (ms) => new Promise((r) => setTimeout(r, ms));
+  const b64urlDecode = (s) => Buffer.from(s, "base64url").toString("utf8");
+  const sign = (claims) => {
+    const h = Buffer.from(JSON.stringify({ alg: "HS256", typ: "JWT" })).toString("base64url");
+    const p = Buffer.from(JSON.stringify(claims)).toString("base64url");
+    return `${h}.${p}.${crypto.createHmac("sha256", secret).update(`${h}.${p}`).digest("base64url")}`;
+  };
+  const decode = (raw) => {
+    const parts = String(raw).split(".");
+    if (parts.length !== 3) return null;
+    try {
+      return {
+        header: JSON.parse(b64urlDecode(parts[0])),
+        claims: JSON.parse(b64urlDecode(parts[1])),
+        signed: `${parts[0]}.${parts[1]}`,
+        sig: parts[2],
+      };
+    } catch {
+      return null;
+    }
+  };
+  // 唯一的鉴权差异：hardened 校验算法与 HMAC 签名，漏洞版拿到能解码的令牌就认（jwt-shop 的写法错误）
+  const authUser = (req) => {
+    const parsed = decode(String(req.headers.authorization ?? "").replace(/^Bearer\s+/, ""));
+    if (!parsed) return null;
+    if (hardened) {
+      if (parsed.header.alg !== "HS256") return null;
+      if (parsed.sig !== crypto.createHmac("sha256", secret).update(parsed.signed).digest("base64url")) return null;
+    }
+    return { id: Number(parsed.claims.sub ?? 0), username: String(parsed.claims.username ?? parsed.claims.name ?? "") };
+  };
+
+  const server = http.createServer(async (req, res) => {
+    const url = new URL(req.url, "http://127.0.0.1");
+    const send = (status, body, extra = {}) => {
+      res.writeHead(status, { "Content-Type": "application/json", ...extra });
+      res.end(JSON.stringify(body));
+    };
+    let raw = "";
+    if (req.method !== "GET" && req.method !== "HEAD") {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      raw = Buffer.concat(chunks).toString("latin1");
+    }
+    const user = authUser(req);
+
+    if (req.method === "POST" && url.pathname === "/api/login") {
+      let body = {};
+      try {
+        body = JSON.parse(raw || "{}");
+      } catch {
+        /* 非法登录体按未登录处理 */
+      }
+      const acc = accounts[body.email];
+      if (!acc || body.password !== `${acc.username}123`) return send(401, { error: "bad credentials" });
+      const exp = Math.floor(Date.now() / 1000) + 3600;
+      return send(200, {
+        authentication: {
+          token: sign({ sub: acc.id, username: acc.username, name: acc.username, email: body.email, role: acc.role, exp }),
+          user: { id: acc.id, role: acc.role, email: body.email },
+        },
+      });
+    }
+
+    // SSRF：漏洞版按参数地址发起服务端请求；hardened 只放行固定外部主机
+    if (req.method === "GET" && url.pathname === "/api/preview") {
+      const target = url.searchParams.get("url") ?? "";
+      if (!target) return send(400, { error: "url is required" });
+      let host = "";
+      try {
+        host = new URL(target).hostname;
+      } catch {
+        return send(400, { error: "malformed url" });
+      }
+      if (hardened && host !== "example.com") return send(403, { error: "host is not allowlisted" });
+      try {
+        const upstream = await fetch(target);
+        return send(200, { fetched: upstream.status, bytes: (await upstream.text()).length });
+      } catch {
+        return send(502, { error: "upstream fetch failed" });
+      }
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/me") {
+      if (!user) return send(401, { error: "unauthorized" });
+      return send(200, { user: { id: user.id, username: user.username } });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/orders") {
+      if (!user) return send(401, { error: "unauthorized" });
+      return send(200, { items: orders.filter((o) => o.ownerId === user.id).map(({ id, status }) => ({ id, status })) });
+    }
+
+    // 上传：漏洞版原样保存并按声明类型同源回读；hardened 只收图片
+    if (req.method === "POST" && url.pathname === "/api/avatar") {
+      if (!user) return send(401, { error: "unauthorized" });
+      if (hardened) return send(415, { error: "only image/png and image/jpeg are accepted" });
+      const name = raw.match(/filename="([^"]+)"/)?.[1] ?? "";
+      const declared = raw.match(/\r\nContent-Type:\s*([^\r\n]+)/i)?.[1]?.trim() ?? "application/octet-stream";
+      const start = raw.indexOf("\r\n\r\n");
+      const end = raw.lastIndexOf("\r\n--");
+      if (!name || start < 0 || end <= start) return send(400, { error: "malformed multipart body" });
+      uploads.set(name, { body: raw.slice(start + 4, end), contentType: declared });
+      return send(201, { url: `/uploads/${name}` });
+    }
+    if (req.method === "GET" && url.pathname.startsWith("/uploads/")) {
+      const file = uploads.get(decodeURIComponent(url.pathname.slice("/uploads/".length)));
+      if (!file) return send(404, { error: "not found" });
+      res.writeHead(200, { "Content-Type": file.contentType });
+      res.end(file.body);
+      return;
+    }
+
+    // 业务逻辑：ship 不看前置状态；refund 在「查状态」与「落账」之间有 await，于是并发全部通过
+    const action = url.pathname.match(/^\/api\/orders\/(\d+)\/([a-z-]+)$/i);
+    if (action && req.method === "POST") {
+      if (!user) return send(401, { error: "unauthorized" });
+      const order = orders.find((o) => String(o.id) === action[1]);
+      if (!order) return send(404, { error: "not found" });
+      const verb = action[2].toLowerCase();
+      if (verb === "ship") {
+        if (hardened) return send(409, { error: "order is not paid yet" });
+        await delay(20);
+        order.status = "shipped";
+        return send(200, { id: order.id, status: order.status });
+      }
+      if (verb === "refund") {
+        if (hardened) {
+          if (order.refundId != null) return send(409, { error: "already refunded" });
+          order.refundId = 9001; // 同步占位，并发只有一个请求能进入
+          await delay(80);
+          ledger.push(order.refundId);
+          return send(200, { id: order.id, refund_id: order.refundId });
+        }
+        await delay(80);
+        ledger.push(1000 + ledger.length);
+        return send(200, { id: order.id, refund_id: ledger[ledger.length - 1] });
+      }
+      return send(404, { error: "unknown action" });
+    }
+
+    return send(404, { error: "not found" });
+  });
+
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        url: `http://127.0.0.1:${server.address().port}`,
+        close: () => new Promise((r) => server.close(r)),
+        orders,
+        refunds: () => ledger.length,
+      });
+    });
+  });
+}
+
+const runFamilies = (ctx, url, options = {}) =>
+  runBlackbox(ctx, url, {
+    config: { login: ctx.loginConfig, identities: ctx.identities, blackbox: null },
+    ...options,
+  });
+
+test("runBlackbox: SSRF 以本机 canary 回连定性、JWT 以伪造身份回显定性，两者默认执行", async () => {
+  const target = await familyTargetServer();
+  const ctx = makeCtx(new Map());
+  try {
+    const result = await runFamilies(ctx, target.url, { allowMutation: false });
+    assert.equal(result.login.ok, true, "登录失败说明 JWT 契约没对上");
+
+    const ssrf = byCase(result, "blackbox-ssrf-").find((e) => e.verdict === "vulnerable");
+    assert.ok(ssrf, JSON.stringify(byCase(result, "blackbox-ssrf-").map((e) => [e.caseId, e.verdict])));
+    assert.equal(ssrf.caseId, "blackbox-ssrf-api-preview");
+    assert.equal(ssrf.evidenceGrade, "strong", "判据是独立监听器收到的回连，不靠响应猜测");
+    assert.match(ssrf.actual, /回连本机 canary/);
+    assert.match(ssrf.endpoint, /url=http%3A%2F%2F127\.0\.0\.1/);
+
+    const jwt = byCase(result, "blackbox-jwt-").find((e) => e.caseId === "blackbox-jwt-api-me");
+    assert.ok(jwt, JSON.stringify(byCase(result, "blackbox-jwt-").map((e) => [e.caseId, e.verdict])));
+    assert.equal(jwt.verdict, "vulnerable");
+    assert.equal(jwt.evidenceGrade, "strong");
+    assert.match(jwt.actual, /alg=none 伪造令牌通过认证/);
+    assert.match(jwt.actual, /响应回显伪造身份/);
+    assert.equal(jwt.request.headers.Authorization, "Bearer <forged-jwt>", "证据只留占位符");
+    assert.ok(!/Bearer\s+(?!\*\*\*|<)[A-Za-z0-9._-]{16,}/.test(JSON.stringify(result.evidence)), "任何证据都不得含令牌明文");
+
+    assert.ok(result.coverage.includes("SSRF（本机回连 canary）"));
+    assert.ok(result.coverage.includes("JWT 伪造令牌"));
+    assert.ok(result.findings.some((f) => /SSRF/.test(f.type)));
+    assert.ok(result.findings.some((f) => /JWT 伪造令牌/.test(f.type)));
+    assert.equal(byCase(result, "blackbox-upload-").length, 0, "未开 allowMutation 不得上传文件");
+    assert.equal(byCase(result, "blackbox-biz-").length, 0, "未开 allowMutation 不得推进业务状态");
+    assert.ok(!result.coverage.includes("文件上传（主动内容）"));
+  } finally {
+    await target.close();
+  }
+});
+
+test("runBlackbox: 上传以同源回读到令牌、状态跳步以回读状态变化定性；并发双花另需 allowDestructive", async () => {
+  const mut = await familyTargetServer();
+  const ctxMut = makeCtx(new Map());
+  try {
+    const result = await runFamilies(ctxMut, mut.url, { allowMutation: true });
+
+    const upload = byCase(result, "blackbox-upload-").find((e) => e.caseId === "blackbox-upload-api-avatar");
+    assert.ok(upload, JSON.stringify(byCase(result, "blackbox-upload-").map((e) => [e.caseId, e.verdict, e.actual])));
+    assert.equal(upload.verdict, "vulnerable");
+    assert.equal(upload.evidenceGrade, "cross-proven", "判据是上传响应与回读内容同时命中随机令牌");
+    assert.match(upload.actual, /text\/html/);
+    assert.match(upload.endpoint, /^\/api\/avatar$/);
+    assert.match(String(upload.request.body), /multipart\/form-data · 字段 file · 文件 gb-/);
+
+    const state = byCase(result, "blackbox-biz-state-").find((e) => e.caseId === "blackbox-biz-state-api-orders-101-ship");
+    assert.ok(state, JSON.stringify(byCase(result, "blackbox-biz-state-").map((e) => [e.caseId, e.verdict])));
+    assert.equal(state.verdict, "vulnerable");
+    assert.equal(state.evidenceGrade, "cross-proven");
+    assert.match(state.actual, /原状态 pending，调用 ship 后回读为 shipped/);
+    assert.equal(mut.orders.find((o) => o.id === 101).status, "shipped");
+
+    assert.equal(byCase(result, "blackbox-biz-race-").length, 0, "未开 allowDestructive 不得发退款这类资金动作");
+    assert.equal(mut.refunds(), 0);
+    assert.ok(result.coverage.includes("文件上传（主动内容）"));
+    assert.ok(result.coverage.includes("业务逻辑跳步/并发双花"));
+    assert.ok(!result.coverage.includes("CSRF（Cookie 会话）"), "Bearer 会话不做 CSRF");
+  } finally {
+    await mut.close();
+  }
+
+  const dest = await familyTargetServer();
+  const ctxDest = makeCtx(new Map());
+  try {
+    const result = await runFamilies(ctxDest, dest.url, { allowMutation: true, allowDestructive: true });
+    const race = byCase(result, "blackbox-biz-race-").find((e) => e.caseId === "blackbox-biz-race-api-orders-102-refund");
+    assert.ok(race, JSON.stringify(byCase(result, "blackbox-biz-race-").map((e) => [e.caseId, e.verdict])));
+    assert.equal(race.verdict, "vulnerable");
+    assert.equal(race.evidenceGrade, "cross-proven");
+    assert.match(race.actual, /并发 5 次 refund，5 次成功且产生 5 个不同副作用标识/);
+    assert.equal(dest.refunds(), 5, "同一笔退款被重复落账 5 次");
+  } finally {
+    await dest.close();
+  }
+});
+
+test("runBlackbox: 主机白名单 + HMAC 验签 + 类型白名单 + 前置状态校验 + 幂等锁 → 四族全部 blocked 且零漏洞", async () => {
+  const target = await familyTargetServer({ hardened: true });
+  const ctx = makeCtx(new Map());
+  try {
+    const result = await runFamilies(ctx, target.url, { allowMutation: true, allowDestructive: true });
+    assert.deepEqual(
+      result.findings.map((f) => `${f.type} ${f.path}`),
+      [],
+      JSON.stringify(result.findings, null, 2)
+    );
+
+    const ssrf = byCase(result, "blackbox-ssrf-").find((e) => e.caseId === "blackbox-ssrf-api-preview");
+    assert.ok(ssrf, JSON.stringify(byCase(result, "blackbox-ssrf-").map((e) => e.caseId)));
+    assert.equal(ssrf.verdict, "blocked");
+    assert.match(ssrf.actual, /携带 canary URL 的请求被拒绝/);
+
+    const jwt = byCase(result, "blackbox-jwt-").find((e) => e.caseId === "blackbox-jwt-api-me");
+    assert.ok(jwt);
+    assert.equal(jwt.verdict, "blocked");
+    assert.match(jwt.actual, /alg=none:401/);
+    assert.match(jwt.actual, /HS256\(签名无效\):401/);
+
+    const upload = byCase(result, "blackbox-upload-").find((e) => e.caseId === "blackbox-upload-api-avatar");
+    assert.ok(upload, JSON.stringify(byCase(result, "blackbox-upload-").map((e) => [e.caseId, e.verdict])));
+    assert.equal(upload.verdict, "blocked");
+    assert.match(upload.actual, /HTTP 415/);
+
+    const state = byCase(result, "blackbox-biz-state-").find((e) => e.caseId === "blackbox-biz-state-api-orders-101-ship");
+    assert.ok(state, JSON.stringify(byCase(result, "blackbox-biz-state-").map((e) => [e.caseId, e.verdict])));
+    assert.equal(state.verdict, "blocked");
+    assert.match(state.actual, /处于 pending，流转被拒绝/);
+
+    const race = byCase(result, "blackbox-biz-race-").find((e) => e.caseId === "blackbox-biz-race-api-orders-102-refund");
+    assert.ok(race, JSON.stringify(byCase(result, "blackbox-biz-race-").map((e) => [e.caseId, e.verdict])));
+    assert.equal(race.verdict, "blocked");
+    assert.match(race.actual, /仅 1 次成功/);
+    assert.equal(target.refunds(), 1, "加固版只落账一次");
   } finally {
     await target.close();
   }

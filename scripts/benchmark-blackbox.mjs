@@ -97,6 +97,8 @@ function startTarget(ws, target) {
       const clean = out.replace(/\x1b\[[0-9;]*m/g, "");
       const m =
         clean.match(/listening on port\s+(\d+)/i) ??
+        clean.match(/GB_LISTEN\s*\{[^}]*"port"\s*:\s*(\d+)/i) ??
+        clean.match(/https?:\/\/127\.0\.0\.1:(\d+)/i) ??
         clean.match(/(?:port|端口)\s*[:=]?\s*(\d{2,5})/i);
       if (m) {
         clearTimeout(timer);

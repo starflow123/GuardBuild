@@ -148,6 +148,96 @@
       "expectedExit": 1,
       "expectedOutcomes": ["vulnerable_unfixed"],
       "expectedVulnerable": ["blackbox-idor-api-v2-orders-5002"]
+    },
+    {
+      "id": "ssrf-shop",
+      "fixture": "fixtures/ssrf-shop",
+      "_note": "GET /api/preview?url=… 把参数交给 fetch；黑盒把 URL 指向本机 canary，只有真实回连才判漏洞。",
+      "expectedExit": 1,
+      "expectedOutcomes": ["vulnerable_unfixed"],
+      "expectedVulnerable": ["blackbox-ssrf-*"],
+      "forbiddenVulnerable": ["blackbox-upload-*", "blackbox-jwt-*", "blackbox-biz-*"]
+    },
+    {
+      "id": "ssrf-shop-hardened",
+      "fixture": "fixtures/ssrf-shop",
+      "serverEnv": { "GB_SSRF_HARDENED": "1" },
+      "expectedExit": 0,
+      "expectedOutcomes": ["no_findings"],
+      "expectedVulnerable": []
+    },
+    {
+      "id": "upload-shop",
+      "fixture": "fixtures/upload-shop",
+      "_note": "allowMutation 下上传仅含随机令牌的 HTML，并要求同源回读命中令牌 + 主动类型。",
+      "env": { "GUARDBUILD_BLACKBOX_MUTATE": "1" },
+      "expectedExit": 1,
+      "expectedOutcomes": ["vulnerable_unfixed"],
+      "expectedVulnerable": ["blackbox-upload-*"],
+      "forbiddenVulnerable": ["blackbox-ssrf-*", "blackbox-jwt-*", "blackbox-biz-*"]
+    },
+    {
+      "id": "upload-shop-default",
+      "fixture": "fixtures/upload-shop",
+      "_note": "同一漏洞目标，但未开 allowMutation：上传探测族必须整族沉默（默认零副作用口径）。",
+      "expectedExit": 0,
+      "expectedOutcomes": ["no_findings"],
+      "expectedVulnerable": [],
+      "forbiddenVulnerable": ["blackbox-upload-*", "blackbox-biz-*"]
+    },
+    {
+      "id": "upload-shop-hardened",
+      "fixture": "fixtures/upload-shop",
+      "serverEnv": { "GB_UPLOAD_HARDENED": "1" },
+      "env": { "GUARDBUILD_BLACKBOX_MUTATE": "1" },
+      "expectedExit": 0,
+      "expectedOutcomes": ["no_findings"],
+      "expectedVulnerable": []
+    },
+    {
+      "id": "jwt-shop",
+      "fixture": "fixtures/jwt-shop",
+      "_note": "受保护端点只 decode 不验签：alg=none / 无效签名令牌被接受且回显伪造身份才判。",
+      "expectedExit": 1,
+      "expectedOutcomes": ["vulnerable_unfixed"],
+      "expectedVulnerable": ["blackbox-jwt-*"],
+      "forbiddenVulnerable": ["blackbox-ssrf-*", "blackbox-upload-*", "blackbox-biz-*"]
+    },
+    {
+      "id": "jwt-shop-hardened",
+      "fixture": "fixtures/jwt-shop",
+      "serverEnv": { "GB_JWT_HARDENED": "1" },
+      "expectedExit": 0,
+      "expectedOutcomes": ["no_findings"],
+      "expectedVulnerable": []
+    },
+    {
+      "id": "bizlogic-shop",
+      "fixture": "fixtures/bizlogic-shop",
+      "_note": "状态跳步 + 并发双花都会真实修改业务状态，仅在 allowMutation + allowDestructive 下执行。",
+      "env": { "GUARDBUILD_BLACKBOX_MUTATE": "1", "GUARDBUILD_BLACKBOX_DELETE": "1" },
+      "expectedExit": 1,
+      "expectedOutcomes": ["vulnerable_unfixed"],
+      "expectedVulnerable": ["blackbox-biz-state-*", "blackbox-biz-race-*"],
+      "forbiddenVulnerable": ["blackbox-ssrf-*", "blackbox-upload-*", "blackbox-jwt-*"]
+    },
+    {
+      "id": "bizlogic-shop-default",
+      "fixture": "fixtures/bizlogic-shop",
+      "_note": "同一漏洞目标，但未开 allowMutation/allowDestructive：状态跳步与并发双花必须整族沉默（会真实改业务状态与资金）。",
+      "expectedExit": 0,
+      "expectedOutcomes": ["no_findings"],
+      "expectedVulnerable": [],
+      "forbiddenVulnerable": ["blackbox-biz-*", "blackbox-upload-*"]
+    },
+    {
+      "id": "bizlogic-shop-hardened",
+      "fixture": "fixtures/bizlogic-shop",
+      "serverEnv": { "GB_BIZ_HARDENED": "1" },
+      "env": { "GUARDBUILD_BLACKBOX_MUTATE": "1", "GUARDBUILD_BLACKBOX_DELETE": "1" },
+      "expectedExit": 0,
+      "expectedOutcomes": ["no_findings"],
+      "expectedVulnerable": []
     }
   ]
 }

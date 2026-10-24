@@ -5,6 +5,7 @@
  * 登录凭证由 Host 保险库注入（identityRef），Sidecar 不见令牌明文。
  * 配置只从 guardbuild.json 读取 login / identities / blackbox 三块（不触发源码分析）。
  */
+import { createServer } from "node:http";
 import { CASE_CATEGORY, RPC_TO_HOST, SEVERITY, VERDICT, shortId } from "../../shared/protocol.mjs";
 import { loginAll } from "./probe.mjs";
 import { followRedirects } from "./http-follow.mjs";
@@ -1828,6 +1829,582 @@ async function probeTraversal(ctx, baseUrl, identity, routes = [], limit = MAX_P
   return records;
 }
 
+// ---------- SSRF / 上传 / JWT / 业务逻辑（黑盒动态取证） ----------
+// 这四族在黑盒里没有源码线索，只能靠「路径与参数命名 → 无害载荷 → 外部可观测证据」取证：
+// 回连本机 canary、同源回读上传令牌、响应回显伪造身份、状态确实被跳过或副作用出现两次。
+// 任何一步拿不到证据都只记 inconclusive，不把「看起来像」当成漏洞。
+
+const SSRF_CANARY_PATH = "/gb-ssrf/";
+const MAX_SSRF_ROUTES = 6;
+const MAX_SSRF_PARAMS = 3;
+const MAX_SSRF_REQUESTS = 48;
+const SSRF_PATH_GUESSES = [
+  "/api/preview", "/api/fetch", "/api/proxy", "/api/url", "/api/link-preview",
+  "/api/image", "/api/screenshot", "/api/render", "/api/import", "/api/webhook",
+];
+const SSRF_PARAM_GUESSES = ["url", "uri", "target", "src", "link", "redirect"];
+
+function startSsrfCanary() {
+  return new Promise((resolve, reject) => {
+    const token = shortId("ssrf");
+    const hits = [];
+    const server = createServer((req, res) => {
+      hits.push({ url: req.url ?? "", at: Date.now() });
+      res.writeHead(200, { "content-type": "text/plain; charset=utf-8" });
+      res.end(`guardbuild-ssrf-canary:${token}`);
+    });
+    server.once("error", reject);
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        token,
+        hits,
+        url: `http://127.0.0.1:${server.address().port}${SSRF_CANARY_PATH}${token}`,
+        close: () => new Promise((r) => server.close(() => r())),
+      });
+    });
+  });
+}
+
+async function waitForCanaryHit(canary, timeoutMs = 700) {
+  const until = Date.now() + timeoutMs;
+  const matched = () => canary.hits.filter((h) => h.url.includes(canary.token)).length;
+  while (Date.now() < until) {
+    if (matched() > 0) break;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  return matched();
+}
+
+/**
+ * SSRF：只把 canary URL 交给「名字像拉取远端资源」的参数。命中回连即成立；
+ * 被服务端拒绝记 blocked；200 但无回连只记 inconclusive（参数可能被忽略）。
+ * 目标在容器里时访问不到宿主回环，此时不会命中，属于已知边界。
+ */
+async function probeSsrf(ctx, baseUrl, routes, identity, limit = MAX_SSRF_ROUTES) {
+  const records = [];
+  const candidates = [];
+  const seen = new Set();
+  const push = (path, params) => {
+    if (seen.has(path) || hasTemplate(path)) return;
+    seen.add(path);
+    candidates.push({ path, params: params.slice(0, MAX_SSRF_PARAMS) });
+  };
+  for (const r of routes) {
+    if (r.method !== "GET" || r.status === 404) continue;
+    const declared = (r.queryParams ?? []).filter((p) => typeof p === "string" && p);
+    if (declared.length) push(r.path, declared);
+  }
+  for (const p of SSRF_PATH_GUESSES) push(p, SSRF_PARAM_GUESSES);
+
+  const canary = await startSsrfCanary();
+  let budget = MAX_SSRF_REQUESTS;
+  let hits = 0;
+  try {
+    for (const { path, params } of candidates.slice(0, limit)) {
+      for (const param of params) {
+        if (budget < 1) return records;
+        const sep = path.includes("?") ? "&" : "?";
+        const attackPath = `${path}${sep}${encodeURIComponent(param)}=${encodeURIComponent(canary.url)}`;
+        const res = await httpJson(ctx, { baseUrl, method: "GET", path: attackPath, identity });
+        budget -= 1;
+        if (res.status === 0) continue;
+        // 路径本身不存在：不再为这条路径猜其余参数
+        if (res.status === 404 || res.status === 405) break;
+        hits = await waitForCanaryHit(canary);
+        const base = {
+          caseId: `blackbox-ssrf-${slug(path)}`,
+          name: `黑盒·SSRF 服务端请求伪造 ${path}${param ? ` · 参数 ${param}` : ""}`,
+          method: "GET",
+          path: attackPath,
+          identity,
+          expectation: "服务端不得按请求参数访问任意地址（应校验协议与主机白名单）",
+        };
+        if (hits > 0) {
+          const rec = makeRecord(ctx, baseUrl, {
+            ...base,
+            res,
+            verdict: VERDICT.VULNERABLE,
+            actual: `服务端回连本机 canary（${canary.url}，命中 ${hits} 次）：请求 URL 由攻击者完全控制`,
+            grade: "strong",
+            crossProof: `独立 canary 监听收到带随机令牌 ${canary.token} 的回连请求`,
+            impact: "可诱导服务端访问内网服务/云元数据或任意外部地址",
+          });
+          records.push(rec);
+          emitRecord(ctx, rec);
+          return records;
+        }
+        if (isDenied(res.status) || res.status === 400 || res.status === 422 || res.status === 409) {
+          const rec = makeRecord(ctx, baseUrl, {
+            ...base,
+            res,
+            verdict: VERDICT.BLOCKED,
+            actual: `HTTP ${res.status}，携带 canary URL 的请求被拒绝，未观测到回连`,
+            grade: "http-only",
+          });
+          records.push(rec);
+          emitRecord(ctx, rec);
+          break;
+        }
+        if (res.ok) {
+          const rec = makeRecord(ctx, baseUrl, {
+            ...base,
+            res,
+            verdict: VERDICT.INCONCLUSIVE,
+            actual: `HTTP ${res.status}，未观测到 canary 回连（参数可能被忽略或已有主机白名单）`,
+            grade: "http-only",
+          });
+          records.push(rec);
+          emitRecord(ctx, rec);
+          break;
+        }
+        break;
+      }
+    }
+  } finally {
+    await canary.close();
+  }
+  return records;
+}
+
+// —— JWT 伪造：alg=none 与无效 HS256 签名。黑盒不读源码、不猜弱密钥（那是字典攻击）。 ——
+const MAX_JWT_ROUTES = 6;
+const JWT_PATH_GUESSES = ["/api/me", "/api/auth/me", "/api/profile", "/api/user", "/api/users/me", "/api/admin/users", "/api/admin"];
+
+function b64urlJson(obj) {
+  return Buffer.from(JSON.stringify(obj)).toString("base64url");
+}
+
+function jwtForgeClaims(marker) {
+  const now = Math.floor(Date.now() / 1000);
+  return {
+    sub: marker,
+    username: marker,
+    name: marker,
+    email: `${marker}@gb.local`,
+    role: "admin",
+    iat: now,
+    exp: now + 3600,
+  };
+}
+
+function jwtForgeNone(marker) {
+  return `${b64urlJson({ alg: "none", typ: "JWT" })}.${b64urlJson(jwtForgeClaims(marker))}.`;
+}
+
+function jwtForgeGarbage(marker) {
+  const body = `${b64urlJson({ alg: "HS256", typ: "JWT" })}.${b64urlJson(jwtForgeClaims(marker))}`;
+  return `${body}.Z2ItZm9yZ2VkLXNpZ25hdHVyZQ`;
+}
+
+/** JWT：匿名被拒的受保护端点才测；伪造令牌被接受且响应回显攻击者身份才算漏洞。 */
+async function probeJwt(ctx, baseUrl, routes, limit = MAX_JWT_ROUTES) {
+  const records = [];
+  const candidates = [];
+  const seen = new Set();
+  const push = (p) => {
+    if (!p || seen.has(p) || hasTemplate(p)) return;
+    seen.add(p);
+    candidates.push(p);
+  };
+  for (const p of JWT_PATH_GUESSES) push(p);
+  for (const r of getRoutesForProbing(routes, 40)) push(r.path);
+
+  for (const path of candidates.slice(0, limit)) {
+    const anon = await httpJson(ctx, { baseUrl, method: "GET", path });
+    if (!isDenied(anon.status) || anon.status === 404) continue;
+    const marker = `gbjwt${shortId("f").replace(/[^a-z0-9]/gi, "")}`;
+    const attempts = [];
+    let hit = null;
+    let acceptedWithoutEcho = null;
+    let last = anon;
+    for (const v of [
+      { alg: "alg=none", token: jwtForgeNone(marker) },
+      { alg: "HS256(签名无效)", token: jwtForgeGarbage(marker) },
+    ]) {
+      const res = await httpJson(ctx, {
+        baseUrl,
+        method: "GET",
+        path,
+        headers: { Authorization: `Bearer ${v.token}` },
+      });
+      last = res;
+      const echo = String(res.body ?? "").includes(marker);
+      attempts.push({ alg: v.alg, status: res.status, markerEcho: echo });
+      if (isOk(res.status) && echo) {
+        hit = { res, alg: v.alg };
+        break;
+      }
+      if (isOk(res.status) && !acceptedWithoutEcho) acceptedWithoutEcho = { res, alg: v.alg };
+    }
+    const chosen = hit?.res ?? last;
+    const tried = attempts.map((a) => `${a.alg}:${a.status || "ERR"}`).join("、");
+    const rec = makeRecord(ctx, baseUrl, {
+      caseId: `blackbox-jwt-${slug(path)}`,
+      name: `黑盒·JWT 伪造令牌 ${path}${hit ? ` · ${hit.alg}` : ""}`,
+      method: "GET",
+      path,
+      identity: null,
+      res: chosen,
+      expectation: "受认证端点必须校验 JWT 算法与签名，拒绝 alg=none 与无效签名令牌",
+      verdict: hit
+        ? VERDICT.VULNERABLE
+        : attempts.every((a) => isDenied(a.status))
+          ? VERDICT.BLOCKED
+          : VERDICT.INCONCLUSIVE,
+      actual: hit
+        ? `HTTP ${chosen.status}，${hit.alg} 伪造令牌通过认证；响应回显伪造身份 ${marker}`
+        : acceptedWithoutEcho
+          ? `HTTP ${chosen.status}，${acceptedWithoutEcho.alg} 伪造令牌被接受但响应未回显伪造身份，无法证明令牌来源（尝试：${tried}）`
+          : `HTTP ${chosen.status}，伪造令牌未取得可判定证据（尝试：${tried}）`,
+      grade: hit ? "strong" : "http-only",
+      crossProof: hit ? `伪造令牌声明身份 ${marker}，服务端响应回显同一身份：签名校验被绕过` : null,
+      impact: hit ? "可伪造任意用户/管理员身份通过认证" : null,
+      reqHeaders: { Authorization: "Bearer <forged-jwt>" },
+    });
+    records.push(rec);
+    emitRecord(ctx, rec);
+  }
+  return records;
+}
+
+// —— 文件上传：只上传仅含随机令牌的无害 HTML，再以同源 GET 回读 ——
+const MAX_UPLOAD_ROUTES = 6;
+const UPLOAD_PATH_GUESSES = [
+  "/api/upload", "/api/uploads", "/api/avatar", "/api/files", "/api/file",
+  "/api/attachments", "/api/media", "/api/images", "/api/photo", "/api/profile/avatar",
+];
+const UPLOAD_FIELDS = ["file", "avatar", "upload", "image"];
+const UPLOAD_ACTIVE_TYPES = new Set(["text/html", "application/xhtml+xml", "image/svg+xml", "application/javascript", "text/javascript"]);
+const UPLOAD_LOCATION_KEYS = ["url", "href", "path", "location", "fileUrl", "file_url", "src"];
+
+function multipartUpload(field, filename, contentType, content, token) {
+  const safeField = String(field ?? "file").replace(/[^A-Za-z0-9_.-]/g, "") || "file";
+  const boundary = `----GuardBuild${token}`;
+  const body = [
+    `--${boundary}`,
+    `Content-Disposition: form-data; name="${safeField}"; filename="${filename}"`,
+    `Content-Type: ${contentType}`,
+    "",
+    content,
+    `--${boundary}--`,
+    "",
+  ].join("\r\n");
+  return { body, contentType: `multipart/form-data; boundary=${boundary}`, field: safeField };
+}
+
+function uploadLocationFrom(res, baseUrl) {
+  const direct = headerOf(res, "location") ?? headerOf(res, "x-file-url") ?? headerOf(res, "x-upload-url");
+  const candidates = [direct];
+  for (const obj of [res?.json, res?.json?.data, res?.json?.file, res?.json?.result, res?.json?.data?.file]) {
+    if (!obj || typeof obj !== "object") continue;
+    for (const key of UPLOAD_LOCATION_KEYS) {
+      if (typeof obj[key] === "string") candidates.push(obj[key]);
+    }
+  }
+  for (const loc of candidates) {
+    if (!loc || typeof loc !== "string" || loc.length > 500) continue;
+    try {
+      const abs = new URL(loc, baseUrl);
+      if (abs.origin !== new URL(baseUrl).origin) continue;
+      return `${abs.pathname}${abs.search}`;
+    } catch {
+      /* 非法地址忽略 */
+    }
+  }
+  return null;
+}
+
+/** 上传接口常见命名猜词，加上 OpenAPI 里声明的 POST 上传端点（受 allowMutation 门控）。 */
+function uploadCandidates(routes) {
+  const out = [];
+  const seen = new Set();
+  const push = (p, source) => {
+    if (!p || seen.has(p) || hasTemplate(p)) return;
+    seen.add(p);
+    out.push({ path: p, source });
+  };
+  for (const r of routes) {
+    if (r.method === "POST" && /(upload|avatar|attachment|media|image|photo|file)/i.test(r.path)) push(r.path, "openapi");
+  }
+  for (const p of UPLOAD_PATH_GUESSES) push(p, "guess");
+  return out;
+}
+
+async function probeUpload(ctx, baseUrl, routes, identity, limit = MAX_UPLOAD_ROUTES) {
+  const records = [];
+  for (const { path } of uploadCandidates(routes).slice(0, limit)) {
+    const token = `gbupload${shortId("u").replace(/[^a-z0-9]/gi, "")}`;
+    const filename = `gb-${token}.html`;
+    const content = `<div data-gb-upload="${token}">${token}</div>`;
+    let res = null;
+    let form = null;
+    for (const field of UPLOAD_FIELDS) {
+      form = multipartUpload(field, filename, "text/html", content, token);
+      res = await httpJson(ctx, {
+        baseUrl,
+        method: "POST",
+        path,
+        identity,
+        body: form.body,
+        contentType: form.contentType,
+      });
+      if (res.status === 0 || res.status === 404 || res.status === 405) break;
+      // 字段名不对时很多框架返回 400/422 并点名字段，换下一个常见字段名再试
+      if (!isOk(res.status) && /field|字段|filename|file/i.test(res.body ?? "") && UPLOAD_FIELDS.indexOf(field) < UPLOAD_FIELDS.length - 1) {
+        continue;
+      }
+      break;
+    }
+    if (!res || res.status === 0 || res.status === 404 || res.status === 405) continue;
+
+    const caseId = `blackbox-upload-${slug(path)}`;
+    const base = {
+      caseId,
+      name: `黑盒·文件上传（主动内容）${path}`,
+      method: "POST",
+      path,
+      identity,
+      body: `multipart/form-data · 字段 ${form?.field ?? "file"} · 文件 ${filename}（仅含随机令牌）`,
+      expectation: "上传接口应校验类型/内容，且不得以可渲染类型同源公开回读攻击者控制的文件",
+    };
+    if (!isOk(res.status)) {
+      // 只有「服务端明确理解上传并拒绝类型」才算 blocked；401/403 可能只是路径不存在或无权限
+      if ([400, 413, 415, 422, 409].includes(res.status)) {
+        const rec = makeRecord(ctx, baseUrl, {
+          ...base,
+          res,
+          verdict: VERDICT.BLOCKED,
+          actual: `HTTP ${res.status}，上传被拒绝：${String(res.body ?? "").slice(0, 120)}`,
+          grade: "http-only",
+        });
+        records.push(rec);
+        emitRecord(ctx, rec);
+      }
+      continue;
+    }
+
+    const location = uploadLocationFrom(res, baseUrl);
+    const readPaths = [...new Set([location, `/uploads/${encodeURIComponent(filename)}`, `/files/${encodeURIComponent(filename)}`].filter(Boolean))].slice(0, 2);
+    let readRes = null;
+    let readPath = null;
+    for (const p of readPaths) {
+      readRes = await httpJson(ctx, { baseUrl, method: "GET", path: p });
+      if (isDenied(readRes.status)) readRes = await httpJson(ctx, { baseUrl, method: "GET", path: p, identity });
+      if (readRes.status > 0 && readRes.status !== 404) {
+        readPath = p;
+        break;
+      }
+    }
+    const body = String(readRes?.body ?? "");
+    const contentType = String(headerOf(readRes, "content-type") ?? "").toLowerCase();
+    const disposition = String(headerOf(readRes, "content-disposition") ?? "").toLowerCase();
+    const echoed = body.includes(token);
+    const activeType = [...UPLOAD_ACTIVE_TYPES].some((t) => contentType.includes(t));
+    const attachment = disposition.includes("attachment");
+
+    if (readRes?.ok && echoed && activeType && !attachment) {
+      const rec = makeRecord(ctx, baseUrl, {
+        ...base,
+        res,
+        verdict: VERDICT.VULNERABLE,
+        actual: `上传被接受（HTTP ${res.status}），文件 ${readPath} 以 ${contentType} 同源回读且含令牌 ${token}：服务端公开提供攻击者控制的主动内容`,
+        grade: "cross-proven",
+        crossProof: `上传响应 + 同源回读内容同时命中随机令牌 ${token}`,
+        impact: "可上传 HTML/SVG 等主动内容并被同源渲染（存储型 XSS/钓鱼页面）",
+      });
+      records.push(rec);
+      emitRecord(ctx, rec);
+      continue;
+    }
+    if (readRes?.ok && echoed && (attachment || !activeType)) {
+      const rec = makeRecord(ctx, baseUrl, {
+        ...base,
+        res,
+        verdict: VERDICT.BLOCKED,
+        actual: `上传被接受，但回读为 ${contentType || "未知类型"}${attachment ? " + attachment" : ""}（非主动渲染）`,
+        grade: "http-only",
+      });
+      records.push(rec);
+      emitRecord(ctx, rec);
+      continue;
+    }
+    const rec = makeRecord(ctx, baseUrl, {
+      ...base,
+      res,
+      verdict: VERDICT.INCONCLUSIVE,
+      actual: `上传被接受（HTTP ${res.status}），但未能在同源回读到令牌（尝试 ${readPaths.join("、") || "无地址"}）`,
+      grade: "http-only",
+    });
+    records.push(rec);
+    emitRecord(ctx, rec);
+  }
+  return records;
+}
+
+// —— 业务逻辑 / 竞态：状态跳步以回读状态变化为准，重复执行以出现多个副作用标识为准 ——
+const MAX_BIZ_LISTS = 3;
+const MAX_BIZ_ACTIONS = 6;
+const RACE_CONCURRENCY = 5;
+const PENDING_STATES = new Set(["pending", "draft", "new", "created", "unpaid", "open", "awaiting", "queued", "requested"]);
+const READY_STATES = new Set(["paid", "active", "approved", "confirmed"]);
+const STATE_ACTIONS = ["ship", "approve", "complete", "publish", "activate", "confirm", "close"];
+const RACE_ACTIONS = ["refund", "payout", "withdraw", "transfer", "claim", "redeem", "checkout"];
+const EFFECT_ID_KEY = /^(?:refund|transaction|txn|transfer|payout|withdrawal|claim|receipt|ledger)_?id$/i;
+
+function firstEffectId(json) {
+  const walk = (node, depth) => {
+    if (!node || depth > 4) return null;
+    if (Array.isArray(node)) {
+      for (const v of node) {
+        const hit = walk(v, depth + 1);
+        if (hit) return hit;
+      }
+      return null;
+    }
+    if (typeof node !== "object") return null;
+    for (const [k, v] of Object.entries(node)) {
+      if (EFFECT_ID_KEY.test(k) && (typeof v === "string" || typeof v === "number") && String(v).length > 0) {
+        return String(v);
+      }
+      const hit = walk(v, depth + 1);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  return walk(json, 0);
+}
+
+/** 状态跳步 / 并发双花只在 allowMutation 下执行；资金类动作（refund 等）还要 allowDestructive。 */
+async function probeBizLogic(ctx, baseUrl, routes, { identity, destructive = false }, limit = MAX_BIZ_LISTS) {
+  const records = [];
+  const lists = [];
+  for (const r of getRoutesForProbing(routes, 40)) {
+    if (lists.length >= limit) break;
+    if (hasTemplate(r.path) || r.status === 404) continue;
+    const res = await httpJson(ctx, { baseUrl, method: "GET", path: r.path, identity });
+    if (!res.ok) continue;
+    const items = extractItems(res.json).filter((o) => extractId(o) != null && o.status != null);
+    if (items.length) lists.push({ path: r.path.replace(/\/+$/, ""), items });
+  }
+
+  for (const { path, items } of lists) {
+    const statusOf = (o) => String(o.status ?? "").toLowerCase();
+    const readBack = async (id) => {
+      const res = await httpJson(ctx, { baseUrl, method: "GET", path, identity });
+      if (!res.ok) return null;
+      return extractItems(res.json).find((o) => String(extractId(o)) === String(id)) ?? null;
+    };
+    const wrong = items.find((o) => PENDING_STATES.has(statusOf(o)));
+    const ready = items.find((o) => READY_STATES.has(statusOf(o)));
+
+    if (wrong) {
+      const id = extractId(wrong);
+      const from = String(wrong.status);
+      for (const action of STATE_ACTIONS.slice(0, MAX_BIZ_ACTIONS)) {
+        const actionPath = `${path}/${encodeURIComponent(id)}/${action}`;
+        const res = await httpJson(ctx, { baseUrl, method: "POST", path: actionPath, identity, body: {} });
+        if (res.status === 0 || res.status === 404 || res.status === 405 || res.status === 403) continue;
+        const after = isOk(res.status) ? await readBack(id) : null;
+        const to = after?.status != null ? String(after.status) : null;
+        const caseId = `blackbox-biz-state-${slug(actionPath)}`;
+        if (isOk(res.status) && to && to !== from) {
+          const rec = makeRecord(ctx, baseUrl, {
+            caseId,
+            name: `黑盒·状态跳步（${action}）${actionPath}`,
+            method: "POST",
+            path: actionPath,
+            identity,
+            body: {},
+            res,
+            expectation: "业务流转必须校验前置状态，不得从待处理状态直接跳到完成态",
+            verdict: VERDICT.VULNERABLE,
+            actual: `对象 #${id} 原状态 ${from}，调用 ${action} 后回读为 ${to}（HTTP ${res.status}）：前置状态校验缺失`,
+            grade: "cross-proven",
+            crossProof: `动作请求 + 按归属回读确认状态由 ${from} 变为 ${to}`,
+            impact: "可跳过支付/审批等前置状态直接推进业务",
+          });
+          records.push(rec);
+          emitRecord(ctx, rec);
+          break;
+        }
+        if ([409, 422, 400].includes(res.status)) {
+          const rec = makeRecord(ctx, baseUrl, {
+            caseId,
+            name: `黑盒·状态跳步（${action}）${actionPath}`,
+            method: "POST",
+            path: actionPath,
+            identity,
+            body: {},
+            res,
+            expectation: "业务流转必须校验前置状态",
+            verdict: VERDICT.BLOCKED,
+            actual: `HTTP ${res.status}，对象 #${id} 处于 ${from}，流转被拒绝`,
+            grade: "http-only",
+          });
+          records.push(rec);
+          emitRecord(ctx, rec);
+          break;
+        }
+        if (isOk(res.status)) break; // 接受但状态未变：不继续猜动作
+      }
+    }
+
+    if (ready && destructive) {
+      const id = extractId(ready);
+      for (const action of RACE_ACTIONS.slice(0, MAX_BIZ_ACTIONS)) {
+        const actionPath = `${path}/${encodeURIComponent(id)}/${action}`;
+        const results = await Promise.all(
+          Array.from({ length: RACE_CONCURRENCY }, () =>
+            httpJson(ctx, { baseUrl, method: "POST", path: actionPath, identity, body: {} }).catch((e) => ({
+              status: 0,
+              json: null,
+              error: String(e?.message ?? e).slice(0, 160),
+            }))
+          )
+        );
+        if (results.every((r) => r.status === 404 || r.status === 405)) continue;
+        const successes = results.filter((r) => isOk(r.status)).length;
+        const effectIds = [...new Set(results.map((r) => firstEffectId(r.json)).filter(Boolean))];
+        const statuses = results.map((r) => r.status || "ERR").join("/");
+        const chosen = results.find((r) => isOk(r.status)) ?? results[results.length - 1];
+        const caseId = `blackbox-biz-race-${slug(actionPath)}`;
+        const rec = makeRecord(ctx, baseUrl, {
+          caseId,
+          name: `黑盒·并发双花（${action}）${actionPath}`,
+          method: "POST",
+          path: actionPath,
+          identity,
+          body: {},
+          res: chosen,
+          expectation: "一次性动作必须幂等/加锁，并发提交只允许一次成功",
+          verdict:
+            successes >= 2 && effectIds.length >= 2
+              ? VERDICT.VULNERABLE
+              : successes === 1 || results.every((r) => isDenied(r.status))
+                ? VERDICT.BLOCKED
+                : VERDICT.INCONCLUSIVE,
+          actual:
+            successes >= 2 && effectIds.length >= 2
+              ? `并发 ${RACE_CONCURRENCY} 次 ${action}，${successes} 次成功且产生 ${effectIds.length} 个不同副作用标识（${effectIds.slice(0, 3).join("、")}）：同一操作被重复执行`
+              : successes === 1
+                ? `并发 ${RACE_CONCURRENCY} 次 ${action} 仅 1 次成功（状态：${statuses}）：一次性动作被串行化或幂等保护`
+                : `并发 ${RACE_CONCURRENCY} 次 ${action} 结果不可判定（状态：${statuses}）`,
+          grade: successes >= 2 && effectIds.length >= 2 ? "cross-proven" : "http-only",
+          crossProof:
+            effectIds.length >= 2
+              ? `并发请求返回 ${effectIds.length} 个不同副作用标识（${effectIds.slice(0, 3).join("、")}）`
+              : null,
+          impact: effectIds.length >= 2 ? "可并发重复执行退款/领取/转账等一次性操作，造成资金双花" : null,
+        });
+        records.push(rec);
+        emitRecord(ctx, rec);
+        break;
+      }
+    }
+  }
+  return records;
+}
+
 function summarize(records, routes, login) {
   const counts = { vulnerable: 0, blocked: 0, passed: 0, regressed: 0, inconclusive: 0 };
   for (const r of records) counts[r.verdict] = (counts[r.verdict] ?? 0) + 1;
@@ -1978,6 +2555,9 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
   probes.push(...(await probeXss(ctx, baseUrl, attackRoutes, who, probeCap)));
   probes.push(...(await probeSqli(ctx, baseUrl, attackRoutes, who, probeCap)));
   probes.push(...(await probeTraversal(ctx, baseUrl, who, attackRoutes)));
+  coverage.push("SSRF（本机回连 canary）", "JWT 伪造令牌");
+  probes.push(...(await probeSsrf(ctx, baseUrl, attackRoutes, who)));
+  probes.push(...(await probeJwt(ctx, baseUrl, attackRoutes)));
   if (login.ok) {
     coverage.push("垂直越权（管理端点）");
     probes.push(
@@ -1990,6 +2570,9 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
     if (allowDestructive) coverage.push("跨用户删除（DELETE）");
     probes.push(...(await probeWriteIdor(ctx, baseUrl, attackRoutes, pair, { methods, destructive: allowDestructive }, probeCap)));
     probes.push(...(await probeAnonymousWrite(ctx, baseUrl, attackRoutes, { victim: pair.victim })));
+    coverage.push("文件上传（主动内容）", "业务逻辑跳步/并发双花");
+    probes.push(...(await probeUpload(ctx, baseUrl, attackRoutes, pair.attacker.name)));
+    probes.push(...(await probeBizLogic(ctx, baseUrl, attackRoutes, { identity: pair.attacker.name, destructive: allowDestructive })));
     if (ctx.loginConfig?.cookieAuth === true) {
       coverage.push("CSRF（Cookie 会话）");
       probes.push(...(await probeCsrf(ctx, baseUrl, attackRoutes, { victim: pair.victim }, probeCap)));

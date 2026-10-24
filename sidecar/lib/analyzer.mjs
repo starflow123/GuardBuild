@@ -28,6 +28,7 @@ import {
   findCommandInjectionSignal,
   findSsrfSignal,
   findUploadSignal,
+  findJwtSignal,
   callArgsSpan,
   braceSpan,
   findBodyOpen,
@@ -571,6 +572,12 @@ export async function analyzeProject(ctx) {
 
   // 跨文件鉴权线索（挂载级 / 文件级中间件），补偿区块文本看不到的守卫
   const authGuards = collectFileAuthGuards(readContents);
+  // 文件级 JWT 验签线索：校验常写在共享 helper 里，路由块只调用 requireUser
+  const jwtByFile = new Map();
+  for (const f of readContents) {
+    const sig = findJwtSignal(f.content);
+    if (sig) jwtByFile.set(normalizePath(f.path), sig);
+  }
   // 跨文件 handler 引用（router.get("/x", mw, appHandler.x)）→ 伪区块
   const handlerScan = collectHandlerSections(readContents, authGuards);
   // Next.js 适配器：app/**/route.ts 与 pages/api/** → 伪区块（style: "next-api"）
@@ -744,6 +751,13 @@ export async function analyzeProject(ctx) {
         resource: upload.field ?? guessResource(fullPath ?? path, s.text),
         upload,
       });
+    }
+
+    // 可疑「JWT 伪造」：受认证端点 + 文件级验签缺口（只解码/允许 none/未固定算法/硬编码密钥）。
+    // 认的是「认证端点」而不是「调用点」：校验通常被封装在共享 helper 中。
+    const jwt = s.graphql ? null : jwtByFile.get(normFile) ?? findJwtSignal(s.text);
+    if (jwt && path && hasAuth) {
+      candidates.push({ ...ep, kind: "jwt-suspect", resource: "token", jwt });
     }
   }
 

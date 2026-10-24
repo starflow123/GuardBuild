@@ -27,6 +27,7 @@ guardbuild-data/
 .demo-bootstrap/
 .demo-ssrf/
 .demo-upload/
+.demo-jwt/
 .benchmark/
 guardbuild.db*
 *.tsbuildinfo

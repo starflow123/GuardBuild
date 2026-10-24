@@ -8,6 +8,7 @@ const FAMILY_BY_KIND = {
   "cmdi-suspect": "cmdi",
   "ssrf-suspect": "ssrf",
   "upload-suspect": "upload",
+  "jwt-suspect": "jwt",
   "traversal-suspect": "traversal",
   "idor-suspect": "idor",
   "no-auth-suspect": "unauth",
@@ -20,6 +21,7 @@ export const KIND_LABELS = {
   "cmdi-suspect": "命令注入静态线索",
   "ssrf-suspect": "SSRF 静态线索",
   "upload-suspect": "文件上传静态线索",
+  "jwt-suspect": "JWT 伪造令牌静态线索",
   "traversal-suspect": "路径穿越静态线索",
   "idor-suspect": "对象级越权（IDOR）静态线索",
   "no-auth-suspect": "无鉴权静态线索",
@@ -77,6 +79,16 @@ const TEMPLATES = {
       "上传目录是否位于可执行/可渲染的 Web 根目录；响应是否带 `Content-Disposition: attachment` 与 `X-Content-Type-Options: nosniff`。",
     ],
     fix: "采用扩展名 + MIME + 魔数三重白名单，只允许业务需要的类型；用随机文件名和固定扩展名落盘；上传目录禁止脚本执行，回读时强制 `Content-Disposition: attachment` 与 `X-Content-Type-Options: nosniff`；补主动内容上传应被拒绝的回归测试。",
+  },
+  jwt: {
+    label: "JWT 令牌伪造",
+    risk: "受认证端点的 JWT 校验可被伪造令牌绕过，攻击者可自造任意用户/管理员身份（本轮已用 alg=none/无效签名令牌访问并回显伪造身份复现）。",
+    inspect: [
+      "是否只 `jwt.decode` 读取载荷而从未 `jwt.verify`；是否关闭了 `verify_signature`。",
+      "验签是否固定算法白名单（拒绝 `none`），是否允许客户端通过 header 指定算法。",
+      "签名密钥是否来自源码/环境默认值；是否与登录签发使用同一密钥且可预测。",
+    ],
+    fix: "统一用 `jwt.verify` 并在服务端固定算法白名单（如仅 HS256/RS256）；拒绝 `alg=none` 与缺失算法；密钥只从密钥管理/环境注入并定期轮换，禁止回退到源码默认值；补伪造令牌应返回 401/403 的回归用例。",
   },
   idor: {
     label: "对象级越权（IDOR）",
@@ -156,6 +168,7 @@ export function detectFamily(finding) {
   if (/命令注入|command\s*injection/i.test(text)) return "cmdi";
   if (/SSRF|服务端请求伪造|server[-\s]*side\s*request\s*forgery/i.test(text)) return "ssrf";
   if (/文件上传|任意文件|主动内容|unrestricted\s*file\s*upload/i.test(text)) return "upload";
+  if (/JWT|令牌伪造|token\s*forge|alg\s*=\s*none|签发/i.test(text)) return "jwt";
   if (/穿越|traversal/i.test(text)) return "traversal";
   if (/RLS|Supabase|行级安全/i.test(text)) return "supabase_rls";
   // 「未认证」优先于「归属」：未认证读取的详情常附带归属类敏感字段说明

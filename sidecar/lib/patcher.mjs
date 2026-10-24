@@ -97,7 +97,7 @@ export async function createPatch(ctx, { feedback = null } = {}) {
       code: "no_patchable_candidates",
       hint: useLlm
         ? "确定性模板覆盖「带认证但缺归属校验」的 IDOR；编码代理可尝试注入/穿越/无鉴权类，但候选需定位到源码文件（外部路由线索与 Supabase 数据策略不在代码层修复范围）"
-        : "自动修复仅覆盖「带认证但缺归属校验」的 IDOR 场景；SQL/命令注入、SSRF、文件上传、无鉴权与路径穿越类需按证据中的攻击用例人工修复后重跑 gate",
+        : "自动修复仅覆盖「带认证但缺归属校验」的 IDOR 场景；SQL/命令注入、SSRF、文件上传、JWT 伪造、无鉴权与路径穿越类需按证据中的攻击用例人工修复后重跑 gate",
     });
   }
 
@@ -642,7 +642,7 @@ export async function createPatch(ctx, { feedback = null } = {}) {
       code: "no_patchable_candidates",
       hint: useLlm
         ? `确定性模板与 LLM 编码代理（已启用）都未能产出经校验的补丁；编码代理只在锚点唯一、目标为源码文件且改动规模受限时才提交补丁意图，拒绝原因见 details.skipped 与报告中的 llmPatch`
-        : "自动修复仅覆盖可识别归属校验位的 IDOR 形态；注入/穿越/SSRF/上传/无鉴权类需对照证据人工修复后重跑 gate（或在 guardbuild.json 开启 llm.enabled/llm.patch 让编码代理尝试）",
+        : "自动修复仅覆盖可识别归属校验位的 IDOR 形态；注入/穿越/SSRF/上传/JWT/无鉴权类需对照证据人工修复后重跑 gate（或在 guardbuild.json 开启 llm.enabled/llm.patch 让编码代理尝试）",
       details: { skipped, llmPatch: useLlm ? llmStats : null },
     });
   }

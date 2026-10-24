@@ -1,0 +1,6 @@
+{
+  "name": "jwt-shop",
+  "private": true,
+  "type": "module",
+  "description": "JWT 令牌伪造靶场：受认证端点只解码不验签；GB_JWT_HARDENED=1 时固定 HS256 算法并校验签名"
+}

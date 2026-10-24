@@ -563,6 +563,54 @@ export function findUploadSignal(text) {
   };
 }
 
+// —— JWT 验签缺口 ——
+// 静态只负责选址与给出伪造素材；是否构成认证绕过由动态用例判定：
+// 必须「匿名被拒 + 伪造令牌被接受 + 响应回显攻击者指定的身份」，缺一记 inconclusive。
+const JWT_DECODE_ONLY =
+  /\b(?:jwt|jsonwebtoken|fastifyJwt|fastify-jwt)\s*\.\s*decode\s*\(|\bdecodeJwt\s*\(|["']?verify_signature["']?\s*[:=]\s*(?:False|false)/;
+const JWT_NONE_ALG =
+  /\balgorithms?\s*[:=]\s*\[?\s*["'`]none["'`]|\ballowedAlgorithms\s*\([^)]*["'`]none["'`]/i;
+const JWT_VERIFY = /\b(?:jwt|jsonwebtoken)\s*\.\s*verify\s*\(/;
+const JWT_ALG_PIN = /\balgorithms?\s*[:=]\s*\[?\s*["'`](?:HS|RS|ES|PS)\d{3}["'`]/i;
+const JWT_SECRET_NAME =
+  /^(?:jwt|token|auth|access|refresh|sign).*(?:secret|key)$|^(?:secret|secretKey|secret_key|jwtSecret|jwt_secret|JWT_SECRET|JWT_KEY|SECRET_KEY|TOKEN_SECRET|AUTH_SECRET|SIGNING_KEY)$/i;
+
+/** 只收集源码里明写的签名密钥（不做字典猜测），供动态用例签发伪造令牌 */
+export function collectJwtSecrets(text) {
+  const out = [];
+  const push = (v) => {
+    const s = String(v ?? "").trim();
+    if (s.length < 4 || s.length > 120 || /^\$\{/.test(s) || /^(?:process\.env|os\.environ|env\.)/.test(s)) return;
+    if (!out.includes(s)) out.push(s);
+  };
+  for (const m of text.matchAll(/\b([A-Za-z_$][\w$]*)\s*[:=]\s*(["'`])([^"'`\n]{4,120})\2/g)) {
+    if (JWT_SECRET_NAME.test(m[1])) push(m[3]);
+  }
+  for (const m of text.matchAll(
+    /\b(?:jwt|jsonwebtoken)\s*\.\s*(?:sign|verify|encode|decode)\s*\([^;\n]*?,\s*(["'`])([^"'`\n]{4,120})\1/g
+  )) {
+    push(m[2]);
+  }
+  return out.slice(0, 3);
+}
+
+/**
+ * JWT 静态线索：返回 { issue, label, secrets } 或 null。
+ * issue ∈ none-algorithm | decode-only | no-algorithm | weak-secret。
+ * 文件级扫描用于共享校验 helper（路由块只调用 requireUser，不出现 jwt 调用）。
+ */
+export function findJwtSignal(text) {
+  const secrets = collectJwtSecrets(text);
+  let issue = null;
+  if (JWT_NONE_ALG.test(text)) issue = { issue: "none-algorithm", label: "允许 alg=none（未固定算法）" };
+  else if (JWT_DECODE_ONLY.test(text) && !JWT_VERIFY.test(text))
+    issue = { issue: "decode-only", label: "只解码不验签（jwt.decode / verify_signature 关闭）" };
+  else if (JWT_VERIFY.test(text) && !JWT_ALG_PIN.test(text)) issue = { issue: "no-algorithm", label: "验签未固定算法" };
+  else if (secrets.length > 0) issue = { issue: "weak-secret", label: "源码内硬编码签名密钥" };
+  if (!issue) return null;
+  return { ...issue, secrets };
+}
+
 /** 从开括号 openIdx（须为 {）找到配平闭括号位置；跳过字符串/模板/注释；未配平返回 -1 */
 export function braceSpan(text, openIdx) {
   if (text[openIdx] !== "{") return -1;

@@ -14,6 +14,7 @@ test("detectFamily: 静态 kind 与黑盒用例名都映射到正确家族", () 
   assert.equal(detectFamily({ kind: "traversal-suspect" }), "traversal");
   assert.equal(detectFamily({ kind: "ssrf-suspect" }), "ssrf");
   assert.equal(detectFamily({ kind: "upload-suspect" }), "upload");
+  assert.equal(detectFamily({ kind: "jwt-suspect" }), "jwt");
   assert.equal(detectFamily({ kind: "idor-suspect" }), "idor");
   assert.equal(detectFamily({ kind: "no-auth-suspect" }), "unauth");
   assert.equal(detectFamily({ kind: "supabase-table" }), "supabase_rls");
@@ -31,6 +32,7 @@ test("detectFamily: 静态 kind 与黑盒用例名都映射到正确家族", () 
   assert.equal(detectFamily({ type: "黑盒·路径穿越 /download" }), "traversal");
   assert.equal(detectFamily({ type: "黑盒·SSRF /api/preview" }), "ssrf");
   assert.equal(detectFamily({ type: "黑盒·文件上传（主动内容）/api/avatar" }), "upload");
+  assert.equal(detectFamily({ type: "黑盒·JWT 令牌伪造 /api/me" }), "jwt");
   assert.equal(detectFamily({ type: "黑盒·敏感文件暴露 /.env" }), "sensitive_file");
   assert.equal(detectFamily({ type: "黑盒·管理/调试面暴露 /actuator/env" }), "debug_surface");
   assert.equal(detectFamily({ type: "未知问题" }), "generic");
@@ -61,6 +63,23 @@ test("buildFixBrief: 白盒 IDOR 用真实证据生成 curl 与免 --url 的复�
   assert.doesNotMatch(brief.verify, /--url/);
   assert.ok(brief.inspect.length > 0);
   assert.ok(brief.fix.length > 0);
+});
+
+test("buildFixBrief: JWT 伪造令牌走 jwt 家族，复现命中已记录的受保护端点", () => {
+  const brief = buildFixBrief(
+    { kind: "jwt-suspect", method: "GET", path: "/api/me", resource: "token" },
+    {
+      mode: "whitebox",
+      baseUrl: "http://127.0.0.1:3000",
+      projectRoot: "D:/tmp/shop",
+      evidence: [{ verdict: "vulnerable", method: "GET", endpoint: "/api/me", identity: "(anonymous)" }],
+    }
+  );
+  assert.equal(brief.family, "jwt");
+  assert.match(brief.reproduce, /'http:\/\/127\.0\.0\.1:3000\/api\/me'/);
+  assert.match(brief.fix, /verify/);
+  assert.match(brief.fix, /算法/);
+  assert.match(brief.fix, /alg=none/);
 });
 
 test("buildFixBrief: 查询参数与 :param 形态都能匹配到证据；无证据时回退为具体路径", () => {

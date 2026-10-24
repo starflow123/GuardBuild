@@ -16,6 +16,7 @@ export const COVERAGE = {
     "命令注入（shell 展开令牌回显）",
     "SSRF（本机 canary 回连取证）",
     "文件上传（主动内容同源回读取证）",
+    "JWT 伪造令牌（alg=none / 无效签名 / 源码密钥）",
     "Supabase / PostgREST 数据暴露与 service_role 密钥泄露",
   ],
   /** 已实现的路由适配器形态 */

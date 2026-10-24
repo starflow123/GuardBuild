@@ -26,11 +26,13 @@
 | 6 | 双重验收 | 修复后：攻击用例（含引擎同源生成的攻击变体）必须全部不再复现，且业务用例（含本人可见性的正向断言）必须全部保持通过 |
 | 7 | 产物 | `report.json` / `report.md` 报告 + SQLite 证据链（7 张表）；桌面模式可经用户授权写回原工作区 |
 
-**攻击类别**：对象级越权（IDOR）、无鉴权读取、路径穿越、SQL 注入（布尔绕过 / 数据库报错双证据）、命令注入（shell 展开令牌回显，避免输入反射误报）、SSRF（本机 canary 回连取证）、文件上传（主动内容同源回读取证）、Supabase 匿名读取与 service_role 暴露。自动修复边界：确定性模板只修「带认证但缺归属校验」的 IDOR；开启 LLM 编码代理（`llm.patch`）后，IDOR / 无鉴权 / 穿越 / SQLi / 命令注入五类候选都可尝试生成补丁，仍须通过严格校验与双重验收才计为 `verified`；黑盒模式无源码、Supabase 属平台策略、SSRF 与文件上传不提供自动补丁，均只取证并给人工修复指引（`vulnerable_unfixed`）。
+**攻击类别**：对象级越权（IDOR）、无鉴权读取、路径穿越、SQL 注入（布尔绕过 / 数据库报错双证据）、命令注入（shell 展开令牌回显，避免输入反射误报）、SSRF（本机 canary 回连取证）、文件上传（主动内容同源回读取证）、JWT 伪造令牌（alg=none / 无效签名 / 源码密钥，身份回显取证）、Supabase 匿名读取与 service_role 暴露。自动修复边界：确定性模板只修「带认证但缺归属校验」的 IDOR；开启 LLM 编码代理（`llm.patch`）后，IDOR / 无鉴权 / 穿越 / SQLi / 命令注入五类候选都可尝试生成补丁，仍须通过严格校验与双重验收才计为 `verified`；黑盒模式无源码、Supabase 属平台策略、SSRF / 文件上传 / JWT 不提供自动补丁，均只取证并给人工修复指引（`vulnerable_unfixed`）。
 
 **SSRF 取证方式**：静态识别「请求输入 → 服务端 HTTP 客户端 URL」（fetch / axios / got / ky / requests / httpx / urlopen 等，含变量、模板字符串与 f-string 传播），复现时由 Sidecar 在 `127.0.0.1` 随机端口起一次性 canary，把攻击者可控的 URL 参数替换成 canary 地址后发起真实请求。只有目标服务**真的回连 canary** 才判 `vulnerable`（内容级交叉证明，报告保留命中次数）；未回连一律 `inconclusive`，不拿状态码猜。副作用为零、无需外部回调服务；局限：Docker 容器或远程目标访问不到宿主回环地址，这类目标的 SSRF 只能如实记 inconclusive。
 
 **文件上传取证方式**：静态识别接收 multipart 的上传端点（multer / express-fileupload / formidable / busboy / @fastify/multipart / Nest `FileInterceptor` / Python `UploadFile` 等），复现时由引擎生成带随机令牌、内容无害的 `.html` 与 `.svg` 主动内容各上传一次。判 `vulnerable` 需同时满足：上传被接受、能拿到**同源**回读地址、回读内容含本次令牌、响应 `Content-Type` 属主动类型（`text/html` / `image/svg+xml` / JS），且不是 `attachment` 下载。只有状态码没有回读、或回读不到同源地址，一律记 `inconclusive`；拒绝上传记 `blocked`。局限：只证明「主动内容可被同源取回」，不代替浏览器执行验证（存储型 XSS 的实际触发仍需人工确认）。
+
+**JWT 取证方式**：静态按文件识别 JWT 校验缺口——只 `jwt.decode` 不 `jwt.verify`、`algorithms: ["none"]`、验签未固定算法、源码内硬编码签名密钥（`JWT_SECRET = "..."` 或 `jwt.sign/verify` 的字面量实参；`process.env` 引用不算）。复现时对每个受认证端点先发匿名基线请求确认端点确实要求认证，再依次用引擎生成的伪造令牌访问：`alg=none`、HS256 无效签名、以及用**源码里写死的密钥**签发的 HS256。判 `vulnerable` 需伪造令牌被接受（2xx）**且**响应回显攻击者在令牌里植入的标记（`sub` / `username` / `name` / `email`，`gbjwt…`）——两者同时成立才算签名校验被绕过并冒用成功（内容级交叉证明）；令牌被接受但响应不含标记记 `inconclusive`，全部被拒记 `blocked`。局限：不猜弱口令、不做字典攻击，只用源码已写死的密钥；只覆盖「认证绕过」这一可实测子集，OAuth 流程（授权码/隐式/客户端凭据的配置错误）与令牌续期/撤销类问题**不在覆盖内**，需人工审计。
 
 ## 架构与信任模型
 
@@ -72,11 +74,12 @@ npm run e2e:gate       # CI gate 演练（53 断言，7 轮裁决 + 报告产物
 npm run e2e:blackbox   # 纯黑盒外部扫描演练（66 断言：漏洞/已修复/Cookie 会话/不可达/写探测分级）
 npm run e2e:ssrf       # SSRF 演练（23 断言：本机 canary 回连取证 + 主机白名单对照）
 npm run e2e:upload     # 文件上传演练（23 断言：主动内容同源回读取证 + 类型白名单对照）
+npm run e2e:jwt        # JWT 演练（24 断言：alg=none / 无效签名伪造放行取证 + 固定算法强密钥对照）
 npm run e2e:attackplan # 攻击规划代理演练（40 断言，本机 mock DeepSeek：预算重排 + 只认编号 + gate 结构性禁用）
 npm run e2e:llm        # LLM 接入侦察演练（50 断言，本机 mock DeepSeek，含候选逐个启动、全灭回退与无密钥磁盘缓存复用）
 npm run e2e:llm-patch  # LLM 编码代理补丁演练（73 断言，本机 mock：守规矩 / 不守规矩 / 无密钥 / 先只读自查四轮）
 npm run e2e:fix-agent  # 本地修复循环演练（21 断言：首轮漏修 → 失败证据+运行日志回传 → 第二轮通过）
-npm run benchmark      # 精度基准（10 个标注靶场：漏报 / 误报 / 退出码一致性）
+npm run benchmark      # 精度基准（11 个标注靶场：漏报 / 误报 / 退出码一致性）
 npm run seed-demo      # 单独生成演示工作区 .demo/vibeshop（供桌面端手动演练）
 
 # 单元测试
@@ -201,7 +204,7 @@ npm run e2e:llm-patch          # 本机 mock DeepSeek 四轮演练，无需真�
 - 判定：任一靶场漏报、误报、退出码不一致或执行失败，基准即以非零码退出；新增适配器/探测能力时在语料追加标注条目并保持全绿
 - 干净对照：`fixtures/clean-shop` 的对象接口把归属校验封装在辅助函数中（静态看起来可疑、运行期真实拒绝），用于验证「动态澄清静态误报」与 exit 0 路径
 - 产物：`.benchmark/benchmark-report.json` / `.benchmark/benchmark-report.md`（逐靶场漏报、误报、静态命中与裁决）；CI 每次自测都会执行并上传
-- 当前基线（2026-10-24）：10 个靶场 · 动态召回 19/19 · 误报 0/19 · 退出码一致 10/10 · 静态召回 19/19 · 零模型调用
+- 当前基线（2026-10-24）：11 个靶场 · 动态召回 21/21 · 误报 0/21 · 退出码一致 11/11 · 静态召回 21/21 · 零模型调用
 
 ## 纯黑盒外部扫描（已运行 / 沙箱中的目标）
 

@@ -1,0 +1,21 @@
+{
+  "_note": "JWT 伪造靶场：受认证端点只解码不验签；设置 GB_JWT_HARDENED=1（并给 GB_JWT_SECRET）后固定 HS256 算法并校验签名（用于验证 exit 0）。",
+  "start": {
+    "cmd": "node",
+    "args": ["server.js"],
+    "env": { "PORT": "0" },
+    "readyPattern": "已就绪",
+    "readyTimeoutMs": 20000
+  },
+  "login": {
+    "path": "/api/login",
+    "bodyTemplate": { "username": "{username}", "password": "{password}" },
+    "credentialPath": "token"
+  },
+  "identities": [
+    { "name": "alice", "username": "alice", "password": "alice123", "role": "user" },
+    { "name": "bob", "username": "bob", "password": "bob123", "role": "user" }
+  ],
+  "llm": { "enabled": false },
+  "scopes": ["project.read", "worktree.write", "proc.spawn", "net.probe"]
+}

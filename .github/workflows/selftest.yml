@@ -71,6 +71,9 @@ jobs:
       - name: 文件上传 E2E（主动内容同源回读取证 + 类型白名单对照）
         run: node scripts/e2e-upload.mjs
 
+      - name: JWT 伪造令牌 E2E（alg=none / 无效签名伪造 + 固定算法强密钥对照）
+        run: node scripts/e2e-jwt.mjs
+
       - name: tRPC 适配器 E2E（过程路径组装 + input 编码协商，本机垫片）
         run: node scripts/e2e-trpc.mjs
 
@@ -101,7 +104,7 @@ jobs:
       - name: S3-full 有界启动代理 E2E（本机 mock：引擎拼装菜单 + 抗命拒绝 + gate 结构性禁用）
         run: node scripts/e2e-bootstrap.mjs
 
-      - name: 精度基准（10 个标注靶场：漏报 / 误报 / 退出码一致性）
+      - name: 精度基准（11 个标注靶场：漏报 / 误报 / 退出码一致性）
         run: node scripts/benchmark.mjs
 
       - name: Docker 沙箱 E2E（无可用 Docker 时自动跳过）
@@ -133,6 +136,8 @@ jobs:
             .demo-ssrf/data/guardbuild.db
             .demo-upload/reports
             .demo-upload/data/guardbuild.db
+            .demo-jwt/reports
+            .demo-jwt/data/guardbuild.db
             .demo-trpc/reports
             .demo-trpc/data/guardbuild.db
             .demo-graphql/reports

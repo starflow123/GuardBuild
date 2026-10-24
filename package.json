@@ -24,6 +24,7 @@
     "e2e:nest": "node scripts/e2e-nest.mjs",
     "e2e:ssrf": "node scripts/e2e-ssrf.mjs",
     "e2e:upload": "node scripts/e2e-upload.mjs",
+    "e2e:jwt": "node scripts/e2e-jwt.mjs",
     "e2e:trpc": "node scripts/e2e-trpc.mjs",
     "e2e:graphql": "node scripts/e2e-graphql.mjs",
     "e2e:python": "node scripts/e2e-python.mjs",

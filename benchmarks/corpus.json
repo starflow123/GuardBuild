@@ -107,6 +107,16 @@
       ]
     },
     {
+      "id": "jwt-shop",
+      "fixture": "fixtures/jwt-shop",
+      "expectedExit": 1,
+      "expectedVulnerableCases": ["attack-jwt-forge", "attack-jwt-forge-2"],
+      "expectedStatic": [
+        { "kind": "jwt-suspect", "method": "GET", "path": "/api/me" },
+        { "kind": "jwt-suspect", "method": "GET", "path": "/api/admin/users" }
+      ]
+    },
+    {
       "id": "clean-shop",
       "fixture": "fixtures/clean-shop",
       "expectedExit": 0,

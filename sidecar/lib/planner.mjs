@@ -100,11 +100,13 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
   const ssrfCandidates = topK((c) => c.kind === "ssrf-suspect");
   const uploadCandidates = topK((c) => c.kind === "upload-suspect");
   const jwtCandidates = topK((c) => c.kind === "jwt-suspect");
+  const bizlogicCandidates = topK((c) => c.kind === "bizlogic-suspect");
   const sqliCandidate = sqliCandidates[0] ?? null;
   const cmdiCandidate = cmdiCandidates[0] ?? null;
   const ssrfCandidate = ssrfCandidates[0] ?? null;
   const uploadCandidate = uploadCandidates[0] ?? null;
   const jwtCandidate = jwtCandidates[0] ?? null;
+  const bizlogicCandidate = bizlogicCandidates[0] ?? null;
 
   const resource =
     readCandidate?.resource ??
@@ -116,6 +118,7 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
     ssrfCandidate?.resource ??
     uploadCandidate?.resource ??
     jwtCandidate?.resource ??
+    bizlogicCandidate?.resource ??
     "resource";
 
   // 列表/管理端点优先选择与资源名匹配的路径（避免把别的资源列表当作探测目标）
@@ -176,6 +179,7 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
     ssrfCandidate,
     uploadCandidate,
     jwtCandidate,
+    bizlogicCandidate,
     readCandidates,
     cancelCandidates,
     unauthReadCandidates,
@@ -185,6 +189,7 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
     ssrfCandidates,
     uploadCandidates,
     jwtCandidates,
+    bizlogicCandidates,
     listEndpoint: epSlot(list),
     adminListEndpoint: epSlot(adminList),
     adminCancelEndpoint: epSlot(adminCancel),

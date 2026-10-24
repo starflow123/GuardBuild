@@ -9,6 +9,7 @@ const FAMILY_BY_KIND = {
   "ssrf-suspect": "ssrf",
   "upload-suspect": "upload",
   "jwt-suspect": "jwt",
+  "bizlogic-suspect": "bizlogic",
   "traversal-suspect": "traversal",
   "idor-suspect": "idor",
   "no-auth-suspect": "unauth",
@@ -22,6 +23,7 @@ export const KIND_LABELS = {
   "ssrf-suspect": "SSRF 静态线索",
   "upload-suspect": "文件上传静态线索",
   "jwt-suspect": "JWT 伪造令牌静态线索",
+  "bizlogic-suspect": "业务逻辑 / 竞态静态线索",
   "traversal-suspect": "路径穿越静态线索",
   "idor-suspect": "对象级越权（IDOR）静态线索",
   "no-auth-suspect": "无鉴权静态线索",
@@ -89,6 +91,16 @@ const TEMPLATES = {
       "签名密钥是否来自源码/环境默认值；是否与登录签发使用同一密钥且可预测。",
     ],
     fix: "统一用 `jwt.verify` 并在服务端固定算法白名单（如仅 HS256/RS256）；拒绝 `alg=none` 与缺失算法；密钥只从密钥管理/环境注入并定期轮换，禁止回退到源码默认值；补伪造令牌应返回 401/403 的回归用例。",
+  },
+  bizlogic: {
+    label: "业务逻辑 / 竞态",
+    risk: "一次性动作缺少前置状态校验或并发/幂等保护，攻击者可跳过支付/审批直接推进流程，或并发重复退款、重复领取造成资金损失（本轮已用状态回读或并发副作用标识复现）。",
+    inspect: [
+      "状态流转端点是否校验当前状态（只允许白名单前驱状态），并用条件更新（`WHERE id = ? AND status = ?`）而不是先读后写。",
+      "退款/领取/转账等一次性动作是否接受重复或并发请求：是否先置位再执行副作用，是否有幂等键、唯一约束或行锁。",
+      "金额、数量、折扣是否由服务端重算；是否拒绝负数、超大值与客户端传入的最终价格。",
+    ],
+    fix: "服务端强制状态机校验并在同一条更新语句里完成条件判断；一次性动作使用幂等键/唯一约束/行锁，先原子置位再执行副作用；金额与数量服务端重算并做范围校验；补状态跳步与并发重复提交回归测试。",
   },
   idor: {
     label: "对象级越权（IDOR）",
@@ -169,6 +181,7 @@ export function detectFamily(finding) {
   if (/SSRF|服务端请求伪造|server[-\s]*side\s*request\s*forgery/i.test(text)) return "ssrf";
   if (/文件上传|任意文件|主动内容|unrestricted\s*file\s*upload/i.test(text)) return "upload";
   if (/JWT|令牌伪造|token\s*forge|alg\s*=\s*none|签发/i.test(text)) return "jwt";
+  if (/业务逻辑|状态跳步|状态机|并发|双花|竞态|重复退款|幂等|race|double[-\s]*spend/i.test(text)) return "bizlogic";
   if (/穿越|traversal/i.test(text)) return "traversal";
   if (/RLS|Supabase|行级安全/i.test(text)) return "supabase_rls";
   // 「未认证」优先于「归属」：未认证读取的详情常附带归属类敏感字段说明

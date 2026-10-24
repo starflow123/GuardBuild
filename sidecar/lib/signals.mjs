@@ -611,6 +611,41 @@ export function findJwtSignal(text) {
   return { ...issue, secrets };
 }
 
+// —— 业务逻辑 / 竞态线索 ——
+// 只按「一次性动作」路由选址；是否可跳过前置状态或并发重复执行由动态用例证明。
+// 状态跳步的前置状态是领域约定：发货/交付要求已支付，审批要求待审，启用/停用要求对侧状态。
+const BIZ_STATE_REQUIRED = [
+  [/^(?:ship|deliver|complete)$/i, "paid"],
+  [/^(?:approve|reject)$/i, "pending"],
+  [/^(?:activate)$/i, "inactive"],
+  [/^(?:deactivate|disable)$/i, "active"],
+];
+const BIZ_RACE_ACTION = /^(?:refund|redeem|claim|consume|withdraw|transfer|payout|checkout)$/i;
+const BIZ_ACTION_SEGMENT =
+  /^(?:ship|deliver|complete|approve|reject|activate|deactivate|disable|refund|redeem|claim|consume|withdraw|transfer|payout|checkout)$/i;
+
+/**
+ * 业务逻辑静态线索：一次性动作路由（非 GET）。
+ * 返回 { action, mode: "state"|"race", requiredFrom? } 或 null。
+ * mode=state → 用「非前置状态」的对象验证状态机跳步；
+ * mode=race  → 并发重复提交验证双花/重复退款。
+ */
+export function findBizLogicSignal(path, method) {
+  if (!path || !method || method.toUpperCase() === "GET") return null;
+  const action = String(path)
+    .split("?")[0]
+    .split("/")
+    .filter(Boolean)
+    .reverse()
+    .find((seg) => BIZ_ACTION_SEGMENT.test(seg));
+  if (!action) return null;
+  const a = action.toLowerCase();
+  const state = BIZ_STATE_REQUIRED.find(([re]) => re.test(a));
+  if (state) return { action: a, mode: "state", requiredFrom: state[1] };
+  if (BIZ_RACE_ACTION.test(a)) return { action: a, mode: "race" };
+  return null;
+}
+
 /** 从开括号 openIdx（须为 {）找到配平闭括号位置；跳过字符串/模板/注释；未配平返回 -1 */
 export function braceSpan(text, openIdx) {
   if (text[openIdx] !== "{") return -1;

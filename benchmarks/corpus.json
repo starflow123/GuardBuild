@@ -117,6 +117,16 @@
       ]
     },
     {
+      "id": "bizlogic-shop",
+      "fixture": "fixtures/bizlogic-shop",
+      "expectedExit": 1,
+      "expectedVulnerableCases": ["attack-state-skip", "attack-race-2"],
+      "expectedStatic": [
+        { "kind": "bizlogic-suspect", "method": "POST", "path": "/api/orders/:id/ship" },
+        { "kind": "bizlogic-suspect", "method": "POST", "path": "/api/orders/:id/refund" }
+      ]
+    },
+    {
       "id": "clean-shop",
       "fixture": "fixtures/clean-shop",
       "expectedExit": 0,

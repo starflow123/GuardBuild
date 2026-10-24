@@ -29,6 +29,7 @@ import {
   findSsrfSignal,
   findUploadSignal,
   findJwtSignal,
+  findBizLogicSignal,
   callArgsSpan,
   braceSpan,
   findBodyOpen,
@@ -758,6 +759,13 @@ export async function analyzeProject(ctx) {
     const jwt = s.graphql ? null : jwtByFile.get(normFile) ?? findJwtSignal(s.text);
     if (jwt && path && hasAuth) {
       candidates.push({ ...ep, kind: "jwt-suspect", resource: "token", jwt });
+    }
+
+    // 可疑「业务逻辑/竞态」：受认证的一次性动作端点（发货/退款/审批/领取…）。
+    // 静态只选址，状态跳步与并发双花必须由动态用例按内容级证据判定。
+    const biz = s.graphql ? null : findBizLogicSignal(path, ep.method);
+    if (biz && path && hasAuth) {
+      candidates.push({ ...ep, kind: "bizlogic-suspect", resource: guessResource(fullPath ?? path, s.text), bizlogic: biz });
     }
   }
 

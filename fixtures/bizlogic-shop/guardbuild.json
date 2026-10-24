@@ -1,0 +1,22 @@
+{
+  "_note": "业务逻辑/竞态靶场：发货未校验前置状态（pending 可直接 shipped）、退款无幂等锁（并发重复退款）；设置 GB_BIZ_HARDENED=1 后两处均加固（用于验证 exit 0）。",
+  "start": {
+    "cmd": "node",
+    "args": ["server.js"],
+    "env": { "PORT": "0" },
+    "readyPattern": "已就绪",
+    "readyTimeoutMs": 20000
+  },
+  "login": {
+    "path": "/api/login",
+    "bodyTemplate": { "username": "{username}", "password": "{password}" },
+    "credentialPath": "token"
+  },
+  "responses": { "list": "items", "entity": "order" },
+  "identities": [
+    { "name": "alice", "username": "alice", "password": "alice123", "role": "user" },
+    { "name": "bob", "username": "bob", "password": "bob123", "role": "user" }
+  ],
+  "llm": { "enabled": false },
+  "scopes": ["project.read", "worktree.write", "proc.spawn", "net.probe"]
+}

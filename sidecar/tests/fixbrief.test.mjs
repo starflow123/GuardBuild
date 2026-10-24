@@ -82,6 +82,25 @@ test("buildFixBrief: JWT 伪造令牌走 jwt 家族，复现命中已记录的�
   assert.match(brief.fix, /alg=none/);
 });
 
+test("buildFixBrief: 业务逻辑/竞态走 bizlogic 家族，复现命中状态流转端点", () => {
+  assert.equal(detectFamily({ kind: "bizlogic-suspect" }), "bizlogic");
+  assert.equal(detectFamily({ type: "黑盒·并发双花 /api/orders/1/refund" }), "bizlogic");
+  const brief = buildFixBrief(
+    { kind: "bizlogic-suspect", method: "POST", path: "/api/orders/:id/ship", resource: "order" },
+    {
+      mode: "whitebox",
+      baseUrl: "http://127.0.0.1:3000",
+      projectRoot: "D:/tmp/shop",
+      evidence: [{ verdict: "vulnerable", method: "POST", endpoint: "/api/orders/:id/ship", identity: "alice" }],
+    }
+  );
+  assert.equal(brief.family, "bizlogic");
+  assert.match(brief.reproduce, /'http:\/\/127\.0\.0\.1:3000\/api\/orders\/:id\/ship'/);
+  assert.match(brief.fix, /状态机/);
+  assert.match(brief.fix, /幂等/);
+  assert.match(brief.risk, /并发|状态/);
+});
+
 test("buildFixBrief: 查询参数与 :param 形态都能匹配到证据；无证据时回退为具体路径", () => {
   const q = buildFixBrief(
     { kind: "idor-suspect", method: "GET", path: "/api/invoices", routePath: "/api/invoices" },

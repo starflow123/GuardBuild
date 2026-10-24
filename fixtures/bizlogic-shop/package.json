@@ -1,0 +1,6 @@
+{
+  "name": "bizlogic-shop",
+  "private": true,
+  "type": "module",
+  "description": "业务逻辑靶场：发货不校验前置状态（状态跳步）+ 退款无幂等/锁（并发双花）；GB_BIZ_HARDENED=1 时两处均加固"
+}

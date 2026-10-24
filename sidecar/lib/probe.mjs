@@ -57,6 +57,8 @@ export class ProbeError extends Error {
 }
 
 const DENIED_STATUS = new Set([401, 403, 404]);
+// 业务规则拒绝：409 冲突 / 422 无法处理，同样说明前置条件或幂等保护生效
+const REJECTED_STATUS = (s) => DENIED_STATUS.has(s) || s === 409 || s === 422;
 
 function trimBody(text, limit = 4000) {
   if (!text) return "";
@@ -588,6 +590,7 @@ function pickTargets(byUser, loggedIn, anonymousItems = [], anonTargets = []) {
     ownReadTarget: attackerItems[0] ?? null,
     ownCancelTarget: attackerPaid[1] ?? attackerPaid[0] ?? null,
     ownNotCancellable: attackerItems.find((o) => o.status !== "paid") ?? null,
+    attackerItems,
     anonTargets,
   };
 }
@@ -1017,6 +1020,35 @@ async function waitForCanaryHit(canary, timeoutMs = SSRF_CANARY_WAIT_MS) {
     await new Promise((r) => setTimeout(r, 50));
   }
   return matched();
+}
+
+// —— 业务逻辑 / 竞态用例辅助 ——
+// 状态跳步：先把对象置于「非前置状态」，再调用流转端点，并以回读状态变化为准；
+// 并发双花：同一一次性动作并发提交，只有出现多个不同的副作用标识才算重复执行。
+const RACE_CONCURRENCY = 5;
+const EFFECT_ID_KEY = /^(?:refund|transaction|txn|transfer|payout|withdrawal|claim|receipt|ledger)_?id$/i;
+
+function firstEffectId(json) {
+  const walk = (node, depth) => {
+    if (!node || depth > 4) return null;
+    if (Array.isArray(node)) {
+      for (const v of node) {
+        const hit = walk(v, depth + 1);
+        if (hit) return hit;
+      }
+      return null;
+    }
+    if (typeof node !== "object") return null;
+    for (const [k, v] of Object.entries(node)) {
+      if (EFFECT_ID_KEY.test(k) && (typeof v === "string" || typeof v === "number") && String(v).length > 0) {
+        return String(v);
+      }
+      const hit = walk(v, depth + 1);
+      if (hit) return hit;
+    }
+    return null;
+  };
+  return walk(json, 0);
 }
 
 // —— JWT 用例辅助 ——
@@ -2024,6 +2056,200 @@ export function buildCases(ctx, targets) {
     });
   }
 
+  // —— 业务逻辑 / 竞态用例：状态跳步 + 并发双花（无自动修复模板，仅取证）——
+  const bizCands = planCandidates(ctx, "bizlogic");
+  const ownItems = targets.attackerItems ?? [];
+  // 状态跳步的判定依据是回读状态，必须走发现阶段用过的按归属列表接口
+  const bizListReq = slotRequest(ctx.plan.listEndpoint);
+  for (const [i, cand] of bizCands.entries()) {
+    const routePath = candPath(cand);
+    if (!routePath || !cand.bizlogic || !attacker) continue;
+    const suffix = i === 0 ? "" : `-${i + 1}`;
+
+    if (cand.bizlogic.mode === "state") {
+      const requiredFrom = cand.bizlogic.requiredFrom;
+      const wrong = ownItems.find(
+        (o) => o?.status != null && String(o.status).toLowerCase() !== String(requiredFrom).toLowerCase()
+      );
+      if (!wrong) continue;
+      const req = candRequest(ctx, cand, resourceIdOf(wrong));
+      if (!req?.path) continue;
+      const method = req.method ?? cand.method ?? "POST";
+      const fromStatus = String(wrong.status);
+      cases.push({
+        id: `attack-state-skip${suffix}`,
+        candidateKey: candKey(cand),
+        category: CASE_CATEGORY.ATTACK,
+        unfixable: true,
+        name: `状态跳步（${routePath} · 要求 ${requiredFrom} · 目标 #${resourceIdOf(wrong)}）`,
+        identity: attacker.name,
+        method,
+        path: req.path,
+        routeKey: cand.routeKeys?.[0] ?? null,
+        expect: `处于非前置状态（应要求 ${requiredFrom}）的对象调用 ${cand.bizlogic.action} 必须被拒绝（409/403）`,
+        send: async (c, baseUrl) => {
+          const transition = await httpJson(c, {
+            baseUrl,
+            method,
+            path: req.path,
+            body: req.body ?? null,
+            graphql: req.graphql ?? null,
+            identity: attacker.name,
+          });
+          let after = null;
+          if (bizListReq?.path) {
+            try {
+              const readRes = await httpJson(c, {
+                baseUrl,
+                method: bizListReq.method ?? "GET",
+                path: bizListReq.path,
+                body: bizListReq.body ?? null,
+                graphql: bizListReq.graphql ?? null,
+                identity: attacker.name,
+              });
+              const items = extractListItems(readRes.json, listPathFor(ctx, bizListReq.graphql)) ?? [];
+              after = items.find((o) => String(resourceIdOf(o)) === String(resourceIdOf(wrong))) ?? null;
+            } catch {
+              after = null;
+            }
+          }
+          transition._bizProof = {
+            kind: "state",
+            action: cand.bizlogic.action,
+            id: resourceIdOf(wrong),
+            from: fromStatus,
+            to: after?.status != null ? String(after.status) : null,
+            requiredFrom,
+            transitionStatus: transition.status,
+          };
+          return { res: transition, path: req.path, method };
+        },
+        verify: (res, phase) => {
+          const p = res._bizProof ?? {};
+          if (REJECTED_STATUS(p.transitionStatus)) {
+            return {
+              verdict: VERDICT.BLOCKED,
+              actual: `HTTP ${p.transitionStatus}，订单 #${p.id} 处于 ${p.from}（应要求 ${p.requiredFrom}），流转被拒绝`,
+            };
+          }
+          if (okStatus(p.transitionStatus) && p.to && p.to !== p.from) {
+            return {
+              verdict: VERDICT.VULNERABLE,
+              actual: `HTTP ${p.transitionStatus}，订单 #${p.id} 原状态 ${p.from}（应要求 ${p.requiredFrom}）被直接置为 ${p.to}：前置状态校验缺失`,
+            };
+          }
+          if (okStatus(p.transitionStatus)) {
+            return {
+              verdict: VERDICT.INCONCLUSIVE,
+              actual: `HTTP ${p.transitionStatus}，但回读状态为 ${p.to ?? "未知"}（原 ${p.from}），未观察到状态跳步`,
+            };
+          }
+          return { verdict: VERDICT.INCONCLUSIVE, actual: `HTTP ${p.transitionStatus ?? "ERR"}，未取得可判定的状态流转证据` };
+        },
+        crossProof: (res) => {
+          const p = res._bizProof ?? {};
+          return p.to && p.to !== p.from
+            ? { note: `订单 #${p.id} 在 ${p.from} 状态被直接流转为 ${p.to}（要求前置状态 ${p.requiredFrom}）：状态机前置校验被绕过` }
+            : null;
+        },
+        impact: (res) => {
+          const p = res._bizProof ?? {};
+          return p.to && p.to !== p.from
+            ? `可跳过支付/审批等前置状态直接推进业务（如未付款发货、未审核通过），造成资金或履约损失`
+            : null;
+        },
+      });
+      continue;
+    }
+
+    // mode === "race"：同一一次性动作并发提交
+    const raceTarget = ownItems.find((o) => String(o.status ?? "").toLowerCase() === "paid") ?? ownItems[0];
+    if (!raceTarget) continue;
+    const raceReq = candRequest(ctx, cand, resourceIdOf(raceTarget));
+    if (!raceReq?.path) continue;
+    const method = raceReq.method ?? cand.method ?? "POST";
+    cases.push({
+      id: `attack-race${suffix}`,
+      candidateKey: candKey(cand),
+      category: CASE_CATEGORY.ATTACK,
+      unfixable: true,
+      name: `并发双花（${routePath} · ${cand.bizlogic.action} · 目标 #${resourceIdOf(raceTarget)}）`,
+      identity: attacker.name,
+      method: raceReq.method ?? method,
+      path: raceReq.path,
+      routeKey: cand.routeKeys?.[0] ?? null,
+      expect: `${cand.bizlogic.action} 属一次性动作：并发提交必须被幂等/锁保护，只允许一次成功`,
+      send: async (c, baseUrl) => {
+        const results = await Promise.all(
+          Array.from({ length: RACE_CONCURRENCY }, () =>
+            httpJson(c, {
+              baseUrl,
+              method: raceReq.method ?? method,
+              path: raceReq.path,
+              body: raceReq.body ?? null,
+              graphql: raceReq.graphql ?? null,
+              identity: attacker.name,
+            }).catch((e) => ({ status: 0, json: null, error: String(e?.message ?? e).slice(0, 160) }))
+          )
+        );
+        const attempts = results.map((r) => ({ status: r.status, effectId: firstEffectId(r.json) }));
+        const effectIds = [...new Set(attempts.map((a) => a.effectId).filter(Boolean))];
+        const successes = attempts.filter((a) => okStatus(a.status)).length;
+        const chosen = results.find((r) => okStatus(r.status)) ?? results[results.length - 1] ?? { status: 0, json: null };
+        chosen._bizProof = {
+          kind: "race",
+          action: cand.bizlogic.action,
+          id: resourceIdOf(raceTarget),
+          total: RACE_CONCURRENCY,
+          successes,
+          attempts,
+          effectIds,
+        };
+        return { res: chosen, path: raceReq.path, method: raceReq.method ?? method };
+      },
+      verify: (res, phase) => {
+        const p = res._bizProof ?? {};
+        const statuses = (p.attempts ?? []).map((a) => a.status || "ERR").join("/");
+        if ((p.successes ?? 0) >= 2 && (p.effectIds ?? []).length >= 2) {
+          return {
+            verdict: VERDICT.VULNERABLE,
+            actual: `并发 ${p.total} 次 ${p.action}，${p.successes} 次成功且产生 ${p.effectIds.length} 个不同副作用标识（${p.effectIds.slice(0, 3).join("、")}）：同一操作被重复执行`,
+          };
+        }
+        if ((p.successes ?? 0) >= 2) {
+          return {
+            verdict: VERDICT.INCONCLUSIVE,
+            actual: `并发 ${p.total} 次 ${p.action}，${p.successes} 次返回成功但未取得不同副作用标识，无法证明重复执行`,
+          };
+        }
+        if ((p.successes ?? 0) === 1) {
+          return {
+            verdict: VERDICT.BLOCKED,
+            actual: `并发 ${p.total} 次 ${p.action} 仅 1 次成功（状态：${statuses}）：一次性动作被串行化或幂等保护`,
+          };
+        }
+        if ((p.attempts ?? []).length > 0 && p.attempts.every((a) => REJECTED_STATUS(a.status))) {
+          return { verdict: VERDICT.BLOCKED, actual: `并发 ${p.total} 次 ${p.action} 均被拒绝（状态：${statuses}）` };
+        }
+        return { verdict: VERDICT.INCONCLUSIVE, actual: `并发 ${p.total} 次 ${p.action} 未取得可判定结果（状态：${statuses}）` };
+      },
+      crossProof: (res) => {
+        const p = res._bizProof ?? {};
+        return (p.effectIds ?? []).length >= 2
+          ? {
+              note: `并发 ${p.total} 次请求返回 ${p.effectIds.length} 个不同副作用标识（${p.effectIds.slice(0, 3).join("、")}），一次${p.action}被重复执行`,
+            }
+          : null;
+      },
+      impact: (res) => {
+        const p = res._bizProof ?? {};
+        return (p.effectIds ?? []).length >= 2
+          ? "可并发重复执行退款/领取/转账等一次性操作，造成重复退款、优惠券重复使用或余额双花"
+          : null;
+      },
+    });
+  }
+
   // —— SQL 注入用例：随机基线 vs 布尔/报错载荷（无修复模板，仅取证）——
   for (const [i, cand] of planCandidates(ctx, "sqli").entries()) {
     const injection = cand.sqli;
@@ -2474,7 +2700,12 @@ export async function runPhase(ctx, { phase, baseUrl }) {
   // 个别实现会同步阻塞事件循环。排在最后，避免一条挂起的用例拖掉整轮注入取证。
   const isSlow = (c) =>
     c.category === CASE_CATEGORY.ATTACK &&
-    (c.id.startsWith("attack-path-traversal") || c.id.startsWith("attack-ssrf") || c.id.startsWith("attack-upload") || c.id.startsWith("attack-jwt-forge"));
+    (c.id.startsWith("attack-path-traversal") ||
+      c.id.startsWith("attack-ssrf") ||
+      c.id.startsWith("attack-upload") ||
+      c.id.startsWith("attack-jwt-forge") ||
+      c.id.startsWith("attack-state-skip") ||
+      c.id.startsWith("attack-race"));
   const orderedCases = [...allCases.filter((c) => !isSlow(c)), ...allCases.filter(isSlow)];
   // 外部攻击面扫描：发常见管理路径/敏感文件，记录暴露面（pre 阶段才跑）
   if (phase === "pre") {
@@ -2507,7 +2738,7 @@ export async function runPhase(ctx, { phase, baseUrl }) {
     ctx.emit({
       kind: "phase",
       severity: SEVERITY.INFO,
-      message: `修复后验收跳过 ${skippedUnfixable.length} 条无自动修复模板的攻击用例（注入/穿越/SSRF/上传/JWT 类仅取证）`,
+      message: `修复后验收跳过 ${skippedUnfixable.length} 条无自动修复模板的攻击用例（注入/穿越/SSRF/上传/JWT/业务逻辑类仅取证）`,
       phase,
       data: { skipped: skippedUnfixable.map((c) => c.id) },
     });
@@ -2530,6 +2761,8 @@ export async function runPhase(ctx, { phase, baseUrl }) {
     { slot: "ssrfCandidate", prefix: "attack-ssrf", count: planCandidates(ctx, "ssrf").length },
     { slot: "uploadCandidate", prefix: "attack-upload", count: planCandidates(ctx, "upload").length },
     { slot: "jwtCandidate", prefix: "attack-jwt-forge", count: planCandidates(ctx, "jwt").length },
+    { slot: "bizlogicCandidate", prefix: "attack-state-skip", count: planCandidates(ctx, "bizlogic").filter((c) => c.bizlogic?.mode === "state").length },
+    { slot: "bizlogicCandidate", prefix: "attack-race", count: planCandidates(ctx, "bizlogic").filter((c) => c.bizlogic?.mode === "race").length },
   ].filter((s) => s.count > 0);
   const skipped = plannedSlots.filter(
     (s) => !allCases.some((c) => c.id === s.prefix || c.id.startsWith(`${s.prefix}-`))

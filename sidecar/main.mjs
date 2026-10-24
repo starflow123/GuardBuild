@@ -1074,7 +1074,9 @@ async function stageAnalyze(ctx) {
                   ? "服务端接收 multipart 文件上传（文件上传静态线索）"
                   : c.kind === "jwt-suspect"
                     ? "受认证端点的 JWT 校验存在缺口（伪造令牌静态线索）"
-                    : "按对象 ID 取资源但未见归属校验（IDOR 静态线索）",
+                    : c.kind === "bizlogic-suspect"
+                      ? `${c.bizlogic?.mode === "race" ? "一次性动作端点未做并发/幂等保护" : "状态流转端点未见前置状态校验"}（业务逻辑静态线索）`
+                      : "按对象 ID 取资源但未见归属校验（IDOR 静态线索）",
   }));
   if (supa) {
     for (const t of supa.tables ?? []) {
@@ -1166,12 +1168,13 @@ async function stageAnalyze(ctx) {
     !ctx.plan.ssrfCandidate &&
     !ctx.plan.uploadCandidate &&
     !ctx.plan.jwtCandidate &&
+    !ctx.plan.bizlogicCandidate &&
     !supaProbeable &&
     !supaStaticLeak
   ) {
     throw new SessionError("无法构建探测计划：候选端点中缺少可探测的接口", {
       code: "plan_incomplete",
-      hint: `已发现 ${cands.length} 个候选端点，但均不含「按 ID 取单体资源」的路径（如 GET /api/orders/:id）、文件读取线索、SQL/命令注入线索、SSRF 线索、文件上传线索、JWT 伪造线索，也未定位到可探测的 Supabase 项目（需 URL + anon key + 至少一个表引用）。请确认目标接口形态或在 guardbuild.json 中补充契约/supabase 配置`,
+      hint: `已发现 ${cands.length} 个候选端点，但均不含「按 ID 取单体资源」的路径（如 GET /api/orders/:id）、文件读取线索、SQL/命令注入线索、SSRF 线索、文件上传线索、JWT 伪造线索、业务逻辑/竞态线索，也未定位到可探测的 Supabase 项目（需 URL + anon key + 至少一个表引用）。请确认目标接口形态或在 guardbuild.json 中补充契约/supabase 配置`,
     });
   }
   ctx.view.plan = {
@@ -1186,6 +1189,7 @@ async function stageAnalyze(ctx) {
     ssrfPath: ctx.plan.ssrfCandidate?.fullPath ?? ctx.plan.ssrfCandidate?.path ?? null,
     uploadPath: ctx.plan.uploadCandidate?.fullPath ?? ctx.plan.uploadCandidate?.path ?? null,
     jwtPath: ctx.plan.jwtCandidate?.fullPath ?? ctx.plan.jwtCandidate?.path ?? null,
+    bizlogicPath: ctx.plan.bizlogicCandidate?.fullPath ?? ctx.plan.bizlogicCandidate?.path ?? null,
     listPath: ctx.plan.listEndpoint?.path ?? null,
   };
   pushView(ctx);
@@ -1430,7 +1434,8 @@ async function stageReproduce(ctx) {
     plan.cmdiCandidate ||
     plan.ssrfCandidate ||
     plan.uploadCandidate ||
-    plan.jwtCandidate
+    plan.jwtCandidate ||
+    plan.bizlogicCandidate
   );
   const supa = plan.supabase ?? null;
 

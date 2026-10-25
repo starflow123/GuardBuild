@@ -163,15 +163,10 @@ export function App() {
         showToast("黑盒目标仅支持 http/https");
         return;
       }
-      let dir = bbProject;
-      if (!dir) {
-        dir = await bridge.pickProjectDir();
-        if (!dir) return;
-        setBbProject(dir);
-      }
       setTab("findings");
       setEvFilter("all");
-      await bridge.startSession(dir, url);
+      // 契约目录可选：不选时 Host 在数据目录下建会话目录，黑盒仅匿名探测（无测试身份）
+      await bridge.startSession(bbProject || null, url);
     }, "黑盒扫描启动失败");
 
   const resolveConsent = async (approved: boolean) => {
@@ -250,7 +245,7 @@ export function App() {
                   契约目录
                 </button>
                 <span className="small muted ellipsis grow" title={bbProject ?? ""}>
-                  {bbProject ?? "未选择（扫描时再选）"}
+                  {bbProject ?? "可选：用于登录身份与报告归属，不选则匿名探测"}
                 </span>
               </div>
               <button

@@ -372,7 +372,7 @@ interface Bridge {
   getEvents(limit?: number): Promise<UiEvent[]>;
   getHostInfo(): Promise<{ protocolVersion: string; appVersion: string; dataDir: string; sidecarReady: boolean }>;
   pickProjectDir(): Promise<string | null>;
-  startSession(projectRoot: string, targetUrl?: string | null): Promise<{ sessionId: string }>;
+  startSession(projectRoot: string | null, targetUrl?: string | null): Promise<{ sessionId: string }>;
   resolveConsent(consentId: string, approved: boolean): Promise<unknown>;
   approvePatch(patchHash?: string): Promise<unknown>;
   approveWriteback(patchHash: string): Promise<unknown>;
@@ -406,7 +406,7 @@ const tauriBridge: Bridge = {
   },
   async startSession(projectRoot, targetUrl) {
     const { invoke } = await import("@tauri-apps/api/core");
-    return invoke("start_session", { projectRoot, targetUrl: targetUrl ?? null });
+    return invoke("start_session", { projectRoot: projectRoot ?? null, targetUrl: targetUrl ?? null });
   },
   async resolveConsent(consentId, approved) {
     const { invoke } = await import("@tauri-apps/api/core");

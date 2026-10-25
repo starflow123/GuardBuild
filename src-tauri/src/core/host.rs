@@ -1661,11 +1661,28 @@ impl Host {
     }
 
     pub fn start_session(self: &Arc<Self>, root: &str, blackbox_url: Option<&str>) -> HostResult<Value> {
-        let root_path = PathBuf::from(root);
+        let blackbox_url = normalize_blackbox_url(blackbox_url)?;
+        // 黑盒模式允许不带契约目录：目录只用于契约与报告落盘，缺省时在数据目录下新建会话目录
+        let root_path = if root.trim().is_empty() {
+            if blackbox_url.is_none() {
+                return Err(HostError::InvalidParams(
+                    "白盒诊断必须选择项目目录；仅黑盒扫描（提供外部目标 URL）可省略".into(),
+                ));
+            }
+            let dir = self
+                .cfg
+                .data_dir
+                .join("blackbox-sessions")
+                .join(format!("bb_{}", uuid::Uuid::new_v4().simple()));
+            std::fs::create_dir_all(&dir)
+                .map_err(|e| HostError::Internal(format!("创建黑盒会话目录失败: {e}")))?;
+            dir
+        } else {
+            PathBuf::from(root)
+        };
         if !root_path.is_dir() {
             return Err(HostError::NotFound(format!("目录不存在: {root}")));
         }
-        let blackbox_url = normalize_blackbox_url(blackbox_url)?;
         let canon = root_path
             .canonicalize()
             .map_err(|e| HostError::NotFound(format!("目录不可访问: {e}")))?;
@@ -2101,6 +2118,38 @@ mod tests {
         assert!(normalize_blackbox_url(Some("http://example.com")).is_err());
         assert!(normalize_blackbox_url(Some("ftp://example.com")).is_err());
         assert!(normalize_blackbox_url(Some("not a url")).is_err());
+    }
+
+    #[test]
+    fn blackbox_start_without_project_dir_creates_session_dir() {
+        let tmp = std::env::temp_dir().join(format!("gb-test-{}", uuid::Uuid::new_v4().simple()));
+        let host = Host::new(HostConfig {
+            data_dir: tmp.clone(),
+            sidecar_path: PathBuf::from("sidecar/main.mjs"),
+            node_bin: "node".into(),
+            auto_consent: true,
+            headless: true,
+            app_version: "test".into(),
+            gate: false,
+            granted_scopes: vec![],
+            report_dir: None,
+        });
+        // 测试环境无 Sidecar，会话启动的收尾通知会报 Protocol 错——这里只验证目录契约
+        let _ = host.start_session("", Some("http://127.0.0.1:3000"));
+        let sessions_dir = tmp.join("blackbox-sessions");
+        let created: Vec<PathBuf> = std::fs::read_dir(&sessions_dir)
+            .expect("blackbox-sessions 目录应已创建")
+            .flatten()
+            .map(|e| e.path())
+            .collect();
+        assert_eq!(created.len(), 1, "应恰好新建一个会话目录");
+        assert!(created[0].is_dir());
+        // 白盒（无外部目标 URL）不允许空目录：必须显式选择项目目录
+        let err = host.start_session("", None).unwrap_err();
+        assert!(matches!(err, HostError::InvalidParams(_)), "err={err:?}");
+        let after: usize = std::fs::read_dir(&sessions_dir).unwrap().count();
+        assert_eq!(after, 1, "被拒绝的启动不得再建目录");
+        let _ = std::fs::remove_dir_all(tmp);
     }
 
     fn sidecar_env_reads(dir: &std::path::Path) -> Vec<String> {

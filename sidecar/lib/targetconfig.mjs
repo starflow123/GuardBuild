@@ -9,7 +9,10 @@
  *   "login": { "path": "/api/login", "bodyTemplate": { "email": "{email}", "password": "{password}" },
  *              "credentialHeader": "Authorization", "credentialPath": "authentication.token",
  *              "credentialPrefix": "Bearer " },
- *   "responses": { "list": "orders", "entity": "order" },
+ *   "responses": { "list": "data.items", "entity": "data", "id": "order_id", "owner": "created_by_uid" },
+ *   "listEndpoint": { "method": "GET", "path": "/api/orders", "query": { "page": "1", "limit": "50" } },
+ *   "routes": [{ "method": "GET", "path": "/api/orgs/:orgId/orders/:orderId",
+ *                "params": { "orgId": "orgId", "orderId": "id" } }],
  *   "identities": [{ "name": "alice", "email": "alice@example.com", "password": "alice123", "role": "user" }],
  *   "supabase": { "envFile": ".env", "url": "https://xyz.supabase.co", "anonKey": "eyJ…", "tables": ["profiles"] },
  *   "llm": { "enabled": true, "model": "deepseek-chat" },
@@ -23,8 +26,11 @@
  *   默认关闭、gate 模式结构性禁用；命令行始终由引擎拼装，模型只报编号；预算耗尽即回退确定性契约，不伪造成功。
  * start 的 cmd/args/env 中可使用 `${GB_PORT}` 占位符：宿主每次 spawn 前分配一个空闲端口注入，
  *   使「原始工作区 / 隔离 worktree」多个实例可并存，也让打印字面量端口的项目无需改写。
- * responses 声明列表/单体资源在响应 JSON 中的位置（点路径，如 "data.items"）；
- * 缺省时按「顶层数组 → 首个对象数组」/「首个对象值字段」自适应。
+ * responses 声明列表/单体资源在响应 JSON 中的位置（点路径，如 "data.items"），以及主键/归属字段名
+ *   （如 order_id / created_by_uid）；缺省时按「顶层数组 → 首个对象数组」/「首个对象值字段」自适应。
+ * listEndpoint 显式指定列表端点与固定查询参数（分页/过滤），静态找不到列表接口时用于资源发现。
+ * routes[].params 声明多段路径参数从资源对象的哪个字段取值，使 /orgs/:orgId/orders/:orderId 可寻址。
+ * 这些字段只决定「怎么发请求、怎么取值」，漏洞判定仍由动态探测的真实响应决定。
  *
  * 文件缺失或字段不合法时回落到内建缺省（node server.js + GB_LISTEN），
  * 保持对既有目标（含内置演示项目）的向后兼容。
@@ -336,14 +342,90 @@ function normalizePrepare(raw) {
   return out.length ? out : null;
 }
 
-/** 响应形状契约：列表/单体资源在 JSON 响应中的点路径（如 "data.items"），缺省为自适应探测。 */
+/** 点路径（"data.items" / "created_by_uid"）：只允许标识符段，避免把任意字符串当取值路径。 */
+const FIELD_PATH_RE = /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/;
+
+export function normalizeFieldPath(value) {
+  if (typeof value !== "string") return null;
+  const p = value.trim();
+  return p.length <= 100 && FIELD_PATH_RE.test(p) ? p : null;
+}
+
+/**
+ * 响应形状契约：列表/单体资源在 JSON 响应中的点路径，以及主键/归属字段名。
+ * 静态分析拿不到运行期字段名（created_by_uid / order_id 这类），此处在契约里显式声明，
+ * 由动态探测按真实响应验证——契约只影响「怎么取值」，不影响「是否判漏洞」。
+ */
 function normalizeResponses(raw) {
   const r = raw && typeof raw === "object" && !Array.isArray(raw) ? raw : null;
   if (!r) return null;
-  const list = typeof r.list === "string" && r.list.trim() ? r.list.trim() : null;
-  const entity = typeof r.entity === "string" && r.entity.trim() ? r.entity.trim() : null;
-  if (!list && !entity) return null;
-  return { list, entity };
+  const out = {
+    list: normalizeFieldPath(r.list),
+    entity: normalizeFieldPath(r.entity),
+    id: normalizeFieldPath(r.id),
+    owner: normalizeFieldPath(r.owner),
+  };
+  return Object.values(out).some(Boolean) ? out : null;
+}
+
+/** 显式列表端点：静态分析找不到「按归属过滤的列表接口」时，由契约指定并可带固定查询参数（分页/过滤）。 */
+const MAX_QUERY_PARAMS = 12;
+
+function normalizeQueryParams(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const out = {};
+  for (const [k, v] of Object.entries(raw)) {
+    if (!/^[A-Za-z_][\w.-]*$/.test(k)) continue;
+    if (typeof v === "string" || typeof v === "number" || typeof v === "boolean") out[k] = String(v);
+    if (Object.keys(out).length >= MAX_QUERY_PARAMS) break;
+  }
+  return Object.keys(out).length ? out : null;
+}
+
+function normalizeListEndpoint(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const path = typeof raw.path === "string" ? raw.path.trim() : "";
+  if (!path.startsWith("/") || path.includes("..") || /^[A-Za-z]:[\\/]/.test(path)) return null;
+  const method = String(raw.method ?? "GET").toUpperCase();
+  if (method !== "GET" && method !== "POST") return null;
+  return {
+    method,
+    path,
+    query: normalizeQueryParams(raw.query),
+    resource:
+      typeof raw.resource === "string" && raw.resource.trim() ? raw.resource.trim() : null,
+  };
+}
+
+/**
+ * 路径参数绑定：多段路径（/orgs/:orgId/orders/:orderId）默认无法寻址，
+ * 契约可声明每个参数从哪个字段取值：
+ *   "params": { "orgId": "orgId" }                                   ← 从当前资源对象的 orgId 取
+ *   "params": { "orgId": { "from": "item", "field": "org_id" } }
+ *   "params": { "version": { "from": "const", "value": "v2" } }
+ * 未声明的参数仍用目标对象主键填充（保持单参数路由的既有行为）。
+ */
+function normalizeParamBindings(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const out = {};
+  for (const [name, spec] of Object.entries(raw)) {
+    if (!/^[A-Za-z_]\w*$/.test(name)) continue;
+    if (typeof spec === "string" && spec.trim()) {
+      const field = normalizeFieldPath(spec);
+      if (field) out[name] = { from: "item", field };
+      continue;
+    }
+    if (!spec || typeof spec !== "object" || Array.isArray(spec)) continue;
+    if (spec.from === "const") {
+      if (spec.value != null && ["string", "number", "boolean"].includes(typeof spec.value)) {
+        out[name] = { from: "const", value: String(spec.value) };
+      }
+      continue;
+    }
+    const field = normalizeFieldPath(spec.field ?? name);
+    if (field) out[name] = { from: "item", field };
+  }
+  return Object.keys(out).length ? out : null;
 }
 
 /** 手工路由线索：用户在 guardbuild.json 里直接声明的端点（未知框架用）。 */
@@ -366,7 +448,9 @@ function normalizeRoutes(raw) {
       path,
       resource: typeof it.resource === "string" && it.resource.trim() ? it.resource.trim() : null,
       hasAuth: typeof it.hasAuth === "boolean" ? it.hasAuth : true,
-      ownerField: typeof it.ownerField === "string" && it.ownerField.trim() ? it.ownerField.trim() : null,
+      ownerField: normalizeFieldPath(it.ownerField),
+      idField: normalizeFieldPath(it.idField),
+      params: normalizeParamBindings(it.params),
       query: typeof it.query === "string" && it.query.trim() ? it.query.trim() : null,
       source: "routes",
     });
@@ -463,6 +547,7 @@ function emptyConfig(source, invalid = null) {
     login: null,
     prepare: null,
     responses: null,
+    listEndpoint: null,
     supabase: null,
     routes: null,
     openapi: null,
@@ -556,6 +641,7 @@ export async function loadTargetConfig(ctx) {
     login: normalizeLogin(parsed.login),
     prepare: normalizePrepare(parsed.prepare),
     responses: normalizeResponses(parsed.responses),
+    listEndpoint: normalizeListEndpoint(parsed.listEndpoint),
     docker: normalizeDocker(parsed.docker),
     supabase: normalizeSupabase(parsed.supabase),
     routes: normalizeRoutes(parsed.routes),

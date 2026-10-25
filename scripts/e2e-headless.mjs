@@ -324,13 +324,13 @@ try {
   send({ cmd: "start", project: emptyProj });
   await waitState("error", 60_000);
   check(
-    "空项目正常终止（no_candidates → 未命中覆盖范围）",
-    view.error?.code === "no_candidates" && view.error?.kind === "coverage",
+    "空项目如实报「未识别路由 · 无法证明」（exit 2，不再伪装成 exit 0）",
+    view.error?.code === "no_endpoints" && view.error?.kind === "inconclusive",
     `code=${view.error?.code} kind=${view.error?.kind}`
   );
   check(
-    "未命中覆盖范围不得显示为执行失败",
-    view.stateLabel === "未命中覆盖范围",
+    "未识别路由不得显示为执行失败",
+    view.stateLabel === "未识别路由 · 无法证明",
     `stateLabel=${view.stateLabel}`
   );
   const failedSessionId = view.sessionId;

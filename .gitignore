@@ -29,6 +29,7 @@ guardbuild-data/
 .demo-upload/
 .demo-jwt/
 .demo-bizlogic/
+.demo-contract/
 .demo-package/
 .demo-install/
 .demo-install-*/

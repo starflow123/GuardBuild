@@ -117,14 +117,28 @@ function resourceLabel(ctx) {
   return resourceLabelOf(ctx.plan?.resource);
 }
 
-/** 归属字段读取：兼容 userId / user_id / ownerId / owner_id / uid 命名 */
-function ownerOf(obj) {
-  return obj?.userId ?? obj?.user_id ?? obj?.ownerId ?? obj?.owner_id ?? obj?.uid ?? null;
+/** 归属字段读取：契约 responses.owner（或路由 ownerField）优先，未声明时兼容常见命名 */
+const OWNER_FALLBACK_KEYS = ["userId", "user_id", "ownerId", "owner_id", "uid", "created_by_uid", "createdByUid", "created_by"];
+export function ownerOf(ctx, obj, override = null) {
+  const path = override ?? ctx?.targetConfig?.responses?.owner ?? null;
+  if (path) return getByDotPath(obj, path) ?? null;
+  for (const key of OWNER_FALLBACK_KEYS) {
+    const v = obj?.[key];
+    if (v !== undefined && v !== null) return v;
+  }
+  return null;
 }
 
-/** 资源主键读取：兼容 id / userId / user_id / resourceId 命名（响应体字段名不统一） */
-function resourceIdOf(obj) {
-  return obj?.id ?? obj?.resourceId ?? obj?.userId ?? obj?.user_id ?? null;
+/** 资源主键读取：契约 responses.id（或路由 idField）优先，未声明时兼容 id / userId 等命名 */
+const ID_FALLBACK_KEYS = ["id", "resourceId", "userId", "user_id"];
+export function resourceIdOf(ctx, obj, override = null) {
+  const path = override ?? ctx?.targetConfig?.responses?.id ?? null;
+  if (path) return getByDotPath(obj, path) ?? null;
+  for (const key of ID_FALLBACK_KEYS) {
+    const v = obj?.[key];
+    if (v !== undefined && v !== null) return v;
+  }
+  return null;
 }
 
 /** 经 Host 发起一次 HTTP 请求（可携带保险库身份） */
@@ -454,7 +468,7 @@ async function discoverViaAnonymousProbe(ctx, baseUrl, cand) {
       graphql: req.graphql ?? false,
     });
     const o = extractEntity(res.json, entityPathFor(ctx, cand.graphql));
-    if (o && String(o.id) === String(id)) anonymousItems.push(o);
+    if (o && String(resourceIdOf(ctx, o)) === String(id)) anonymousItems.push(o);
   }
   ctx.emit({
     kind: "discovery",
@@ -463,7 +477,7 @@ async function discoverViaAnonymousProbe(ctx, baseUrl, cand) {
       anonymousItems.length > 0
         ? `资源发现（匿名探测回退）：无按归属过滤的列表接口，在 ${path} 匿名探测到 ${anonymousItems.length} 个公开可见对象`
         : `资源发现（匿名探测回退）：无列表接口，且 ${path} 匿名 ID 探测未找到可见对象`,
-    data: { mode: "anonymous-probe", path, ids: anonymousItems.map((o) => o.id) },
+    data: { mode: "anonymous-probe", path, ids: anonymousItems.map((o) => resourceIdOf(ctx, o)) },
   });
   return anonymousItems;
 }
@@ -533,7 +547,7 @@ async function discoverResources(ctx, baseUrl, loggedIn) {
     }
     throw new ProbeError("静态分析未能定位列表接口，无法发现资源归属", {
       code: "no_list_endpoint",
-      hint: "当前策略要求目标项目存在按归属过滤的列表接口（如 GET /api/orders），或至少一个无鉴权单体资源接口（如 GET /api/users/:id，用于匿名探测回退）",
+      hint: "当前策略要求目标项目存在按归属过滤的列表接口（如 GET /api/orders），或至少一个无鉴权单体资源接口（如 GET /api/users/:id，用于匿名探测回退）。静态找不到时可在 guardbuild.json 用 listEndpoint 显式声明列表端点（可带分页/过滤查询参数），或在 routes 里补充路由",
     });
   }
   const byUser = {};
@@ -554,17 +568,32 @@ async function discoverResources(ctx, baseUrl, loggedIn) {
       kind: "discovery",
       severity: SEVERITY.INFO,
       message: `资源发现：「${ident.name}」名下可见 ${items.length} 个${resourceLabel(ctx)}`,
-      data: { identity: ident.name, count: items.length, ids: items.map((o) => o.id) },
+      data: { identity: ident.name, count: items.length, ids: items.map((o) => resourceIdOf(ctx, o)) },
     });
   }
   return { byUser, anonymousItems: [], anonTargets: [] };
 }
 
 /**
+ * 建立「资源主键 → 资源对象」索引：多段路径参数（/orgs/:orgId/orders/:orderId）
+ * 需要从同一个对象里取出除主键以外的上下文值，索引在发现阶段一次性建立。
+ */
+function indexResources(ctx, byUser, anonymousItems = []) {
+  const map = new Map();
+  const add = (o) => {
+    const id = resourceIdOf(ctx, o);
+    if (id != null && !map.has(String(id))) map.set(String(id), o);
+  };
+  for (const items of Object.values(byUser ?? {})) for (const o of items ?? []) add(o);
+  for (const o of anonymousItems ?? []) add(o);
+  return map;
+}
+
+/**
  * 从发现结果中挑选攻击/业务用例所需的具体对象（loggedIn 携带登录响应中的 user 对象）。
  * 宽容化：缺少身份/对象时返回 null 槽位，由 buildCases 按槽位条件决定哪些用例可构建。
  */
-function pickTargets(byUser, loggedIn, anonymousItems = [], anonTargets = []) {
+function pickTargets(ctx, byUser, loggedIn, anonymousItems = [], anonTargets = []) {
   const users = loggedIn.filter((i) => i.role !== "admin");
   const attacker = users[0] ?? null;
   const victim = users[1] ?? null; // 归属类用例（越权读/操作）需要第二个普通用户，缺则跳过该槽位
@@ -574,7 +603,7 @@ function pickTargets(byUser, loggedIn, anonymousItems = [], anonTargets = []) {
   const victimPaid = victimItems.filter((o) => o.status === "paid");
   const attackerPaid = attackerItems.filter((o) => o.status === "paid");
   // attacker 自己列表里已有的资源 id：这些资源不属于"他人"，请求成功不算越权
-  const attackerOwnIds = new Set(attackerItems.map((o) => String(resourceIdOf(o))).filter(Boolean));
+  const attackerOwnIds = new Set(attackerItems.map((o) => String(resourceIdOf(ctx, o))).filter(Boolean));
   return {
     attacker,
     victim,
@@ -595,13 +624,36 @@ function pickTargets(byUser, loggedIn, anonymousItems = [], anonTargets = []) {
   };
 }
 
-/** 填充路径参数（任意 :param 形态，不限于 :id） */
-function fillParams(path, id) {
-  return path.replace(/:[A-Za-z_]\w*/g, String(id));
+/** 追加固定查询参数（契约 listEndpoint.query，用于分页/过滤）。 */
+export function appendQuery(path, query) {
+  if (!query || typeof query !== "object") return path;
+  const qs = Object.entries(query)
+    .filter(([, v]) => v != null)
+    .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
+    .join("&");
+  if (!qs) return path;
+  return `${path}${path.includes("?") ? "&" : "?"}${qs}`;
+}
+
+/**
+ * 填充路径参数（任意 :param 形态，不限于 :id）。
+ * 契约 params 声明的参数从当前资源对象的字段取值（如 /orgs/:orgId/orders/:orderId 的 orgId），
+ * 支持常量；未声明的参数仍按目标对象主键填充（保持单参数路由的既有行为）。
+ */
+export function fillParams(ctx, cand, path, id) {
+  const bindings = cand?.paramBindings ?? null;
+  return path.replace(/:([A-Za-z_]\w*)/g, (_m, name) => {
+    const b = bindings?.[name];
+    if (!b) return String(id);
+    if (b.from === "const") return encodeURIComponent(b.value);
+    const item = ctx?._resourceById?.get(String(id)) ?? null;
+    const v = item ? getByDotPath(item, b.field) : undefined;
+    return v === undefined || v === null ? String(id) : encodeURIComponent(String(v));
+  });
 }
 
 /** 按候选构造请求路径：查询参数形态（?param=id，idor-suspect/queryParam 候选）或路径参数填充 */
-function fillCandPath(cand, id) {
+function fillCandPath(ctx, cand, id) {
   const path = candPath(cand);
   if (!path) return null;
   if (cand?.queryParam && !/:[A-Za-z_]\w*/.test(path)) {
@@ -609,7 +661,7 @@ function fillCandPath(cand, id) {
     const name = cand.queryParam.param || "id";
     return `${path}${sep}${name}=${encodeURIComponent(String(id))}`;
   }
-  return fillParams(path, id);
+  return fillParams(ctx, cand, path, id);
 }
 
 /**
@@ -622,11 +674,11 @@ function candRequest(ctx, cand, id) {
   if (isGraphqlCandidate(cand)) {
     const req = graphqlRequest(cand, id, ctx._graphqlCastFlip ?? false);
     if (req) return { path: req.path, body: req.body, method: req.method, graphql: true };
-    return { path: fillCandPath(cand, id), body: null, method: null, graphql: null };
+    return { path: fillCandPath(ctx, cand, id), body: null, method: null, graphql: null };
   }
-  if (!isTrpcCandidate(cand)) return { path: fillCandPath(cand, id), body: null, method: null, graphql: null };
+  if (!isTrpcCandidate(cand)) return { path: fillCandPath(ctx, cand, id), body: null, method: null, graphql: null };
   const req = trpcRequest(cand, id, variantAt(ctx._trpcVariant ?? 0));
-  if (!req) return { path: fillCandPath(cand, id), body: null, method: null, graphql: null };
+  if (!req) return { path: fillCandPath(ctx, cand, id), body: null, method: null, graphql: null };
   return { path: req.path, body: req.body, method: req.method, graphql: null };
 }
 
@@ -640,7 +692,7 @@ function slotRequest(slot) {
     const req = graphqlPlainRequest(slot.graphql, slot.path);
     if (req) return { path: req.path, body: req.body, method: req.method, graphql: true };
   }
-  return { path: slot.path, body: null, method: slot.method ?? "GET", graphql: null };
+  return { path: appendQuery(slot.path, slot.query), body: null, method: slot.method ?? "GET", graphql: null };
 }
 
 /** 计划里是否存在需要 input 的 tRPC 候选 */
@@ -1334,12 +1386,12 @@ export function buildCases(ctx, targets) {
     const suffix = i === 0 ? "" : `-${i + 1}`;
     const multi = readCands.length > 1 ? `（${path}）` : "";
     const candLabel = resourceLabelOf(cand.resource ?? ctx.plan?.resource);
-    const req = candRequest(ctx, cand, readTarget.id);
+    const req = candRequest(ctx, cand, resourceIdOf(ctx, readTarget));
     cases.push({
       id: `attack-read-foreign${suffix}`,
       candidateKey: candKey(cand),
       category: CASE_CATEGORY.ATTACK,
-      name: `${attacker.name} 读取 ${victim.name} 的${candLabel} #${readTarget.id}${multi}`,
+      name: `${attacker.name} 读取 ${victim.name} 的${candLabel} #${resourceIdOf(ctx, readTarget)}${multi}`,
       identity: attacker.name,
       method: req.method ?? "GET",
       path: req.path,
@@ -1349,25 +1401,25 @@ export function buildCases(ctx, targets) {
       expect: `越权读取他人${candLabel}应被拒绝（401/403/404）`,
       verify: (res, phase) => {
         const o = extractEntity(res.json, entityPathFor(ctx, cand.graphql));
-        const leaked = o && String(resourceIdOf(o)) === String(readTarget.id);
+        const leaked = o && String(resourceIdOf(ctx, o)) === String(resourceIdOf(ctx, readTarget));
         // 跨端点 id 串号防护：如果 attacker 自己列表里就有这个 id，说明是自己的资源，不是越权
-        const isOwnResource = leaked && targets.attackerOwnIds?.has(String(readTarget.id));
+        const isOwnResource = leaked && targets.attackerOwnIds?.has(String(resourceIdOf(ctx, readTarget)));
         const detail = leaked
-          ? `证据：返回${candLabel} #${resourceIdOf(o)}（归属 ${ownerOf(o)}，金额 ${o.amount}，状态 ${o.status}）${isOwnResource ? "（但该 id 在 attacker 自己列表中，疑似串号）" : ""}`
+          ? `证据：返回${candLabel} #${resourceIdOf(ctx, o)}（归属 ${ownerOf(ctx, o, cand.ownerField)}，金额 ${o.amount}，状态 ${o.status}）${isOwnResource ? "（但该 id 在 attacker 自己列表中，疑似串号）" : ""}`
           : "";
         if (isOwnResource) {
           // 不算越权：attacker 本来就能访问自己的资源
-          return { verdict: "inconclusive", actual: `目标 #${readTarget.id} 在 attacker 自己的资源列表中，疑似跨端点 id 串号，不计为越权` };
+          return { verdict: "inconclusive", actual: `目标 #${resourceIdOf(ctx, readTarget)} 在 attacker 自己的资源列表中，疑似跨端点 id 串号，不计为越权` };
         }
         return verifyAttack(res, phase, detail, leaked);
       },
       crossProof: (res) => {
         const o = extractEntity(res.json, entityPathFor(ctx, cand.graphql));
-        if (!o || String(resourceIdOf(o)) !== String(readTarget.id)) return null;
-        const ownerOk = !victim.user?.id || ownerOf(o) === victim.user.id;
+        if (!o || String(resourceIdOf(ctx, o)) !== String(resourceIdOf(ctx, readTarget))) return null;
+        const ownerOk = !victim.user?.id || ownerOf(ctx, o, cand.ownerField) === victim.user.id;
         if (!ownerOk) return null;
         return {
-          note: `响应对象 #${resourceIdOf(o)} 与请求目标一致，归属 ${ownerOf(o)}${victim.user?.id ? "（与受害人身份一致）" : ""}`,
+          note: `响应对象 #${resourceIdOf(ctx, o)} 与请求目标一致，归属 ${ownerOf(ctx, o, cand.ownerField)}${victim.user?.id ? "（与受害人身份一致）" : ""}`,
         };
       },
       impact: (res) => (okStatus(res.status) ? `可读取他人${candLabel}详情及字段（id/userId/amount/address 等）` : null),
@@ -1380,7 +1432,7 @@ export function buildCases(ctx, targets) {
   const primaryRead = readCands[0];
   if (primaryRead && targets.readTarget && attacker && victim) {
     const candLabel = resourceLabelOf(primaryRead.resource ?? ctx.plan?.resource);
-    const targetId = targets.readTarget.id;
+    const targetId = resourceIdOf(ctx, targets.readTarget);
     const variants = [];
     for (const v of foreignObjectVariants(
       targets.victimItems,
@@ -1390,8 +1442,8 @@ export function buildCases(ctx, targets) {
       variants.push({
         axis: "obj",
         label: v.label,
-        targetId: v.item.id,
-        req: candRequest(ctx, primaryRead, v.item.id),
+        targetId: resourceIdOf(ctx, v.item),
+        req: candRequest(ctx, primaryRead, resourceIdOf(ctx, v.item)),
       });
     }
     for (const v of idEncodingVariants(targetId)) {
@@ -1429,20 +1481,20 @@ export function buildCases(ctx, targets) {
         expect: `同一越权入口的变体应被拒绝（401/403/404），补丁不能只挡住基线写法`,
         verify: (res, phase) => {
           const o = extractEntity(res.json, entityPathFor(ctx, primaryRead.graphql));
-          const leaked = o && String(resourceIdOf(o)) === String(v.targetId);
+          const leaked = o && String(resourceIdOf(ctx, o)) === String(v.targetId);
           if (leaked && targets.attackerOwnIds?.has(String(v.targetId))) {
             return { verdict: "inconclusive", actual: `目标 #${v.targetId} 在 attacker 自己的资源列表中，疑似跨端点 id 串号，不计为越权` };
           }
           const detail = leaked
-            ? `证据：变体写法仍返回${candLabel} #${resourceIdOf(o)}（归属 ${ownerOf(o)}），补丁只挡住了部分入口`
+            ? `证据：变体写法仍返回${candLabel} #${resourceIdOf(ctx, o)}（归属 ${ownerOf(ctx, o, primaryRead.ownerField)}），补丁只挡住了部分入口`
             : "";
           return verifyAttack(res, phase, detail, leaked);
         },
         crossProof: (res) => {
           const o = extractEntity(res.json, entityPathFor(ctx, primaryRead.graphql));
-          if (!o || String(resourceIdOf(o)) !== String(v.targetId)) return null;
-          if (victim.user?.id && ownerOf(o) !== victim.user.id) return null;
-          return { note: `变体「${v.label}」命中的对象 #${resourceIdOf(o)} 归属 ${ownerOf(o)}（与受害人一致）` };
+          if (!o || String(resourceIdOf(ctx, o)) !== String(v.targetId)) return null;
+          if (victim.user?.id && ownerOf(ctx, o, primaryRead.ownerField) !== victim.user.id) return null;
+          return { note: `变体「${v.label}」命中的对象 #${resourceIdOf(ctx, o)} 归属 ${ownerOf(ctx, o, primaryRead.ownerField)}（与受害人一致）` };
         },
         impact: (res) =>
           okStatus(res.status) ? `换一种写法即可绕过补丁继续越权读取他人${candLabel}` : null,
@@ -1457,12 +1509,12 @@ export function buildCases(ctx, targets) {
     const suffix = i === 0 ? "" : `-${i + 1}`;
     const multi = cancelCands.length > 1 ? `（${path}）` : "";
     const candLabel = resourceLabelOf(cand.resource ?? ctx.plan?.resource);
-    const req = candRequest(ctx, cand, cancelTarget.id);
+    const req = candRequest(ctx, cand, resourceIdOf(ctx, cancelTarget));
     cases.push({
       id: `attack-cancel-foreign${suffix}`,
       candidateKey: candKey(cand),
       category: CASE_CATEGORY.ATTACK,
-      name: `${attacker.name} 取消 ${victim.name} 的${candLabel} #${cancelTarget.id}${multi}`,
+      name: `${attacker.name} 取消 ${victim.name} 的${candLabel} #${resourceIdOf(ctx, cancelTarget)}${multi}`,
       identity: attacker.name,
       method: req.method ?? cand.method ?? "POST",
       path: req.path,
@@ -1473,16 +1525,16 @@ export function buildCases(ctx, targets) {
       verify: (res, phase) => {
         const o = extractEntity(res.json, entityPathFor(ctx, cand.graphql));
         const changed =
-          o && o.status === "cancelled" && (!victim.user?.id || ownerOf(o) === victim.user.id);
-        const detail = changed ? `证据：${candLabel} #${o.id}（归属 ${ownerOf(o)}）状态已被改为 cancelled` : "";
+          o && o.status === "cancelled" && (!victim.user?.id || ownerOf(ctx, o, cand.ownerField) === victim.user.id);
+        const detail = changed ? `证据：${candLabel} #${resourceIdOf(ctx, o)}（归属 ${ownerOf(ctx, o, cand.ownerField)}）状态已被改为 cancelled` : "";
         return verifyAttack(res, phase, detail, changed);
       },
       crossProof: (res) => {
         const o = extractEntity(res.json, entityPathFor(ctx, cand.graphql));
-        if (!o || o.id !== cancelTarget.id) return null;
-        if (victim.user?.id && ownerOf(o) !== victim.user.id) return null;
+        if (!o || String(resourceIdOf(ctx, o)) !== String(resourceIdOf(ctx, cancelTarget))) return null;
+        if (victim.user?.id && ownerOf(ctx, o, cand.ownerField) !== victim.user.id) return null;
         return {
-          note: `被操对象 #${o.id} 归属 ${ownerOf(o)}${o.status === "cancelled" ? "，状态已变更为 cancelled" : ""}`,
+          note: `被操对象 #${resourceIdOf(ctx, o)} 归属 ${ownerOf(ctx, o, cand.ownerField)}${o.status === "cancelled" ? "，状态已变更为 cancelled" : ""}`,
         };
       },
       impact: (res) => {
@@ -1508,14 +1560,14 @@ export function buildCases(ctx, targets) {
         const arr = extractListItems(res.json, listPathFor(ctx, ctx.plan.adminListEndpoint?.graphql));
         const leaked = arr && arr.length > 0;
         const detail = leaked
-          ? `证据：返回 ${arr.length} 条${label}（归属 ${[...new Set(arr.map((o) => ownerOf(o)))].join(",")}），纵向越权可览全局数据`
+          ? `证据：返回 ${arr.length} 条${label}（归属 ${[...new Set(arr.map((o) => ownerOf(ctx, o)))].join(",")}），纵向越权可览全局数据`
           : "";
         return verifyAttack(res, phase, detail, leaked);
       },
       crossProof: (res) => {
         const arr = extractListItems(res.json, listPathFor(ctx, ctx.plan.adminListEndpoint?.graphql));
         if (!arr || arr.length === 0) return null;
-        const foreign = arr.filter((o) => ownerOf(o) !== victim.user?.id).length;
+        const foreign = arr.filter((o) => ownerOf(ctx, o) !== victim.user?.id).length;
         if (foreign === 0) return null;
         return { note: `普通用户响应含 ${foreign} 条他人${label}（跨归属全局列表）` };
       },
@@ -1536,12 +1588,12 @@ export function buildCases(ctx, targets) {
     const suffix = i === 0 ? "" : `-${i + 1}`;
     const multiText = unauthCands.length > 1 ? ` ${path}` : "";
     const candLabel = resourceLabelOf(cand.resource ?? ctx.plan?.resource);
-    const req = candRequest(ctx, cand, anonTarget.id);
+    const req = candRequest(ctx, cand, resourceIdOf(ctx, anonTarget));
     cases.push({
       id: `attack-anonymous-read${suffix}`,
       candidateKey: candKey(cand),
       category: CASE_CATEGORY.ATTACK,
-      name: `未携带凭证读取${candLabel} #${anonTarget.id}（无鉴权端点${multiText}）`,
+      name: `未携带凭证读取${candLabel} #${resourceIdOf(ctx, anonTarget)}（无鉴权端点${multiText}）`,
       identity: null,
       method: req.method ?? "GET",
       path: req.path,
@@ -1551,20 +1603,20 @@ export function buildCases(ctx, targets) {
       expect: `未认证读取${candLabel}应被拒绝（401/403/404）`,
       verify: (res, phase) => {
         const o = extractEntity(res.json, entityPathFor(ctx, cand.graphql));
-        const leaked = o && String(o.id) === String(anonTarget.id);
+        const leaked = o && String(resourceIdOf(ctx, o)) === String(resourceIdOf(ctx, anonTarget));
         const detail = leaked
-          ? `证据：匿名请求即返回${candLabel} #${o.id}（归属 ${ownerOf(o)}），无需任何认证`
+          ? `证据：匿名请求即返回${candLabel} #${resourceIdOf(ctx, o)}（归属 ${ownerOf(ctx, o, cand.ownerField)}），无需任何认证`
           : "";
         return verifyAttack(res, phase, detail, leaked);
       },
       crossProof: (res) => {
         const o = extractEntity(res.json, entityPathFor(ctx, cand.graphql));
-        if (!o || o.id !== anonTarget.id) return null;
-        return { note: `匿名响应对象 #${o.id} 与请求目标一致，归属 ${ownerOf(o)}` };
+        if (!o || String(resourceIdOf(ctx, o)) !== String(resourceIdOf(ctx, anonTarget))) return null;
+        return { note: `匿名响应对象 #${resourceIdOf(ctx, o)} 与请求目标一致，归属 ${ownerOf(ctx, o, cand.ownerField)}` };
       },
       impact: (res) => {
         const o = extractEntity(res.json, entityPathFor(ctx, cand.graphql));
-        return o && o.id === anonTarget.id ? `未认证即可读取任意${candLabel}详情（认证缺失）` : null;
+        return o && String(resourceIdOf(ctx, o)) === String(resourceIdOf(ctx, anonTarget)) ? `未认证即可读取任意${candLabel}详情（认证缺失）` : null;
       },
     });
   }
@@ -2072,7 +2124,7 @@ export function buildCases(ctx, targets) {
         (o) => o?.status != null && String(o.status).toLowerCase() !== String(requiredFrom).toLowerCase()
       );
       if (!wrong) continue;
-      const req = candRequest(ctx, cand, resourceIdOf(wrong));
+      const req = candRequest(ctx, cand, resourceIdOf(ctx, wrong));
       if (!req?.path) continue;
       const method = req.method ?? cand.method ?? "POST";
       const fromStatus = String(wrong.status);
@@ -2081,7 +2133,7 @@ export function buildCases(ctx, targets) {
         candidateKey: candKey(cand),
         category: CASE_CATEGORY.ATTACK,
         unfixable: true,
-        name: `状态跳步（${routePath} · 要求 ${requiredFrom} · 目标 #${resourceIdOf(wrong)}）`,
+        name: `状态跳步（${routePath} · 要求 ${requiredFrom} · 目标 #${resourceIdOf(ctx, wrong)}）`,
         identity: attacker.name,
         method,
         path: req.path,
@@ -2108,7 +2160,7 @@ export function buildCases(ctx, targets) {
                 identity: attacker.name,
               });
               const items = extractListItems(readRes.json, listPathFor(ctx, bizListReq.graphql)) ?? [];
-              after = items.find((o) => String(resourceIdOf(o)) === String(resourceIdOf(wrong))) ?? null;
+              after = items.find((o) => String(resourceIdOf(ctx, o)) === String(resourceIdOf(ctx, wrong))) ?? null;
             } catch {
               after = null;
             }
@@ -2116,7 +2168,7 @@ export function buildCases(ctx, targets) {
           transition._bizProof = {
             kind: "state",
             action: cand.bizlogic.action,
-            id: resourceIdOf(wrong),
+            id: resourceIdOf(ctx, wrong),
             from: fromStatus,
             to: after?.status != null ? String(after.status) : null,
             requiredFrom,
@@ -2165,7 +2217,7 @@ export function buildCases(ctx, targets) {
     // mode === "race"：同一一次性动作并发提交
     const raceTarget = ownItems.find((o) => String(o.status ?? "").toLowerCase() === "paid") ?? ownItems[0];
     if (!raceTarget) continue;
-    const raceReq = candRequest(ctx, cand, resourceIdOf(raceTarget));
+    const raceReq = candRequest(ctx, cand, resourceIdOf(ctx, raceTarget));
     if (!raceReq?.path) continue;
     const method = raceReq.method ?? cand.method ?? "POST";
     cases.push({
@@ -2173,7 +2225,7 @@ export function buildCases(ctx, targets) {
       candidateKey: candKey(cand),
       category: CASE_CATEGORY.ATTACK,
       unfixable: true,
-      name: `并发双花（${routePath} · ${cand.bizlogic.action} · 目标 #${resourceIdOf(raceTarget)}）`,
+      name: `并发双花（${routePath} · ${cand.bizlogic.action} · 目标 #${resourceIdOf(ctx, raceTarget)}）`,
       identity: attacker.name,
       method: raceReq.method ?? method,
       path: raceReq.path,
@@ -2199,7 +2251,7 @@ export function buildCases(ctx, targets) {
         chosen._bizProof = {
           kind: "race",
           action: cand.bizlogic.action,
-          id: resourceIdOf(raceTarget),
+          id: resourceIdOf(ctx, raceTarget),
           total: RACE_CONCURRENCY,
           successes,
           attempts,
@@ -2417,12 +2469,12 @@ export function buildCases(ctx, targets) {
   // 正向断言：修复不得把「本人可见」一并关掉，也不得靠删字段/返回空壳来伪装「攻击已阻断」。
   // 字段契约以修复前的响应为基线（runPhase 在 pre 阶段记录），修复后缺字段即判回归。
   const ownerReadCase = (id, ident, ownTarget) => {
-    const req = candRequest(ctx, readCands[0], ownTarget.id);
+    const req = candRequest(ctx, readCands[0], resourceIdOf(ctx, ownTarget));
     const entityOf = (res) => extractEntity(res.json, entityPathFor(ctx, readCands[0]?.graphql));
     return {
       id,
       category: CASE_CATEGORY.BUSINESS,
-      name: `${ident.name} 读取自己的${label} #${ownTarget.id}`,
+      name: `${ident.name} 读取自己的${label} #${resourceIdOf(ctx, ownTarget)}`,
       identity: ident.name,
       method: req.method ?? "GET",
       path: req.path,
@@ -2435,12 +2487,12 @@ export function buildCases(ctx, targets) {
         verifyBusiness(res, 200, () => {
           const o = entityOf(res);
           if (!o) return `FAIL:响应缺少${label}对象`;
-          if (String(resourceIdOf(o)) !== String(ownTarget.id)) return `FAIL:返回了错误的${label} #${resourceIdOf(o)}`;
-          if (ownerOf(o) !== ident.user?.id) return `FAIL:${label}归属异常 ${ownerOf(o)}`;
+          if (String(resourceIdOf(ctx, o)) !== String(resourceIdOf(ctx, ownTarget))) return `FAIL:返回了错误的${label} #${resourceIdOf(ctx, o)}`;
+          if (ownerOf(ctx, o) !== ident.user?.id) return `FAIL:${label}归属异常 ${ownerOf(ctx, o)}`;
           const base = ctx._ownerContract?.get(id) ?? [];
           const missing = base.filter((k) => !(k in o));
           if (missing.length) return `FAIL:字段契约缺失 ${missing.join("、")}（不得删减本人可见内容来冒充修复）`;
-          return `返回${label} #${resourceIdOf(o)}，归属 ${ownerOf(o)}，字段 ${Object.keys(o).length} 项`;
+          return `返回${label} #${resourceIdOf(ctx, o)}，归属 ${ownerOf(ctx, o)}，字段 ${Object.keys(o).length} 项`;
         }),
     };
   };
@@ -2471,7 +2523,7 @@ export function buildCases(ctx, targets) {
         verifyBusiness(res, 200, () => {
           const arr = extractListItems(res.json, listPathFor(ctx, ctx.plan.listEndpoint?.graphql));
           if (!arr) return `FAIL:响应中未找到${label}列表`;
-          const foreign = arr.filter((o) => ownerOf(o) !== attacker.user?.id);
+          const foreign = arr.filter((o) => ownerOf(ctx, o) !== attacker.user?.id);
           if (foreign.length > 0) return `FAIL:列表泄露他人${label} ${foreign.map((o) => o.id).join(",")}`;
           return `共 ${arr.length} 条，全部归属 ${attacker.user?.id}`;
         }),
@@ -2480,11 +2532,11 @@ export function buildCases(ctx, targets) {
 
   if (cancelPath && targets.ownCancelTarget && attacker) {
     const c = targets.ownCancelTarget;
-    const ownCancelReq = candRequest(ctx, cancelCands[0], c.id);
+    const ownCancelReq = candRequest(ctx, cancelCands[0], resourceIdOf(ctx, c));
     cases.push({
       id: "business-cancel-own",
       category: CASE_CATEGORY.BUSINESS,
-      name: `${attacker.name} 取消自己的${label} #${c.id}`,
+      name: `${attacker.name} 取消自己的${label} #${resourceIdOf(ctx, c)}`,
       identity: attacker.name,
       method: ownCancelReq.method ?? "POST",
       path: ownCancelReq.path,
@@ -2504,11 +2556,11 @@ export function buildCases(ctx, targets) {
 
   if (cancelPath && targets.ownNotCancellable && attacker) {
     const s = targets.ownNotCancellable;
-    const shippedReq = candRequest(ctx, cancelCands[0], s.id);
+    const shippedReq = candRequest(ctx, cancelCands[0], resourceIdOf(ctx, s));
     cases.push({
       id: "business-shipped-guard",
       category: CASE_CATEGORY.BUSINESS,
-      name: `${attacker.name} 取消已发货${label} #${s.id} 被业务规则拒绝`,
+      name: `${attacker.name} 取消已发货${label} #${resourceIdOf(ctx, s)} 被业务规则拒绝`,
       identity: attacker.name,
       method: shippedReq.method ?? "POST",
       path: shippedReq.path,
@@ -2541,7 +2593,7 @@ export function buildCases(ctx, targets) {
           const arr = extractListItems(res.json, listPathFor(ctx, ctx.plan.adminListEndpoint?.graphql));
           if (!arr) return `FAIL:响应中未找到${label}列表`;
           // 归属读取：列表项无归属字段时（如资源本身即用户），以自身 id 视作独立归属
-          const owners = new Set(arr.map((o) => ownerOf(o) ?? o.id));
+          const owners = new Set(arr.map((o) => ownerOf(ctx, o) ?? o.id));
           if (owners.size < 2) return `FAIL:仅见单一归属（${[...owners].join(",")}）`;
           return `可见 ${arr.length} 条，覆盖 ${owners.size} 个归属`;
         }),
@@ -2550,11 +2602,11 @@ export function buildCases(ctx, targets) {
 
   if (adminCancelPath && admin && targets.adminCancelTarget) {
     const adminTarget = targets.adminCancelTarget;
-    const adminCancelReq = candRequest(ctx, ctx.plan.adminCancelEndpoint, adminTarget.id);
+    const adminCancelReq = candRequest(ctx, ctx.plan.adminCancelEndpoint, resourceIdOf(ctx, adminTarget));
     cases.push({
       id: "business-admin-cancel",
       category: CASE_CATEGORY.BUSINESS,
-      name: `管理员代取消 ${victim.name} 的${label} #${adminTarget.id}`,
+      name: `管理员代取消 ${victim.name} 的${label} #${resourceIdOf(ctx, adminTarget)}`,
       identity: admin.name,
       method: adminCancelReq.method ?? "POST",
       path: adminCancelReq.path,
@@ -2567,7 +2619,7 @@ export function buildCases(ctx, targets) {
           const o = extractEntity(res.json, entityPathFor(ctx, ctx.plan.adminCancelEndpoint?.graphql));
           if (!o) return `FAIL:响应缺少${label}对象`;
           if (o.status !== "cancelled") return `FAIL:状态未变更（${o.status}）`;
-          return `${label} #${o.id}（归属 ${ownerOf(o)}）已由管理员取消`;
+          return `${label} #${o.id}（归属 ${ownerOf(ctx, o)}）已由管理员取消`;
         }),
     });
   }
@@ -2609,7 +2661,7 @@ export function buildCases(ctx, targets) {
   }
 
   if (readPath && own) {
-    const anonReq = candRequest(ctx, readCands[0], own.id);
+    const anonReq = candRequest(ctx, readCands[0], resourceIdOf(ctx, own));
     cases.push({
       id: "business-unauth-401",
       category: CASE_CATEGORY.BUSINESS,
@@ -2673,7 +2725,8 @@ export async function runPhase(ctx, { phase, baseUrl }) {
   await confirmGraphqlEndpoint(ctx, baseUrl, loggedIn);
   await negotiateGraphqlCast(ctx, baseUrl, loggedIn);
   const { byUser, anonymousItems, anonTargets } = await discoverResources(ctx, baseUrl, loggedIn);
-  const targets = pickTargets(byUser, loggedIn, anonymousItems, anonTargets);
+  ctx._resourceById = indexResources(ctx, byUser, anonymousItems);
+  const targets = pickTargets(ctx, byUser, loggedIn, anonymousItems, anonTargets);
   // 身份交叉校验：attacker 与 victim 必须是两个不同用户，否则"越权读他人"用例退化为"读自己"
   if (targets.attacker && targets.victim) {
     const aId = targets.attacker.user?.id;
@@ -2768,12 +2821,17 @@ export async function runPhase(ctx, { phase, baseUrl }) {
     (s) => !allCases.some((c) => c.id === s.prefix || c.id.startsWith(`${s.prefix}-`))
   );
   if (skipped.length > 0) {
+    // 计划里有候选、却因身份/资源/契约不足一条用例都构不出来：这是「没测到」，
+    // 不是「测过没复现」。pre 阶段记下来，由 main 判为 inconclusive（exit 2）。
+    if (phase === "pre") ctx._unverifiedSlots = skipped.map((s) => s.slot);
     ctx.emit({
       kind: "discovery",
       severity: SEVERITY.WARN,
       message: `计划中有 ${skipped.length} 类攻击用例因身份/资源不足被跳过：${skipped.map((s) => s.slot).join("、")}`,
       data: { skipped },
     });
+  } else if (phase === "pre") {
+    ctx._unverifiedSlots = [];
   }
 
   const evidence = [];

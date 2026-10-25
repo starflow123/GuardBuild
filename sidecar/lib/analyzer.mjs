@@ -868,6 +868,9 @@ export async function analyzeProject(ctx) {
         graphql: null,
         source: "routes",
         resource: r.resource ?? guessResource(r.path, ""),
+        ownerField: r.ownerField ?? null,
+        idField: r.idField ?? null,
+        paramBindings: r.params ?? null,
         ...(r.query ? { queryParam: { param: r.query, in: "query" } } : {}),
       });
     }

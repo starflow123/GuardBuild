@@ -59,16 +59,37 @@ const OUTCOME_PRESENTATION = {
   no_candidates: {
     outcome: "no_candidates",
     kind: "coverage",
-    title: "未命中当前覆盖范围",
-    stateLabel: "未命中覆盖范围",
-    hint: "引擎正常结束（exit 0）：项目形态不在当前适配器覆盖内，未产出可探测候选，并非执行失败。",
+    title: "已扫描但未发现可探测候选",
+    stateLabel: "已扫描 · 无安全候选",
+    hint: "已识别出 HTTP 路由，但没有命中任何「静态形状 + 攻击用例」组合（exit 0）：这是覆盖范围的边界，不是「系统安全」的证明。",
+  },
+  no_endpoints: {
+    outcome: "inconclusive",
+    kind: "inconclusive",
+    title: "未识别到 HTTP 路由（无法证明）",
+    stateLabel: "未识别路由 · 无法证明",
+    hint: "引擎一条路由都没识别出来（exit 2）：既不能确认系统被覆盖，也不能据此判定安全。请在 guardbuild.json 用 routes / openapi.file / listEndpoint 声明接口，或开启接入侦察。",
+  },
+  attack_inconclusive: {
+    outcome: "inconclusive",
+    kind: "inconclusive",
+    title: "证据不足（无法证明）",
+    stateLabel: "攻击用例未跑全 · 无法证明",
+    hint: "计划中的攻击用例因身份/资源/契约不足被跳过（exit 2）：本轮既没有复现漏洞，也没有把它们真正测到。补齐身份、可读资源与契约（listEndpoint / responses / routes[].params）后重跑。",
+  },
+  plan_incomplete: {
+    outcome: "inconclusive",
+    kind: "inconclusive",
+    title: "候选端点无法构造探测请求（无法证明）",
+    stateLabel: "无法构造探测请求 · 无法证明",
+    hint: "已识别出候选，但没有一个能构造出可寻址请求（exit 2）：多段路径需要 routes[].params 给每个参数声明取值来源，否则引擎不会猜。补齐契约后重跑；本轮没有真正打到目标，不能据此判定安全。",
   },
   attack_not_reproducible: {
     outcome: "not_reproducible",
     kind: "clean",
-    title: "未发现可复现漏洞",
-    stateLabel: "未发现可复现漏洞",
-    hint: "静态有候选，但攻击在真实运行实例上打不通（exit 0）：可能已有运行期防护，未建立漏洞基线。",
+    title: "已测用例未复现（不等于安全）",
+    stateLabel: "已测未复现 · 未证明安全",
+    hint: "静态有候选，但本轮实际发出的攻击在运行实例上都没有复现（exit 0）。这只说明已测用例打不通（可能已有运行期防护），不构成「系统安全」的证明。",
   },
   no_patchable_candidates: {
     outcome: "vulnerable_unfixed",
@@ -94,12 +115,20 @@ const OUTCOME_PRESENTATION = {
 };
 
 /**
- * 会话错误码 → 终态呈现。gate 的 verdict 与 exit code 语义不变：
- * failed→2、vulnerable_unfixed→1、其余→0。
+ * 会话错误码 → 终态呈现。gate 的 verdict 与 exit code 语义：
+ * vulnerable_unfixed→1、failed / inconclusive→2、其余→0。
+ * inconclusive 与 failed 同为 2，但文案区分「没测到」与「跑挂了」。
  */
 export function describeOutcome(code) {
-  const pres = OUTCOME_PRESENTATION[code === "no_candidates" ? "no_candidates" : code] ?? OUTCOME_PRESENTATION.failed;
-  const exitCode = pres.outcome === "failed" ? 2 : pres.outcome === "vulnerable_unfixed" ? 1 : 0;
-  const severity = pres.kind === "failed" || pres.kind === "blocked" ? "error" : "warn";
+  const pres = OUTCOME_PRESENTATION[code] ?? OUTCOME_PRESENTATION.failed;
+  const exitCode =
+    pres.outcome === "failed"
+      ? 2
+      : pres.outcome === "inconclusive"
+        ? 2
+        : pres.outcome === "vulnerable_unfixed"
+          ? 1
+          : 0;
+  const severity = exitCode === 0 ? "warn" : "error";
   return { ...pres, exitCode, severity };
 }

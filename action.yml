@@ -1,5 +1,5 @@
 name: 'GuardBuild Gate'
-description: '漏洞发现→复现→隔离修复→双重验收的 CI 门禁。退出码约定：0=无漏洞证据（no_candidates / not_reproducible）；1=漏洞证据成立（附已验证补丁与报告）；2=执行失败。gate 模式结构性禁止写回，不修改被测工作区。'
+description: '漏洞发现→复现→隔离修复→双重验收的 CI 门禁。退出码约定：0=已测未复现（no_candidates / not_reproducible，不等于安全）；1=漏洞证据成立（附已验证补丁与报告）；2=无法证明覆盖（inconclusive）或执行失败。gate 模式结构性禁止写回，不修改被测工作区。'
 author: 'GuardBuild'
 branding:
   icon: 'shield'
@@ -29,7 +29,7 @@ inputs:
 
 outputs:
   verdict:
-    description: '裁决：vulnerable / no_candidates / not_reproducible / failed / aborted / timeout'
+    description: '裁决：vulnerable / vulnerable_unfixed / no_candidates / not_reproducible / inconclusive（no_endpoints / attack_inconclusive / plan_incomplete）/ failed / aborted / timeout'
     value: ${{ steps.gate.outputs.verdict }}
   exit-code:
     description: 'gate 退出码（0/1/2）'

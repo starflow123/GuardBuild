@@ -1,0 +1,44 @@
+{
+  "_note": "契约驱动靶场：路由由运行期分发表拼出（静态找不到 decl 形态），响应字段是 order_id / created_by_uid，列表接口要求 page+limit，且对象端点带两段路径参数。用来验证 guardbuild.json 的 responses / listEndpoint / routes[].params 能把这类项目接入动态探测。GB_CONTRACT_HARDENED=1 时加归属校验（用于验证 exit 0）。",
+  "start": {
+    "cmd": "node",
+    "args": ["server.js"],
+    "env": { "PORT": "0" },
+    "readyPattern": "已就绪",
+    "readyTimeoutMs": 20000
+  },
+  "login": {
+    "path": "/v1/session",
+    "bodyTemplate": { "username": "{username}", "password": "{password}" },
+    "credentialPath": "token"
+  },
+  "identities": [
+    { "name": "alice", "username": "alice", "password": "alice123", "role": "user" },
+    { "name": "bob", "username": "bob", "password": "bob123", "role": "user" }
+  ],
+  "responses": {
+    "list": "payload.rows",
+    "entity": "record",
+    "id": "order_id",
+    "owner": "created_by_uid"
+  },
+  "listEndpoint": {
+    "method": "GET",
+    "path": "/v2/orders/paged",
+    "query": { "page": "1", "limit": "50" },
+    "resource": "order"
+  },
+  "routes": [
+    {
+      "method": "GET",
+      "path": "/v1/orgs/:orgId/orders/:orderId",
+      "hasAuth": true,
+      "resource": "order",
+      "ownerField": "created_by_uid",
+      "idField": "order_id",
+      "params": { "orgId": "org_id", "orderId": "order_id" }
+    }
+  ],
+  "llm": { "enabled": false },
+  "scopes": ["project.read", "worktree.write", "proc.spawn", "net.probe"]
+}

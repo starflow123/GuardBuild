@@ -65,7 +65,7 @@ const PATCH_STATUS_LABELS = {
   rolled_back: "已回滚（工作区恢复写回前）",
 };
 
-function headline(outcome, patchStatus, supabase, blackbox = null) {
+function headline(outcome, patchStatus, supabase, blackbox = null, errorCode = null) {
   if (blackbox) {
     if (outcome === "vulnerable_unfixed") {
       return `黑盒外部扫描发现 ${blackbox.findings?.length ?? 0} 个可利用漏洞（证据来自对运行实例的外部请求）`;
@@ -96,7 +96,15 @@ function headline(outcome, patchStatus, supabase, blackbox = null) {
       }
       return "发现可利用的对象级越权（IDOR）漏洞，已生成双重验收通过的修复补丁（gate 未写回工作区）";
     case "no_candidates":
-      return "未命中当前覆盖范围（exit 0，非执行失败）：静态分析未发现可探测的安全候选端点。项目形态不在适配器覆盖内时属正常结果；未识别框架可在 guardbuild.json 用 routes / openapi.file 声明路由，或开启 llm.enabled 做接入侦察";
+      return "已识别出 HTTP 路由，但未发现可探测候选（exit 0，覆盖边界而非安全结论）：候选需要「静态形状 + 攻击用例」同时命中；可在 guardbuild.json 用 routes / openapi.file 声明接口，或开启 llm.enabled 做接入侦察";
+    case "inconclusive":
+      if (errorCode === "no_endpoints") {
+        return "未识别到任何 HTTP 路由（exit 2，无法证明）：引擎无法确认被测系统已被覆盖，本轮结论不能当作安全";
+      }
+      if (errorCode === "plan_incomplete") {
+        return "候选端点无法构造探测请求（exit 2，无法证明）：多段路径缺少参数取值来源，本轮没有真正打到目标";
+      }
+      return "攻击用例未跑全（exit 2，无法证明）：计划中的用例因身份 / 资源 / 运行期契约不足被跳过，本轮既没有复现漏洞，也没有真正测到它们";
     case "vulnerable_unfixed":
       if (supaCritical) {
         return supabase.leaks > 0
@@ -108,7 +116,7 @@ function headline(outcome, patchStatus, supabase, blackbox = null) {
       if (supabase && !supaCritical) {
         return "存在 Supabase 线索，但匿名探测未读出数据（RLS 已生效）且未见 service_role 暴露（可能已有防护）";
       }
-      return "存在静态候选，但攻击在运行期不可复现（可能已有运行期防护）";
+      return "已测用例在运行实例上未复现（exit 0，不等于安全）：可能已有运行期防护，但只代表本轮发出的攻击打不通，未覆盖到的攻击面仍未知";
     case "failed":
       return "诊断执行失败，未能完成漏洞验证闭环";
     case "aborted":
@@ -205,11 +213,27 @@ function suggestions(r) {
     lines.push("- 补丁未通过双重验收（存在未阻断攻击或业务回归），请对照 post 证据中的 regressed/inconclusive 用例人工审查。");
     lines.push(`- 补丁保留在隔离 worktree：\`${r.patch?.worktree}\`。`);
   } else if (outcome === "no_candidates") {
-    lines.push("- 这是 exit 0 的正常终态（未命中覆盖范围），不是执行失败：引擎完成了源码扫描，只是没识别出可探测的对象级接口。");
+    lines.push("- 这是 exit 0 的覆盖边界说明，既不是执行失败，也不是「系统安全」的结论：引擎完成了源码扫描与路由识别，但没有候选同时命中「静态形状 + 攻击用例」。");
     lines.push(`- ${coverageSummary()}`);
     lines.push(
       "- 让这类项目进入检测：在 guardbuild.json 用 `routes` 或 `openapi.file` 显式声明路由；未知框架可开启 `llm.enabled` 做接入侦察；纯前端 + 托管后端（如 Supabase）请核对 `identities` 与登录契约。"
     );
+  } else if (outcome === "inconclusive") {
+    if (r.error?.code === "no_endpoints") {
+      lines.push("- 本轮**无法证明**被测系统已被覆盖（exit 2）：引擎没有识别出任何 HTTP 路由，因此一条攻击请求都没有发出。");
+      lines.push("- 补齐入口后重跑：`routes`（对象级接口同时给 `params` 绑定）或 `openapi.file`；资源发现可另配 `listEndpoint`；未知框架可开启 `llm.enabled` 做接入侦察。");
+    } else if (r.error?.code === "plan_incomplete") {
+      lines.push("- 本轮**无法证明**被测系统已测到位（exit 2）：候选端点存在，但没有能构造出可寻址请求的接口，引擎没有发出攻击。");
+      lines.push(
+        "- 多段路径（如 `/orgs/:orgId/orders/:orderId`）必须在 `routes[].params` 给每个参数声明取值来源（字段名简写 / `{\"from\":\"item\",\"field\":\"org_id\"}` / `{\"from\":\"const\",\"value\":\"v2\"}`）；单参数接口确认路径里有 `:param` 或声明了 `query`。"
+      );
+    } else {
+      lines.push("- 本轮**无法证明**被测系统已测到位（exit 2）：计划中的攻击用例因身份 / 可读资源 / 运行期契约不足被跳过，未真正执行。");
+      lines.push(
+        "- 按跳过原因补齐：`identities` 至少两个不同用户、可读资源列表（`listEndpoint` 连同分页 / 过滤 `query`）、响应字段（`responses.id` / `responses.owner`）、多参数路由绑定（`routes[].params`），然后重跑。"
+      );
+    }
+    lines.push(`- 覆盖口径：${coverageSummary()}`);
   } else if (outcome === "vulnerable_unfixed") {
     if (supabase && ((supabase.leaks ?? 0) > 0 || supabase.serviceRoleLeak)) {
       if ((supabase.leaks ?? 0) > 0) {
@@ -234,7 +258,8 @@ function suggestions(r) {
     if (supabase) {
       lines.push("- Supabase 匿名探测未读出数据（RLS 生效或表为空），未见 service_role 暴露；如仍有顾虑，请在数据库侧核对 RLS 策略与密钥管理。");
     } else {
-      lines.push("- 攻击在修复前即不可复现，未建立漏洞基线；请核对 guardbuild.json 的身份契约与目标的资源发现接口。");
+      lines.push("- 已测用例未复现，但这不是「系统安全」的证明：只说明本轮发出的攻击在运行实例上打不通（可能已有运行期防护），未覆盖的攻击面仍未知。");
+      lines.push("- 如怀疑存在未测到的入口，请核对 guardbuild.json 的身份契约、可读资源接口（`listEndpoint`）与响应字段（`responses`）。");
     }
   } else if (outcome === "failed") {
     lines.push(`- 执行失败（${r.error?.code}）：${r.error?.message ?? ""}${r.error?.hint ? `；建议：${r.error.hint}` : ""}`);
@@ -639,7 +664,7 @@ function renderMarkdown(r) {
       ...(bb ? [`| 扫描目标 | \`${esc(bb.url)}\` |`] : []),
       `| 会话 | ${esc(r.session.id)} |`,
       `| 终态 | ${esc(r.session.stateLabel)}（${esc(r.session.state)}） |`,
-      `| 退出码 | ${r.verdict.exitCode}（0=无漏洞证据 / 1=漏洞证据成立 / 2=执行失败） |`,
+      `| 退出码 | ${r.verdict.exitCode}（0=已测未复现 / 1=漏洞证据成立 / 2=无法证明或执行失败） |`,
       `| 模式 | ${bb ? "纯黑盒外部扫描（不读源码 / 不启动目标 / 不生成补丁）" : r.tool.gate ? "CI gate（策略授权，禁止写回）" : "交互会话"} |`,
       ...(r.targets?.docker?.enabled
         ? [
@@ -952,7 +977,7 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
       outcome,
       exitCode,
       patchStatus,
-      headline: headline(outcome, patchStatus, supabase, blackbox),
+      headline: headline(outcome, patchStatus, supabase, blackbox, error?.code ?? null),
     },
     summary: {
       findingCount: (view.findings ?? []).length,

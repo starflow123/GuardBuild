@@ -113,7 +113,25 @@ npm run test:rust      # Rust Host
     "bodyTemplate": { "email": "{email}", "password": "{password}" },
     "credentialPath": "authentication.token"
   },
-  "responses": { "list": "data.items", "entity": "data.order" },
+  "responses": {
+    "list": "data.items",
+    "entity": "data.order",
+    "id": "order_id",
+    "owner": "created_by_uid"
+  },
+  "listEndpoint": {
+    "method": "GET",
+    "path": "/api/orders",
+    "query": { "page": "1", "limit": "50" },
+    "resource": "order"
+  },
+  "routes": [
+    {
+      "method": "GET",
+      "path": "/api/orgs/:orgId/orders/:orderId",
+      "params": { "orgId": "org_id", "orderId": "order_id" }
+    }
+  ],
   "identities": [
     { "name": "alice", "email": "alice@example.com", "password": "alice123", "role": "user" },
     { "name": "admin", "email": "admin@example.com", "password": "admin123", "role": "admin" }
@@ -129,7 +147,9 @@ npm run test:rust      # Rust Host
 - `start`：就绪以 `readyPattern` 在 stdout 出现为准（解析前先剥 ANSI 色码，依次识别行内 JSON `port` → `host:port` → 「端口 NNNN」/ `listening on port NNNN` 文本形状）。端口两种写法任选：`env.PORT=0` 让服务自选端口（要求服务把真实端口打进就绪行）；硬编码端口或打印字面量的服务改用 **`${GB_PORT}` 槽位**——宿主每次 spawn 前分配一个空闲端口注入，`cmd` / `args` / `env` 均可使用（修复阶段会先停止原始实例，验收实例与原始实例不再争用端口）
 - `prepare`：目标启动前按序执行的前置命令（安装依赖 / 构建），`cwd` 相对项目根；在「原始工作区」与「隔离 worktree」各执行一次——修复阶段的验收不依赖原工作区的构建产物
 - `login`：登录契约——`path` 指定登录端点（优先级高于静态分析候选）；`bodyTemplate` 适配非 `username` 的请求体形状，值支持 `{name}` / `{username}` / `{email}` / `{password}` 占位符；`credentialPath` 支持点路径（如 `authentication.token`），`credentialHeader` / `credentialPrefix` 缺省为 `Authorization` / `Bearer `；`encoding: "form"` 以 `application/x-www-form-urlencoded` 提交；`cookieAuth: true` 表示会话鉴权——登录响应可返回 3xx，`Set-Cookie` 由 Host 收进保险库并在后续请求以 `Cookie` 头注入（`credentialPath` 不填），Cookie 明文不会回到 Sidecar/报告
-- `responses`：声明列表 / 单体资源在响应 JSON 中的位置（点路径，如 `data.items`）；不声明时自适应——列表找「顶层数组 → 首个含 `id` 的对象数组」，单体找「首个对象值字段 → 响应自身」；资源名参与用例文案（`order` 显示为「订单」）
+- `responses`：声明列表 / 单体资源在响应 JSON 中的位置（点路径，如 `data.items`），以及资源主键与归属字段（`id` / `owner`，同样支持点路径）；不声明时自适应——列表找「顶层数组 → 首个含 `id` 的对象数组」，单体找「首个对象值字段 → 响应自身」，主键按 `id` / `resourceId` / `userId` / `user_id`、归属按 `ownerId` / `user_id` / `created_by` 等常见键推断；资源名参与用例文案（`order` 显示为「订单」）
+- `listEndpoint`：显式声明「按归属过滤的资源列表接口」（`method` / `path` / `query` / `resource`），优先于静态推断。用于列表路径静态认不出、或服务端强制要求分页 / 过滤查询参数（缺参数直接 400）的项目；`query` 的值会随发现请求一起发送
+- `routes`：补充静态分析看不到的接口（手写分发表、动态注册）；对象级路由可声明 `idField` / `ownerField`（按路由覆盖 `responses`），多段路径（`/orgs/:orgId/orders/:orderId`）用 `params` 给每个参数声明取值来源：字段名简写（取资源对象同名字段）、`{ "from": "item", "field": "org_id" }` 或 `{ "from": "const", "value": "v2" }`。参数未绑定全的候选会被判为不可寻址，报告按「无法构造探测请求」exit 2 处理，而不是静默跳过
 - `identities`：支持 `username` / `email` / 自定义 `fields` 三种形状；至少 2 个，否则回退到内置演示身份；`role: "admin"` 的身份用于管理端用例
 - `scopes`：仅 CI gate 模式读取，作为「预声明授权」白名单；桌面模式不生效（仍逐次征求用户授权）
 - `llm`：可选 LLM 开关——接入侦察（`enabled` / `model` / `maxFiles`）与编码代理补丁（`patch` / `autoVerify` / `patchMaxFiles` / `patchToolRounds`），默认全关；启用与安全边界见下两节
@@ -141,6 +161,9 @@ npm run test:rust      # Rust Host
 - 服务依赖构建产物（`tsc` / 打包）→ 把构建命令放进 `prepare`，gate 与桌面模式都会在启动前执行，无需手工预生成
 - 登录不是 `/api/login`、不是 `{username, password}`、token 不在顶层 → 用 `login` 契约显式声明；引擎先后尝试「契约声明 → 静态分析候选 → `/api/login`」，成功后固化优先级
 - 列表 / 单体不在响应顶层（如 `{ "code": 0, "data": { "items": [] } }`）→ 用 `responses` 契约声明 `list` / `entity` 点路径；不声明时靠自适应探测，形状歧义（多个对象数组）时建议显式声明
+- 资源主键 / 归属字段不叫 `id` / `ownerId`（如 `order_id` / `created_by_uid`）→ `responses.id` / `responses.owner`，或按路由用 `routes[].idField` / `ownerField` 覆盖；声明后归属比对与越权取证都按这些字段读
+- 列表接口需要分页 / 过滤参数才返回数据（缺参数直接 400）→ 用 `listEndpoint` 声明端点并把 `query` 参数一并给出；静态推断出的列表端点优先级低于它
+- 路由是手写分发表 / 正则（静态适配器认不出），或多段路径参数（`/orgs/:orgId/orders/:orderId`）→ 用 `routes` 显式声明，多段路径给 `params` 绑定取值来源；这类项目缺声明时终态是「未识别路由 / 无法构造探测请求」（exit 2），不会被伪装成「已测无问题」
 - 登录失败会给出归因：凭据错误（401/403）、端点不存在（404/405）、服务端异常（5xx），并提示检查契约对应字段
 - Windows 上 `npm` / `npx` 等 `.cmd` shim 自动解析（沿 `PATH` × `PATHEXT` 查找），契约里直接写 `npm` / `npx` 即可
 - 服务硬编码端口、启动脚本不支持 `PORT=0`、或就绪行只打印字面量端口 → 契约改用 `${GB_PORT}` 槽位（宿主分配空闲端口注入，解析不到就绪端口时直接回退到分配值）
@@ -312,12 +335,13 @@ guardbuild-headless --url https://staging.example.com --project ./my-project --g
 
 | 退出码 | verdict | 含义 |
 | --- | --- | --- |
-| 0 | `no_candidates` / `not_reproducible` | 无漏洞证据 |
+| 0 | `no_candidates` / `not_reproducible` | 已测未复现：完成了扫描与路由识别但没有可探测候选，或攻击在真实实例上打不通——**不等于系统安全** |
 | 1 | `vulnerable`（附已验证补丁）/ `vulnerable_unfixed` | 漏洞证据成立：`patchStatus: verified`（通过双重验收）、`verify_failed`（修复未通过验收，附证据），或 `vulnerable_unfixed`（攻击已复现但候选无可自动修复端点，需人工修复） |
-| 2 | `failed` / `aborted` / `timeout` | 执行失败（契约 / 环境 / 内部错误 / 超时 / 中断） |
+| 2 | `inconclusive`（`no_endpoints` / `attack_inconclusive` / `plan_incomplete`）/ `failed` / `aborted` / `timeout` | 无法证明覆盖（未识别到路由 / 攻击用例未跑全 / 候选无法构造探测请求），或执行失败（契约 / 环境 / 内部错误 / 超时 / 中断） |
 
 - 输出：`verdict`、`exit-code`、`patch-hash`；报告目录含 `report.json`、`report.md`、`gate.json`（GB_GATE 裁决行）、`gate.log`
-- **exit 0 / 1 都是完成取证的正常终态**：`no_candidates` 表示项目形态未命中当前覆盖范围（已覆盖的漏洞类别与框架形态、以及暂无适配器的形态由 `sidecar/lib/coverage.mjs` 统一给出，并写进报告「结论与建议」），`not_reproducible` 表示静态有候选但攻击在真实实例上打不通；两者都**不是执行失败**，桌面界面按中性提示渲染（状态标签分别为「未命中覆盖范围」「未发现可复现漏洞」），内部仍记为 error 终态以便会话槽位释放与 gate 判定
+- **exit 0 / 1 都是完成取证的正常终态**：`no_candidates` 表示已识别出 HTTP 路由但没有候选同时命中「静态形状 + 攻击用例」（覆盖边界，由 `sidecar/lib/coverage.mjs` 统一给出并写进报告「结论与建议」），`not_reproducible` 表示静态有候选但攻击在真实实例上打不通；两者都**不是执行失败**，桌面界面按中性提示渲染（状态标签分别为「已扫描 · 无安全候选」「已测未复现 · 未证明安全」），报告文案明确写出「不等于安全」
+- **「没测到」不放行**：未识别到任何路由（`no_endpoints`）、计划中的用例因身份 / 资源 / 运行期契约不足被跳过（`attack_inconclusive`）、候选端点缺少可寻址参数（`plan_incomplete`）都归为 `inconclusive`，退出码 **2**——引擎无法证明覆盖，就不当作安全结论；补齐 `routes` / `openapi.file` / `identities` / `listEndpoint` / `responses` / `routes[].params` 后重跑
 - **写回预检被拒也不是执行失败**：授权写回时若原工作区已变化，Host 在 `git apply --check` 阶段原子拒绝（先预检后落盘，不会写到一半）。Sidecar 把 Host 的 JSON-RPC 数字码归一为符号码 `conflict`，界面呈现「补丁未写回 · 工作区已变化」而非「执行出错」，报告明确写出原文件未被修改、补丁仍在隔离 worktree，并给出「按当前代码重跑会话」与「自行合并报告中的 Diff」两条落地路径
 - gate 语义：无人工交互；作用域仅按 `guardbuild.json.scopes` 预声明签发（审批留痕 `via: gate-policy`）；`workspace.write` 被结构性禁止，**不修改被测工作区**，只输出已验证补丁供人工应用
 

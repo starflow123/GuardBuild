@@ -68,6 +68,7 @@ GuardBuild 是一个面向 Vibe Coding 开发者的本地安全 Agent：先启�
 - Node.js ≥ 22.5（`node:sqlite`）、Rust stable；桌面模式需 Tauri 2 平台依赖。
 - 目标项目能按 `guardbuild.json` 启动（或自行启动后用黑盒 `--url`）。
 - 跨用户越权需要 **≥2 个普通测试身份**，纵向越权需要管理身份；工具**不创建用户**。
+- 运行期形态静态看不见时要用契约补齐：响应包装与主键/归属字段（`responses.list/entity/id/owner`）、需要分页或过滤参数才返回数据的列表接口（`listEndpoint` + `query`）、静态认不出的路由与多段路径参数（`routes` + `params`）。缺这些不会静默跳过，而是判 `inconclusive`（exit 2）。
 - 建议用 `prepare` 步骤跑幂等种子脚本准备数据。
 - 验证码 / MFA / SSO 需要先绕过或提供测试通道，当前不自动处理。
 
@@ -90,11 +91,13 @@ GuardBuild 是一个面向 Vibe Coding 开发者的本地安全 Agent：先启�
 
 | 退出码 | verdict | 含义 |
 | --- | --- | --- |
-| 0 | `no_candidates` / `not_reproducible` | 未命中覆盖范围，或攻击在真实实例上打不通——**不是执行失败** |
+| 0 | `no_candidates` / `not_reproducible` | 已扫描但无可探测候选，或攻击在真实实例上打不通——**不是执行失败，也不是「系统安全」的证明** |
 | 1 | `vulnerable_unfixed` / `patchStatus=verified` / `verify_failed` | 漏洞证据成立（附补丁或人工修复指引） |
-| 2 | `failed` / `aborted` / `timeout` | 契约、环境、内部错误、超时或中断 |
+| 2 | `inconclusive`（`no_endpoints` / `attack_inconclusive` / `plan_incomplete`）/ `failed` / `aborted` / `timeout` | 无法证明覆盖，或契约、环境、内部错误、超时、中断 |
 
-`no_candidates` 在桌面界面显示为「未命中覆盖范围」并列出支持清单，不按错误渲染。
+- `no_candidates`（exit 0）：路由已识别，但没有候选同时命中「静态形状 + 攻击用例」，界面显示「已扫描 · 无安全候选」并列出支持清单。
+- `not_reproducible`（exit 0）：静态有线索、攻击已发出但打不通，显示「已测未复现 · 未证明安全」。
+- `inconclusive`（exit 2）：**没测到 ≠ 安全**。未识别到任何路由（`no_endpoints`）、计划用例因身份 / 资源 / 运行期契约不足被跳过（`attack_inconclusive`）、候选端点缺少可寻址参数（`plan_incomplete`）都归这一档，门禁不放行，报告给出对应的契约补齐字段。
 
 ## 精度口径
 
@@ -126,10 +129,10 @@ GuardBuild 是一个面向 Vibe Coding 开发者的本地安全 Agent：先启�
 ### 常见问答
 
 **问：能保证扫出所有漏洞吗？**
-不能。它只对已覆盖的类别和形态给出「有证据」或「未命中」两种诚实结论；未命中不等于安全。
+不能。它只对已覆盖的类别和形态给出「有证据」「已测未复现」两种诚实结论，测不到的部分单独记「无法证明」（exit 2）；「已测未复现」与「未命中」都不等于安全。
 
 **问：为什么有些项目没有发现？**
-先看终态：`no_candidates` 表示形态未命中适配器；`not_reproducible` 表示静态有线索但运行期打不通。两者都是正常结束（exit 0），不是工具坏了。
+先看终态：`no_candidates`（exit 0）表示已识别路由但无可探测候选；`not_reproducible`（exit 0）表示静态有线索但运行期打不通——两者都不是工具坏了，但也都**不等于安全**。若项目形态根本测不了（未识别到路由、用例因契约不足被跳过、多段路径没有参数来源），终态是 `inconclusive`（exit 2），门禁不放行；此时按报告建议补 `routes` / `openapi.file` / `identities` / `listEndpoint` / `responses` / `routes[].params` 后重跑。
 
 **问：能直接改我的代码吗？**
 默认不能。补丁只在临时 worktree 生成；写回需要用户在桌面端审阅 Diff 后授权，gate/CI 结构性禁止。

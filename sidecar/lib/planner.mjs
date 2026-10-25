@@ -38,8 +38,8 @@ export function candKey(c) {
   return c.graphql ? `${base} ${c.graphql.root}.${c.graphql.field}` : base;
 }
 
-/** 由静态分析结果构建探测计划；loginPathOverride 来自契约（优先级最高） */
-export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
+/** 由静态分析结果构建探测计划；loginPathOverride / contract 来自守卫契约（优先级最高） */
+export function buildProbePlan(analysis, { loginPathOverride = null, contract = null } = {}) {
   const eps = analysis.endpoints;
   const candidates = analysis.candidates;
   const graphql = analysis.graphql ?? null;
@@ -71,9 +71,22 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
     }
     return out;
   };
-  // 可寻址：REST 的单个 :param / 查询参数形态、tRPC 的标量输入字段、GraphQL 的单标量 ID 参数
+  // 可寻址：REST 的单个 :param / 查询参数形态、tRPC 的标量输入字段、GraphQL 的单标量 ID 参数。
+  // 多段路径（/orgs/:orgId/orders/:orderId）只有在契约把每个参数都声明了取值来源时才可寻址，
+  // 否则没有第二个参数的真实取值，只能诚实跳过而不是猜。
+  const paramNames = (c) =>
+    String(epPath(c) ?? "")
+      .match(/:([A-Za-z_]\w*)/g)
+      ?.map((s) => s.slice(1)) ?? [];
+  const pathAddressable = (c) => {
+    const names = paramNames(c);
+    if (names.length === 0) return false;
+    if (names.length === 1) return true;
+    const bindings = c.paramBindings;
+    return !!bindings && names.every((n) => bindings[n]);
+  };
   const addressable = (c) =>
-    paramCount(epPath(c)) === 1 || !!c.queryParam || !!c.trpc?.addressable || !!c.graphql?.addressable;
+    pathAddressable(c) || !!c.queryParam || !!c.trpc?.addressable || !!c.graphql?.addressable;
   // 读语义：REST/tRPC 走 GET；GraphQL 的 query 过程（传输层仍是 POST）
   const readShaped = (c) => c.method === "GET" || c.graphql?.op === "query";
   const trpcProcLast = (c) => String(c.trpc?.procPath ?? "").split(".").pop() ?? "";
@@ -119,6 +132,7 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
     uploadCandidate?.resource ??
     jwtCandidate?.resource ??
     bizlogicCandidate?.resource ??
+    contract?.listEndpoint?.resource ??
     "resource";
 
   // 列表/管理端点优先选择与资源名匹配的路径（避免把别的资源列表当作探测目标）
@@ -138,6 +152,15 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
       !/admin/i.test(e.graphql?.field ?? "")
   );
   const list = byResource(listFields);
+  // 契约显式声明的列表端点优先（静态找不到按归属过滤的列表接口时，靠它做资源发现与分页参数）
+  const listEndpointOverride = contract?.listEndpoint
+    ? {
+        path: contract.listEndpoint.path,
+        method: contract.listEndpoint.method ?? "GET",
+        graphql: null,
+        query: contract.listEndpoint.query ?? null,
+      }
+    : null;
   const adminFields = eps.filter(
     (e) =>
       ((e.method === "GET" && /admin/i.test(epPath(e) ?? "")) ||
@@ -190,7 +213,7 @@ export function buildProbePlan(analysis, { loginPathOverride = null } = {}) {
     uploadCandidates,
     jwtCandidates,
     bizlogicCandidates,
-    listEndpoint: epSlot(list),
+    listEndpoint: listEndpointOverride ?? epSlot(list),
     adminListEndpoint: epSlot(adminList),
     adminCancelEndpoint: epSlot(adminCancel),
     candidates,

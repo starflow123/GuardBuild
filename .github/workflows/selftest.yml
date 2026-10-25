@@ -83,6 +83,9 @@ jobs:
       - name: GraphQL 适配器 E2E（SDL 字段级越权 + 两种拒绝语义流派 + 内省降级）
         run: node scripts/e2e-graphql.mjs
 
+      - name: 契约扩展 E2E（静态看不见的路由 + responses/listEndpoint/多参数绑定 + inconclusive 终态）
+        run: node scripts/e2e-contract.mjs
+
       - name: Python 适配器 E2E（FastAPI 真实 uvicorn + 越权/匿名/修复三分支）
         run: node scripts/e2e-python.mjs
 

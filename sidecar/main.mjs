@@ -1136,9 +1136,19 @@ async function stageAnalyze(ctx) {
     const scanned = `已扫描 ${d.scannedFiles ?? 0} 个源文件（项目共 ${d.candidateFiles ?? 0} 个候选源文件${
       d.outputDirFiles > 0 ? `，其中产物目录 ${d.outputDirFiles} 个` : ""
     }${d.readFailures > 0 ? `，读取失败 ${d.readFailures} 个` : ""}）`;
-    throw new SessionError(`${scanned}，未发现可探测的安全候选（未命中当前覆盖范围，非执行失败）`, {
+    const endpointCount = (ctx.analysis.endpoints ?? []).length;
+    if (endpointCount === 0) {
+      // 一条路由都没识别出来 = 引擎没看清这个系统的 HTTP 面，不能当作「扫描通过」。
+      throw new SessionError(`${scanned}，未识别出任何 HTTP 路由（无法证明被测系统已被覆盖）`, {
+        code: "no_endpoints",
+        hint: `${coverageSummary()} 请在 guardbuild.json 用 routes / openapi.file 声明路由，或开启 llm.enabled 让接入侦察补齐；确认是本机可访问的 HTTP 服务后再跑 gate。`,
+        details: { scannedFiles: d.scannedFiles ?? 0, endpointCount: 0 },
+      });
+    }
+    throw new SessionError(`${scanned}，已识别 ${endpointCount} 条路由但未发现可探测的安全候选`, {
       code: "no_candidates",
       hint: `${coverageSummary()} 想让这类项目进入检测：在 guardbuild.json 用 routes / openapi.file 声明路由，或开启 llm.enabled 做接入侦察。`,
+      details: { endpointCount },
     });
   }
 
@@ -1155,7 +1165,10 @@ async function stageAnalyze(ctx) {
     };
   }
 
-  ctx.plan = buildProbePlan(ctx.analysis, { loginPathOverride: ctx.loginConfig?.path ?? null });
+  ctx.plan = buildProbePlan(ctx.analysis, {
+    loginPathOverride: ctx.loginConfig?.path ?? null,
+    contract: ctx.targetConfig ?? null,
+  });
   const supaProbeable = ctx.plan.supabase?.probeable === true;
   const supaStaticLeak = !!ctx.plan.supabase?.serviceRoleLeak;
   if (
@@ -1174,7 +1187,7 @@ async function stageAnalyze(ctx) {
   ) {
     throw new SessionError("无法构建探测计划：候选端点中缺少可探测的接口", {
       code: "plan_incomplete",
-      hint: `已发现 ${cands.length} 个候选端点，但均不含「按 ID 取单体资源」的路径（如 GET /api/orders/:id）、文件读取线索、SQL/命令注入线索、SSRF 线索、文件上传线索、JWT 伪造线索、业务逻辑/竞态线索，也未定位到可探测的 Supabase 项目（需 URL + anon key + 至少一个表引用）。请确认目标接口形态或在 guardbuild.json 中补充契约/supabase 配置`,
+      hint: `已发现 ${cands.length} 个候选端点，但均不含「按 ID 取单体资源」的路径（如 GET /api/orders/:id）、文件读取线索、SQL/命令注入线索、SSRF 线索、文件上传线索、JWT 伪造线索、业务逻辑/竞态线索，也未定位到可探测的 Supabase 项目（需 URL + anon key + 至少一个表引用）。多段路径（/orgs/:orgId/orders/:orderId）需在 guardbuild.json 的 routes[].params 给每个参数声明取值来源；也可在 routes/openapi 里补充可寻址接口`,
     });
   }
   ctx.view.plan = {
@@ -1580,6 +1593,17 @@ async function stageReproduce(ctx) {
 
   const mergedRepro = (pre?.summary?.attackRepro ?? 0) + supaLeaks;
   if (mergedRepro === 0 && !ctx.serviceRoleLeak) {
+    const unverified = Array.isArray(ctx._unverifiedSlots) ? ctx._unverifiedSlots : [];
+    if (pre && unverified.length > 0) {
+      throw new SessionError(
+        `攻击用例未能跑全：${unverified.length} 类计划用例因身份/资源/契约不足被跳过，无法证明目标安全`,
+        {
+          code: "attack_inconclusive",
+          hint: `补齐 guardbuild.json 后重跑：至少两个不同的普通用户身份、victim 名下的可读资源（列表接口可用 listEndpoint 声明并带分页参数）、响应字段名（responses.id / responses.owner）或多段路由参数绑定（routes[].params）。被跳过的槽位：${unverified.join("、")}`,
+          details: { unverifiedSlots: unverified, pre: ctx.view.phases.pre ?? null },
+        }
+      );
+    }
     throw new SessionError("攻击用例在修复前即无法复现，无法建立漏洞基线", {
       code: "attack_not_reproducible",
       hint: hasLocalProbes

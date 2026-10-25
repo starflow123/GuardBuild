@@ -20,6 +20,20 @@ test("describeOutcome: 终态语义与退出码映射（README 退出码表的�
   assert.equal(clean.outcome, "not_reproducible");
   assert.equal(clean.kind, "clean");
   assert.equal(clean.exitCode, 0);
+  assert.match(clean.title, /不等于安全/, "未复现不得暗示「系统安全」");
+
+  // 「没测到」必须与「测了没复现」分开：前者 exit 2，后者 exit 0
+  for (const code of ["no_endpoints", "attack_inconclusive", "plan_incomplete"]) {
+    const inc = describeOutcome(code);
+    assert.equal(inc.outcome, "inconclusive", `${code} 应归为 inconclusive`);
+    assert.equal(inc.kind, "inconclusive");
+    assert.equal(inc.exitCode, 2, `${code} 是「无法证明」，必须阻断门禁`);
+    assert.match(inc.title, /无法证明/);
+    assert.notEqual(inc.stateLabel, "执行出错");
+  }
+  assert.match(describeOutcome("no_endpoints").title, /未识别到 HTTP 路由/);
+  assert.match(describeOutcome("attack_inconclusive").title, /证据不足/);
+  assert.match(describeOutcome("plan_incomplete").hint, /routes\[\]\.params/);
 
   const blocked = describeOutcome("no_patchable_candidates");
   assert.equal(blocked.outcome, "vulnerable_unfixed");
@@ -90,10 +104,10 @@ function makeCtx(state, findings = []) {
 test("buildReport: no_candidates 的终态标签不写「执行出错」，报告给出覆盖清单", () => {
   const error = {
     code: "no_candidates",
-    message: "已扫描 2 个源文件，未发现可探测的安全候选",
+    message: "已扫描 2 个源文件，已识别 3 条路由但未发现可探测的安全候选",
     kind: "coverage",
     outcome: "no_candidates",
-    title: "未命中当前覆盖范围",
+    title: "已扫描但未发现可探测候选",
     semanticHint: "引擎正常结束（exit 0）",
     hint: "在 guardbuild.json 声明 routes",
   };
@@ -104,11 +118,33 @@ test("buildReport: no_candidates 的终态标签不写「执行出错」，报�
     state: "error",
   });
   assert.equal(json.session.state, "error", "内部状态仍记为 error（终态判定与槽位释放依赖它）");
-  assert.equal(json.session.stateLabel, "未命中覆盖范围");
-  assert.match(markdown, /未命中当前覆盖范围（exit 0，非执行失败）/);
+  assert.equal(json.session.stateLabel, "已扫描 · 无安全候选");
+  assert.match(markdown, /已识别出 HTTP 路由，但未发现可探测候选（exit 0，覆盖边界而非安全结论）/);
   assert.match(markdown, /不是执行失败/);
+  assert.match(markdown, /不是「系统安全」的结论/);
   assert.match(markdown, /Java \/ Spring Boot/);
   assert.doesNotMatch(markdown, /诊断执行失败/);
+});
+
+test("buildReport: inconclusive（没测到）exit 2 且明确写「无法证明」，不写成已测未复现", () => {
+  for (const [code, label, headlineRe] of [
+    ["no_endpoints", "未识别路由 · 无法证明", /未识别到任何 HTTP 路由（exit 2，无法证明）/],
+    ["attack_inconclusive", "攻击用例未跑全 · 无法证明", /攻击用例未跑全（exit 2，无法证明）/],
+    ["plan_incomplete", "无法构造探测请求 · 无法证明", /候选端点无法构造探测请求（exit 2，无法证明）/],
+  ]) {
+    const error = { code, message: "无法完成覆盖", kind: "inconclusive", outcome: "inconclusive" };
+    const { json, markdown } = buildReport(makeCtx("error"), {
+      outcome: "inconclusive",
+      exitCode: 2,
+      error,
+      state: "error",
+    });
+    assert.equal(json.verdict.exitCode, 2, `${code} 必须 exit 2`);
+    assert.equal(json.session.stateLabel, label);
+    assert.match(markdown, headlineRe);
+    assert.match(markdown, /本轮\*\*无法证明\*\*/);
+    assert.doesNotMatch(markdown, /已测用例未复现/, `${code} 不得混淆成「已测未复现」`);
+  }
 });
 
 test("buildReport: 真实执行失败仍显示「执行出错」", () => {

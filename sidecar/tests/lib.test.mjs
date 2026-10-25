@@ -26,6 +26,10 @@ import {
   buildCases,
   loginAll,
   postPhaseCases,
+  appendQuery,
+  fillParams,
+  ownerOf,
+  resourceIdOf,
 } from "../lib/probe.mjs";
 import { loadTargetConfig, startUsesPortSlot, renderStart, PORT_SLOT } from "../lib/targetconfig.mjs";
 import {
@@ -590,6 +594,144 @@ test("buildProbePlan: 路径穿越候选入独立槽位（去重 + 首元素 + r
   assert.equal(plan.traversalCandidate, plan.traversalCandidates[0], "单槽位应为首元素");
   assert.equal(plan.resource, "picture", "无其它候选时 resource 回退到穿越候选");
   assert.equal(plan.readCandidate, null, "穿越候选不得占用 IDOR 槽位");
+});
+
+test("buildProbePlan: 多参数路由默认不可寻址，契约 params 全绑定后才进计划", () => {
+  const mk = (over = {}) => ({ method: "GET", path: null, fullPath: null, routeKeys: [], ...over });
+  const multi = mk({ fullPath: "/api/orgs/:orgId/orders/:orderId", resource: "order", kind: "idor-suspect" });
+
+  const without = buildProbePlan({ endpoints: [], candidates: [multi] });
+  assert.equal(without.readCandidate, null, "两个 :param 都没有真实取值来源时不得猜，应诚实跳过");
+
+  const partial = buildProbePlan({
+    endpoints: [],
+    candidates: [{ ...multi, paramBindings: { orgId: { from: "item", field: "orgId" } } }],
+  });
+  assert.equal(partial.readCandidate, null, "只绑定一个参数仍不可寻址");
+
+  const full = buildProbePlan({
+    endpoints: [],
+    candidates: [
+      {
+        ...multi,
+        paramBindings: { orgId: { from: "item", field: "orgId" }, orderId: { from: "item", field: "order_id" } },
+      },
+    ],
+  });
+  assert.equal(full.readCandidate?.fullPath, "/api/orgs/:orgId/orders/:orderId", "全部参数有取值来源后可进入探测计划");
+});
+
+test("buildProbePlan: 契约 listEndpoint 优先于静态推断，并携带分页/过滤 query", () => {
+  const plan = buildProbePlan(
+    {
+      endpoints: [{ method: "GET", path: "/api/orders", hasOwnerFilter: true }],
+      candidates: [{ method: "GET", path: "/api/orders/:orderId", resource: "order", kind: "idor-suspect" }],
+    },
+    {
+      contract: {
+        listEndpoint: { method: "POST", path: "/api/orders/search", query: { page: "1", limit: "50" }, resource: "order" },
+      },
+    }
+  );
+  assert.equal(plan.listEndpoint.path, "/api/orders/search", "契约声明优先于静态列表");
+  assert.equal(plan.listEndpoint.method, "POST");
+  assert.deepEqual(plan.listEndpoint.query, { page: "1", limit: "50" });
+});
+
+test("appendQuery: 追加固定分页/过滤参数，保留已有 query 并编码取值", () => {
+  assert.equal(appendQuery("/api/orders", { page: "1", limit: "50" }), "/api/orders?page=1&limit=50");
+  assert.equal(appendQuery("/api/orders?scope=mine", { page: "2" }), "/api/orders?scope=mine&page=2");
+  assert.equal(appendQuery("/api/orders", null), "/api/orders");
+  assert.equal(appendQuery("/api/orders", {}), "/api/orders");
+  assert.equal(appendQuery("/api/orders", { q: "a b" }), "/api/orders?q=a%20b");
+  assert.equal(appendQuery("/api/orders", { skip: null, page: "3" }), "/api/orders?page=3", "空值不参与拼接");
+});
+
+test("fillParams: 契约绑定从资源对象取值，支持常量与缺省回退", () => {
+  const ctx = { _resourceById: new Map([["42", { orgId: 9, meta: { region: "eu" } }]]) };
+  const path = "/api/orgs/:orgId/orders/:orderId";
+  const bound = {
+    paramBindings: {
+      orgId: { from: "item", field: "orgId" },
+      orderId: { from: "item", field: "meta.region" },
+    },
+  };
+  assert.equal(fillParams(ctx, bound, path, "42"), "/api/orgs/9/orders/eu", "嵌套字段经点路径取值");
+
+  assert.equal(
+    fillParams({}, { paramBindings: { version: { from: "const", value: "v2" } } }, "/api/:version/orders/:orderId", "42"),
+    "/api/v2/orders/42",
+    "常量绑定 + 未声明参数回退主键"
+  );
+  assert.equal(fillParams({}, {}, "/api/orders/:orderId", "42"), "/api/orders/42", "无绑定保持既有单参数行为");
+  assert.equal(
+    fillParams(ctx, bound, path, "404"),
+    "/api/orgs/404/orders/404",
+    "资源不在索引里不得编造取值，回退主键"
+  );
+});
+
+test("ownerOf/resourceIdOf: 契约点路径优先，路由级覆盖优先于全局，未声明时回退常见命名", () => {
+  const obj = { order_id: 7001, created_by_uid: "u-bob", userId: "wrong", resourceId: 7 };
+  const ctx = { targetConfig: { responses: { id: "order_id", owner: "created_by_uid" } } };
+  assert.equal(resourceIdOf(ctx, obj), 7001, "契约 responses.id 优先于 id 回退");
+  assert.equal(ownerOf(ctx, obj), "u-bob", "契约 responses.owner 优先于 userId 回退");
+  assert.equal(ownerOf(ctx, obj, "userId"), "wrong", "路由级 ownerField 覆盖全局契约");
+
+  const bare = { id: 1, resourceId: 7, createdByUid: "u-bob" };
+  assert.equal(resourceIdOf({}, { resourceId: 7 }), 7, "未声明契约时回退 resourceId");
+  assert.equal(ownerOf({}, { createdByUid: "u-bob" }), "u-bob", "未声明契约时回退 createdByUid");
+  assert.equal(ownerOf(ctx, { userId: "wrong" }), null, "声明了契约但不匹配时不得猜测");
+});
+
+// —— P0：响应字段 / 列表端点 / 多参数路由契约归一化 ——
+
+test("loadTargetConfig: responses / listEndpoint / 多参数 routes 归一化", async () => {
+  const raw = {
+    responses: { list: "data.items", entity: "data", id: "order_id", owner: "created_by_uid" },
+    listEndpoint: {
+      method: "post",
+      path: "/api/orders/search",
+      query: { page: 1, limit: 50, bad: { nested: true } },
+      resource: "order",
+    },
+    routes: [
+      {
+        method: "get",
+        path: "/api/orgs/:orgId/orders/:orderId",
+        hasAuth: true,
+        ownerField: "created_by_uid",
+        idField: "order_id",
+        params: { orgId: "orgId", orderId: { field: "order_id" }, version: { from: "const", value: 2 } },
+      },
+      { method: "GET", path: "/api/no-param", params: { id: "id" } },
+      { method: "TRACE", path: "/api/:id" },
+    ],
+  };
+  const res = await loadTargetConfig(fakeCtx(JSON.stringify(raw)));
+  assert.deepEqual(res.responses, { list: "data.items", entity: "data", id: "order_id", owner: "created_by_uid" });
+  assert.equal(res.listEndpoint.method, "POST");
+  assert.equal(res.listEndpoint.path, "/api/orders/search");
+  assert.deepEqual(res.listEndpoint.query, { page: "1", limit: "50" }, "查询参数只接受标量并转字符串");
+  assert.equal(res.routes.length, 1, "不可寻址的路由与不支持的方法应被丢弃");
+
+  const route = res.routes[0];
+  assert.equal(route.ownerField, "created_by_uid");
+  assert.equal(route.idField, "order_id");
+  assert.deepEqual(route.params.orgId, { from: "item", field: "orgId" }, "字符串简写 = 从资源对象同名字段取");
+  assert.deepEqual(route.params.orderId, { from: "item", field: "order_id" });
+  assert.deepEqual(route.params.version, { from: "const", value: "2" });
+});
+
+test("loadTargetConfig: 非法字段路径 / 列表端点被拒绝（不把任意字符串当取值路径）", async () => {
+  const res = await loadTargetConfig(
+    fakeCtx(JSON.stringify({ responses: { owner: "created by!" }, listEndpoint: { path: "api/orders" } }))
+  );
+  assert.equal(res.responses, null);
+  assert.equal(res.listEndpoint, null);
+
+  const abs = await loadTargetConfig(fakeCtx(JSON.stringify({ listEndpoint: { path: "/api/../../etc/passwd" } })));
+  assert.equal(abs.listEndpoint, null, "含 .. 的列表端点应拒绝");
 });
 
 test("buildProbePlan: 查询参数形态候选（无 :param）进 read 槽位（DVNA 修复）", () => {

@@ -68,7 +68,7 @@ GuardBuild 是一个面向 Vibe Coding 开发者的本地安全 Agent：先启�
 - Node.js ≥ 22.5（`node:sqlite`）、Rust stable；桌面模式需 Tauri 2 平台依赖。
 - 目标项目能按 `guardbuild.json` 启动（或自行启动后用黑盒 `--url`）。
 - 跨用户越权需要 **≥2 个普通测试身份**，纵向越权需要管理身份；工具**不创建用户**。
-- 运行期形态静态看不见时要用契约补齐：响应包装与主键/归属字段（`responses.list/entity/id/owner`）、需要分页或过滤参数才返回数据的列表接口（`listEndpoint` + `query`）、静态认不出的路由与多段路径参数（`routes` + `params`）。缺这些不会静默跳过，而是判 `inconclusive`（exit 2）。
+- 运行期形态静态看不见时优先自动发现：响应包装与主键/归属字段、分页参数、多段路径参数取值都用两个测试身份的真实请求实测（结论见报告 `summary.resourceContract`）。自动发现试不出时再用契约显式声明：`responses.list/entity/id/owner`、`listEndpoint` + `query`、`routes` + `params`。声明或实测都缺时不会静默跳过，而是判 `inconclusive`（exit 2）。
 - 建议用 `prepare` 步骤跑幂等种子脚本准备数据。
 - 验证码 / MFA / SSO 需要先绕过或提供测试通道，当前不自动处理。
 
@@ -93,11 +93,11 @@ GuardBuild 是一个面向 Vibe Coding 开发者的本地安全 Agent：先启�
 | --- | --- | --- |
 | 0 | `no_candidates` / `not_reproducible` | 已扫描但无可探测候选，或攻击在真实实例上打不通——**不是执行失败，也不是「系统安全」的证明** |
 | 1 | `vulnerable_unfixed` / `patchStatus=verified` / `verify_failed` | 漏洞证据成立（附补丁或人工修复指引） |
-| 2 | `inconclusive`（`no_endpoints` / `attack_inconclusive` / `plan_incomplete` / `scout_routes_unverified`）/ `failed` / `aborted` / `timeout` | 无法证明覆盖，或契约、环境、内部错误、超时、中断 |
+| 2 | `inconclusive`（`no_endpoints` / `attack_inconclusive` / `plan_incomplete` / `scout_routes_unverified` / `no_list_endpoint` / `param_binding_unverified`）/ `failed` / `aborted` / `timeout` | 无法证明覆盖，或契约、环境、内部错误、超时、中断 |
 
 - `no_candidates`（exit 0）：路由已识别，但没有候选同时命中「静态形状 + 攻击用例」，界面显示「已扫描 · 无安全候选」并列出支持清单。
 - `not_reproducible`（exit 0）：静态有线索、攻击已发出但打不通，显示「已测未复现 · 未证明安全」。
-- `inconclusive`（exit 2）：**没测到 ≠ 安全**。未识别到任何路由（`no_endpoints`）、计划用例因身份 / 资源 / 运行期契约不足被跳过（`attack_inconclusive`）、候选端点缺少可寻址参数（`plan_incomplete`）、模型侦察给出的路由在真实运行实例上逐条打完全部不成立（`scout_routes_unverified`）都归这一档，门禁不放行，报告给出对应的契约补齐字段。
+- `inconclusive`（exit 2）：**没测到 ≠ 安全**。未识别到任何路由（`no_endpoints`）、计划用例因身份 / 资源 / 运行期契约不足被跳过（`attack_inconclusive`）、候选端点缺少可寻址参数（`plan_incomplete`）、模型侦察给出的路由在真实运行实例上逐条打完全部不成立（`scout_routes_unverified`）、定位不到按归属过滤的列表接口（`no_list_endpoint`）、多段路径参数取值来源实测不出（`param_binding_unverified`）都归这一档，门禁不放行，报告给出对应的契约补齐字段。
 
 ## 精度口径
 

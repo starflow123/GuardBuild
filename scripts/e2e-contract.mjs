@@ -7,7 +7,8 @@
  *   ① 无契约线索   → exit 2（inconclusive / no_endpoints）：静态看不见 = 无法证明，不得放行
  *   ② 完整契约     → exit 1（vulnerable_unfixed）：alice 用 bob 的 order_id 读到 bob 的订单
  *                     （字段名 order_id / created_by_uid 与两段路径参数都来自契约）
- *   ③ 去掉 params  → exit 2（inconclusive / plan_incomplete）：多参数不可寻址 = 无法证明
+ *   ③ 去掉 params  → exit 1（vulnerable_unfixed）：参数取值来源改由运行期绑定实测补上
+ *                     （用本人列表里的真实对象逐参数对号并真实回读验证），不再只能 plan_incomplete
  *   ④ 运行期归属校验 → exit 0（not_reproducible）：已测用例打不通
  *
  * 用法: node scripts/e2e-contract.mjs
@@ -184,7 +185,7 @@ async function main() {
   check("业务基线：匿名读取被拒（business-unauth-401 → passed）", bizAnon?.verdict === "passed", `verdict=${bizAnon?.verdict}`);
 
   // ---------- ③ 去掉 params → exit 2（无法证明） ----------
-  console.log("\n[CONTRACT] 3/4 多段路径缺参数绑定：期望 exit 2（inconclusive / plan_incomplete）…");
+  console.log("\n[CONTRACT] 3/4 多段路径缺参数绑定：期望 exit 1（运行期绑定实测补上取值来源，不再只能 plan_incomplete）…");
   const ws3 = makeWorkspace("c3-noparams", (ws) =>
     editContract(ws, (cfg) => {
       delete cfg.routes[0].params;
@@ -192,16 +193,18 @@ async function main() {
   );
   const r3 = await runGate(ws3, "c3-noparams");
   const g3 = r3.gate ?? {};
-  check("退出码 = 2（缺少取值来源时不得猜着打）", r3.code === 2, `code=${r3.code}`);
-  check(
-    "verdict=inconclusive 且 error.code=plan_incomplete",
-    g3.verdict === "inconclusive" && g3.error?.code === "plan_incomplete",
-    `verdict=${g3.verdict} code=${g3.error?.code}`
-  );
+  check("退出码 = 1（运行期绑定实测后复现越权）", r3.code === 1, `code=${r3.code} verdict=${g3.verdict} error=${g3.error?.code}`);
+  check("verdict=vulnerable_unfixed（非 inconclusive / 非静默跳过）", g3.verdict === "vulnerable_unfixed", `verdict=${g3.verdict} code=${g3.error?.code}`);
   const rep3 = readReport("c3-noparams");
   const md3 = readMarkdown("c3-noparams");
-  check("报告结论一致（inconclusive / exit 2）", rep3?.verdict?.outcome === "inconclusive" && rep3?.verdict?.exitCode === 2, `outcome=${rep3?.verdict?.outcome}`);
-  check("建议点名 routes[].params", /routes\[\]\.params/.test(md3), "");
+  const idor3 = (rep3?.evidence?.pre ?? []).find(
+    (e) => e.caseId === "attack-read-foreign" && e.verdict === "vulnerable" && /v1\/orgs\/9\/orders\/7002/.test(String(e.endpoint ?? ""))
+  );
+  check(
+    "pre 证据：两段路径参数由真实对象实测填充（/v1/orgs/9/orders/7002）",
+    !!idor3,
+    `endpoints=${(rep3?.evidence?.pre ?? []).map((e) => e.endpoint).filter((e) => /orgs/.test(String(e))).join("、") || "无"}`
+  );
   check("未伪装成「已测未复现」", !/已测用例未复现/.test(md3), "");
 
   // ---------- ④ 运行期归属校验 → exit 0 ----------

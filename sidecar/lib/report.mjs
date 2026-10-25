@@ -104,6 +104,12 @@ function headline(outcome, patchStatus, supabase, blackbox = null, errorCode = n
       if (errorCode === "plan_incomplete") {
         return "候选端点无法构造探测请求（exit 2，无法证明）：多段路径缺少参数取值来源，本轮没有真正打到目标";
       }
+      if (errorCode === "no_list_endpoint") {
+        return "未定位到按归属过滤的列表接口（exit 2，无法证明）：静态、契约与运行期自动发现都没能确定资源列表，本轮没有真正测到";
+      }
+      if (errorCode === "param_binding_unverified") {
+        return "多段路径参数取值来源未通过实测（exit 2，无法证明）：已用真实对象试过字段映射，响应里没有可对应的字段，引擎不会猜";
+      }
       if (errorCode === "scout_routes_unverified") {
         return "模型给出的路由经运行期实测全部不成立（exit 2，无法证明）：本轮没有可打的真实接口，报告列出每条路由的实测状态码";
       }
@@ -229,6 +235,16 @@ function suggestions(r) {
       lines.push("- 本轮**无法证明**被测系统已测到位（exit 2）：候选端点存在，但没有能构造出可寻址请求的接口，引擎没有发出攻击。");
       lines.push(
         "- 多段路径（如 `/orgs/:orgId/orders/:orderId`）必须在 `routes[].params` 给每个参数声明取值来源（字段名简写 / `{\"from\":\"item\",\"field\":\"org_id\"}` / `{\"from\":\"const\",\"value\":\"v2\"}`）；单参数接口确认路径里有 `:param` 或声明了 `query`。"
+      );
+    } else if (r.error?.code === "no_list_endpoint") {
+      lines.push("- 本轮**无法证明**被测系统已测到位（exit 2）：静态分析与运行期自动发现都没能确定按归属过滤的列表接口，资源归属发现没有着落。");
+      lines.push(
+        "- 在 guardbuild.json 用 `listEndpoint` 显式声明列表端点（可带分页/过滤 `query`），或在 `routes` 里补充路由后重跑；响应字段异常时配 `responses.list`。"
+      );
+    } else if (r.error?.code === "param_binding_unverified") {
+      lines.push("- 本轮**无法证明**被测系统已测到位（exit 2）：引擎已用本人列表里的真实对象实测过多段路径的参数绑定，响应里没有与参数对应的字段，引擎不会猜。");
+      lines.push(
+        "- 在 guardbuild.json 的 `routes[].params` 为每个参数声明取值来源（字段名简写 / `{\"from\":\"item\",\"field\":\"org_id\"}` / `{\"from\":\"const\",\"value\":\"v2\"}`）后重跑。"
       );
     } else {
       lines.push("- 本轮**无法证明**被测系统已测到位（exit 2）：计划中的攻击用例因身份 / 可读资源 / 运行期契约不足被跳过，未真正执行。");
@@ -808,6 +824,24 @@ function renderMarkdown(r) {
     summaryLines.push(`- Supabase：${bits.join("，")}`);
   }
   if (!bb && r.summary.start) summaryLines.push(`- 启动契约：\`${esc(r.summary.start.cmd)} ${esc((r.summary.start.args ?? []).join(" "))}\`（就绪模式 ${esc(r.summary.start.readyPattern)}）`);
+  if (!bb && r.summary.resourceContract?.idField) {
+    const rc = r.summary.resourceContract;
+    const sourceLabel =
+      rc.source === "llm-hinted-verified"
+        ? "模型假设 + 逐条真实验证"
+        : rc.source === "cached-confirmed"
+          ? "缓存复用 + 真实复核"
+          : "双身份真实验证";
+    const bits = [
+      `列表 \`${esc(rc.listPath ?? "—")}\`${rc.listQuery ? `（${esc(JSON.stringify(rc.listQuery))}）` : ""}`,
+      `主键 \`${esc(rc.idField)}\``,
+      rc.ownerField ? `归属 \`${esc(rc.ownerField)}\`` : null,
+      rc.entityPath ? `实体 \`${esc(rc.entityPath)}\`` : null,
+      rc.needsPagination ? "需分页参数" : null,
+      `共 ${rc.requestsUsed ?? 0} 个请求实测`,
+    ].filter(Boolean);
+    summaryLines.push(`- 资源契约自动发现：${bits.join(" · ")}（${sourceLabel}）`);
+  }
   if (!bb && r.llm?.used) {
     const applied = [
       r.llm.applied?.start ? "启动" : null,
@@ -1072,6 +1106,19 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
         ? { cmd: start.cmd, args: start.args, cwd: start.cwd ?? null, readyPattern: start.readyPattern }
         : null,
       startSource: ctx.targetConfig?.startSource ?? null,
+      resourceContract: ctx._resourceContract
+        ? {
+            source: ctx._resourceContract.source ?? null,
+            listPath: ctx._resourceContract.listPath ?? null,
+            listQuery: ctx._resourceContract.listQuery ?? null,
+            idField: ctx._resourceContract.idField ?? null,
+            ownerField: ctx._resourceContract.ownerField ?? null,
+            entityPath: ctx._resourceContract.entityPath ?? null,
+            needsPagination: !!ctx._resourceContract.needsPagination,
+            requestsUsed: ctx._resourceContract.requestsUsed ?? 0,
+            applied: ctx._resourceContract.applied ?? [],
+          }
+        : null,
     },
     llm: view.llm
       ? {

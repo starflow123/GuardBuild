@@ -1,0 +1,7 @@
+{
+  "name": "gb-shape-shop",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "响应形状靶场：深嵌套分页列表 + 非默认字段名 + {meta,record} 包装 + 两段路径；不写 responses/listEndpoint/routes[].params，验证资源契约自动发现（双身份实测）"
+}

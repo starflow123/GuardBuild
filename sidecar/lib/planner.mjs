@@ -54,6 +54,7 @@ export function planView(plan) {
     jwtPath: plan.jwtCandidate?.fullPath ?? plan.jwtCandidate?.path ?? null,
     bizlogicPath: plan.bizlogicCandidate?.fullPath ?? plan.bizlogicCandidate?.path ?? null,
     listPath: plan.listEndpoint?.path ?? null,
+    pendingPaths: (plan.pendingCandidates ?? []).map((c) => `${c.method} ${c.fullPath ?? c.path}`),
   };
 }
 
@@ -118,6 +119,11 @@ export function buildProbePlan(analysis, { loginPathOverride = null, contract = 
         (!!c.graphql && c.graphql.op === "mutation" && /cancel/i.test(c.graphql.field)))
   );
   const readCandidates = topK((c) => c.kind === "idor-suspect" && readShaped(c) && addressable(c));
+  // 多段路径但没有取值来源：静态判不了可寻址，但也不该在目标还没跑起来时就判死。
+  // 这些候选进 pendingCandidates，由运行期用本人列表里的真实对象实测绑定（probe.resolveDerivedBindings）。
+  const pendingCandidates = topK(
+    (c) => c.kind === "idor-suspect" && readShaped(c) && paramNames(c).length >= 2 && !addressable(c)
+  );
   // 无鉴权候选：匿名读取用例的靶点（与 IDOR 槽位互斥，不做自动修复）
   const unauthReadCandidates = topK((c) => c.kind === "no-auth-suspect" && readShaped(c) && addressable(c));
   const cancelCandidate = cancelCandidates[0] ?? null;
@@ -223,6 +229,7 @@ export function buildProbePlan(analysis, { loginPathOverride = null, contract = 
     jwtCandidate,
     bizlogicCandidate,
     readCandidates,
+    pendingCandidates,
     cancelCandidates,
     unauthReadCandidates,
     traversalCandidates,

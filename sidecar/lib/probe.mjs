@@ -41,6 +41,21 @@ import {
 import { MAX_VARIANT_CASES, channelVariantFor, foreignObjectVariants, idEncodingVariants, rawTokenRequest, variantCaseId } from "./attackvariants.mjs";
 import { buildProbePlan, candKey } from "./planner.mjs";
 import { MAX_SCOUT_ROUTES, verifyScoutRoutes } from "./routeverify.mjs";
+import {
+  MAX_CONTRACT_REQUESTS,
+  MAX_LIST_SLOTS,
+  compareIdSets,
+  contractForCache,
+  contractFingerprint,
+  discoverBindings,
+  discoverEntityContract,
+  discoverListContract,
+  readCommitFromGit,
+  readContractCache,
+  validateExtras,
+  writeContractCache,
+} from "./rescontract.mjs";
+import { chat as llmChat, isEnabled as llmIsEnabled, parseJson as llmParseJson } from "./llm.mjs";
 
 export class ProbeError extends Error {
   constructor(message, { code = "probe_failed", hint = null, details = null } = {}) {
@@ -112,10 +127,20 @@ function resourceLabel(ctx) {
   return resourceLabelOf(ctx.plan?.resource);
 }
 
+/**
+ * 响应取值路径的统一读取顺序：人工契约（guardbuild.json）> 运行期实测推断（ctx._derived）> 框架形态。
+ * 自动发现只补「人没声明」的空洞，绝不覆盖人工声明；它自己也已经过真实请求验证。
+ */
+function respPath(ctx, key) {
+  const manual = ctx?.targetConfig?.responses?.[key];
+  if (manual) return manual;
+  return ctx?._derived?.[key] ?? null;
+}
+
 /** 归属字段读取：契约 responses.owner（或路由 ownerField）优先，未声明时兼容常见命名 */
 const OWNER_FALLBACK_KEYS = ["userId", "user_id", "ownerId", "owner_id", "uid", "created_by_uid", "createdByUid", "created_by"];
 export function ownerOf(ctx, obj, override = null) {
-  const path = override ?? ctx?.targetConfig?.responses?.owner ?? null;
+  const path = override ?? respPath(ctx, "owner");
   if (path) return getByDotPath(obj, path) ?? null;
   for (const key of OWNER_FALLBACK_KEYS) {
     const v = obj?.[key];
@@ -127,7 +152,7 @@ export function ownerOf(ctx, obj, override = null) {
 /** 资源主键读取：契约 responses.id（或路由 idField）优先，未声明时兼容 id / userId 等命名 */
 const ID_FALLBACK_KEYS = ["id", "resourceId", "userId", "user_id"];
 export function resourceIdOf(ctx, obj, override = null) {
-  const path = override ?? ctx?.targetConfig?.responses?.id ?? null;
+  const path = override ?? respPath(ctx, "id");
   if (path) return getByDotPath(obj, path) ?? null;
   for (const key of ID_FALLBACK_KEYS) {
     const v = obj?.[key];
@@ -492,25 +517,472 @@ function candPath(cand) {
   return cand?.fullPath ?? cand?.path ?? null;
 }
 
+/** 读语义：REST 走 GET；GraphQL 的 query 过程（传输层仍是 POST），与 planner 的判定保持一致 */
+function isReadShaped(c) {
+  return (c?.method ?? "GET") === "GET" || c?.graphql?.op === "query";
+}
+
 /**
  * 响应取值路径。契约（guardbuild.json 的 responses.entity/list）优先；
  * GraphQL 单次文档只请求一个字段，字段名随候选而变（order / myOrders / adminOrders…），
  * 契约里的固定点路径无法覆盖，故回退为「本次请求的字段名」。
  */
 function entityPathFor(ctx, graphql) {
-  return ctx.targetConfig?.responses?.entity ?? graphql?.field ?? null;
+  const manual = ctx.targetConfig?.responses?.entity ?? null;
+  if (manual) return manual;
+  if (graphql?.field) return graphql.field;
+  return ctx._derived?.entity ?? null;
 }
 function listPathFor(ctx, graphql) {
-  return ctx.targetConfig?.responses?.list ?? graphql?.field ?? null;
+  const manual = ctx.targetConfig?.responses?.list ?? null;
+  if (manual) return manual;
+  if (graphql?.field) return graphql.field;
+  return ctx._derived?.list ?? null;
 }
+
+/**
+ * 资源契约自动发现（P2）：列表在哪一层、要不要分页参数、主键与归属字段叫什么、
+ * 单体响应里哪个字段才是实体 —— 过去只能人手写进 guardbuild.json，
+ * 没写就退化成「找不到列表接口」或者取错对象。这里用两个真实身份的对拉响应来推断：
+ * 只有「同一字段在两个身份的列表里互斥」才认定它是主键，只有「同身份内恒定、两身份之间不同」
+ * 才认定它是归属字段。推断结果同样要过这一步，模型只能补充候选路径/字段名。
+ * 人工契约优先：已声明的字段一律不覆盖。
+ */
+
+const COLLECTION_SKIP_RE = /login|logout|session|auth\/|health|metrics|status|swagger|openapi|admin|debug|__diag/i;
+
+function listSlotsForDiscovery(ctx) {
+  const slots = [];
+  const seen = new Set();
+  const declaredPath = ctx.plan?.listEndpoint?.path ?? ctx.targetConfig?.listEndpoint?.path ?? null;
+  if (declaredPath) {
+    seen.add(`GET ${declaredPath}`);
+    slots.push({
+      key: `GET ${declaredPath}`,
+      method: ctx.plan?.listEndpoint?.method ?? "GET",
+      path: declaredPath,
+      extraQuery: ctx.plan?.listEndpoint?.query ?? ctx.targetConfig?.listEndpoint?.query ?? null,
+    });
+  }
+  for (const e of ctx.analysis?.endpoints ?? []) {
+    if (slots.length >= MAX_LIST_SLOTS) break;
+    if (e.graphql || e.trpc) continue; // 这两种线协议各有自己的协商层
+    if ((e.method ?? "GET") !== "GET") continue;
+    const p = e.fullPath ?? e.path;
+    if (!p || /:/.test(p)) continue; // 只谈无路径参数的集合端点
+    if (COLLECTION_SKIP_RE.test(p)) continue;
+    const key = `GET ${p}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    slots.push({ key, method: "GET", path: p });
+  }
+  return slots;
+}
+
+async function readCommitForCache(ctx) {
+  const base = String(ctx.projectRoot ?? "").replace(/[\\/]+$/, "");
+  const read = async (rel) => {
+    try {
+      const res = await ctx.rpc.request(
+        RPC_TO_HOST.FS_READ,
+        { token: ctx.tokens.project, path: `${base}/${rel}`, redact: true },
+        { timeoutMs: 10_000 }
+      );
+      return typeof res?.content === "string" ? res.content : "";
+    } catch {
+      return "";
+    }
+  };
+  return readCommitFromGit(read);
+}
+
+function contractRequest(ctx, baseUrl) {
+  return async ({ method, path, query, identity }) => {
+    const res = await httpJson(ctx, {
+      baseUrl,
+      method: method ?? "GET",
+      path: appendQuery(path, query ?? null),
+      identity,
+    });
+    return { status: res.status, json: res.json, body: res.body };
+  };
+}
+
+/** 命中缓存也要重新实测一次：契约缓存是线索，不是结论（目标可能已经改了） */
+async function confirmCachedContract(ctx, { baseUrl, cached, users }) {
+  const c = cached?.contract;
+  if (!c?.listPath || !c?.idField || !c?.slot?.path) return false;
+  const request = contractRequest(ctx, baseUrl);
+  const sets = [];
+  for (const name of users.slice(0, 2)) {
+    let res = null;
+    try {
+      res = await request({ method: c.slot.method, path: c.slot.path, query: c.listQuery, identity: name });
+    } catch {
+      return false;
+    }
+    const items = extractListItems(res.json, c.listPath);
+    if (!Array.isArray(items) || items.length === 0) return false;
+    sets.push(new Set(items.map((o) => String(o?.[c.idField] ?? "")).filter((v) => v !== "")));
+  }
+  return compareIdSets(sets[0], sets[1]) === "disjoint";
+}
+
+function applyDerivedContract(ctx, { contract, entityPath, source, requestsUsed, key }) {
+  const declared = ctx.targetConfig?.responses ?? {};
+  ctx._derived = { ...(ctx._derived ?? {}) };
+  const applied = [];
+  if (!declared.list && contract.listPath) {
+    ctx._derived.list = contract.listPath;
+    applied.push(`列表数组=${contract.listPath}`);
+  }
+  if (!declared.id && contract.idField) {
+    ctx._derived.id = contract.idField;
+    applied.push(`主键字段=${contract.idField}`);
+  }
+  if (!declared.owner && contract.ownerField) {
+    ctx._derived.owner = contract.ownerField;
+    applied.push(`归属字段=${contract.ownerField}`);
+  }
+  if (!declared.entity && entityPath) {
+    ctx._derived.entity = entityPath;
+    applied.push(`实体字段=${entityPath}`);
+  }
+  ctx.plan.listEndpoint = {
+    ...(ctx.plan.listEndpoint ?? {}),
+    path: contract.slot.path,
+    method: contract.slot.method ?? "GET",
+    query: contract.listQuery ?? ctx.plan?.listEndpoint?.query ?? null,
+    graphql: null,
+    routeKey: contract.slot.routeKey ?? ctx.plan?.listEndpoint?.routeKey ?? null,
+  };
+  ctx._resourceContract = {
+    slotKey: contract.slotKey,
+    listPath: contract.listPath,
+    listQuery: contract.listQuery ?? null,
+    idField: contract.idField,
+    ownerField: contract.ownerField ?? null,
+    entityPath: entityPath ?? null,
+    needsPagination: contract.needsPagination === true,
+    counts: contract.counts ?? null,
+    applied,
+    source,
+    requestsUsed,
+    fingerprint: key,
+  };
+  return ctx._resourceContract;
+}
+
+/** 人工契约把四类字段都说全了就不再花请求去推断 */
+function contractFullyDeclared(ctx) {
+  const r = ctx.targetConfig?.responses ?? {};
+  const q = ctx.targetConfig?.listEndpoint?.query ?? ctx.plan?.listEndpoint?.query ?? null;
+  return !!r.list && !!r.id && !!r.owner && !!r.entity && q != null;
+}
+
+/** 用「本人列表里的真实对象」回读单体端点，认出实体字段（{ meta, record } 这类包装） */
+async function probeEntityPath(ctx, { baseUrl, contract, users }) {
+  const cand = (ctx.plan?.readCandidates ?? [])[0] ?? ctx.plan?.readCandidate ?? null;
+  const path = candPath(cand);
+  if (!cand || !path) return null;
+  const names = (path.match(/:([A-Za-z_]\w*)/g) ?? []).map((s) => s.slice(1));
+  if (names.length !== 1) return null; // 多段路径交给绑定实测，这里不猜
+  const identity = users[0];
+  const res = await httpJson(ctx, {
+    baseUrl,
+    method: contract.slot.method ?? "GET",
+    path: appendQuery(contract.slot.path, contract.listQuery),
+    identity,
+  });
+  const items = extractListItems(res.json, listPathForWith(ctx, contract)) ?? [];
+  const own = items.find((o) => o?.[contract.idField] != null);
+  if (!own) return null;
+  const idValue = own[contract.idField];
+  const filled = path.replace(/:([A-Za-z_]\w*)/g, () => encodeURIComponent(String(idValue)));
+  const out = await discoverEntityContract({
+    request: contractRequest(ctx, baseUrl),
+    slot: { method: cand.method ?? "GET", path: filled },
+    identity,
+    idField: contract.idField,
+    idValue,
+    ownerField: contract.ownerField ?? null,
+  });
+  return out.entityPath ?? null;
+}
+
+function listPathForWith(ctx, contract) {
+  return ctx.targetConfig?.responses?.list ?? contract.listPath ?? null;
+}
+
+async function ensureResourceContract(ctx, { baseUrl, loggedIn }) {
+  if (contractFullyDeclared(ctx)) return null;
+  const users = (loggedIn ?? []).filter((i) => i.role !== "admin").map((i) => i.name);
+  if (users.length < 2) return null; // 只有一个身份无法证明「按归属过滤」
+  const slots = listSlotsForDiscovery(ctx);
+  if (slots.length === 0) return null;
+
+  const declared = ctx.targetConfig?.responses ?? {};
+  const commit = await readCommitForCache(ctx);
+  const key = contractFingerprint({ commit, slots, identities: users, resourceName: ctx.plan?.resource ?? null, declared });
+
+  const cached = readContractCache(ctx, key);
+  if (cached?.contract && (await confirmCachedContract(ctx, { baseUrl, cached, users }))) {
+    ctx.emit({
+      kind: "discovery",
+      severity: SEVERITY.INFO,
+      message: `资源契约缓存经两身份实测复核通过（列表=${cached.contract.listPath} · 主键=${cached.contract.idField}）`,
+      data: { fingerprint: key, commit, replay: true },
+    });
+    return applyDerivedContract(ctx, {
+      contract: cached.contract,
+      entityPath: cached.entityPath ?? null,
+      source: "cached-confirmed",
+      requestsUsed: 2,
+      key,
+    });
+  }
+  if (cached?.contract) {
+    ctx.emit({
+      kind: "discovery",
+      severity: SEVERITY.WARN,
+      message: "资源契约缓存与当前响应不符，重新逐条实测推断",
+      data: { fingerprint: key },
+    });
+  }
+
+  const out = await discoverListContract({
+    request: contractRequest(ctx, baseUrl),
+    slots,
+    identities: users,
+    budget: MAX_CONTRACT_REQUESTS,
+  });
+  let contract = out.contract;
+  let requestsUsed = out.requestsUsed;
+  let source = "live-verified";
+  let triedLog = out.tried;
+  if (!contract && llmIsEnabled() && typeof ctx.llm?.getToken === "function") {
+    const hinted = await llmContractHints(ctx, { baseUrl, slots, users, key });
+    if (hinted?.contract) {
+      contract = hinted.contract;
+      requestsUsed = out.requestsUsed + hinted.requestsUsed;
+      source = "llm-hinted-verified";
+      triedLog = hinted.tried;
+    }
+  }
+  if (!contract) {
+    ctx._resourceContract = {
+      attempted: slots.map((s) => s.key),
+      tried: out.tried.slice(0, 12),
+      requestsUsed: out.requestsUsed,
+      applied: [],
+      source: "not-verified",
+      fingerprint: key,
+    };
+    ctx.emit({
+      kind: "discovery",
+      severity: SEVERITY.WARN,
+      message: `资源契约自动发现未通过实测（试了 ${slots.length} 个集合端点、发 ${out.requestsUsed} 个请求），仍无法确定列表/主键/归属字段`,
+      data: { tried: out.tried.slice(0, 12), requestsUsed: out.requestsUsed },
+    });
+    return null;
+  }
+
+  const entityPath = declared.entity ? null : await probeEntityPath(ctx, { baseUrl, contract, users });
+  const summary = applyDerivedContract(ctx, {
+    contract,
+    entityPath,
+    source,
+    requestsUsed,
+    key,
+  });
+  writeContractCache(ctx, key, {
+    commit,
+    contract: contractForCache(contract),
+    entityPath,
+    verifiedBy: source === "llm-hinted-verified" ? "llm-hint-verified-by-live-requests" : "two-identity-live-requests",
+  });
+  ctx.emit({
+    kind: "discovery",
+    severity: SEVERITY.SUCCESS,
+    message: `资源契约自动发现（双身份实测）：${summary.applied.join(" · ")}${summary.needsPagination ? " · 该列表需分页参数" : ""}${
+      source === "llm-hinted-verified" ? "（列表/字段线索来自模型假设，每条已经真实请求验证）" : ""
+    }`,
+    data: { ...summary, tried: triedLog.slice(0, 12) },
+  });
+  return summary;
+}
+
+const CONTRACT_HINTS_SYSTEM =
+  "你是 API 响应结构分析器。给你一个 HTTP 列表接口的真实响应 JSON 样本。" +
+  "任务：指出对象数组所在的键路径、可作为资源主键的字段名、以及这个列表需要的分页查询参数。" +
+  "硬性规则：只能引用样本里真实存在的路径与字段，禁止输出数据值，禁止编造；" +
+  "不确定就输出空数组。只输出严格 JSON，形如 " +
+  '{"arrayPaths":["a.b.list"],"idFields":["batch_id"],"pagination":[{"page":"1","size":"100"}]}，不要任何解释文字。';
+
+/**
+ * agent 兜底（受约束）：引擎枚举不到契约时，把一份真实响应样本给模型，只让它提
+ * 「路径/字段名/分页键」假设；validateExtras 逐条对照实测响应过滤，剩下的假设再由
+ * discoverListContract 用两个身份的真实请求验证。模型不判定任何结论，判定只来自实测。
+ */
+async function llmContractHints(ctx, { baseUrl, slots, users }) {
+  const request = contractRequest(ctx, baseUrl);
+  const slot = slots[0];
+  let sample = null;
+  try {
+    sample = await request({ method: slot.method ?? "GET", path: slot.path, query: slot.extraQuery ?? null, identity: users[0] });
+  } catch {
+    sample = null;
+  }
+  if (!sample || sample.error || !sample.json || typeof sample.json !== "object") return null;
+
+  const res = await llmChat(ctx, {
+    systemPrompt: CONTRACT_HINTS_SYSTEM,
+    userPrompt: `响应样本（GET ${slot.path}）：\n${JSON.stringify(sample.json).slice(0, 4000)}\n\n只输出严格 JSON 假设。`,
+    getToken: ctx.llm.getToken,
+    model: ctx.targetConfig?.llm?.model ?? null,
+    timeoutMs: 60_000,
+    maxTokens: 400,
+    purpose: "提出资源契约补充假设（仅路径/字段名/分页键）",
+  });
+  const { extras, rejected } = validateExtras(llmParseJson(res.content), sample.json);
+  const total =
+    extras.arrayPaths.length + extras.idFields.length + extras.pagination.length;
+  if (total === 0) {
+    ctx.emit({
+      kind: "discovery",
+      severity: SEVERITY.WARN,
+      message: "LLM 契约假设全部被拒（未引用实测响应里真实存在的路径/字段），继续按无契约处理",
+      data: { rejected: rejected.slice(0, 6) },
+    });
+    return null;
+  }
+  ctx.emit({
+    kind: "discovery",
+    severity: SEVERITY.INFO,
+    message: `LLM 契约补充假设已接受 ${total} 条（列表路径 ${extras.arrayPaths.length} · 主键 ${extras.idFields.length} · 分页 ${extras.pagination.length}），拒掉 ${rejected.length} 条，逐条真实验证中`,
+    data: { accepted: extras, rejected: rejected.slice(0, 6) },
+  });
+  const out2 = await discoverListContract({
+    request,
+    slots,
+    identities: users,
+    extras,
+    budget: MAX_CONTRACT_REQUESTS,
+  });
+  if (!out2.contract) {
+    ctx.emit({
+      kind: "discovery",
+      severity: SEVERITY.WARN,
+      message: `LLM 契约假设经双身份实测未成立（再发 ${out2.requestsUsed} 个请求仍无法确定列表/主键/归属字段）`,
+      data: { tried: out2.tried.slice(0, 12) },
+    });
+    return null;
+  }
+  return { contract: out2.contract, requestsUsed: out2.requestsUsed, tried: out2.tried };
+}
+
+/**
+ * 多段路径参数绑定实测：:orgId/orders/:orderId 这类路由，第二个参数没有真实来源时
+ * 过去只能判不可寻址。现在用本人列表里的对象试出字段映射，再真发一次「读自己的对象」请求，
+ * 只有目标回读同一个对象才算这条路由可寻址。
+ */
+async function resolveDerivedBindings(ctx, { baseUrl, byUser, loggedIn, phase }) {
+  const users = (loggedIn ?? []).filter((i) => i.role !== "admin").map((i) => i.name);
+  if (users.length === 0) return [];
+  const idField = respPath(ctx, "id") ?? "id";
+  const pending = (ctx.plan?.pendingCandidates ?? []).filter((c) => {
+    const names = (candPath(c) ?? "").match(/:([A-Za-z_]\w*)/g) ?? [];
+    if (names.length < 2) return false;
+    const bindings = c.paramBindings ?? null;
+    return !names.every((n) => bindings?.[n.slice(1)]);
+  });
+  if (pending.length === 0) return [];
+  const itemsByIdentity = {};
+  for (const name of users) {
+    const item = (byUser?.[name] ?? []).find((o) => getByDotPath(o, idField) != null) ?? null;
+    if (item) itemsByIdentity[name] = { item };
+  }
+  const out = await discoverBindings({
+    request: contractRequest(ctx, baseUrl),
+    slots: pending.map((c) => ({
+      key: candKey(c),
+      method: c.method ?? "GET",
+      path: candPath(c),
+      params: (candPath(c).match(/:([A-Za-z_]\w*)/g) ?? []).map((s) => s.slice(1)),
+      identity: users[0],
+    })),
+    itemsByIdentity,
+    idField,
+  });
+  const byKey = new Map(out.results.map((r) => [r.key, r]));
+  const resolved = [];
+  for (const c of pending) {
+    const r = byKey.get(candKey(c));
+    if (!r || r.outcome !== "verified" || !r.bindings) {
+      ctx.emit({
+        kind: "discovery",
+        severity: SEVERITY.WARN,
+        message: `多段路径「${r?.key ?? candKey(c)}」参数取值未通过实测：${
+          r?.outcome === "unbound_param" ? "对象里没有可对应的字段（不猜）" : r?.outcome ?? "unknown"
+        }`,
+        data: { key: r?.key ?? candKey(c), outcome: r?.outcome ?? "unknown" },
+      });
+      continue;
+    }
+    c.paramBindings = { ...(c.paramBindings ?? {}), ...r.bindings };
+    const asRead = isReadShaped(c);
+    if (asRead && !ctx.plan.readCandidates.includes(c)) {
+      ctx.plan.readCandidates = [...(ctx.plan.readCandidates ?? []), c];
+      if (!ctx.plan.readCandidate) ctx.plan.readCandidate = c;
+    }
+    // 单体实体包装路径可能只有这条多段路由能探到（无其它单参数读端点的项目）：
+    // 回读 200 已证实响应里哪个位置承载实体，这里补进推导契约
+    if (r.entityPath != null && !ctx.targetConfig?.responses?.entity && !ctx._derived?.entity) {
+      ctx._derived = { ...(ctx._derived ?? {}), entity: r.entityPath };
+      ctx.emit({
+        kind: "discovery",
+        severity: SEVERITY.INFO,
+        message: `实体包装路径经回读实测补推：实体字段=${r.entityPath}（${r.key}）`,
+        data: { key: r.key, entityPath: r.entityPath },
+      });
+    }
+    resolved.push({
+      key: r.key,
+      bindings: Object.fromEntries(Object.entries(r.bindings).map(([k, v]) => [k, v.field])),
+      status: r.status,
+    });
+    ctx.emit({
+      kind: "discovery",
+      severity: SEVERITY.SUCCESS,
+      message: `多段路径参数绑定经实测确认：${r.key} ← ${Object.entries(r.bindings).map(([k, v]) => `${k}=${v.field}`).join("、")}（本人回读 ${r.status}）`,
+      data: { key: r.key, bindings: r.bindings },
+    });
+  }
+  // 静态计划只有「多段但无取值来源」这一类候选时，绑定实测就是唯一的放行依据：
+  // 全都没绑上则如实报无法构造，而不是带着没填参数的路径去打分。
+  if (phase === "pre" && resolved.length === 0 && ctx._planPendingOnly) {
+    throw new ProbeError("多段路径参数在真实响应里找不到取值来源，无法构造探测请求", {
+      code: "param_binding_unverified",
+      hint: `已用本人列表里的真实对象试过这些多段路由（${pending.map((c) => candKey(c)).join("、")}），对象里没有与参数对应的字段，引擎不会猜。请在 guardbuild.json 的 routes[].params 为每个参数声明取值来源（字段名或常量）`,
+      details: { pending: pending.map((c) => candKey(c)) },
+    });
+  }
+  return resolved;
+}
+
+/* --------------------------------- 资源发现 --------------------------------- */
 
 /**
  * 发现资源归属。优先各身份的按归属列表接口；
  * 无列表接口时可回退匿名 ID 探测（逐个无鉴权候选路径探测，服务匿名用例）；
  * 两者皆无且计划不依赖对象归属时返回空结果（如仅路径穿越用例）。
+ * 列表接口/字段名/分页参数没写契约时，先走上面的自动发现（双身份实测）。
  * 返回 { byUser, anonymousItems, anonTargets }。
  */
 async function discoverResources(ctx, baseUrl, loggedIn) {
+  if (ctx.plan?.listEndpoint || (ctx.analysis?.endpoints ?? []).some((e) => !e.graphql && !e.trpc && (e.method ?? "GET") === "GET" && !/:/.test(e.fullPath ?? e.path ?? ""))) {
+    await ensureResourceContract(ctx, { baseUrl, loggedIn });
+  }
   const listPath = ctx.plan.listEndpoint?.path;
   if (!listPath) {
     const unauthCands = planCandidates(ctx, "unauthRead");
@@ -2909,6 +3381,9 @@ export async function runPhase(ctx, { phase, baseUrl }) {
       ctx._resourceById = indexResources(ctx, byUser, anonymousItems);
     }
   }
+  // 多段路径（/orgs/:orgId/orders/:orderId）的取值来源：静态没声明时用本人列表里的真实对象实测绑定，
+  // 绑上的候选才进入读候选槽位；绑不上就如实拒掉，绝不猜。
+  await resolveDerivedBindings(ctx, { baseUrl, byUser, loggedIn, phase });
   const targets = pickTargets(ctx, byUser, loggedIn, anonymousItems, anonTargets);
   // 身份交叉校验：attacker 与 victim 必须是两个不同用户，否则"越权读他人"用例退化为"读自己"
   if (targets.attacker && targets.victim) {

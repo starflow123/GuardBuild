@@ -140,6 +140,8 @@ function createCtx(params) {
     procs: {},
     // Docker 沙箱：本会话创建的容器名，用于失败/结束时 docker rm -f
     docker: { containers: [], seq: 0 },
+    // 出站令牌提供方（契约假设兜底等 LLM 辅助共用）；密钥仍只从环境变量读
+    llm: { getToken: (url, why) => ensureLlmToken(ctx, url, why) },
     cancelled: false,
     gate: params.gate === true,
     outcomeLabel: null,
@@ -1173,6 +1175,9 @@ async function stageAnalyze(ctx) {
   });
   const supaProbeable = ctx.plan.supabase?.probeable === true;
   const supaStaticLeak = !!ctx.plan.supabase?.serviceRoleLeak;
+  // 多段路径但没有取值来源的候选（pendingCandidates）不在 analyze 阶段判死：
+  // 目标跑起来后用本人列表的真实对象实测绑定，绑上才有覆盖，绑不上如实报无法构造。
+  ctx._planPendingOnly = false;
   if (
     !ctx.plan.readCandidate &&
     !ctx.plan.cancelCandidate &&
@@ -1187,10 +1192,14 @@ async function stageAnalyze(ctx) {
     !supaProbeable &&
     !supaStaticLeak
   ) {
-    throw new SessionError("无法构建探测计划：候选端点中缺少可探测的接口", {
-      code: "plan_incomplete",
-      hint: `已发现 ${cands.length} 个候选端点，但均不含「按 ID 取单体资源」的路径（如 GET /api/orders/:id）、文件读取线索、SQL/命令注入线索、SSRF 线索、文件上传线索、JWT 伪造线索、业务逻辑/竞态线索，也未定位到可探测的 Supabase 项目（需 URL + anon key + 至少一个表引用）。多段路径（/orgs/:orgId/orders/:orderId）需在 guardbuild.json 的 routes[].params 给每个参数声明取值来源；也可在 routes/openapi 里补充可寻址接口`,
-    });
+    if ((ctx.plan.pendingCandidates ?? []).length > 0) {
+      ctx._planPendingOnly = true;
+    } else {
+      throw new SessionError("无法构建探测计划：候选端点中缺少可探测的接口", {
+        code: "plan_incomplete",
+        hint: `已发现 ${cands.length} 个候选端点，但均不含「按 ID 取单体资源」的路径（如 GET /api/orders/:id）、文件读取线索、SQL/命令注入线索、SSRF 线索、文件上传线索、JWT 伪造线索、业务逻辑/竞态线索，也未定位到可探测的 Supabase 项目（需 URL + anon key + 至少一个表引用）。多段路径（/orgs/:orgId/orders/:orderId）会在运行期用真实对象实测参数取值来源，测不出时需在 guardbuild.json 的 routes[].params 声明；也可在 routes/openapi 里补充可寻址接口`,
+      });
+    }
   }
   ctx.view.plan = planView(ctx.plan);
   pushView(ctx);
@@ -1478,7 +1487,9 @@ async function stageReproduce(ctx) {
     plan.ssrfCandidate ||
     plan.uploadCandidate ||
     plan.jwtCandidate ||
-    plan.bizlogicCandidate
+    plan.bizlogicCandidate ||
+    // 多段路径但缺取值来源的候选：静态判不了，跑起来后用真实对象实测绑定，绑上才算覆盖
+    (plan.pendingCandidates ?? []).length > 0
   );
   const supa = plan.supabase ?? null;
 

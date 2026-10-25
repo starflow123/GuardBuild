@@ -84,6 +84,20 @@ const OUTCOME_PRESENTATION = {
     stateLabel: "无法构造探测请求 · 无法证明",
     hint: "已识别出候选，但没有一个能构造出可寻址请求（exit 2）：多段路径需要 routes[].params 给每个参数声明取值来源，否则引擎不会猜。补齐契约后重跑；本轮没有真正打到目标，不能据此判定安全。",
   },
+  no_list_endpoint: {
+    outcome: "inconclusive",
+    kind: "inconclusive",
+    title: "未定位到列表接口（无法证明）",
+    stateLabel: "无列表接口 · 无法证明",
+    hint: "静态、运行期实测（含自动发现）都没能确定按归属过滤的列表接口（exit 2）：既没复现漏洞，也没真正测到。请在 guardbuild.json 用 listEndpoint 显式声明列表端点（可带分页/过滤查询参数），或在 routes 里补充路由后重跑。",
+  },
+  param_binding_unverified: {
+    outcome: "inconclusive",
+    kind: "inconclusive",
+    title: "多段路径参数取值来源未通过实测（无法证明）",
+    stateLabel: "参数取值测不出 · 无法证明",
+    hint: "已用本人列表里的真实对象实测过多段路径的参数绑定，响应里没有与参数对应的字段（exit 2）：引擎不会猜，本轮没有真正打到目标。请在 guardbuild.json 的 routes[].params 为每个参数声明取值来源（字段名或常量）后重跑。",
+  },
   scout_routes_unverified: {
     outcome: "inconclusive",
     kind: "inconclusive",

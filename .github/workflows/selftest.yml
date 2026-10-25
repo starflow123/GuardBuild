@@ -86,6 +86,9 @@ jobs:
       - name: 契约扩展 E2E（静态看不见的路由 + responses/listEndpoint/多参数绑定 + inconclusive 终态）
         run: node scripts/e2e-contract.mjs
 
+      - name: 资源契约自动发现 E2E（零人工契约 + 多段路径运行期绑定 + 不猜终态）
+        run: node scripts/e2e-shape.mjs
+
       - name: Python 适配器 E2E（FastAPI 真实 uvicorn + 越权/匿名/修复三分支）
         run: node scripts/e2e-python.mjs
 

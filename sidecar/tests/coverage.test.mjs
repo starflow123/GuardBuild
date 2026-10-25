@@ -23,7 +23,14 @@ test("describeOutcome: 终态语义与退出码映射（README 退出码表的�
   assert.match(clean.title, /不等于安全/, "未复现不得暗示「系统安全」");
 
   // 「没测到」必须与「测了没复现」分开：前者 exit 2，后者 exit 0
-  for (const code of ["no_endpoints", "attack_inconclusive", "plan_incomplete", "scout_routes_unverified"]) {
+  for (const code of [
+    "no_endpoints",
+    "attack_inconclusive",
+    "plan_incomplete",
+    "scout_routes_unverified",
+    "no_list_endpoint",
+    "param_binding_unverified",
+  ]) {
     const inc = describeOutcome(code);
     assert.equal(inc.outcome, "inconclusive", `${code} 应归为 inconclusive`);
     assert.equal(inc.kind, "inconclusive");
@@ -34,6 +41,9 @@ test("describeOutcome: 终态语义与退出码映射（README 退出码表的�
   assert.match(describeOutcome("no_endpoints").title, /未识别到 HTTP 路由/);
   assert.match(describeOutcome("attack_inconclusive").title, /证据不足/);
   assert.match(describeOutcome("plan_incomplete").hint, /routes\[\]\.params/);
+  assert.match(describeOutcome("no_list_endpoint").hint, /listEndpoint/);
+  assert.match(describeOutcome("param_binding_unverified").title, /多段路径参数/);
+  assert.match(describeOutcome("param_binding_unverified").hint, /不会猜/);
   // 模型路由被实测全部打掉：断言没有变成覆盖，不能 exit 0
   assert.match(describeOutcome("scout_routes_unverified").title, /未通过运行期实测/);
   assert.match(describeOutcome("scout_routes_unverified").hint, /openapi\.file/);

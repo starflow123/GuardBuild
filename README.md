@@ -147,9 +147,9 @@ npm run test:rust      # Rust Host
 - `start`：就绪以 `readyPattern` 在 stdout 出现为准（解析前先剥 ANSI 色码，依次识别行内 JSON `port` → `host:port` → 「端口 NNNN」/ `listening on port NNNN` 文本形状）。端口两种写法任选：`env.PORT=0` 让服务自选端口（要求服务把真实端口打进就绪行）；硬编码端口或打印字面量的服务改用 **`${GB_PORT}` 槽位**——宿主每次 spawn 前分配一个空闲端口注入，`cmd` / `args` / `env` 均可使用（修复阶段会先停止原始实例，验收实例与原始实例不再争用端口）
 - `prepare`：目标启动前按序执行的前置命令（安装依赖 / 构建），`cwd` 相对项目根；在「原始工作区」与「隔离 worktree」各执行一次——修复阶段的验收不依赖原工作区的构建产物
 - `login`：登录契约——`path` 指定登录端点（优先级高于静态分析候选）；`bodyTemplate` 适配非 `username` 的请求体形状，值支持 `{name}` / `{username}` / `{email}` / `{password}` 占位符；`credentialPath` 支持点路径（如 `authentication.token`），`credentialHeader` / `credentialPrefix` 缺省为 `Authorization` / `Bearer `；`encoding: "form"` 以 `application/x-www-form-urlencoded` 提交；`cookieAuth: true` 表示会话鉴权——登录响应可返回 3xx，`Set-Cookie` 由 Host 收进保险库并在后续请求以 `Cookie` 头注入（`credentialPath` 不填），Cookie 明文不会回到 Sidecar/报告
-- `responses`：声明列表 / 单体资源在响应 JSON 中的位置（点路径，如 `data.items`），以及资源主键与归属字段（`id` / `owner`，同样支持点路径）；不声明时自适应——列表找「顶层数组 → 首个含 `id` 的对象数组」，单体找「首个对象值字段 → 响应自身」，主键按 `id` / `resourceId` / `userId` / `user_id`、归属按 `ownerId` / `user_id` / `created_by` 等常见键推断；资源名参与用例文案（`order` 显示为「订单」）
-- `listEndpoint`：显式声明「按归属过滤的资源列表接口」（`method` / `path` / `query` / `resource`），优先于静态推断。用于列表路径静态认不出、或服务端强制要求分页 / 过滤查询参数（缺参数直接 400）的项目；`query` 的值会随发现请求一起发送
-- `routes`：补充静态分析看不到的接口（手写分发表、动态注册）；对象级路由可声明 `idField` / `ownerField`（按路由覆盖 `responses`），多段路径（`/orgs/:orgId/orders/:orderId`）用 `params` 给每个参数声明取值来源：字段名简写（取资源对象同名字段）、`{ "from": "item", "field": "org_id" }` 或 `{ "from": "const", "value": "v2" }`。参数未绑定全的候选会被判为不可寻址，报告按「无法构造探测请求」exit 2 处理，而不是静默跳过
+- `responses`：声明列表 / 单体资源在响应 JSON 中的位置（点路径，如 `data.items`），以及资源主键与归属字段（`id` / `owner`，同样支持点路径）；不声明时先自适应推断，再由**资源契约自动发现**兜底——引擎用两个测试身份的真实请求对拉（逐个候选集合端点 × 常见分页参数），只有「同一字段在两个身份的列表里互斥」才认定主键、「同身份内恒定、两身份之间不同」才认定归属，单体响应的实体包装（`{ meta, record }` 之类）也用真实回读实测；结论写入报告 `summary.resourceContract` 并缓存（按提交指纹，复用时仍先真实复核）。仍发现不了才回落「无法证明」终态
+- `listEndpoint`：显式声明「按归属过滤的资源列表接口」（`method` / `path` / `query` / `resource`），优先于自动发现。用于自动发现试不出（自造分页键名等）、或想跳过发现请求直接固定接口的项目；`query` 的值会随发现请求一起发送
+- `routes`：补充静态分析看不到的接口（手写分发表、动态注册）；对象级路由可声明 `idField` / `ownerField`（按路由覆盖 `responses`），多段路径（`/orgs/:orgId/orders/:orderId`）用 `params` 给每个参数声明取值来源：字段名简写（取资源对象同名字段）、`{ "from": "item", "field": "org_id" }` 或 `{ "from": "const", "value": "v2" }`。未声明 `params` 时引擎会先实测兜底——用本人列表里的真实对象逐参数找同名字段并真实回读验证（命中即视为可寻址）；实测不出的候选才判「取值来源未通过实测」，报告按「无法证明」exit 2（`param_binding_unverified`）处理，而不是静默跳过或猜着打
 - `identities`：支持 `username` / `email` / 自定义 `fields` 三种形状；至少 2 个，否则回退到内置演示身份；`role: "admin"` 的身份用于管理端用例
 - `scopes`：仅 CI gate 模式读取，作为「预声明授权」白名单；桌面模式不生效（仍逐次征求用户授权）
 - `llm`：可选 LLM 开关——接入侦察（`enabled` / `model` / `maxFiles`）与编码代理补丁（`patch` / `autoVerify` / `patchMaxFiles` / `patchToolRounds`），默认全关；启用与安全边界见下两节
@@ -160,10 +160,10 @@ npm run test:rust      # Rust Host
 - 多数 Node / Python 项目可零启动契约接入（自动探测 `npm run start` / `dev` / `uvicorn` 等）；启动来源与依据见事件流与报告 `start` / `startSource` 字段，接不上时优先看诊断事件里的 `hint`
 - 服务依赖构建产物（`tsc` / 打包）→ 把构建命令放进 `prepare`，gate 与桌面模式都会在启动前执行，无需手工预生成
 - 登录不是 `/api/login`、不是 `{username, password}`、token 不在顶层 → 用 `login` 契约显式声明；引擎先后尝试「契约声明 → 静态分析候选 → `/api/login`」，成功后固化优先级
-- 列表 / 单体不在响应顶层（如 `{ "code": 0, "data": { "items": [] } }`）→ 用 `responses` 契约声明 `list` / `entity` 点路径；不声明时靠自适应探测，形状歧义（多个对象数组）时建议显式声明
+- 列表 / 单体不在响应顶层（如 `{ "code": 0, "data": { "items": [] } }`）→ 多数情况**无需声明**：资源契约自动发现会用两个身份的真实请求实测出列表数组、主键、归属与实体包装（报告 `summary.resourceContract` 可查）；形状歧义（多个对象数组、自造分页键名）导致发现失败时再用 `responses` / `listEndpoint` 显式声明
 - 资源主键 / 归属字段不叫 `id` / `ownerId`（如 `order_id` / `created_by_uid`）→ `responses.id` / `responses.owner`，或按路由用 `routes[].idField` / `ownerField` 覆盖；声明后归属比对与越权取证都按这些字段读
-- 列表接口需要分页 / 过滤参数才返回数据（缺参数直接 400）→ 用 `listEndpoint` 声明端点并把 `query` 参数一并给出；静态推断出的列表端点优先级低于它
-- 路由是手写分发表 / 正则（静态适配器认不出），或多段路径参数（`/orgs/:orgId/orders/:orderId`）→ 用 `routes` 显式声明，多段路径给 `params` 绑定取值来源；这类项目缺声明时终态是「未识别路由 / 无法构造探测请求」（exit 2），不会被伪装成「已测无问题」
+- 列表接口需要分页 / 过滤参数才返回数据（缺参数直接 400）→ 常见分页键名（`page` / `size` / `pageSize` / `limit` / `offset` / `per_page` 等）自动发现会逐个试；自造键名再用 `listEndpoint` 显式声明并把 `query` 参数一并给出；显式声明优先级最高
+- 路由是手写分发表 / 正则（静态适配器认不出），或多段路径参数（`/orgs/:orgId/orders/:orderId`）→ 用 `routes` 显式声明，多段路径给 `params` 绑定取值来源；未声明时引擎会用本人列表里的真实对象实测参数取值（真实回读验证），实测不出才落「无法构造探测请求 / 取值来源未通过实测」（exit 2），不会被伪装成「已测无问题」
 - 登录失败会给出归因：凭据错误（401/403）、端点不存在（404/405）、服务端异常（5xx），并提示检查契约对应字段
 - Windows 上 `npm` / `npx` 等 `.cmd` shim 自动解析（沿 `PATH` × `PATHEXT` 查找），契约里直接写 `npm` / `npx` 即可
 - 服务硬编码端口、启动脚本不支持 `PORT=0`、或就绪行只打印字面量端口 → 契约改用 `${GB_PORT}` 槽位（宿主分配空闲端口注入，解析不到就绪端口时直接回退到分配值）

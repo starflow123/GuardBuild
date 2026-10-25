@@ -41,7 +41,8 @@
     "benchmark:blackbox": "node scripts/benchmark-blackbox.mjs",
     "e2e:blackbox": "node scripts/e2e-blackbox.mjs",
     "e2e:attackplan": "node scripts/e2e-attackplan.mjs",
-    "e2e:docker": "node scripts/e2e-docker.mjs"
+    "e2e:docker": "node scripts/e2e-docker.mjs",
+    "benchmark:realworld": "node scripts/benchmark-realworld.mjs"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.9.0",

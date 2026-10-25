@@ -84,6 +84,7 @@ npm run e2e:llm-patch  # LLM 编码代理补丁演练（73 断言，本机 mock�
 npm run e2e:fix-agent  # 本地修复循环演练（21 断言：首轮漏修 → 失败证据+运行日志回传 → 第二轮通过）
 npm run benchmark      # 精度基准（12 个标注靶场：漏报 / 误报 / 退出码一致性）
 npm run benchmark:blackbox  # 黑盒精度基准（25 个标注靶场：用例族召回 / 误报 / 写与破坏性探测开关 / 退出码）
+npm run benchmark:realworld # 第三方真实靶场基准（可选开启：本机备好的上游真代码，缺则自动跳过）
 npm run seed-demo      # 单独生成演示工作区 .demo/vibeshop（供桌面端手动演练）
 
 # 单元测试
@@ -220,6 +221,18 @@ npm run e2e:llm-patch          # 本机 mock DeepSeek 四轮演练，无需真�
 - 开关语义：SSRF 与 JWT 伪造无副作用，默认执行；上传与状态跳步要 `allowMutation`；跨用户删除与退款类并发双花要 `allowDestructive`——`upload-shop-default`、`bizlogic-shop-default` 两条标注专门锁住「默认不打」
 - 当前基线（2026-10-24）：25 个靶场 · 用例召回 46/46 · 误报 0/46 · 退出码一致 25/25 · 终态一致 25/25
 - 产物：`.benchmark-blackbox/benchmark-report.json` / `.benchmark-blackbox/benchmark-report.md`；CI 每次自测都会执行并上传
+
+### 第三方真实靶场基准（可选开启，缺则自动跳过）
+
+`npm run benchmark:realworld` 对 `benchmarks/realworld-corpus.json` 中的**上游真代码**靶场逐个发起真实黑盒扫描。它存在的唯一理由：自建 fixture 的路径、参数名、加固开关都是我们自己挑的，召回 100% 只证明引擎在自己的框架里自洽；误报往往只在陌生框架里露头（Juice Shop 上实测到的「共享商品目录被读成他人对象」就是一例）。
+
+- 语料字段：`dir` / `requires`（缺任一文件即跳过）/ `start`（`${GB_PORT}` 槽位 + 就绪行正则）/ `expectedExit` / `expectedVulnerable` / `forbiddenVulnerable` / `expectOpenapiFound`
+- 跳过 ≠ 失败：本机没有这份第三方代码是常态，未实跑的靶场不进指标；`--require=<id>` 可把指定靶场的跳过判为失败，防止 CI 里「全跳过也全绿」的空转
+- 标注口径：阳性只写实测证实过的用例（上游声明的漏洞清单 + 逐行核对源码）；否定断言只写「结构上不可能」的用例族；未被标注覆盖的发现列入「未标注」供人工核对，不直接算误报
+- 用法：`npm run benchmark:realworld`（默认靶场根 `D:/AiAgent/dogfood`，可用 `GUARDBUILD_REAL_DIR` 覆盖；`--only=<id>` 单跑）
+- 成本：单轮约 6 分钟（VulnAPI ≈ 340s，Juice Shop ≈ 16s），且需本机预装第三方代码与依赖，因此**尚未接入 CI**，作为本地/夜间可选项
+- 产物：`.benchmark-realworld/benchmark-report.json` / `.md`
+- 当前基线（2026-10-25）：2 个靶场 · 用例召回 3/3 · 明令禁止命中 0 · 未标注 0 · 退出码一致 2/2 · 零模型调用
 
 ## 纯黑盒外部扫描（已运行 / 沙箱中的目标）
 

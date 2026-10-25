@@ -1021,6 +1021,18 @@ async function probeUnauthRead(ctx, baseUrl, routes, limit = MAX_PROBE_ROUTES) {
   return records;
 }
 
+/**
+ * 「victim 的列表里有这个对象」不等于「对象归 victim 所有」：商品、字典、公告这类
+ * 共享/全局集合，两个身份的同一个列表接口都会返回同一批 id。跨用户判定必须先排除这种形状，
+ * 否则会把「公开目录读得到」读成「读到了别人的对象」（第三方靶场上实测到的误报）。
+ * 顺带挡住另一件事：写/删探测不能拿共享对象开刀——改坏的是全局数据，不是越权证据。
+ */
+async function sharedCollectionMember(ctx, baseUrl, routePath, victimId, attackerName) {
+  const own = await httpJson(ctx, { baseUrl, method: "GET", path: routePath, identity: attackerName });
+  if (!own.ok) return false;
+  return extractItems(own.json).some((o) => extractId(o) != null && String(extractId(o)) === String(victimId));
+}
+
 async function probeIdor(ctx, baseUrl, routes, { attacker, victim }, limit = MAX_PROBE_ROUTES) {
   const records = [];
   const candidates = routes.filter((r) => r.method === "GET").slice(0, limit);
@@ -1036,6 +1048,24 @@ async function probeIdor(ctx, baseUrl, routes, { attacker, victim }, limit = MAX
     if (!baseline.ok) continue;
     const victimEntity = extractEntityById(baseline.json, victimId);
     if (!victimEntity) continue;
+
+    if (await sharedCollectionMember(ctx, baseUrl, route.path, victimId, attacker.name)) {
+      const rec = makeRecord(ctx, baseUrl, {
+        caseId: `blackbox-idor-${slug(detailPath)}`,
+        name: `黑盒·跨用户读取（IDOR）${detailPath}`,
+        method: "GET",
+        path: detailPath,
+        identity: attacker.name,
+        res: baseline,
+        expectation: "身份 A 不得读取身份 B 的对象",
+        verdict: VERDICT.INCONCLUSIVE,
+        actual: `${attacker.name} 自己的 ${route.path} 列表同样返回 #${victimId}：这是共享/全局集合而非按身份切分的对象集合，跨用户读取不成立（不据此报漏洞）`,
+        grade: "http-only",
+      });
+      records.push(rec);
+      emitRecord(ctx, rec);
+      continue;
+    }
 
     const attack = await httpJson(ctx, { baseUrl, method: "GET", path: detailPath, identity: attacker.name });
     const owner = extractOwner(victimEntity) ?? extractOwner(victimItem);
@@ -1136,6 +1166,24 @@ async function probeWriteIdor(
     if (!field) continue;
     const original = victimItem[field];
     const detailPath = `${route.path.replace(/\/+$/, "")}/${encodeURIComponent(victimId)}`;
+
+    if (await sharedCollectionMember(ctx, baseUrl, route.path, victimId, attacker.name)) {
+      const rec = makeRecord(ctx, baseUrl, {
+        caseId: `blackbox-idor-write-${slug(detailPath)}`,
+        name: `黑盒·跨用户写/删（IDOR）${detailPath}`,
+        method: "GET",
+        path: detailPath,
+        identity: attacker.name,
+        res: list,
+        expectation: "身份 A 不得修改或删除身份 B 的对象",
+        verdict: VERDICT.INCONCLUSIVE,
+        actual: `${attacker.name} 自己的 ${route.path} 列表同样返回 #${victimId}：共享/全局集合，写/删探测跳过（改动会影响全局数据，也不构成越权证据）`,
+        grade: "http-only",
+      });
+      records.push(rec);
+      emitRecord(ctx, rec);
+      continue;
+    }
 
     for (const method of methods) {
       if (method === "DELETE" && !destructive) continue;

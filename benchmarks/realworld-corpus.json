@@ -1,0 +1,63 @@
+{
+  "version": 1,
+  "title": "第三方真实靶场基准（自建靶场之外的真代码）",
+  "note": [
+    "这一层不是「又一个靶场」，而是防止自建靶场把自己的设计假设喂成结论：",
+    "自建 fixture 的路径、参数名、加固开关都是我们挑的，召回 100% 只说明引擎在自己的框架里自洽。",
+    "这里的标注来自上游作者自己声明的漏洞清单 + 逐行核对源码，跳过不算失败（本机没这份代码很正常）。"
+  ],
+  "realDirEnv": "GUARDBUILD_REAL_DIR",
+  "defaultRealDir": "D:/AiAgent/dogfood",
+  "targets": [
+    {
+      "id": "vulnapi",
+      "name": "VulnAPI (maseela/vulnapi, FastAPI)",
+      "dir": "vulnapi",
+      "groundTruth": "上游 README「Current implemented vulns」+ main.py 逐行核对",
+      "notes": [
+        "上游清单：数据暴露 / Mass assignment / BOLA / Broken authentication / 反序列化 RCE / SQLi / 文件包含·路径穿越 / SSTI。",
+        "SSRF 不在上游清单里，但 main.py:204 `/currentexchangerate/?url=` 直接 requests.get(用户传入 URL)，属实证真阳；SSTI(/greeter) 与反序列化 RCE 引擎未覆盖，不会也不该出现。",
+        "否定断言只写「结构上不可能」的两族：main.py 路由表（/token /accounts /me/notifications /bulk /bank_codes /exchangerate /currentexchangerate /greeter /）里没有上传端点、也没有多步状态资源，所以 upload/biz 命中即为误报。BOLA/JWT 类不断言——它取决于登录态与数据归属，需人工核对。"
+      ],
+      "requires": ["main.py", "guardbuild.json"],
+      "start": {
+        "cmd": "python",
+        "args": ["-m", "uvicorn", "main:app", "--host", "127.0.0.1", "--port", "${GB_PORT}"],
+        "readyPattern": "Uvicorn running on|Application startup complete",
+        "readyTimeoutMs": 60000
+      },
+      "expectedExit": 1,
+      "expectedOutcomes": ["vulnerable_unfixed"],
+      "expectedVulnerable": ["blackbox-sqli-*", "blackbox-ssrf-*"],
+      "forbiddenVulnerable": ["blackbox-upload-*", "blackbox-biz-*"],
+      "expectOpenapiFound": true,
+      "timeoutMs": 600000
+    },
+    {
+      "id": "juice-shop",
+      "name": "OWASP Juice Shop",
+      "dir": "juice-shop",
+      "groundTruth": "上游 OWASP Juice Shop 已知弱点清单 + 本地 dogfood 契约",
+      "notes": [
+        "需要已编译产物（build/app.js）与 dogfood-ready-hook.cjs（PORT=0 + GBREADY 就绪行）；缺任一项自动跳过。",
+        "该靶场体量真实（几百个路由），主要回归「发现层能不能在陌生框架里看见接口」与「未标注发现有多少」。",
+        "阳性标注来自实测：blackbox-idor-api-orders-5002 打的是本地 dogfood 契约注入的 no-check 路由（去掉归属校验），属真阳；上游原生 /rest/* 接口都带校验，未判出。未认证读取族在 Juice Shop 上全部 blocked/inconclusive（匿名只拿到公开商品目录），故不作期望。",
+        "否定断言锁的是自建 fixture 抓不到的那类误报：/api/products 是两个身份都能看到同一批 id 的共享目录，早先被读成「bob 读到 alice 的对象」。共享集合守卫（sharedCollectionMember）生效后该用例必须回落为 inconclusive。"
+      ],
+      "requires": ["build/app.js", "dogfood-ready-hook.cjs", "guardbuild.json"],
+      "start": {
+        "cmd": "node",
+        "args": ["--require", "./dogfood-ready-hook.cjs", "build/app"],
+        "env": { "PORT": "0" },
+        "readyPattern": "GBREADY|listening on port",
+        "readyTimeoutMs": 240000
+      },
+      "expectedExit": 1,
+      "expectedOutcomes": ["vulnerable_unfixed"],
+      "expectedVulnerable": ["blackbox-idor-api-orders-*"],
+      "forbiddenVulnerable": ["blackbox-idor-api-products-*"],
+      "expectOpenapiFound": false,
+      "timeoutMs": 900000
+    }
+  ]
+}

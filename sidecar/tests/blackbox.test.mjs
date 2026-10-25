@@ -1767,3 +1767,145 @@ test("discoverOpenapi: 规格只写在 /swagger-ui.html 页面里也能找到（
     await target.close();
   }
 });
+
+/**
+ * 第三方靶场上实测到的误报形状：商品目录这类共享/全局集合，两个身份的同一个列表接口
+ * 返回同一批 id，早先会被判成「bob 读到了 alice 的对象」。orders 才是真按身份切分的集合，
+ * 用来证明加固后真阳性不丢。writeAttempts 记录服务端真的收到过哪些写请求。
+ */
+function sharedCatalogServer() {
+  const tokens = new Map();
+  const writeAttempts = [];
+  const catalog = [
+    { id: 1, name: "widget", price: 9 },
+    { id: 2, name: "gadget", price: 19 },
+  ];
+  const orders = [
+    { id: 101, userId: 1, note: "alice-note" },
+    { id: 102, userId: 2, note: "bob-note" },
+  ];
+  const server = http.createServer(async (req, res) => {
+    const url = new URL(req.url, "http://127.0.0.1");
+    const send = (status, body) => {
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(body));
+    };
+    const user = tokens.get((req.headers.authorization ?? "").replace(/^Bearer\s+/, "")) ?? null;
+    const readBody = async () => {
+      const chunks = [];
+      for await (const c of req) chunks.push(c);
+      try {
+        return JSON.parse(Buffer.concat(chunks).toString("utf8") || "{}");
+      } catch {
+        return {};
+      }
+    };
+
+    if (req.method === "POST" && url.pathname === "/api/login") {
+      const body = await readBody();
+      const users = {
+        "alice@test.com": { id: 1, email: "alice@test.com", password: "alice123", role: "user" },
+        "bob@test.com": { id: 2, email: "bob@test.com", password: "bob123", role: "user" },
+      };
+      const u = users[body.email];
+      if (!u || u.password !== body.password) return send(401, { error: "bad credentials" });
+      const t = `tok-${u.id}`;
+      tokens.set(t, u);
+      return send(200, { authentication: { token: t } });
+    }
+
+    if (req.method === "GET" && url.pathname === "/openapi.json") {
+      return send(200, { openapi: "3.0.0", paths: { "/api/catalog": { get: {} }, "/api/orders": { get: {} } } });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/catalog") return send(200, { items: catalog });
+
+    const catalogDetail = url.pathname.match(/^\/api\/catalog\/(\d+)$/);
+    if (catalogDetail) {
+      const item = catalog.find((x) => String(x.id) === catalogDetail[1]);
+      if (!item) return send(404, { error: "not found" });
+      if (req.method === "GET") return send(200, { ...item });
+      writeAttempts.push(`${req.method} ${url.pathname}`);
+      return send(405, { error: "catalog is read-only" });
+    }
+
+    if (req.method === "GET" && url.pathname === "/api/orders") {
+      if (!user) return send(401, { error: "unauthorized" });
+      return send(200, { items: orders.filter((o) => o.userId === user.id) });
+    }
+
+    const orderDetail = url.pathname.match(/^\/api\/orders\/(\d+)$/);
+    if (orderDetail) {
+      const o = orders.find((x) => String(x.id) === orderDetail[1]);
+      if (!o) return send(404, { error: "not found" });
+      if (req.method === "GET") return send(200, { ...o });
+      writeAttempts.push(`${req.method} ${url.pathname}`);
+      const body = await readBody();
+      if (typeof body.note === "string") o.note = body.note;
+      return send(200, { ...o });
+    }
+
+    return send(404, { error: "not found" });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({
+        url: `http://127.0.0.1:${server.address().port}`,
+        writeAttempts,
+        close: () => new Promise((r) => server.close(r)),
+      });
+    });
+  });
+}
+
+test("runBlackbox: 共享/全局目录不被当成他人对象（IDOR 误报回退为 inconclusive）", async () => {
+  const target = await sharedCatalogServer();
+  const ctx = makeCtx(new Map());
+  try {
+    const result = await runBlackbox(ctx, target.url, {
+      config: { login: ctx.loginConfig, identities: ctx.identities, blackbox: null },
+      allowMutation: false,
+    });
+    const shared = byCase(result, "blackbox-idor-").find((e) => e.caseId.includes("api-catalog-1"));
+    assert.ok(shared, JSON.stringify(byCase(result, "blackbox-idor-").map((e) => e.caseId)));
+    assert.equal(shared.verdict, "inconclusive");
+    assert.match(shared.actual, /共享\/全局集合/);
+    assert.ok(
+      !result.findings.some((f) => /catalog/i.test(f.path ?? "")),
+      `共享目录不该进结论清单：${JSON.stringify(result.findings.map((f) => f.path))}`
+    );
+
+    // 真按身份切分的集合不能因为这次加固而漏报
+    const real = byCase(result, "blackbox-idor-").find((e) => e.caseId.includes("api-orders-"));
+    assert.ok(real, JSON.stringify(byCase(result, "blackbox-idor-").map((e) => e.caseId)));
+    assert.equal(real.verdict, "vulnerable");
+    assert.equal(real.evidenceGrade, "cross-proven");
+  } finally {
+    await target.close();
+  }
+});
+
+test("runBlackbox: 写越权探测不对共享/全局集合下手（真实请求根本没发出去）", async () => {
+  const target = await sharedCatalogServer();
+  const ctx = makeCtx(new Map());
+  try {
+    const result = await runBlackbox(ctx, target.url, {
+      config: { login: ctx.loginConfig, identities: ctx.identities, blackbox: null },
+      allowMutation: true,
+    });
+    const rec = byCase(result, "blackbox-idor-write-").find((e) => e.caseId.includes("api-catalog-1"));
+    assert.ok(rec, JSON.stringify(byCase(result, "blackbox-idor-write-").map((e) => e.caseId)));
+    assert.equal(rec.verdict, "inconclusive");
+    assert.match(rec.actual, /写\/删探测跳过/);
+    assert.ok(
+      !target.writeAttempts.some((a) => /catalog/.test(a)),
+      `不该对共享目录发起写请求：${JSON.stringify(target.writeAttempts)}`
+    );
+    assert.ok(
+      target.writeAttempts.some((a) => /orders\/10/.test(a)),
+      `按身份切分的集合仍要照常探写越权：${JSON.stringify(target.writeAttempts)}`
+    );
+  } finally {
+    await target.close();
+  }
+});

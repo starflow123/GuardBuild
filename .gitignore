@@ -34,6 +34,7 @@ guardbuild-data/
 .demo-install-*/
 .benchmark/
 .benchmark-blackbox/
+.benchmark-realworld/
 
 # 分发构建产物：随包 Node 由 scripts/prepare-runtime.mjs 生成
 src-tauri/runtime/

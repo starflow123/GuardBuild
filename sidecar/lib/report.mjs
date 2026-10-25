@@ -104,6 +104,9 @@ function headline(outcome, patchStatus, supabase, blackbox = null, errorCode = n
       if (errorCode === "plan_incomplete") {
         return "候选端点无法构造探测请求（exit 2，无法证明）：多段路径缺少参数取值来源，本轮没有真正打到目标";
       }
+      if (errorCode === "scout_routes_unverified") {
+        return "模型给出的路由经运行期实测全部不成立（exit 2，无法证明）：本轮没有可打的真实接口，报告列出每条路由的实测状态码";
+      }
       return "攻击用例未跑全（exit 2，无法证明）：计划中的用例因身份 / 资源 / 运行期契约不足被跳过，本轮既没有复现漏洞，也没有真正测到它们";
     case "vulnerable_unfixed":
       if (supaCritical) {
@@ -322,6 +325,54 @@ function renderAttributionSection(at) {
   return lines.join("\n");
 }
 
+const ROUTE_DROP_LABEL = {
+  not_found: "实测未命中（目标回不存在响应）",
+  method_not_allowed: "方法不被允许",
+  no_probe_id: "无真实资源 id 可填充，无法验证",
+  request_failed: "复核请求失败",
+  budget: "复核请求预算用尽",
+};
+
+function routeVerifySummary(rv) {
+  if (!rv) return "未进行（本轮无 LLM 路由线索，或目标未启动）";
+  const parts = [`送检 ${rv.checked ?? 0} 条，命中 ${rv.kept ?? 0} 条，丢弃 ${rv.dropped?.length ?? 0} 条`];
+  if (rv.requestsUsed != null) parts.push(`复核请求 ${rv.requestsUsed} 个`);
+  return parts.join("，");
+}
+
+function renderRouteVerification(rv) {
+  if (!rv) return [];
+  const rows = [];
+  for (const d of rv.detail ?? []) {
+    const auth =
+      d.auth === "open" ? "匿名可取数（无鉴权确认）" : d.auth === "protected" ? "匿名被拒（需登录确认）" : "鉴权未定性";
+    const owner =
+      d.ownerFilter === false
+        ? "两身份列表一致（未过滤）"
+        : d.ownerFilter === true
+          ? "两身份列表互斥（过滤生效）"
+          : "归属未测";
+    rows.push(
+      `| \`${esc(d.declaredPath ?? d.key)}\` | ${d.status ?? "—"} | ${esc(auth)} | ${esc(owner)} |`
+    );
+  }
+  for (const d of rv.dropped ?? []) {
+    rows.push(
+      `| \`${esc(d.key)}\` | — | 已丢弃 | ${esc(ROUTE_DROP_LABEL[d.reason] ?? d.reason ?? "—")}${
+        d.detail ? `（${esc(d.detail)}）` : ""
+      } |`
+    );
+  }
+  if (!rows.length) return [];
+  return [
+    "\n**LLM 路由运行期实测**（判定只来自真实响应；丢弃即表示目标实例上没有这条路由）\n",
+    "| 路由 | 带身份状态码 | 鉴权实测 | 归属过滤实测 |",
+    "| --- | --- | --- | --- |",
+    ...rows,
+    "",
+  ];
+}
+
 function renderLlmSection(llm) {
   const applied = [
     llm.applied?.start ? "启动契约" : null,
@@ -340,6 +391,7 @@ function renderLlmSection(llm) {
     `| 启动验证 | ${llm.verified?.start ? "已通过实际启动验证" : "未通过/未验证"} |`,
     `| 登录验证 | ${llm.verified?.login ? "已通过实际登录验证" : "未通过/未验证"} |`,
     `| 路由线索 | ${llm.routeCount ?? 0} 条（仅用于定位动态探测目标，不参与自动改码） |`,
+    `| 路由实测 | ${routeVerifySummary(llm.routeVerification)} |`,
     `| 来源 | ${esc(cache)} |`,
     `| Token | ${llm.usage?.total_tokens ?? "—"} |`,
     `| 证据 | ${llm.evidenceFiles?.length ?? 0} 个文件 / ${llm.evidenceChars ?? 0} 字符 |`,
@@ -374,6 +426,7 @@ function renderLlmSection(llm) {
       `- 启动回退：LLM 启动契约未通过实际启动验证（\`${esc(rejected.cmd ?? "?")} ${esc((rejected.args ?? []).join(" "))}\`）。`
     );
   }
+  lines.push(...renderRouteVerification(llm.routeVerification));
   if (llm.warnings?.length) {
     lines.push("\n**侦察警告**\n", ...llm.warnings.slice(0, 10).map((w) => `- ${esc(w)}`), "");
   }
@@ -1052,6 +1105,8 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
           usage: view.llm.usage ?? null,
           notes: view.llm.notes ?? [],
           warnings: view.llm.warnings ?? [],
+          // 路由线索的运行期实测结论（存在性 / 鉴权 / 归属过滤，全部来自真实请求）
+          routeVerification: view.llm.routeVerification ?? null,
         }
       : null,
     bootstrap: summarizeBootstrap(view.bootstrap),

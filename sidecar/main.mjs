@@ -13,7 +13,7 @@ import { RpcPeer } from "./lib/rpc.mjs";
 import { EvidenceStore } from "./lib/db.mjs";
 import { StateMachine } from "./lib/statemachine.mjs";
 import { analyzeProject } from "./lib/analyzer.mjs";
-import { buildProbePlan, loadIdentities } from "./lib/planner.mjs";
+import { buildProbePlan, loadIdentities, planView } from "./lib/planner.mjs";
 import {
   loadTargetConfig,
   loadBlackboxConfig,
@@ -343,8 +343,8 @@ async function stageScout(ctx, targetConfig) {
   emit(ctx, {
     kind: "scout",
     severity: SEVERITY.INFO,
-    message: `开始 LLM 接入侦察${model ? `（${model}）` : ""}：只推断启动/登录/路由，不参与漏洞判定`,
-    data: { model, needsStart, needsLogin, needsRoutes },
+    message: `开始 LLM 接入侦察${model ? `（${model}）` : ""}：只推断启动/登录/路由，不参与漏洞判定${ctx.gate ? "（gate：推断结论仍需逐条实测）" : ""}`,
+    data: { model, needsStart, needsLogin, needsRoutes, gate: ctx.gate },
   });
 
   let scout;
@@ -410,6 +410,8 @@ async function stageScout(ctx, targetConfig) {
     verified: { start: false, login: false },
     rejectedStart: scout.rejectedStart ?? null,
     startAttempts: [],
+    // 运行期实测关的结果在动态阶段回填
+    routeVerification: null,
   };
   pushView(ctx);
   if (scout.cached) {
@@ -1190,21 +1192,7 @@ async function stageAnalyze(ctx) {
       hint: `已发现 ${cands.length} 个候选端点，但均不含「按 ID 取单体资源」的路径（如 GET /api/orders/:id）、文件读取线索、SQL/命令注入线索、SSRF 线索、文件上传线索、JWT 伪造线索、业务逻辑/竞态线索，也未定位到可探测的 Supabase 项目（需 URL + anon key + 至少一个表引用）。多段路径（/orgs/:orgId/orders/:orderId）需在 guardbuild.json 的 routes[].params 给每个参数声明取值来源；也可在 routes/openapi 里补充可寻址接口`,
     });
   }
-  ctx.view.plan = {
-    loginPath: ctx.plan.loginPath,
-    resource: ctx.plan.resource,
-    readPath: ctx.plan.readCandidate?.fullPath ?? ctx.plan.readCandidate?.path ?? null,
-    cancelPath: ctx.plan.cancelCandidate?.fullPath ?? ctx.plan.cancelCandidate?.path ?? null,
-    unauthReadPath: ctx.plan.unauthReadCandidate?.fullPath ?? ctx.plan.unauthReadCandidate?.path ?? null,
-    traversalPath: ctx.plan.traversalCandidate?.fullPath ?? ctx.plan.traversalCandidate?.path ?? null,
-    sqliPath: ctx.plan.sqliCandidate?.fullPath ?? ctx.plan.sqliCandidate?.path ?? null,
-    cmdiPath: ctx.plan.cmdiCandidate?.fullPath ?? ctx.plan.cmdiCandidate?.path ?? null,
-    ssrfPath: ctx.plan.ssrfCandidate?.fullPath ?? ctx.plan.ssrfCandidate?.path ?? null,
-    uploadPath: ctx.plan.uploadCandidate?.fullPath ?? ctx.plan.uploadCandidate?.path ?? null,
-    jwtPath: ctx.plan.jwtCandidate?.fullPath ?? ctx.plan.jwtCandidate?.path ?? null,
-    bizlogicPath: ctx.plan.bizlogicCandidate?.fullPath ?? ctx.plan.bizlogicCandidate?.path ?? null,
-    listPath: ctx.plan.listEndpoint?.path ?? null,
-  };
+  ctx.view.plan = planView(ctx.plan);
   pushView(ctx);
   return ctx.plan;
 }
@@ -1433,6 +1421,48 @@ async function runBootstrapStart(ctx, { reason, cwd, label, role }) {
   return booted ? { ...summary, ...booted } : null;
 }
 
+/**
+ * 把 LLM 路由的运行期实测结论同步到视图 / 侦察缓存 / 事件流。
+ * 实测丢弃的路由不会再出现在 findings 与探测计划里；命中并确认的路由按实测形态改写
+ * 鉴权结论——报告里说的是「打到过」，不是「模型说过」。
+ */
+function syncScoutRouteVerification(ctx) {
+  const v = ctx.scoutRouteVerification;
+  if (!v) return;
+  if (ctx.view.llm) ctx.view.llm.routeVerification = v;
+  ctx.view.plan = planView(ctx.plan ?? {});
+  const dropped = new Set((v.dropped ?? []).map((d) => d.key));
+  const keptByKey = new Map((v.detail ?? []).map((d) => [d.key, d]));
+  ctx.view.findings = (ctx.view.findings ?? []).filter((f) => !dropped.has(`${f.method} ${f.path}`));
+  for (const f of ctx.view.findings) {
+    const k = keptByKey.get(`${f.method} ${f.path}`);
+    if (!k) continue;
+    f.liveVerified = true;
+    if (k.auth === "open") {
+      f.kind = "no-auth-suspect";
+      f.reason = "匿名实测即可取到数据（运行期确认的无鉴权读取）";
+    } else if (k.auth === "protected") {
+      f.reason = `${f.reason}；实测确认需登录`;
+    }
+    if (k.ownerFilter === false) f.reason = `${f.reason}；两身份列表实测内容一致（未按归属过滤）`;
+  }
+  recordScoutVerification(ctx, { routeVerdicts: v });
+  emit(ctx, {
+    kind: "scout",
+    severity: v.dropped.length > 0 ? SEVERITY.WARN : SEVERITY.SUCCESS,
+    message: `LLM 路由运行期实测：送检 ${v.checked} 条，命中 ${v.kept} 条，丢弃 ${v.dropped.length} 条（复核请求 ${v.requestsUsed} 个）`,
+    phase: STATE.PROBING,
+    data: {
+      checked: v.checked,
+      kept: v.kept,
+      dropped: v.dropped,
+      requestsUsed: v.requestsUsed,
+      baselineStatus: v.baselineStatus,
+    },
+  });
+  pushView(ctx);
+}
+
 async function stageReproduce(ctx) {
   ensureAlive(ctx);
   setState(ctx, STATE.PROBING);
@@ -1547,8 +1577,10 @@ async function stageReproduce(ctx) {
       pre = await runPhase(ctx, { phase: "pre", baseUrl: target.url });
     } catch (e) {
       if (ctx.scoutApplied?.login) recordScoutVerification(ctx, { login: !!ctx._loginVerified });
+      syncScoutRouteVerification(ctx);
       throw e;
     }
+    syncScoutRouteVerification(ctx);
     ctx.pushEvidence(pre.evidence);
     ctx.view.phases.pre = pre.summary;
     ctx.view.baseline = acceptanceVerdict(pre.summary);

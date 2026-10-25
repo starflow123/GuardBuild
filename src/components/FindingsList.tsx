@@ -22,6 +22,7 @@ export function FindingsList({ findings }: { findings: FindingItem[] }) {
             <span className="path">{f.path}</span>
             <span className="tag warn">对象级越权候选</span>
             <span className="grow" />
+            <span className="tag">{f.liveVerified ? "路由实测已确认" : "待运行期实测"}</span>
             <span className="tag">{RESOURCE_LABEL[f.resource] ?? f.resource}</span>
           </div>
           <div className="row small muted">

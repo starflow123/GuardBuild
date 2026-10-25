@@ -588,6 +588,8 @@ function writeDiskCache(ctx, key, result) {
     notes: result.notes ?? [],
     warnings: result.warnings ?? [],
     verified: { start: null, login: null },
+    // 上一轮运行期实测结论（存在性 / 鉴权 / 归属过滤）；仅供审计与报告，重放仍会实测
+    routeVerdicts: result.routeVerdicts ?? null,
   };
   try {
     mkdirSync(dirname(file), { recursive: true });
@@ -669,6 +671,7 @@ async function readDiskCache(ctx, key, evidence) {
     cached: true,
     cacheSource: "disk",
     savedAt: data.savedAt,
+    routeVerdicts: data.routeVerdicts ?? null,
     verified: {
       start: typeof data.verified?.start === "boolean" ? data.verified.start : null,
       login: typeof data.verified?.login === "boolean" ? data.verified.login : null,
@@ -698,6 +701,8 @@ export function recordScoutVerification(ctx, patch = {}) {
     if (patch.rejectedStart !== undefined) data.rejectedStart = patch.rejectedStart;
     if (patch.rejectedStarts !== undefined) data.rejectedStarts = patch.rejectedStarts;
     if (patch.workingStart !== undefined) data.workingStart = patch.workingStart;
+    // 运行期实测结论：路由存在性 / 鉴权 / 归属过滤，供下次报告与审计参考
+    if (patch.routeVerdicts !== undefined) data.routeVerdicts = patch.routeVerdicts;
     writeJsonAtomic(file, data);
     for (const entry of SCOUT_CACHE.values()) {
       if (entry.result?._cacheFile !== file) continue;
@@ -709,6 +714,7 @@ export function recordScoutVerification(ctx, patch = {}) {
       if (patch.rejectedStart !== undefined) entry.result.rejectedStart = patch.rejectedStart;
       if (patch.rejectedStarts !== undefined) entry.result.rejectedStarts = patch.rejectedStarts;
       if (patch.workingStart !== undefined) entry.result.workingStart = patch.workingStart;
+      if (patch.routeVerdicts !== undefined) entry.result.routeVerdicts = patch.routeVerdicts;
     }
     return true;
   } catch {

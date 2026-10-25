@@ -79,7 +79,7 @@ npm run e2e:upload     # 文件上传演练（23 断言：主动内容同源回�
 npm run e2e:jwt        # JWT 演练（24 断言：alg=none / 无效签名伪造放行取证 + 固定算法强密钥对照）
 npm run e2e:bizlogic   # 业务逻辑/竞态演练（29 断言：状态跳步回读 + 并发双花副作用标识，加固后 409/单次成功对照）
 npm run e2e:attackplan # 攻击规划代理演练（40 断言，本机 mock DeepSeek：预算重排 + 只认编号 + gate 结构性禁用）
-npm run e2e:llm        # LLM 接入侦察演练（50 断言，本机 mock DeepSeek，含候选逐个启动、全灭回退与无密钥磁盘缓存复用）
+npm run e2e:llm        # LLM 接入侦察演练（61 断言，本机 mock DeepSeek：候选逐个启动、全灭回退、无密钥磁盘缓存复用，含模型编造路由被运行期实测拦下）
 npm run e2e:llm-patch  # LLM 编码代理补丁演练（73 断言，本机 mock：守规矩 / 不守规矩 / 无密钥 / 先只读自查四轮）
 npm run e2e:fix-agent  # 本地修复循环演练（21 断言：首轮漏修 → 失败证据+运行日志回传 → 第二轮通过）
 npm run benchmark      # 精度基准（12 个标注靶场：漏报 / 误报 / 退出码一致性）
@@ -186,8 +186,9 @@ npm run e2e:llm                # 本机 mock DeepSeek 演练，无需真实密�
 ```
 
 - 优先级：显式契约（`start` / `login` / `routes`）> 确定性自动探测 > LLM 侦察；LLM 只补缺，不覆盖已有声明
-- 四道验证关：结构白名单 → 路由文件可定位 → 实际启动成功 → 实际登录成功；任一失败都会回退到确定性流程，不中止会话
+- 五道验证关：结构白名单 → 路由文件可定位 → 实际启动成功 → 实际登录成功 → **模型路由的运行期实测**；任一失败都会回退到确定性流程，不中止会话
 - 启动候选：侦察按可能性给出 1–4 个启动方式（全部经启动器白名单/参数/端口槽位校验并去重）；引擎按序**真实启动**，首选缺依赖/入口不对时自动换下一个，全部失败才回退自动探测/缺省契约；重试总预算 120 秒。实际验证通过的候选写回缓存并在下次优先，避免每轮都从已知失败的猜测开始
+- 路由实测（`sidecar/lib/routeverify.mjs`）：静态「文件里能找到这条路径」拦不住模型编造的路由（如源码注释里残留的历史接口）。动态阶段在身份已登录、资源 id 已发现之后，用真实请求逐条复核：先打一条不存在的路径作基线（用来区分 SPA 的兜底响应），再带身份打目标路由（404 / 命中基线形态即判「目标上没有这条路由」并丢弃，405 判方法不符），随后匿名重打一次给鉴权定性（匿名被拒=确实要登录，匿名 2xx 带数据=确实不用登录），列表路由再让两个身份各拉一次对拉结果（一致=未按归属过滤，互斥=过滤生效）。送检上限 12 条、复核请求预算 48 个；没有可填充的真实资源 id 就判「无法验证」而不是猜一个。丢弃只会缩小覆盖面，不会造出漏洞结论；若模型的候选被全部实测否掉且再无其它候选，终态是 `inconclusive`（exit 2，「没测到 ≠ 安全」）。实测结论进视图 `llm.routeVerification`、报告的「LLM 路由运行期实测」表与侦察缓存（`routeVerdicts`）；复用缓存的轮次照样重新实打，模型结论不因缓存免检
 - 安全边界：只发送目录树与脱敏源码片段，**不发送 `guardbuild.json`（含测试身份）、`.env`、密钥/锁文件**；出站统一走 Host 的 `net.egress`（仅预声明主机 + https）；密钥不写入契约、日志、证据与报告
 - 裁决边界：LLM 不判定漏洞、不生成身份；其路由线索只用于定位动态探测目标。未开启 `llm.patch` 时修复阶段跳过 LLM 侦察出的候选（攻击复现后裁决为 `vulnerable_unfixed`，需人工修复）
 - 可观测：事件流与视图 `llm` 字段记录 model / 证据文件 / 路由数 / 应用与验证结果 / token 用量 / **逐候选启动记录**（命令、结果、诊断、耗时）；报告 `report.json` 与 `report.md` 的「LLM 接入侦察」段同步记录缓存来源、实际启动/登录验证与被拒绝的启动方式；GUI 增加「LLM 接入侦察」面板
@@ -337,11 +338,11 @@ guardbuild-headless --url https://staging.example.com --project ./my-project --g
 | --- | --- | --- |
 | 0 | `no_candidates` / `not_reproducible` | 已测未复现：完成了扫描与路由识别但没有可探测候选，或攻击在真实实例上打不通——**不等于系统安全** |
 | 1 | `vulnerable`（附已验证补丁）/ `vulnerable_unfixed` | 漏洞证据成立：`patchStatus: verified`（通过双重验收）、`verify_failed`（修复未通过验收，附证据），或 `vulnerable_unfixed`（攻击已复现但候选无可自动修复端点，需人工修复） |
-| 2 | `inconclusive`（`no_endpoints` / `attack_inconclusive` / `plan_incomplete`）/ `failed` / `aborted` / `timeout` | 无法证明覆盖（未识别到路由 / 攻击用例未跑全 / 候选无法构造探测请求），或执行失败（契约 / 环境 / 内部错误 / 超时 / 中断） |
+| 2 | `inconclusive`（`no_endpoints` / `attack_inconclusive` / `plan_incomplete` / `scout_routes_unverified`）/ `failed` / `aborted` / `timeout` | 无法证明覆盖（未识别到路由 / 攻击用例未跑全 / 候选无法构造探测请求 / 模型路由实测全部落空），或执行失败（契约 / 环境 / 内部错误 / 超时 / 中断） |
 
 - 输出：`verdict`、`exit-code`、`patch-hash`；报告目录含 `report.json`、`report.md`、`gate.json`（GB_GATE 裁决行）、`gate.log`
 - **exit 0 / 1 都是完成取证的正常终态**：`no_candidates` 表示已识别出 HTTP 路由但没有候选同时命中「静态形状 + 攻击用例」（覆盖边界，由 `sidecar/lib/coverage.mjs` 统一给出并写进报告「结论与建议」），`not_reproducible` 表示静态有候选但攻击在真实实例上打不通；两者都**不是执行失败**，桌面界面按中性提示渲染（状态标签分别为「已扫描 · 无安全候选」「已测未复现 · 未证明安全」），报告文案明确写出「不等于安全」
-- **「没测到」不放行**：未识别到任何路由（`no_endpoints`）、计划中的用例因身份 / 资源 / 运行期契约不足被跳过（`attack_inconclusive`）、候选端点缺少可寻址参数（`plan_incomplete`）都归为 `inconclusive`，退出码 **2**——引擎无法证明覆盖，就不当作安全结论；补齐 `routes` / `openapi.file` / `identities` / `listEndpoint` / `responses` / `routes[].params` 后重跑
+- **「没测到」不放行**：未识别到任何路由（`no_endpoints`）、计划中的用例因身份 / 资源 / 运行期契约不足被跳过（`attack_inconclusive`）、候选端点缺少可寻址参数（`plan_incomplete`）、接入侦察给出的路由在真实实例上被逐条实测否掉且再无其它候选（`scout_routes_unverified`）都归为 `inconclusive`，退出码 **2**——引擎无法证明覆盖，就不当作安全结论；补齐 `routes` / `openapi.file` / `identities` / `listEndpoint` / `responses` / `routes[].params` 后重跑
 - **写回预检被拒也不是执行失败**：授权写回时若原工作区已变化，Host 在 `git apply --check` 阶段原子拒绝（先预检后落盘，不会写到一半）。Sidecar 把 Host 的 JSON-RPC 数字码归一为符号码 `conflict`，界面呈现「补丁未写回 · 工作区已变化」而非「执行出错」，报告明确写出原文件未被修改、补丁仍在隔离 worktree，并给出「按当前代码重跑会话」与「自行合并报告中的 Diff」两条落地路径
 - gate 语义：无人工交互；作用域仅按 `guardbuild.json.scopes` 预声明签发（审批留痕 `via: gate-policy`）；`workspace.write` 被结构性禁止，**不修改被测工作区**，只输出已验证补丁供人工应用
 

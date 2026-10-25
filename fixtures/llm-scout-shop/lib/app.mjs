@@ -14,6 +14,9 @@ const routes = [
 const decisionLog = [];
 let decisionSeq = 0;
 
+// 计费模块的历史接口文档残留（本服务从未注册该路由，客户端仍在调）：
+//   GET /api/invoices/:id -> invoices.get
+
 function recordDecision(entry) {
   decisionSeq += 1;
   decisionLog.push({ seq: decisionSeq, ts: Date.now(), ...entry });

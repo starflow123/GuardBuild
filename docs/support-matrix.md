@@ -93,11 +93,11 @@ GuardBuild 是一个面向 Vibe Coding 开发者的本地安全 Agent：先启�
 | --- | --- | --- |
 | 0 | `no_candidates` / `not_reproducible` | 已扫描但无可探测候选，或攻击在真实实例上打不通——**不是执行失败，也不是「系统安全」的证明** |
 | 1 | `vulnerable_unfixed` / `patchStatus=verified` / `verify_failed` | 漏洞证据成立（附补丁或人工修复指引） |
-| 2 | `inconclusive`（`no_endpoints` / `attack_inconclusive` / `plan_incomplete`）/ `failed` / `aborted` / `timeout` | 无法证明覆盖，或契约、环境、内部错误、超时、中断 |
+| 2 | `inconclusive`（`no_endpoints` / `attack_inconclusive` / `plan_incomplete` / `scout_routes_unverified`）/ `failed` / `aborted` / `timeout` | 无法证明覆盖，或契约、环境、内部错误、超时、中断 |
 
 - `no_candidates`（exit 0）：路由已识别，但没有候选同时命中「静态形状 + 攻击用例」，界面显示「已扫描 · 无安全候选」并列出支持清单。
 - `not_reproducible`（exit 0）：静态有线索、攻击已发出但打不通，显示「已测未复现 · 未证明安全」。
-- `inconclusive`（exit 2）：**没测到 ≠ 安全**。未识别到任何路由（`no_endpoints`）、计划用例因身份 / 资源 / 运行期契约不足被跳过（`attack_inconclusive`）、候选端点缺少可寻址参数（`plan_incomplete`）都归这一档，门禁不放行，报告给出对应的契约补齐字段。
+- `inconclusive`（exit 2）：**没测到 ≠ 安全**。未识别到任何路由（`no_endpoints`）、计划用例因身份 / 资源 / 运行期契约不足被跳过（`attack_inconclusive`）、候选端点缺少可寻址参数（`plan_incomplete`）、模型侦察给出的路由在真实运行实例上逐条打完全部不成立（`scout_routes_unverified`）都归这一档，门禁不放行，报告给出对应的契约补齐字段。
 
 ## 精度口径
 

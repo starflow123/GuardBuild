@@ -16,6 +16,12 @@
  * 靶场里只有 boot.mjs）：引擎按序真实启动，首个候选失败后自动切换第二个；
  * r2 从缓存复用时应把上次实际验证通过的候选提到最前，只尝试一次。
  *
+ * 模型还会给出第 4 条路由 GET /api/invoices/:id —— 它来自靶场源码里的一条历史注释，
+ * 能通过「文件真实存在 + 路径可定位」的静态把关，但目标实例上根本没有注册。
+ * 动态阶段在身份登录、资源 id 发现之后用真实请求逐条复核（存在性 / 匿名鉴权 /
+ * 两身份列表归属过滤），这条路由必须被判 not_found 并丢弃：不进 findings、不进探测
+ * 计划，报告与视图留痕，结论写回缓存。r2 复用缓存时同样重打，模型结论不因缓存免检。
+ *
  * 同时校验安全边界：
  *   - 侦察请求经 Host 出站，带 Bearer 鉴权；密钥只从环境变量读取；
  *   - 发送给 LLM 的证据不含 identities / 密码 / 任何密钥；
@@ -118,6 +124,9 @@ const MOCK_CONTRACT = {
       resource: "order",
       hasAuth: true,
     },
+    // 模型从注释里读到的「历史接口」：代码定位关卡放行（文件里确实有这个字符串），
+    // 但目标实例上根本没有这条路由 —— 只有运行期实测能把它挡住
+    { method: "GET", path: "/api/invoices/:id", file: "lib/app.mjs", resource: "order", hasAuth: true },
   ],
   notes: ["mock LLM contract: custom route table"],
 };
@@ -368,7 +377,7 @@ async function main() {
       llm.source === "llm-scout" &&
       llm.applied?.start === true &&
       llm.applied?.login === true &&
-      llm.applied?.routes === 3,
+      llm.applied?.routes === 4,
     `applied=${JSON.stringify(llm.applied)}`
   );
   check(
@@ -376,6 +385,57 @@ async function main() {
     llm.verified?.start === true && llm.verified?.login === true,
     `verified=${JSON.stringify(llm.verified)}`
   );
+  // ---------- 模型路由的运行期实测关（agent 兜底的第 3 关）----------
+  const rv = llm.routeVerification ?? {};
+  const rvDetail = new Map((rv.detail ?? []).map((d) => [d.key, d]));
+  check(
+    "实测送检全部模型路由：带真实资源 id，并先打一条不存在路径作基线",
+    rv.checked === 4 && rv.baselineStatus === 404 && rv.requestsUsed >= 9 && rv.requestsUsed <= 20,
+    `checked=${rv.checked} baseline=${rv.baselineStatus} requests=${rv.requestsUsed}`
+  );
+  check(
+    "注释里的历史接口被实测否掉（not_found）——静态定位关卡放行它，动态层拦住它",
+    rv.kept === 3 &&
+      (rv.dropped ?? []).length === 1 &&
+      rv.dropped[0]?.key === "GET /api/invoices/:id" &&
+      rv.dropped[0]?.reason === "not_found",
+    JSON.stringify(rv.dropped)
+  );
+  check(
+    "被实测否定的路由不进 findings，也不进探测计划",
+    !(view.findings ?? []).some((f) => String(f.path ?? "").includes("/api/invoices")) &&
+      !(view.plan?.readPath ?? "").includes("/api/invoices") &&
+      !(view.plan?.cancelPath ?? "").includes("/api/invoices") &&
+      (view.findings ?? []).length === 2,
+    `findings=${(view.findings ?? []).map((f) => f.path).join(",")} readPath=${view.plan?.readPath} cancelPath=${view.plan?.cancelPath}`
+  );
+  check(
+    "鉴权结论改由匿名实测给出：模型说「需登录」的两条确实被拒",
+    rvDetail.get("GET /api/orders/:id")?.auth === "protected" &&
+      rvDetail.get("POST /api/orders/:id/cancel")?.auth === "protected",
+    `auth=${[...rvDetail].map(([k, v]) => `${k}:${v.auth}`).join(",")}`
+  );
+  check(
+    "列表归属过滤由两身份对拉实测（本靶场确实按归属过滤）",
+    rvDetail.get("GET /api/orders")?.ownerFilter === true,
+    `ownerFilter=${JSON.stringify(rvDetail.get("GET /api/orders")?.ownerFilter)}`
+  );
+  check(
+    "存活路由标记实测确认（liveVerified）并在 reason 中留痕",
+    (view.findings ?? []).every((f) => f.liveVerified === true && String(f.reason).includes("实测确认需登录")),
+    `liveVerified=${(view.findings ?? []).map((f) => f.liveVerified).join(",")}`
+  );
+  const eventMarks = [
+    "丢弃 LLM 侦察路由「GET /api/invoices/:id」",
+    "LLM 侦察路由「GET /api/orders/:id」实测复核",
+    "LLM 路由运行期实测：送检",
+  ];
+  check(
+    "事件流逐条留痕：丢弃原因 + 复核结论 + 汇总",
+    eventMarks.every((m) => r1.stdout.includes(m)),
+    `缺失=${eventMarks.filter((m) => !r1.stdout.includes(m)).join(" | ") || "无"}`
+  );
+
   const attempts = llm.startAttempts ?? [];
   check(
     "视图记录逐候选启动：首选失败（缺入口）→ 第二候选就绪",
@@ -448,10 +508,29 @@ async function main() {
     md.includes("启动候选实际验证") && md.includes("missing_local_file") && md.includes("boot.mjs"),
     ""
   );
+  check(
+    "报告呈现路由实测表：命中条给出状态码与鉴权/归属结论，丢弃条给出原因",
+    md.includes("LLM 路由运行期实测") &&
+      md.includes("/api/invoices/:id") &&
+      md.includes("实测未命中") &&
+      md.includes("匿名被拒（需登录确认）") &&
+      md.includes("两身份列表互斥（过滤生效）"),
+    ""
+  );
+  check(
+    "report.json 记录路由实测明细（送检/命中/丢弃/请求数）",
+    rep?.llm?.routeVerification?.checked === 4 &&
+      rep.llm.routeVerification.kept === 3 &&
+      rep.llm.routeVerification.dropped?.[0]?.reason === "not_found" &&
+      Number(rep.llm.routeVerification.requestsUsed) > 0,
+    `rv=${JSON.stringify(rep?.llm?.routeVerification ?? null).slice(0, 80)}…`
+  );
   const findingPaths = (rep?.summary?.findings ?? []).map((f) => f.path);
   check(
-    "静态发现来自侦察路由（详情 + 取消）",
-    findingPaths.includes("/api/orders/:id") && findingPaths.includes("/api/orders/:id/cancel"),
+    "静态发现来自侦察路由（详情 + 取消），且不含被实测否定的那条",
+    findingPaths.includes("/api/orders/:id") &&
+      findingPaths.includes("/api/orders/:id/cancel") &&
+      !findingPaths.some((p) => String(p).includes("/api/invoices")),
     findingPaths.join(" | ")
   );
   check("侦察路由为可定位的源码行（lib/app.mjs）", (rep?.summary?.findings ?? []).every((f) => f.file === "lib/app.mjs"), "");
@@ -531,6 +610,13 @@ async function main() {
     llm2.verified?.start === true && llm2.verified?.login === true,
     `verified=${JSON.stringify(llm2.verified)}`
   );
+  check(
+    "r2 复用缓存时仍逐条实测模型路由（模型结论不因缓存而免检）",
+    llm2.routeVerification?.checked === 4 &&
+      llm2.routeVerification.kept === 3 &&
+      (llm2.routeVerification.dropped ?? []).some((d) => d.key === "GET /api/invoices/:id"),
+    `rv=${JSON.stringify(llm2.routeVerification ?? null).slice(0, 80)}…`
+  );
   const attempts2 = llm2.startAttempts ?? [];
   check(
     "r2 复用缓存时优先上次验证通过的候选（只启动一次）",
@@ -574,6 +660,21 @@ async function main() {
       try {
         const d = JSON.parse(readFileSync(f, "utf8"));
         return d.verified?.start === true && d.verified?.login === true;
+      } catch {
+        return false;
+      }
+    }),
+    ""
+  );
+  check(
+    "缓存写回路由实测结论（下次运行可见哪些模型路由被打过）",
+    cacheFiles.some((f) => {
+      try {
+        const d = JSON.parse(readFileSync(f, "utf8"));
+        return (
+          d.routeVerdicts?.checked === 4 &&
+          (d.routeVerdicts?.dropped ?? []).some((x) => x.key === "GET /api/invoices/:id")
+        );
       } catch {
         return false;
       }

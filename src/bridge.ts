@@ -49,6 +49,8 @@ export interface FindingItem {
   kind: string;
   sinkCalls: string[];
   reason: string;
+  /** 模型线索来源的路由经运行期真实请求确认过 */
+  liveVerified?: boolean;
 }
 
 export interface BlackboxFinding {
@@ -259,6 +261,22 @@ export interface LlmView {
     hint?: string | null;
     durationMs?: number | null;
   }[];
+  /** 模型路由的运行期实测：存在性、匿名鉴权、两身份归属过滤（判定只来自真实响应） */
+  routeVerification?: {
+    checked: number;
+    kept: number;
+    dropped?: { key: string; reason?: string | null; detail?: string | null }[];
+    detail?: {
+      key: string;
+      method?: string | null;
+      declaredPath?: string | null;
+      auth?: string | null;
+      ownerFilter?: boolean | null;
+      status?: number | null;
+    }[];
+    requestsUsed?: number | null;
+    baselineStatus?: number | null;
+  } | null;
 }
 
 export interface BootstrapAction {

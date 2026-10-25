@@ -389,6 +389,46 @@ test("runScout：证据变化使磁盘缓存失效", async () => {
   }
 });
 
+test("recordScoutVerification：路由实测结论写回缓存并在下次读取时带回", async () => {
+  clearScoutCache();
+  const temp = tempDataDir();
+  const saved = process.env.DEEPSEEK_API_KEY;
+  try {
+    process.env.DEEPSEEK_API_KEY = "test-key";
+    const { ctx } = makeRpcCtx({ files: FILES });
+    const first = await runScout(ctx, {
+      getToken: async () => "t",
+      chatImpl: async () => ({ content: LLM_JSON, model: "deepseek-chat" }),
+      model: "deepseek-chat",
+    });
+    ctx.scoutCacheFile = first._cacheFile;
+    const verdicts = {
+      checked: 2,
+      kept: 1,
+      dropped: [{ key: "GET /api/ghost/:id", reason: "not_found" }],
+      detail: [{ key: "GET /api/orders/:id", method: "GET", auth: "protected", ownerFilter: false, status: 200 }],
+      requestsUsed: 5,
+      baselineStatus: 404,
+    };
+    assert.equal(recordScoutVerification(ctx, { routeVerdicts: verdicts }), true);
+    const savedData = JSON.parse(readFileSync(first._cacheFile, "utf8"));
+    assert.deepEqual(savedData.routeVerdicts.dropped, [{ key: "GET /api/ghost/:id", reason: "not_found" }]);
+    assert.equal(savedData.routeVerdicts.requestsUsed, 5);
+
+    clearScoutCache();
+    delete process.env.DEEPSEEK_API_KEY;
+    const second = await runScout(makeRpcCtx({ files: FILES }).ctx, { getToken: async () => "t", model: "deepseek-chat" });
+    assert.equal(second.cached, true);
+    assert.equal(second.routeVerdicts.kept, 1);
+    assert.deepEqual(second.routeVerdicts.dropped, verdicts.dropped);
+  } finally {
+    clearScoutCache();
+    temp.restore();
+    if (saved == null) delete process.env.DEEPSEEK_API_KEY;
+    else process.env.DEEPSEEK_API_KEY = saved;
+  }
+});
+
 test("applyScoutResult：显式契约优先，LLM 只补缺", () => {
   const contract = {
     startSource: "contract",
@@ -459,8 +499,12 @@ test("analyzeProject：LLM 侦察路由并入候选，来源标记 llm-scout", a
   const cand = a.candidates.find((c) => c.fullPath === "/api/invoices/:id");
   assert.equal(cand.kind, "idor-suspect");
   assert.equal(cand.source, "llm-scout");
+  // 模型断言在实测前只是线索：候选必须带着「未实测」标记进入动态阶段
+  assert.equal(cand.liveVerified, false);
+  assert.equal(ep.liveVerified, false);
   const listEp = a.endpoints.find((e) => e.fullPath === "/api/invoices");
   assert.equal(listEp.hasOwnerFilter, true);
+  assert.equal(listEp.list, true);
   // 列表路由不产生攻击候选，但能被探测计划用作资源发现端点
   assert.equal(a.candidates.some((c) => c.fullPath === "/api/invoices"), false);
   assert.equal(buildProbePlan(a).listEndpoint?.path, "/api/invoices");

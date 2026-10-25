@@ -38,21 +38,16 @@ import {
   isGraphqlDenied,
   graphqlShapeRejected,
 } from "./graphqlwire.mjs";
-import {
-  MAX_VARIANT_CASES,
-  channelVariantFor,
-  foreignObjectVariants,
-  idEncodingVariants,
-  rawTokenRequest,
-  variantCaseId,
-} from "./attackvariants.mjs";
-import { candKey } from "./planner.mjs";
+import { MAX_VARIANT_CASES, channelVariantFor, foreignObjectVariants, idEncodingVariants, rawTokenRequest, variantCaseId } from "./attackvariants.mjs";
+import { buildProbePlan, candKey } from "./planner.mjs";
+import { MAX_SCOUT_ROUTES, verifyScoutRoutes } from "./routeverify.mjs";
 
 export class ProbeError extends Error {
-  constructor(message, { code = "probe_failed", hint = null } = {}) {
+  constructor(message, { code = "probe_failed", hint = null, details = null } = {}) {
     super(message);
     this.code = code;
     this.hint = hint;
+    this.details = details;
   }
 }
 
@@ -587,6 +582,182 @@ function indexResources(ctx, byUser, anonymousItems = []) {
   for (const items of Object.values(byUser ?? {})) for (const o of items ?? []) add(o);
   for (const o of anonymousItems ?? []) add(o);
   return map;
+}
+
+/**
+ * LLM 侦察路由的运行期实测关（agent 兜底的第 3 关）。
+ *
+ * 接入侦察只做静态把关（文件存在 + 路径能在文件里定位），hasAuth / hasOwnerFilter
+ * 完全是模型断言。这里在目标已启动、身份已登录、资源 id 已发现之后，用真实请求复核：
+ * 不存在的路由直接丢弃，鉴权与归属过滤按实测响应回写。验证不通过只会缩小覆盖面，
+ * 绝不会凭空造出漏洞结论。
+ *
+ * 前提：ctx.analysis 中存在 source==="llm-scout" 的候选（其它来源由静态证据支撑，不在此复核）。
+ */
+export function hasScoutCandidates(ctx) {
+  return Array.isArray(ctx?.analysis?.endpoints) && ctx.analysis.endpoints.some((e) => e.source === "llm-scout");
+}
+
+function isCollectionCandidate(c) {
+  if (c?.list === true) return true;
+  const p = candPath(c) ?? "";
+  return !/:[A-Za-z_]\w*/.test(p) && !c?.queryParam;
+}
+
+function applyScoutVerdict(cand, verdict) {
+  cand.liveVerified = true;
+  if (verdict.auth === "protected") {
+    cand.hasAuth = true;
+    cand.authSource = "live-anonymous";
+  } else if (verdict.auth === "open") {
+    cand.hasAuth = false;
+    cand.authSource = "live-anonymous";
+    if (cand.kind === "idor-suspect") cand.kind = "no-auth-suspect";
+  }
+  if (verdict.ownerFilter != null) {
+    cand.hasOwnerFilter = verdict.ownerFilter;
+    cand.ownerFilterSource = "live-two-identity";
+  }
+}
+
+async function verifyScoutTargets(ctx, { baseUrl, loggedIn, byUser }) {
+  const scoutEps = (ctx.analysis?.endpoints ?? []).filter((e) => e.source === "llm-scout");
+  if (scoutEps.length === 0) return null;
+  const scoutCands = (ctx.analysis?.candidates ?? []).filter((c) => c.source === "llm-scout");
+
+  const users = (loggedIn ?? []).filter((i) => i.role !== "admin");
+  const identities = users.map((u) => u.name);
+  const firstIdFor = (name) => {
+    const items = byUser?.[name] ?? [];
+    for (const o of items) {
+      const id = resourceIdOf(ctx, o);
+      if (id != null) return id;
+    }
+    return null;
+  };
+  // 存在性必须打在真实资源上：假 id 的 404 与「路由不存在」的 404 无法区分。
+  let probeId = null;
+  let probeIdentity = identities[0] ?? null;
+  for (const name of identities) {
+    const id = firstIdFor(name);
+    if (id != null) {
+      probeId = id;
+      probeIdentity = name;
+      break;
+    }
+  }
+
+  const routes = scoutEps.slice(0, MAX_SCOUT_ROUTES).map((c) => {
+    const collection = isCollectionCandidate(c);
+    if (collection) return { key: candKey(c), method: c.method, path: candPath(c), declaredPath: candPath(c), identity: probeIdentity, list: true };
+    if (probeId == null) return { key: candKey(c), method: c.method, path: null, declaredPath: candPath(c), identity: null, list: false };
+    const req = candRequest(ctx, c, probeId);
+    return {
+      key: candKey(c),
+      method: c.method,
+      path: req?.path ?? null,
+      declaredPath: candPath(c),
+      identity: probeIdentity,
+      list: false,
+    };
+  });
+
+  const result = await verifyScoutRoutes(routes, {
+    request: ({ method, path, identity }) => httpJson(ctx, { baseUrl, method, path, identity }),
+    fetchList: async (route, identity) => {
+      const res = await httpJson(ctx, {
+        baseUrl,
+        method: route.method ?? "GET",
+        path: appendQuery(route.path, ctx.plan?.listEndpoint?.query ?? null),
+        identity,
+      });
+      return extractListItems(res.json, listPathFor(ctx, ctx.plan?.listEndpoint?.graphql)) ?? [];
+    },
+    idOf: (o) => resourceIdOf(ctx, o),
+    identities,
+  });
+
+  const droppedKeys = new Map(result.dropped.map((d) => [d.key, d]));
+  const keptByKey = new Map(result.kept.map((k) => [k.key, k]));
+  const removed = result.dropped.map((d) => ({ key: d.key, reason: d.reason, detail: d.detail ?? null }));
+  const droppedCandCount = scoutCands.filter((c) => droppedKeys.has(candKey(c))).length;
+  ctx.analysis.candidates = (ctx.analysis.candidates ?? []).filter((c) => {
+    return c.source !== "llm-scout" || !droppedKeys.has(candKey(c));
+  });
+  for (const c of ctx.analysis.candidates ?? []) {
+    if (c.source !== "llm-scout") continue;
+    const v = keptByKey.get(candKey(c));
+    if (v) applyScoutVerdict(c, v);
+  }
+  ctx.analysis.endpoints = (ctx.analysis.endpoints ?? []).filter((e) => {
+    return e.source !== "llm-scout" || !droppedKeys.has(candKey(e));
+  });
+  for (const e of ctx.analysis.endpoints ?? []) {
+    if (e.source !== "llm-scout") continue;
+    const v = keptByKey.get(candKey(e));
+    if (v) applyScoutVerdict(e, v);
+  }
+
+  ctx.scoutRouteVerification = {
+    checked: routes.length,
+    kept: result.kept.length,
+    dropped: removed,
+    detail: result.detail,
+    requestsUsed: result.requestsUsed,
+    baselineStatus: result.baselineStatus,
+  };
+
+  if (removed.length > 0) {
+    const before = ctx.plan?.listEndpoint?.path ?? null;
+    ctx.plan = buildProbePlan(ctx.analysis, {
+      loginPathOverride: ctx.loginConfig?.path ?? null,
+      contract: ctx.targetConfig ?? null,
+    });
+    ctx._scoutPlanRebuilt = true;
+    ctx._scoutListChanged = (ctx.plan?.listEndpoint?.path ?? null) !== before;
+  }
+  for (const r of removed) {
+    ctx.emit({
+      kind: "scout",
+      severity: SEVERITY.WARN,
+      message: `丢弃 LLM 侦察路由「${r.key}」：实测 ${
+        r.reason === "not_found"
+          ? "未命中该路由"
+          : r.reason === "method_not_allowed"
+            ? "方法不被允许"
+            : r.reason === "no_probe_id"
+              ? "无可填充的真实资源 id，无法验证"
+              : r.reason
+      }`,
+      data: { key: r.key, reason: r.reason, detail: r.detail },
+    });
+  }
+  for (const k of result.kept) {
+    const confirmed = [];
+    if (k.auth === "open") confirmed.push("匿名即可取到数据（无鉴权确认）");
+    if (k.auth === "protected") confirmed.push("匿名被拒绝（需登录确认）");
+    if (k.ownerFilter === false) confirmed.push("两身份列表内容一致（未按归属过滤确认）");
+    if (k.ownerFilter === true) confirmed.push("两身份列表互斥（归属过滤生效）");
+    if (confirmed.length === 0) continue;
+    ctx.emit({
+      kind: "scout",
+      severity: SEVERITY.INFO,
+      message: `LLM 侦察路由「${k.key}」实测复核：${confirmed.join("；")}`,
+      data: { key: k.key, auth: k.auth, ownerFilter: k.ownerFilter, status: k.status },
+    });
+  }
+
+  if ((ctx.analysis.candidates ?? []).length === 0 && droppedCandCount > 0) {
+    throw new ProbeError(
+      `LLM 侦察的 ${droppedCandCount} 条候选路由在运行实例上均未命中，无法证明攻击面`,
+      {
+        code: "scout_routes_unverified",
+        hint: `模型给出的路由实测被目标拒绝（${removed.map((r) => `${r.key}→${r.reason}`).join("；")}）。请在 guardbuild.json 用 routes / openapi.file / listEndpoint 声明真实接口后重跑；本轮没有打到目标，不能据此判定安全`,
+        details: { dropped: removed, baselineStatus: result.baselineStatus },
+      }
+    );
+  }
+  return ctx.scoutRouteVerification;
 }
 
 /**
@@ -2724,8 +2895,20 @@ export async function runPhase(ctx, { phase, baseUrl }) {
   await negotiateTrpcInput(ctx, baseUrl, loggedIn);
   await confirmGraphqlEndpoint(ctx, baseUrl, loggedIn);
   await negotiateGraphqlCast(ctx, baseUrl, loggedIn);
-  const { byUser, anonymousItems, anonTargets } = await discoverResources(ctx, baseUrl, loggedIn);
+  let { byUser, anonymousItems, anonTargets } = await discoverResources(ctx, baseUrl, loggedIn);
   ctx._resourceById = indexResources(ctx, byUser, anonymousItems);
+  // LLM 侦察线索只有在真实实例上打通过才算攻击面；丢弃的路由会让计划重建，
+  // 列表端点被换掉时必须按新计划重新发现资源，否则后续用例拿的是过期归属数据。
+  if (phase === "pre" && hasScoutCandidates(ctx)) {
+    await verifyScoutTargets(ctx, { baseUrl, loggedIn, byUser });
+    if (ctx._scoutPlanRebuilt && ctx._scoutListChanged) {
+      const again = await discoverResources(ctx, baseUrl, loggedIn);
+      byUser = again.byUser;
+      anonymousItems = again.anonymousItems;
+      anonTargets = again.anonTargets;
+      ctx._resourceById = indexResources(ctx, byUser, anonymousItems);
+    }
+  }
   const targets = pickTargets(ctx, byUser, loggedIn, anonymousItems, anonTargets);
   // 身份交叉校验：attacker 与 victim 必须是两个不同用户，否则"越权读他人"用例退化为"读自己"
   if (targets.attacker && targets.victim) {

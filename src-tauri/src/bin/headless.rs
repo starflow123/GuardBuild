@@ -159,7 +159,9 @@ fn spawn_gate_watcher(host: Arc<Host>) {
                         "attack_not_reproducible" => (0, "not_reproducible"),
                         "no_patchable_candidates" => (1, "vulnerable_unfixed"),
                         // 「没测到」不能当作 exit 0：未能证明覆盖就不放行
-                        "no_endpoints" | "attack_inconclusive" | "plan_incomplete" => (2, "inconclusive"),
+                        "no_endpoints" | "attack_inconclusive" | "plan_incomplete" | "scout_routes_unverified" => {
+                            (2, "inconclusive")
+                        }
                         _ => (2, "failed"),
                     };
                     let mut p = base(verdict);

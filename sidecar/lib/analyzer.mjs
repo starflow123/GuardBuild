@@ -896,6 +896,9 @@ export async function analyzeProject(ctx) {
         hasRoleGuard: false,
         // 列表路由仅用于动态资源发现；归属过滤由实际响应验证，不据此判定漏洞
         hasOwnerFilter: r.list === true && r.hasOwnerFilter === true,
+        list: r.list === true,
+        // 模型断言在实测确认前不得当作结论：动态阶段会逐条打真实请求复核
+        liveVerified: false,
         sinkCalls: [],
         trpc: null,
         graphql: null,

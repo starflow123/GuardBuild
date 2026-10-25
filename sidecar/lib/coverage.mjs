@@ -84,6 +84,13 @@ const OUTCOME_PRESENTATION = {
     stateLabel: "无法构造探测请求 · 无法证明",
     hint: "已识别出候选，但没有一个能构造出可寻址请求（exit 2）：多段路径需要 routes[].params 给每个参数声明取值来源，否则引擎不会猜。补齐契约后重跑；本轮没有真正打到目标，不能据此判定安全。",
   },
+  scout_routes_unverified: {
+    outcome: "inconclusive",
+    kind: "inconclusive",
+    title: "模型给出的路由未通过运行期实测（无法证明）",
+    stateLabel: "模型路由全部未命中 · 无法证明",
+    hint: "静态分析没有候选，接入侦察给出的路由在真实运行实例上逐条打了一次、全部不成立（exit 2）：模型的断言没有变成覆盖，本轮不能判定安全。报告列出每条路由的实测状态码与不存在路径基线；请在 guardbuild.json 用 routes / openapi.file 声明真实接口，或让侦察的证据包含更多路由定义代码后重跑。",
+  },
   attack_not_reproducible: {
     outcome: "not_reproducible",
     kind: "clean",

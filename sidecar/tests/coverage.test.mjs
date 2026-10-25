@@ -23,7 +23,7 @@ test("describeOutcome: 终态语义与退出码映射（README 退出码表的�
   assert.match(clean.title, /不等于安全/, "未复现不得暗示「系统安全」");
 
   // 「没测到」必须与「测了没复现」分开：前者 exit 2，后者 exit 0
-  for (const code of ["no_endpoints", "attack_inconclusive", "plan_incomplete"]) {
+  for (const code of ["no_endpoints", "attack_inconclusive", "plan_incomplete", "scout_routes_unverified"]) {
     const inc = describeOutcome(code);
     assert.equal(inc.outcome, "inconclusive", `${code} 应归为 inconclusive`);
     assert.equal(inc.kind, "inconclusive");
@@ -34,6 +34,9 @@ test("describeOutcome: 终态语义与退出码映射（README 退出码表的�
   assert.match(describeOutcome("no_endpoints").title, /未识别到 HTTP 路由/);
   assert.match(describeOutcome("attack_inconclusive").title, /证据不足/);
   assert.match(describeOutcome("plan_incomplete").hint, /routes\[\]\.params/);
+  // 模型路由被实测全部打掉：断言没有变成覆盖，不能 exit 0
+  assert.match(describeOutcome("scout_routes_unverified").title, /未通过运行期实测/);
+  assert.match(describeOutcome("scout_routes_unverified").hint, /openapi\.file/);
 
   const blocked = describeOutcome("no_patchable_candidates");
   assert.equal(blocked.outcome, "vulnerable_unfixed");
@@ -131,6 +134,7 @@ test("buildReport: inconclusive（没测到）exit 2 且明确写「无法证明
     ["no_endpoints", "未识别路由 · 无法证明", /未识别到任何 HTTP 路由（exit 2，无法证明）/],
     ["attack_inconclusive", "攻击用例未跑全 · 无法证明", /攻击用例未跑全（exit 2，无法证明）/],
     ["plan_incomplete", "无法构造探测请求 · 无法证明", /候选端点无法构造探测请求（exit 2，无法证明）/],
+    ["scout_routes_unverified", "模型路由全部未命中 · 无法证明", /模型给出的路由经运行期实测全部不成立（exit 2，无法证明）/],
   ]) {
     const error = { code, message: "无法完成覆盖", kind: "inconclusive", outcome: "inconclusive" };
     const { json, markdown } = buildReport(makeCtx("error"), {

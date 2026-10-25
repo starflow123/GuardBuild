@@ -38,6 +38,25 @@ export function candKey(c) {
   return c.graphql ? `${base} ${c.graphql.root}.${c.graphql.field}` : base;
 }
 
+/** 探测计划的视图投影（GUI/报告展示用）：静态分析与运行期实测重建计划共用同一份映射 */
+export function planView(plan) {
+  return {
+    loginPath: plan.loginPath,
+    resource: plan.resource,
+    readPath: plan.readCandidate?.fullPath ?? plan.readCandidate?.path ?? null,
+    cancelPath: plan.cancelCandidate?.fullPath ?? plan.cancelCandidate?.path ?? null,
+    unauthReadPath: plan.unauthReadCandidate?.fullPath ?? plan.unauthReadCandidate?.path ?? null,
+    traversalPath: plan.traversalCandidate?.fullPath ?? plan.traversalCandidate?.path ?? null,
+    sqliPath: plan.sqliCandidate?.fullPath ?? plan.sqliCandidate?.path ?? null,
+    cmdiPath: plan.cmdiCandidate?.fullPath ?? plan.cmdiCandidate?.path ?? null,
+    ssrfPath: plan.ssrfCandidate?.fullPath ?? plan.ssrfCandidate?.path ?? null,
+    uploadPath: plan.uploadCandidate?.fullPath ?? plan.uploadCandidate?.path ?? null,
+    jwtPath: plan.jwtCandidate?.fullPath ?? plan.jwtCandidate?.path ?? null,
+    bizlogicPath: plan.bizlogicCandidate?.fullPath ?? plan.bizlogicCandidate?.path ?? null,
+    listPath: plan.listEndpoint?.path ?? null,
+  };
+}
+
 /** 由静态分析结果构建探测计划；loginPathOverride / contract 来自守卫契约（优先级最高） */
 export function buildProbePlan(analysis, { loginPathOverride = null, contract = null } = {}) {
   const eps = analysis.endpoints;

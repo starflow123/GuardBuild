@@ -48,9 +48,18 @@ fn apply_no_window(cmd: &mut Command) {
 #[cfg(not(windows))]
 fn apply_no_window(_cmd: &mut Command) {}
 
+/// Windows 默认 260 字符路径上限会让真实前端仓库（嵌套组件目录）检出失败：
+/// `error: unable to create file …: Filename too long`。这里按命令注入 core.longpaths，
+/// 只影响 GuardBuild 自己起的 git 进程，不改用户全局配置。
+#[cfg(windows)]
+const LONG_PATHS_ARGS: [&str; 2] = ["-c", "core.longpaths=true"];
+
+#[cfg(not(windows))]
+const LONG_PATHS_ARGS: [&str; 0] = [];
+
 fn run_git(dir: &Path, args: &[&str]) -> HostResult<(bool, String, String)> {
     let mut cmd = Command::new("git");
-    cmd.arg("-C").arg(dir).args(args);
+    cmd.args(LONG_PATHS_ARGS).arg("-C").arg(dir).args(args);
     apply_no_window(&mut cmd);
     let out = cmd
         .output()
@@ -60,6 +69,18 @@ fn run_git(dir: &Path, args: &[&str]) -> HostResult<(bool, String, String)> {
         String::from_utf8_lossy(&out.stdout).to_string(),
         String::from_utf8_lossy(&out.stderr).to_string(),
     ))
+}
+
+/// 长路径失败的原文要翻译成人话：否则用户看到 `Filename too long` 只会以为磁盘坏了。
+pub fn annotate_git_error(context: &str, stderr: &str) -> String {
+    const LONG_PATH_MARKS: [&str; 3] = ["Filename too long", "unable to create file", "Could not reset index file"];
+    let text = stderr.trim();
+    if LONG_PATH_MARKS.iter().any(|m| text.contains(m)) {
+        return format!(
+            "{context}: {text}（疑似 Windows 长路径：GuardBuild 已按命令启用 core.longpaths=true，若仍失败请把会话数据目录设到更短的路径，如 D:/gbdata，或安装 Git for Windows ≥ 2.37）"
+        );
+    }
+    format!("{context}: {text}")
 }
 
 pub fn is_git_repo(dir: &Path) -> bool {
@@ -107,8 +128,9 @@ pub fn worktree_add(root: &Path, target_dir: &Path) -> HostResult<()> {
         let _ = run_git(root, &["worktree", "prune"]);
         let (ok2, _, stderr2) = run_git(root, &["worktree", "add", "--detach", &dir_str, "HEAD"])?;
         if !ok2 {
-            return Err(HostError::Git(format!(
-                "git worktree add 失败: {stderr} / {stderr2}"
+            return Err(HostError::Git(annotate_git_error(
+                "git worktree add 失败",
+                &format!("{stderr} / {stderr2}"),
             )));
         }
     }
@@ -311,7 +333,7 @@ pub fn writeback_patch(
     // 3) 应用
     let (ok2, _out, stderr2) = run_git(root, &["apply", "--whitespace=nowarn", &tmp_str])?;
     if !ok2 {
-        return Err(HostError::Git(format!("git apply 失败: {stderr2}")));
+        return Err(HostError::Git(annotate_git_error("git apply 失败", &stderr2)));
     }
     let _ = std::fs::remove_file(&tmp_patch);
 
@@ -397,6 +419,34 @@ fn parse_patch_files(patch: &str) -> Vec<String> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn long_path_git_failure_is_translated() {
+        // 取自 juice-shop 白盒实测原文（2026-10-30，dogfood/reports/kb-20261030/juice）
+        let stderr = "Preparing worktree (detached HEAD dc40466)\nerror: unable to create file frontend/src/app/score-board/components/filter-settings/components/score-board-additional-settings-dialog/score-board-additional-settings-dialog.component.scss: Filename too long\nfatal: Could not reset index file to revision 'HEAD'.";
+        let msg = annotate_git_error("git worktree add 失败", stderr);
+        assert!(msg.contains("git worktree add 失败"), "保留原始上下文");
+        assert!(msg.contains("core.longpaths"), "给出长路径处置建议");
+        assert!(msg.contains("Filename too long"), "原文不能丢");
+    }
+
+    #[test]
+    fn unrelated_git_failure_gets_no_longpath_hint() {
+        let msg = annotate_git_error("git apply 失败", "error: patch failed: src/app.js:12");
+        assert_eq!(msg, "git apply 失败: error: patch failed: src/app.js:12");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn every_git_command_carries_longpaths_flag() {
+        assert_eq!(LONG_PATHS_ARGS, ["-c", "core.longpaths=true"]);
+    }
+
+    #[cfg(not(windows))]
+    #[test]
+    fn longpaths_flag_is_windows_only() {
+        assert!(LONG_PATHS_ARGS.is_empty());
+    }
+
     fn git_init(dir: &Path) {
         let run = |args: &[&str]| {
             let mut c = Command::new("git");
@@ -470,6 +520,40 @@ mod tests {
         assert!(matches!(err, HostError::Conflict(_)), "应返回冲突错误，实际: {err:?}");
         let content3 = std::fs::read_to_string(repo.join("src/app.js")).unwrap();
         assert!(content3.contains("const a = 999"), "拒绝写回后本地文件不应被改动: {content3}");
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// 真实回归：juice-shop 白盒轮曾死在 worktree add
+    /// （`error: unable to create file …component.scss: Filename too long`）。
+    /// 只在 Windows 有意义——POSIX 下 260 字符不是限制。
+    #[cfg(windows)]
+    #[test]
+    fn worktree_add_checks_out_windows_long_paths() {
+        let base = std::env::temp_dir().join(format!("gb_git_lp_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let repo = base.join("repo");
+        let seg = "score-board-additional-settings-dialog-component";
+        let deep = (0..5)
+            .map(|i| format!("{seg}-{i}"))
+            .collect::<Vec<_>>()
+            .join("/");
+        let rel = format!("{deep}/{seg}.scss");
+        let abs_len = repo.join(&rel).to_string_lossy().len();
+        assert!(abs_len > 260, "测试路径必须真的超过 260 字符才能复现，实际 {abs_len}");
+
+        std::fs::create_dir_all(repo.join(&deep)).unwrap();
+        git_init(&repo);
+        std::fs::write(repo.join(&rel), ".dialog { color: red; }\n").unwrap();
+        // 夹具自身的 git 命令也走 run_git：长路径下裸 git 连目录都打不开
+        for args in [&["add", "-A"][..], &["commit", "-qm", "base"][..]] {
+            let (ok, _out, stderr) = run_git(&repo, args).unwrap();
+            assert!(ok, "git {args:?} 失败: {stderr}");
+        }
+
+        let wt = base.join("wt");
+        worktree_add(&repo, &wt).expect("按命令启用 core.longpaths 后，深路径应能检出");
+        assert!(wt.join(&rel).exists(), "worktree 里应能看到长路径文件");
 
         let _ = std::fs::remove_dir_all(&base);
     }

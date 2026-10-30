@@ -23,7 +23,7 @@ import {
   normalizeStart,
   PORT_SLOT,
 } from "./lib/targetconfig.mjs";
-import { diagnoseStartFailure } from "./lib/autostart.mjs";
+import { diagnoseStartFailure, redactLogLines } from "./lib/autostart.mjs";
 import { parsePortFromLine, stripAnsi } from "./lib/readyline.mjs";
 import { runPhase, ProbeError } from "./lib/probe.mjs";
 import { runSupabasePhase, isLoopbackHostname } from "./lib/supabase.mjs";
@@ -36,7 +36,7 @@ import { createPatch, writebackPatch, rollbackWorkspace, PatchError } from "./li
 import { crossFilePatchEnabled } from "./lib/llm-patcher.mjs";
 import { buildAttribution } from "./lib/attribution.mjs";
 import { buildFixFeedback, feedbackDigest } from "./lib/fixfeedback.mjs";
-import { emitReport } from "./lib/report.mjs";
+import { emitReport, sanitizeErrorDetails } from "./lib/report.mjs";
 import {
   PROTOCOL_VERSION,
   RPC_TO_HOST,
@@ -1206,18 +1206,24 @@ async function stageAnalyze(ctx) {
   return ctx.plan;
 }
 
-/** 把启动失败压缩成可进视图/报告的一条记录；不带进程输出（可能含目标项目的敏感信息）。 */
+/**
+ * 把启动失败压缩成可进视图/报告的一条记录。
+ * 进程输出默认不入报告（可能含目标项目的敏感信息），只带脱敏后的日志尾部——
+ * 「已抓到崩溃原文却不展示」等于让读者对着「未输出可识别的错误」猜原因。
+ */
 function startFailureRecord(e) {
   const diag = e?.details?.diagnosis ?? null;
   return {
     code: e?.code ?? "unknown",
     hint: e?.hint ?? diag?.hint ?? null,
     diagnosisCode: diag?.code ?? null,
+    matched: diag?.matched ?? null,
     exitCode: Number.isInteger(diag?.exitCode)
       ? diag.exitCode
       : Number.isInteger(e?.details?.exitCode)
         ? e.details.exitCode
         : null,
+    excerpt: redactLogLines(diag?.excerpt ?? e?.details?.output ?? []),
   };
 }
 
@@ -2356,7 +2362,8 @@ async function failSession(ctx, e) {
     code,
     message: e.message,
     hint: e.hint ?? null,
-    details: e.details ?? null,
+    details: sanitizeErrorDetails(e.details),
+    start: e?.details?.diagnosis || e?.details?.output ? startFailureRecord(e) : null,
     outcome: pres.outcome,
     kind: pres.kind,
     title: pres.title,

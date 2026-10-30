@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { buildReport } from "../lib/report.mjs";
+import { buildReport, sanitizeErrorDetails } from "../lib/report.mjs";
 
 // 写回/回滚是真实工作区的终态，报告必须如实反映「补丁已落地 / 已撤销」，
 // 不能停在「等待写回」——否则 artifact 与视图、数据库三处口径不一致。
@@ -253,4 +253,94 @@ test("未建立任何会话：身份段不出现，报告不臆造身份结论",
   const { json, markdown } = buildReport(ctx, { outcome: "vulnerable", exitCode: 1 });
   assert.equal(json.summary.identities, null);
   assert.doesNotMatch(markdown, /身份会话/);
+});
+
+const startError = () => ({
+  code: "target_not_ready",
+  message: "目标进程未在超时内就绪",
+  hint: "请检查启动契约",
+  outcome: "failed",
+  details: {
+    cwd: "D:/tmp/shop",
+    start: {
+      cmd: "node",
+      args: ["server.js"],
+      env: { SESSION_SECRET: "super-secret-value-123", DATABASE_URL: "postgres://u:p@h/d" },
+    },
+    output: ["raw log line 1", "raw log line 2 token=abcdefghijklmnop0123456789"],
+    diagnosis: {
+      code: "missing_env",
+      exitCode: 1,
+      hint: "缺少环境变量",
+      matched: "SESSION_SECRET is not set",
+      excerpt: "booting…\nError: SESSION_SECRET is not set",
+    },
+  },
+});
+
+test("启动失败：报告给出诊断码与脱敏后的启动输出尾部，原始日志与环境变量值不入产物", () => {
+  const ctx = ctxFor({ patchStatus: null });
+  const { json, markdown } = buildReport(ctx, { outcome: "failed", exitCode: 2, error: startError(), state: "error" });
+  assert.match(markdown, /启动诊断（missing_env，退出码 1）：命中原文「`SESSION_SECRET is not set`」/);
+  assert.match(markdown, /启动输出尾部（已脱敏：凭据键值与长随机串打码）：/);
+  assert.match(markdown, /Error: SESSION_SECRET is not set/, "崩溃原文必须出现在报告里");
+  assert.equal(json.error.details.output, undefined, "原始日志数组不写进 report.json");
+  assert.deepEqual(json.error.details.start.env, ["SESSION_SECRET", "DATABASE_URL"], "只留变量名，不留值");
+  assert.equal(json.error.details.diagnosis.code, "missing_env", "诊断结构保留");
+});
+
+test("环境变量名单二次脱敏不退化成下标（会话事件已脱敏，报告再脱敏一次）", () => {
+  const once = sanitizeErrorDetails({ start: { cmd: "node", env: { PORT: "3000", SESSION_SECRET: "s3cr3t" } } });
+  assert.deepEqual(once.start.env, ["PORT", "SESSION_SECRET"]);
+  const twice = sanitizeErrorDetails(once);
+  assert.deepEqual(twice.start.env, ["PORT", "SESSION_SECRET"], "第二次仍要保留变量名");
+  assert.deepEqual(sanitizeErrorDetails({ start: { env: ["PORT=3000", "SESSION_SECRET=s3cr3t"] } }).start.env, ["PORT", "SESSION_SECRET"]);
+  assert.doesNotMatch(JSON.stringify(twice), /3000|s3cr3t/, "任何一轮都不留值");
+});
+
+test("启动失败但进程没输出日志：如实说明，不留空壳段落", () => {
+  const ctx = ctxFor({ patchStatus: null });
+  const err = startError();
+  err.details.diagnosis.excerpt = "";
+  err.details.diagnosis.matched = null;
+  const { markdown } = buildReport(ctx, { outcome: "failed", exitCode: 2, error: err, state: "error" });
+  assert.match(markdown, /未命中已知诊断规则/);
+  assert.match(markdown, /目标进程未输出任何可记录的日志/);
+});
+
+test("正常裁决不带启动诊断时，报告不出现启动诊断段", () => {
+  const ctx = ctxFor({ patchStatus: "verified" });
+  const { markdown } = buildReport(ctx, { outcome: "vulnerable", exitCode: 1 });
+  assert.doesNotMatch(markdown, /启动诊断（/);
+});
+
+test("LLM 启动候选：失败候选的命中原文与脱敏输出尾部进报告", () => {
+  const ctx = ctxFor({ patchStatus: null });
+  ctx.view.llm = {
+    used: true,
+    model: "deepseek-chat",
+    startAttempts: [
+      {
+        index: 1,
+        total: 2,
+        cmd: "node",
+        args: ["server.js"],
+        ok: false,
+        code: "target_not_ready",
+        diagnosisCode: "missing_env",
+        exitCode: 1,
+        hint: "缺少环境变量",
+        matched: "SESSION_SECRET is not set",
+        excerpt: "booting…\nError: SESSION_SECRET is not set",
+        durationMs: 1200,
+      },
+      { index: 2, total: 2, cmd: "node", args: ["app.js"], ok: true, durationMs: 900 },
+    ],
+  };
+  const { json, markdown } = buildReport(ctx, { outcome: "no_candidates", exitCode: 0 });
+  assert.equal(json.llm.startAttempts[0].matched, "SESSION_SECRET is not set");
+  assert.match(json.llm.startAttempts[0].excerpt, /SESSION_SECRET is not set/);
+  assert.equal(json.llm.startAttempts[1].excerpt, null);
+  assert.match(markdown, /失败候选 1\/2（`node server\.js`）命中原文「`SESSION_SECRET is not set`」/);
+  assert.match(markdown, /booting…\nError: SESSION_SECRET is not set/);
 });

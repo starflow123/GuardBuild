@@ -194,6 +194,7 @@ function suggestions(r) {
     } else {
       lines.push("- 黑盒扫描未完成裁决；可重新运行。");
     }
+    lines.push(...startDiagnosisLines(r));
     return lines.join("\n");
   }
   if (outcome === "vulnerable" && patchStatus === "written_back") {
@@ -293,6 +294,7 @@ function suggestions(r) {
   } else {
     lines.push("- 会话被中止，未完成裁决；可重新运行。");
   }
+  lines.push(...startDiagnosisLines(r));
   return lines.join("\n");
 }
 
@@ -444,6 +446,20 @@ function renderLlmSection(llm) {
       );
     }
     lines.push("");
+    const withText = llm.startAttempts.filter((a) => !a.ok && !a.skipped && (a.excerpt || a.matched));
+    for (const a of withText) {
+      const tail = String(a.excerpt ?? "")
+        .split("\n")
+        .map((l) => String(l).trimEnd())
+        .filter((l) => l.trim() !== "");
+      lines.push(
+        `失败候选 ${a.index ?? "?"}/${a.total ?? "?"}（\`${esc(`${a.cmd ?? "?"} ${(a.args ?? []).join(" ")}`.trim())}\`）${
+          a.matched ? `命中原文「\`${esc(String(a.matched))}\`」` : "未命中已知诊断规则"
+        }，启动输出尾部（已脱敏）：`,
+        "",
+        ...(tail.length ? ["```", ...tail, "```", ""] : ["_进程未输出日志_", ""])
+      );
+    }
   } else if (llm.rejectedStart) {
     const rejected = llm.rejectedStart;
     lines.push(
@@ -1060,6 +1076,44 @@ function renderMarkdown(r) {
   return parts.join("\n");
 }
 
+/**
+ * 报告与会话事件是会被存档、分享、入库的产物：原始日志数组和启动契约的环境变量值不进去，
+ * 只保留脱敏后的日志尾部（diagnosis.excerpt）与变量名列表。
+ */
+export function sanitizeErrorDetails(details) {
+  if (!details || typeof details !== "object") return null;
+  const out = { ...details };
+  for (const k of ["output", "lines", "stdout", "stderr"]) delete out[k];
+  for (const k of ["start", "docker", "candidate"]) {
+    const v = out[k];
+    if (v && typeof v === "object" && v.env && typeof v.env === "object") {
+      // 幂等：事件层可能已经把它压成变量名数组，二次序列化不能再退化成下标
+      const names = (Array.isArray(v.env) ? v.env : Object.keys(v.env)).map((e) =>
+        String(e).split("=")[0]
+      );
+      out[k] = { ...v, env: names };
+    }
+  }
+  return out;
+}
+
+/** 启动失败原文：报告要给出崩在哪一行，而不是只留一个错误码 */
+function startDiagnosisLines(r) {
+  const d = r.error?.details?.diagnosis;
+  if (!d) return [];
+  const tail = (Array.isArray(d.excerpt) ? d.excerpt : String(d.excerpt ?? "").split("\n"))
+    .map((l) => String(l ?? ""))
+    .filter((l) => l.trim() !== "");
+  return [
+    `- 启动诊断（${d.code ?? "unknown"}${Number.isInteger(d.exitCode) ? `，退出码 ${d.exitCode}` : ""}）${
+      d.matched ? `：命中原文「\`${esc(String(d.matched).slice(0, 200))}\`」` : "：未命中已知诊断规则"
+    }`,
+    ...(tail.length
+      ? ["- 启动输出尾部（已脱敏：凭据键值与长随机串打码）：", "", "```", ...tail, "```", ""]
+      : ["- 目标进程未输出任何可记录的日志。"]),
+  ];
+}
+
 /** 构造 report.json 结构（不落盘） */
 export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error = null, state = null }) {
   const view = ctx.view;
@@ -1191,6 +1245,8 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
             diagnosisCode: a.diagnosisCode ?? null,
             exitCode: a.exitCode ?? null,
             hint: a.hint ?? null,
+            matched: a.matched ?? null,
+            excerpt: a.excerpt ?? null,
             durationMs: a.durationMs ?? null,
           })),
           evidenceFiles: view.llm.evidenceFiles ?? [],
@@ -1247,7 +1303,7 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
     acceptance: view.acceptance ?? null,
     targets: view.targets ?? {},
     rollback: view.rollback ?? null,
-    error,
+    error: error ? { ...error, details: sanitizeErrorDetails(error.details) } : null,
   };
   r.summary.fixBriefs = buildFixBriefs(r);
   return { json: r, markdown: renderMarkdown(r) };

@@ -36,6 +36,7 @@ import {
   detectStartConfig,
   diagnoseStartFailure,
   parseProcfile,
+  redactLogLines,
   GENERIC_READY_PATTERN,
 } from "../lib/autostart.mjs";
 import { RPC_TO_HOST } from "../../shared/protocol.mjs";
@@ -2346,6 +2347,65 @@ test("diagnoseStartFailure: 常见启动错误翻译为可操作建议", () => {
 
   const silent = diagnoseStartFailure({ output: [] });
   assert.equal(silent.code, "no_ready_output");
+});
+
+test("redactLogLines: 保留崩溃原文形状，凭据值与长随机串打码", () => {
+  const out = redactLogLines(
+    [
+      "\x1b[31mFATAL\x1b[0m: app crashed",
+      "  secret: \"s3cr3t-value\"",
+      "  jwt = eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnop",
+      "",
+      "TypeError: Cannot read properties of undefined (reading 'id')",
+    ],
+    { keep: 8 }
+  );
+  assert.match(out, /FATAL: app crashed/, "ANSI 转义要清掉，原文行要留下");
+  assert.match(out, /Cannot read properties of undefined/, "崩溃原文必须可见");
+  assert.doesNotMatch(out, /s3cr3t-value/, "键值型凭据值必须打码");
+  assert.doesNotMatch(out, /eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9/, "长随机串必须打码");
+  assert.match(out, /secret:[^"]*"\*\*\*"/, "键名保留、值替换为 ***");
+});
+
+test("redactLogLines: 只留尾部若干行并按 maxChars 截断", () => {
+  const many = Array.from({ length: 60 }, (_, i) => `line-${i} ${"x".repeat(40)}`);
+  const out = redactLogLines(many, { keep: 3, maxChars: 120 });
+  const lines = out.split("\n");
+  assert.ok(lines.length <= 3, `最多 3 行，实际 ${lines.length}`);
+  assert.match(lines[lines.length - 1], /line-59/, "保留的是尾部");
+  assert.ok(out.length <= 120, `字符上限生效：${out.length}`);
+});
+
+test("diagnoseStartFailure: early_exit 的 hint 带脱敏尾部，excerpt 也是脱敏字符串", () => {
+  const d = diagnoseStartFailure({
+    output: ["booting…", "Fatal: worker pool rejected the request"],
+    exitCode: 1,
+  });
+  assert.equal(d.code, "early_exit");
+  assert.match(d.hint, /worker pool rejected the request/, "崩溃原因要直接出现在 hint 里");
+  assert.equal(typeof d.excerpt, "string", "excerpt 是脱敏后的字符串，不是原始日志数组");
+  assert.match(d.excerpt, /Fatal/);
+});
+
+test("diagnoseStartFailure: 诊断命中原文与日志尾部都不留凭据值", () => {
+  const d = diagnoseStartFailure({
+    output: ["Error: spawn postgres://admin:abcdefghijklmnopqrstuvwxyz0123@127.0.0.1:5432/db ENOENT"],
+    exitCode: 1,
+  });
+  assert.equal(d.code, "command_not_found");
+  assert.doesNotMatch(String(d.matched ?? ""), /abcdefghijklmnopqrstuvwxyz0123/, "matched 不能带出连接串里的密码段");
+  assert.doesNotMatch(d.excerpt, /abcdefghijklmnopqrstuvwxyz0123/, "excerpt 同样脱敏");
+  assert.match(String(d.matched ?? ""), /postgres:\/\/admin:/, "命令形状保留，只打码长随机串");
+});
+
+test("diagnoseStartFailure: 「Set X before starting the app」归为缺环境变量而非通用 early_exit", () => {
+  const d = diagnoseStartFailure({
+    output: ["booting demo api…", "Error: Set SESSION_SECRET before starting the app."],
+    exitCode: 1,
+  });
+  assert.equal(d.code, "missing_env");
+  assert.match(String(d.matched), /SESSION_SECRET/, "命中原文要带上变量名，用户才知道补哪个");
+  assert.equal(typeof d.excerpt, "string");
 });
 
 test("GENERIC_READY_PATTERN: 匹配主流框架监听行，忽略普通启动日志", () => {

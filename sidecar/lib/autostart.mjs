@@ -490,7 +490,7 @@ const DIAGNOSTICS = [
   {
     code: "missing_env",
     re:
-      /missing (?:required )?environment variable|environment variable [`'"]?([A-Z0-9_]+)[`'"]? (?:is )?(?:not set|missing)|(?:DATABASE_URL|JWT_SECRET|SESSION_SECRET|API_KEY)[^\n]{0,40}(?:not set|missing|undefined|未设置)|缺少环境变量/i,
+      /missing (?:required )?environment variable|environment variable [`'"]?([A-Z0-9_]+)[`'"]? (?:is )?(?:not set|missing)|(?:DATABASE_URL|JWT_SECRET|SESSION_SECRET|API_KEY)[^\n]{0,40}(?:not set|missing|undefined|未设置)|\b(?:set|export|define|provide)\s+[`'"]?([A-Za-z][A-Za-z0-9_]{2,})[`'"]?\s+(?:before\s+(?:starting|running|launching)|to\s+(?:start|boot|run)\b)|缺少环境变量/i,
     hint:
       "缺少环境变量。Host 只透传白名单变量与 start.env，请把数据库连接串/密钥等写进 guardbuild.json 的 start.env（不要把本机 .env 直接暴露给被测进程）",
   },
@@ -555,8 +555,33 @@ const DIAGNOSTICS = [
   },
 ];
 
-function tailLines(lines, n = 12) {
-  return lines.slice(Math.max(0, lines.length - n));
+/** 诊断里的日志尾部：脱敏后最多 12 行 / 1200 字符，够定位报错原文又不至于把项目日志搬进证据库 */
+const EXCERPT = (lines) => redactLogLines(lines, { keep: 12, maxChars: 1200 });
+
+const SECRET_ASSIGN =
+  /((?:["']?\b(?:[A-Za-z0-9_]*(?:secret|token|password|passwd|pwd|apikey|api_key|access_key|private_key|authorization|cookie|credential|session)[A-Za-z0-9_]*)["']?)\s*[:=]\s*)(["']?)([^\s"'&,;]{4,})\2/gi;
+const LONG_OPAQUE = /\b[A-Za-z0-9+/_-]{24,}={0,2}\b/g;
+
+/** 键值型凭据与长随机串打码，保留可定位问题的原文形状 */
+export function redactSecrets(text) {
+  return String(text ?? "")
+    .replace(SECRET_ASSIGN, (m, key, q) => `${key}${q}***${q}`)
+    .replace(LONG_OPAQUE, (m) => (/[0-9]/.test(m) && /[a-zA-Z]/.test(m) ? "***" : m));
+}
+
+/**
+ * 启动日志尾部脱敏：只保留定位崩溃所需的行，键值型凭据与长随机串一律打码。
+ * 目标是「报告里能看到 Set SESSION_SECRET before starting the app 这类原文」，
+ * 而不是把项目日志整段搬进证据库。
+ */
+export function redactLogLines(lines, { keep = 8, maxChars = 700 } = {}) {
+  const picked = (Array.isArray(lines) ? lines : String(lines ?? "").split("\n"))
+    .map((l) => String(l ?? "").replace(/\x1b\[[0-9;]*m/g, ""))
+    .filter((l) => l.trim() !== "")
+    .slice(-keep);
+  let text = picked.map(redactSecrets).join("\n");
+  if (text.length > maxChars) text = text.slice(-maxChars);
+  return text;
 }
 
 /** 按诊断规则表全量扫描日志，返回每条命中（供修复循环回喂编码代理复用启动诊断知识） */
@@ -566,7 +591,7 @@ export function matchDiagnostics(lines, { limit = 4 } = {}) {
   for (const d of DIAGNOSTICS) {
     const m = text.match(d.re);
     if (!m) continue;
-    hits.push({ code: d.code, hint: d.hint, matched: String(m[0]).slice(0, 200) });
+    hits.push({ code: d.code, hint: d.hint, matched: redactSecrets(m[0]).slice(0, 200) });
     if (hits.length >= limit) break;
   }
   return hits;
@@ -585,20 +610,21 @@ export function diagnoseStartFailure({ output = [], exitCode = null, start = nul
       exitCode,
       hint: `项目内缺少该文件（${missing}）。若它是构建产物，请先执行构建（如 npm run build）；若它是启动入口，请修正 start.args 或补齐文件`,
       matched: `Cannot find module '${missing}'`.slice(0, 200),
-      excerpt: tailLines(lines),
+      excerpt: EXCERPT(lines),
     };
   }
   for (const d of DIAGNOSTICS) {
     const m = text.match(d.re);
     if (!m) continue;
-    return { code: d.code, exitCode, hint: d.hint, matched: m[0].slice(0, 200), excerpt: tailLines(lines) };
+    return { code: d.code, exitCode, hint: d.hint, matched: redactSecrets(m[0]).slice(0, 200), excerpt: EXCERPT(lines) };
   }
   if (Number.isInteger(exitCode)) {
+    const last = redactLogLines(lines, { keep: 2, maxChars: 220 }).replace(/\n/g, " ⏎ ");
     return {
       code: "early_exit",
       exitCode,
-      hint: `目标进程启动后立即退出（退出码 ${exitCode}），且未输出可识别的错误。请先在项目目录手动运行启动命令确认；如缺依赖或环境变量，请补充 prepare / start.env`,
-      excerpt: tailLines(lines),
+      hint: `目标进程启动后立即退出（退出码 ${exitCode}）${last ? `，最后一条输出：「${last}」` : "，且未输出任何内容"}。请先在项目目录手动运行启动命令确认；如缺依赖或环境变量，请补充 prepare / start.env`,
+      excerpt: EXCERPT(lines),
     };
   }
   const cmd = start ? `${start.cmd} ${(start.args ?? []).join(" ")}`.trim() : "启动命令";
@@ -606,6 +632,6 @@ export function diagnoseStartFailure({ output = [], exitCode = null, start = nul
     code: "no_ready_output",
     exitCode,
     hint: `进程未在超时内输出可识别的就绪行（${cmd}）。若服务不打印监听日志，GuardBuild 已尝试 HTTP 探活；也可在 guardbuild.json 中把 start.readyPattern 设为实际输出`,
-    excerpt: tailLines(lines),
+    excerpt: EXCERPT(lines),
   };
 }

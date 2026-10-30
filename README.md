@@ -85,6 +85,7 @@ npm run e2e:fix-agent  # 本地修复循环演练（21 断言：首轮漏修 →
 npm run benchmark      # 精度基准（12 个标注靶场：漏报 / 误报 / 退出码一致性）
 npm run benchmark:blackbox  # 黑盒精度基准（25 个标注靶场：用例族召回 / 误报 / 写与破坏性探测开关 / 退出码）
 npm run benchmark:realworld # 第三方真实靶场基准（可选开启：本机备好的上游真代码，缺则自动跳过）
+npm run benchmark:indie  # 真实项目白盒基准（强制白盒链路 + 假绿灯结构审计；本批只跑公开条目）
 npm run seed-demo      # 单独生成演示工作区 .demo/vibeshop（供桌面端手动演练）
 
 # 单元测试
@@ -144,6 +145,7 @@ npm run test:rust      # Rust Host
 - `start.cwd`：启动目录（相对项目根），适配 monorepo 后端位于子目录的项目
 - 就绪判定：先看 `readyPattern` 是否在 stdout 出现（自动探测使用通用模式，覆盖 `http://localhost:3000`、`listening on port 3000`、`server started` 等）；服务静默无输出时，若端口已可连通，主动回环 HTTP 探活兜底，避免误报未就绪
 - 启动失败诊断：识别 `next_no_build` / `port_in_use` / `missing_env` / `dependency_unreachable` / `db_not_initialized` / `django_migrations` / `command_not_found` / `python_missing_dependency` / `missing_dependency` / `script_missing` / `bind_address` / `permission_denied` / `syntax_error` 等常见原因并给出处置建议，附退出码与日志尾部摘录
+- 崩溃原文必须可见：`early_exit` 的 hint 直接带最后一行输出；report.md「结论与建议」给出「启动诊断（诊断码 + 退出码）：命中原文」与脱敏后的启动输出尾部代码块；`report.json` 的 `error.details.diagnosis` 与 `llm.startAttempts[].matched/excerpt` 同源。脱敏规则：`password/token/secret/cookie/...` 类键值只留键名、24 位以上混合大小写数字的随机串打码，最多 12 行 / 1200 字符；原始日志数组（`details.output`）与 `start.env` 的值一律不写进产物（只留变量名）
 - `start`：就绪以 `readyPattern` 在 stdout 出现为准（解析前先剥 ANSI 色码，依次识别行内 JSON `port` → `host:port` → 「端口 NNNN」/ `listening on port NNNN` 文本形状）。端口两种写法任选：`env.PORT=0` 让服务自选端口（要求服务把真实端口打进就绪行）；硬编码端口或打印字面量的服务改用 **`${GB_PORT}` 槽位**——宿主每次 spawn 前分配一个空闲端口注入，`cmd` / `args` / `env` 均可使用（修复阶段会先停止原始实例，验收实例与原始实例不再争用端口）
 - `prepare`：目标启动前按序执行的前置命令（安装依赖 / 构建），`cwd` 相对项目根；在「原始工作区」与「隔离 worktree」各执行一次——修复阶段的验收不依赖原工作区的构建产物
 - `login`：登录契约——`path` 指定登录端点（优先级高于静态分析候选），`loginPaths` 给出多角色/多端点应用的候选序列；`bodyTemplate` 适配非 `username` 的请求体形状，值支持 `{name}` / `{username}` / `{email}` / `{password}` 占位符；`credentialPath` 支持点路径（如 `authentication.token`），`credentialHeader` / `credentialPrefix` 缺省为 `Authorization` / `Bearer `；`encoding: "form"` 以 `application/x-www-form-urlencoded` 提交；`cookieAuth: true` 表示会话鉴权——登录响应可返回 3xx，`Set-Cookie` 由 Host 收进保险库并在后续请求以 `Cookie` 头注入（`credentialPath` 不填），Cookie 明文不会回到 Sidecar/报告
@@ -169,6 +171,7 @@ npm run test:rust      # Rust Host
 - Windows 上 `npm` / `npx` 等 `.cmd` shim 自动解析（沿 `PATH` × `PATHEXT` 查找），契约里直接写 `npm` / `npx` 即可
 - 服务硬编码端口、启动脚本不支持 `PORT=0`、或就绪行只打印字面量端口 → 契约改用 `${GB_PORT}` 槽位（宿主分配空闲端口注入，解析不到就绪端口时直接回退到分配值）
 - 目标项目不是 git 仓库 / 尚无提交基线 → 修复阶段会在创建隔离 worktree 前预检并给出明确指引（`git init && git add -A && git commit -m baseline`）
+- Windows 260 字符路径上限：GuardBuild 起的每个 git 命令都带 `-c core.longpaths=true`（只作用于自己的进程，不改用户全局配置）。此前 juice-shop 这类深目录仓库在 `git worktree add` 阶段死于 `Filename too long`，整轮白盒 failed；仍失败时报错会点名长路径并给出「把会话数据目录设短」的处置建议，git 层原始 stderr 一字不删
 
 ### 可选：LLM 接入侦察（未知框架兜底）
 
@@ -258,6 +261,30 @@ npm run e2e:llm-patch          # 本机 mock DeepSeek 四轮演练，无需真�
 - 成本：单轮约 6 分钟（VulnAPI ≈ 340s，Juice Shop ≈ 16s），且需本机预装第三方代码与依赖，因此**尚未接入 CI**，作为本地/夜间可选项
 - 产物：`.benchmark-realworld/benchmark-report.json` / `.md`
 - 当前基线（2026-10-25）：2 个靶场 · 用例召回 3/3 · 明令禁止命中 0 · 未标注 0 · 退出码一致 2/2 · 零模型调用
+
+### 真实项目白盒基准（绿灯必须有测量支撑）
+
+`npm run benchmark:indie` 对 `benchmarks/indie-corpus.json` 里的**公开真实项目**逐个跑**白盒 gate**（不是黑盒）。单独一层的理由：只跑黑盒的基准既不建 worktree 也不启动进程，白盒独有的失败（Windows 长路径导致 worktree 建不出来、挂载前缀重复拼接、启动崩溃被吞成一句错误码）会一路绿灯。
+
+这一层不预测结论方向——真实项目跑成 exit 0 / 1 / 2 都可能，判据是结构性的（`sidecar/lib/falsegreen.mjs`）：
+
+| 规则 | 断言 | 对应的真实事故 |
+| --- | --- | --- |
+| R0 | 必须产出 `report.json` | 宿主崩了却没留产物 |
+| R1 | 必须真走白盒链路（报告无 `blackbox` 段、有启动契约） | 误跑成黑盒导致白盒缺陷隐身 |
+| R2 | 攻击地址不得出现连续重复路径段（`/api/api/x`） | 2026-10-30 双前缀假绿灯 |
+| R3 | exit 0 只有在「攻击用例真的打到目标（非全 404/405、不过半 404/405）且契约身份真的建立了」时才成立 | 同上：3 条 404 被记成「已阻断」 |
+| R4 | `git_error`（worktree 建不出来）直接判失败 | Windows 长路径 |
+| R5 | 静态候选数为 0 视为适配器漏检，而不是「项目干净」 | 陌生框架漏检 |
+
+- 语料字段：`dir` / `requires`（缺任一即跳过）/ `needsContract` / `minFindings` / `expectedExits` / `personal`
+- **公开优先**：`personal: true` 的条目是用户自己的项目，默认跳过，只有显式 `GUARDBUILD_INDIE_PERSONAL=1` 才纳入（2026-10-30 起：先把公开层跑稳，个人项目等产品成熟再回测）
+- 跳过 ≠ 失败；`--require=<id>` 才把指定条目的跳过判红，防止「全跳过也全绿」的空转
+- 零模型调用：清空所有 `GUARDBUILD_LLM_*` 与 `DEEPSEEK_*`；gate 模式结构性禁止写回被测工作区
+- **「通过（全程无攻击流量）」不是成绩**：这一行只说明终态诚实（没把没测过的东西报成绿灯），本轮没有任何漏洞被实际打出来。报告把它单列成「未产生攻击流量的项目」段并附错误码与原文，控制台汇总同样标出来——基准层宁可暴露「没测到」，不许用「通过」盖过去
+- 用法：`npm run benchmark:indie`（默认项目根 `D:/AiAgent/dogfood`，`GUARDBUILD_INDIE_DIR` 覆盖；`--only=<id>` 单跑、`--keep` 保留产物）
+- 产物：`.benchmark-indie/benchmark-report.json` / `.md`（逐项目退出码、静态候选、攻击用例数、404/405 占比、身份会话数、真实性回读结论与规则命中明细）
+- 首跑（2026-10-30 22:37，提交 `bb00923`，产物 `.benchmark-indie/reports/`）：juice-shop 静态候选 6、exit 2、终态 `target_not_ready`（`no_ready_output`——目标在启动自检里卡在 alchemy.com / localhost:11434 的外部依赖告警，从未输出就绪行）；vuln-express 静态候选 12、身份 3/3、exit 2、终态 `probe_request_failed`（首条上传用例后目标进程即消失）。两个公开靶场都没能打出一条攻击，这一层的当前价值是「把没测到钉在报告上」，对应缺口见 #181
 
 ## 纯黑盒外部扫描（已运行 / 沙箱中的目标）
 

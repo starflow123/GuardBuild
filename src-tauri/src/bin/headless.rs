@@ -9,7 +9,11 @@
 //!                           vulnerable_unfixed 表示攻击已复现但无可自动修复候选）
 //!                       2 = 执行失败（环境/契约/内部错误/超时）或无法证明（no_endpoints /
 //!                           attack_inconclusive / plan_incomplete / scout_routes_unverified /
-//!                           no_list_endpoint / param_binding_unverified：没识别到路由、或契约不足无法构造/确认取值来源）
+//!                           static_routes_unverified / no_list_endpoint / param_binding_unverified /
+//!                           blackbox_login_failed / no_attack_cases：
+//!                           没识别到路由、推断的地址实测全部未命中、契约不足无法构造/确认取值来源、
+//!                           黑盒配了账号却一个身份都登不上；身份类失败 login_form_rerendered /
+//!                           login_session_unverified 亦为 2，只是措辞记作 failed）
 //!   --report <dir>    报告输出目录（report.emit 的落盘位置）
 //!
 //! 环境变量（自动化兼容）：GUARDBUILD_DATA_DIR / GUARDBUILD_SIDECAR / GUARDBUILD_NODE /
@@ -160,10 +164,15 @@ fn spawn_gate_watcher(host: Arc<Host>) {
                         "attack_not_reproducible" => (0, "not_reproducible"),
                         "no_patchable_candidates" => (1, "vulnerable_unfixed"),
                         // 「没测到」不能当作 exit 0：未能证明覆盖就不放行
-                        "no_endpoints" | "attack_inconclusive" | "plan_incomplete" | "scout_routes_unverified"
-                        | "no_list_endpoint" | "param_binding_unverified" => {
-                            (2, "inconclusive")
-                        }
+                        "no_endpoints"
+                        | "attack_inconclusive"
+                        | "plan_incomplete"
+                        | "scout_routes_unverified"
+                        | "static_routes_unverified"
+                        | "no_list_endpoint"
+                        | "param_binding_unverified"
+                        | "blackbox_login_failed"
+                        | "no_attack_cases" => (2, "inconclusive"),
                         _ => (2, "failed"),
                     };
                     let mut p = base(verdict);

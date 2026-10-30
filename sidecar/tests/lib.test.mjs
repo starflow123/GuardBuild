@@ -361,6 +361,26 @@ test("loadTargetConfig: cookieAuth 与 form 编码归一化（默认 json）", a
   const jsonRes = await loadTargetConfig(fakeCtx(JSON.stringify({ login: { path: "/login" } })));
   assert.equal(jsonRes.login.cookieAuth, false);
   assert.equal(jsonRes.login.encoding, "json");
+  assert.deepEqual(jsonRes.login.loginPaths, [], "未声明多登录端点时为空列表");
+
+  const multi = await loadTargetConfig(
+    fakeCtx(
+      JSON.stringify({
+        login: { path: "auth/attendee/login", loginPaths: ["auth/attendee/login", "/auth/organiser/login", "  "] },
+        identities: [
+          { name: "att1", email: "a@x.io", password: "p1", loginPath: "auth/attendee/login" },
+          { name: "org1", email: "o@x.io", password: "p1", loginPath: "/auth/organiser/login" },
+        ],
+      })
+    )
+  );
+  assert.deepEqual(
+    multi.login.loginPaths,
+    ["/auth/attendee/login", "/auth/organiser/login"],
+    "loginPaths 补前导斜杠并去空"
+  );
+  assert.equal(multi.identities[0].loginPath, "/auth/attendee/login", "身份级 loginPath 同样补斜杠");
+  assert.equal(multi.identities[1].loginPath, "/auth/organiser/login");
 });
 
 test("encodeLoginBody: form-urlencoded 与 JSON 两种编码", () => {
@@ -498,6 +518,16 @@ test("buildProbePlan: 登录候选顺序 = 契约 > 分析 > /api/login；overri
 
   const p3 = buildProbePlan({ endpoints: [], candidates: [] });
   assert.deepEqual(p3.loginCandidates, ["/api/login"], "无分析线索时回落缺省");
+
+  const p4 = buildProbePlan(analysis, {
+    loginPathOverride: "/auth/attendee/login",
+    contract: { login: { loginPaths: ["/auth/attendee/login", "/auth/organiser/login"] } },
+  });
+  assert.deepEqual(
+    p4.loginCandidates,
+    ["/auth/attendee/login", "/auth/organiser/login", "/rest/user/login", "/api/login"],
+    "契约声明的多登录端点插在分析候选之前，且不去掉后面的兜底"
+  );
 });
 
 test("buildProbePlan: 任意 :param 单体接口识别 + fullPath 优先 + 旧字段回退", () => {
@@ -1415,6 +1445,51 @@ test("analyzeProject: 挂载前缀还原完整请求路径（fullPath）", async
     a.candidates.some((c) => c.fullPath === "/api/geo-projects/:id"),
     "候选端点应携带 fullPath"
   );
+});
+
+test("analyzeProject: 同文件既挂载又声明全路径时，前缀不得重复拼接（真实项目形态）", async () => {
+  const R = "\\\\?\\D:\\crm";
+  const contents = new Map([
+    [
+      `${R}\\server\\index.js`,
+      [
+        'const auth = require("./auth");',
+        'const orderRoutes = require("./routes/orders");',
+        'app.use("/api", auth);',
+        'app.use("/api/orders", orderRoutes);',
+        'app.get("/api/bookings/:id", async (req, res) => {',
+        "  const b = await Booking.find(req.params.id);",
+        "  res.json(b);",
+        "});",
+      ].join("\n"),
+    ],
+    // auth.js 不在被读取的文件集合内（真实项目里 helper 常落在扫描配额之外）：
+    // 前缀解析退化为「按文件记账」，于是同文件声明的全路径会被再叠一次前缀
+    [`${R}\\server\\routes\\orders.js`, 'router.get("/:id", (req, res) => res.json(Order.find(req.params.id)));'],
+  ]);
+  const ctx = {
+    projectRoot: R,
+    tokens: { project: "tok" },
+    rpc: {
+      request: async (method, params) => {
+        if (method === "fs.list") {
+          return {
+            entries: [...contents.keys()].map((p) => ({ path: p, kind: "file", size: 300 })),
+          };
+        }
+        if (method === "fs.read") {
+          return { content: contents.get(params.path), size: 300, redacted: false, redactions: [] };
+        }
+        throw new Error(`不应调用 ${method}`);
+      },
+    },
+  };
+  const a = await analyzeProject(ctx);
+  const booking = a.endpoints.find((e) => e.method === "GET" && e.file.endsWith("index.js"));
+  assert.equal(booking.path, "/api/bookings/:id", "声明路径保持原样");
+  assert.equal(booking.fullPath, "/api/bookings/:id", "全路径已带挂载前缀，不得再叠一次（/api/api/… 会整轮 404）");
+  const nested = a.endpoints.find((e) => e.file.endsWith("orders.js"));
+  assert.equal(nested.fullPath, "/api/orders/:id", "相对声明路径仍应叠加挂载前缀");
 });
 
 test("analyzeProject: 列表端点归属过滤识别（camelCase filter / snake_case where）", async () => {

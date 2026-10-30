@@ -821,6 +821,7 @@ function mergeRoutes(limit, ...lists) {
 async function tryLogin(ctx, baseUrl, cfg) {
   const candidates = [
     ...(cfg.login?.path ? [cfg.login.path] : []),
+    ...(cfg.login?.loginPaths ?? []),
     ...(cfg.blackbox?.loginPaths ?? []),
     ...LOGIN_PATHS_DEFAULT,
   ];
@@ -840,9 +841,11 @@ async function tryLogin(ctx, baseUrl, cfg) {
       data: { loginPaths: uniq, identities: ctx.identities.map((i) => i.name) },
     });
   }
+  // 契约里给了账号就意味着越权/CSRF/业务流这些身份族本来要打：登录不成不能只记一条 WARN
+  const configured = !!(cfg.login || Array.isArray(cfg.identities) && cfg.identities.length > 0);
   try {
     const loggedIn = await loginAll(ctx, baseUrl);
-    return { ok: true, identities: loggedIn, path: ctx.plan.loginPath };
+    return { ok: true, identities: loggedIn, path: ctx.plan.loginPath, configured };
   } catch (e) {
     ctx.emit({
       kind: "identity",
@@ -850,7 +853,7 @@ async function tryLogin(ctx, baseUrl, cfg) {
       message: `黑盒登录失败：${e.message}（继续执行未认证探测；越权类用例将跳过）`,
       data: { code: e.code ?? null, hint: e.hint ?? null, loginPaths: uniq },
     });
-    return { ok: false, identities: [], path: ctx.plan.loginPath };
+    return { ok: false, identities: [], path: ctx.plan.loginPath, configured, code: e.code ?? "login_failed", reason: e.message };
   }
 }
 
@@ -2916,6 +2919,9 @@ export async function runBlackbox(ctx, baseUrl, options = {}) {
     rateLimited,
     reachable: rate.reachable,
     login: summary.login,
+    // 契约里配了账号却登录不成：身份族（越权/CSRF/业务流）整批没打，这一轮不能算「测过且干净」
+    loginBlocked: !login.ok && login.configured === true,
+    loginFailure: login.configured && !login.ok ? { code: login.code ?? null, reason: login.reason ?? null } : null,
     coverage,
     attackPlan,
     configuredMutation: !!options.allowMutation,

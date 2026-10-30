@@ -72,6 +72,8 @@ export function buildProbePlan(analysis, { loginPathOverride = null, contract = 
     if (typeof p === "string" && p && !loginCandidates.includes(p)) loginCandidates.push(p);
   };
   pushLogin(loginPathOverride);
+  // 契约声明的多登录端点（参与者/组织者分开登录的应用）先于静态分析候选
+  for (const p of contract?.login?.loginPaths ?? []) pushLogin(p);
   if (analysisLogin) pushLogin(epPath(analysisLogin));
   // GraphQL 登录走同一 HTTP 端点的 mutation（请求体由 plan.graphql.login 构造）
   if (graphql?.login?.path) pushLogin(graphql.login.path);

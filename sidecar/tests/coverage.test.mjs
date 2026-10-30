@@ -28,6 +28,7 @@ test("describeOutcome: 终态语义与退出码映射（README 退出码表的�
     "attack_inconclusive",
     "plan_incomplete",
     "scout_routes_unverified",
+    "static_routes_unverified",
     "no_list_endpoint",
     "param_binding_unverified",
   ]) {
@@ -47,6 +48,9 @@ test("describeOutcome: 终态语义与退出码映射（README 退出码表的�
   // 模型路由被实测全部打掉：断言没有变成覆盖，不能 exit 0
   assert.match(describeOutcome("scout_routes_unverified").title, /未通过运行期实测/);
   assert.match(describeOutcome("scout_routes_unverified").hint, /openapi\.file/);
+  // 静态推断的地址同样要过实测闸门（与模型侧对称）
+  assert.match(describeOutcome("static_routes_unverified").title, /静态推断的路由未通过运行期实测/);
+  assert.match(describeOutcome("static_routes_unverified").hint, /挂载前缀/);
 
   const blocked = describeOutcome("no_patchable_candidates");
   assert.equal(blocked.outcome, "vulnerable_unfixed");
@@ -145,6 +149,7 @@ test("buildReport: inconclusive（没测到）exit 2 且明确写「无法证明
     ["attack_inconclusive", "攻击用例未跑全 · 无法证明", /攻击用例未跑全（exit 2，无法证明）/],
     ["plan_incomplete", "无法构造探测请求 · 无法证明", /候选端点无法构造探测请求（exit 2，无法证明）/],
     ["scout_routes_unverified", "模型路由全部未命中 · 无法证明", /模型给出的路由经运行期实测全部不成立（exit 2，无法证明）/],
+    ["static_routes_unverified", "路由地址全部未命中 · 无法证明", /静态推断的路由经运行期实测全部不成立（exit 2，无法证明）/],
   ]) {
     const error = { code, message: "无法完成覆盖", kind: "inconclusive", outcome: "inconclusive" };
     const { json, markdown } = buildReport(makeCtx("error"), {

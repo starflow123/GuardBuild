@@ -6,14 +6,16 @@
  *   "start": { "cmd": "node", "args": ["server.js"], "env": { "PORT": "${GB_PORT}" },
  *              "readyPattern": "GB_LISTEN", "readyTimeoutMs": 20000 },
  *   "prepare": [{ "cmd": "npm", "args": ["run", "build"], "timeoutMs": 120000 }],
- *   "login": { "path": "/api/login", "bodyTemplate": { "email": "{email}", "password": "{password}" },
+ *   "login": { "path": "/api/login", "loginPaths": ["/auth/attendee/login", "/auth/organiser/login"],
+ *              "bodyTemplate": { "email": "{email}", "password": "{password}" },
  *              "credentialHeader": "Authorization", "credentialPath": "authentication.token",
  *              "credentialPrefix": "Bearer " },
  *   "responses": { "list": "data.items", "entity": "data", "id": "order_id", "owner": "created_by_uid" },
  *   "listEndpoint": { "method": "GET", "path": "/api/orders", "query": { "page": "1", "limit": "50" } },
  *   "routes": [{ "method": "GET", "path": "/api/orgs/:orgId/orders/:orderId",
  *                "params": { "orgId": "orgId", "orderId": "id" } }],
- *   "identities": [{ "name": "alice", "email": "alice@example.com", "password": "alice123", "role": "user" }],
+ *   "identities": [{ "name": "alice", "email": "alice@example.com", "password": "alice123", "role": "user",
+ *                    "loginPath": "/auth/attendee/login" }],
  *   "supabase": { "envFile": ".env", "url": "https://xyz.supabase.co", "anonKey": "eyJ…", "tables": ["profiles"] },
  *   "llm": { "enabled": true, "model": "deepseek-chat" },
  *   "bootstrap": { "enabled": true, "maxSteps": 6 },
@@ -114,6 +116,14 @@ function normalizeIdentities(raw) {
           )
         : null;
     if (!username && !email && (!fields || Object.keys(fields).length < 2)) return null;
+    // 多角色应用常有各自的登录端点（/auth/organiser/login 与 /auth/attendee/login），
+    // 不给身份声明路径就会拿错端点，被目标以「200 + 登录表单」拒掉
+    const rawLoginPath = typeof it.loginPath === "string" ? it.loginPath.trim() : "";
+    const loginPath = rawLoginPath.startsWith("/")
+      ? rawLoginPath
+      : rawLoginPath
+        ? `/${rawLoginPath}`
+        : null;
     out.push({
       name:
         typeof it.name === "string" && it.name ? it.name : username ?? email ?? `identity${out.length + 1}`,
@@ -122,6 +132,7 @@ function normalizeIdentities(raw) {
       fields: fields && Object.keys(fields).length ? fields : null,
       password: it.password,
       role: it.role === "admin" ? "admin" : "user",
+      loginPath,
     });
   }
   return out;
@@ -160,6 +171,16 @@ export function normalizeLogin(raw) {
         : {},
     // 是否使用 Cookie 鉴权（登录后从响应 Set-Cookie 提取，后续请求带 Cookie 头）
     cookieAuth: l.cookieAuth === true,
+    // 多登录端点应用（参与者/组织者分开登录等）的候选序列，作为 identities[].loginPath 的兜底
+    loginPaths: Array.isArray(l.loginPaths)
+      ? [
+          ...new Set(
+            l.loginPaths
+              .filter((p) => typeof p === "string" && p.trim())
+              .map((p) => (p.trim().startsWith("/") ? p.trim() : `/${p.trim()}`))
+          ),
+        ].slice(0, 8)
+      : [],
     // 登录请求体编码：json（默认）或 form（application/x-www-form-urlencoded）
     encoding:
       l.encoding === "form" || l.encoding === "urlencoded" || l.encoding === "x-www-form-urlencoded"

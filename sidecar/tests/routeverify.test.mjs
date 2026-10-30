@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import {
   ABSENT_PROBE_PATH,
   MAX_SCOUT_ROUTES,
+  allRequestsMissed,
   classifyAnonymous,
   classifyExistence,
   compareOwnerFilter,
@@ -198,4 +199,40 @@ test("纯判定函数", () => {
   assert.deepEqual(compareOwnerFilter([{ id: 1 }], [{ id: 2 }], (o) => o.id), true);
   assert.deepEqual(compareOwnerFilter([], [{ id: 2 }], (o) => o.id), null);
   assert.deepEqual(compareOwnerFilter([{ id: 1 }, { id: 2 }], [{ id: 2 }], (o) => o.id), null);
+});
+
+test("allRequestsMissed: 静态推断地址的实测证伪判据（与模型路由同一把尺）", () => {
+  const baseline = { status: 404, body: '{"error":"Not Found"}' };
+  // 整轮 404 且与「绝对不存在的路径」同形 → 没打到接口
+  const missed = allRequestsMissed(
+    [
+      { method: "GET", path: "/api/api/bookings/7", status: 404, body: '{"error":"Not Found"}' },
+      { method: "POST", path: "/api/api/bookings/7/cancel", status: 404, body: '{"error":"Not Found"}' },
+    ],
+    baseline
+  );
+  assert.equal(missed.missed, true);
+  assert.deepEqual(missed.statuses, [404]);
+  assert.deepEqual(missed.attempted, ["GET /api/api/bookings/7", "POST /api/api/bookings/7/cancel"]);
+
+  // 只要有一条打到真接口（2xx / 401 / 403），就不算全轮空转
+  assert.equal(
+    allRequestsMissed(
+      [
+        { method: "GET", path: "/api/bookings/7", status: 404, body: '{"error":"Not Found"}' },
+        { method: "GET", path: "/api/bookings", status: 200, body: '{"items":[{"id":7}]}' },
+      ],
+      baseline
+    ).missed,
+    false
+  );
+  // 资源级 404（路径存在、对象不存在）与路由级 404 不同形 → 覆盖已建立，不得判空转
+  assert.equal(
+    allRequestsMissed([{ method: "GET", path: "/api/bookings/999", status: 404, body: '{"error":"Booking not found"}' }], baseline)
+      .missed,
+    false
+  );
+  // 基线不可用时按状态码判；空轮次不判空转（由上游 no_attack_cases 等口径负责）
+  assert.equal(allRequestsMissed([{ method: "GET", path: "/api/x", status: 410, body: "" }], null).missed, true);
+  assert.equal(allRequestsMissed([], baseline).missed, false);
 });

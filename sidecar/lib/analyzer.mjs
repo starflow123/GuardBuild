@@ -222,11 +222,21 @@ function joinNormalize(dir, spec) {
   return lead + out.join("/");
 }
 
-/** 拼接请求 URL：挂载前缀 + 路由路径（折叠重复斜杠、去尾部斜杠） */
+/**
+ * 拼接请求 URL：挂载前缀 + 路由路径（折叠重复斜杠、去尾部斜杠）。
+ * 幂等折叠不可省：真实项目常在同一个文件里既 app.use("/api", auth) 挂载中间件、
+ * 路由又声明全路径 /api/x，此时前缀已在路径里，再叠一次会得到 /api/api/x。
+ * 前缀语义本属于挂载点，而这里按文件记账（见 collectFileAuthGuards），故先折叠。
+ */
 function joinUrl(prefix, routePath) {
   if (!prefix) return routePath ?? null;
   if (!routePath) return String(prefix).replace(/\/+$/, "") || "/";
-  const joined = `${prefix}/${routePath}`.replace(/\/{2,}/g, "/");
+  const head = String(prefix).replace(/\/+$/, "");
+  if (!head || head === "/") return routePath;
+  if (routePath === head || routePath.startsWith(`${head}/`)) {
+    return routePath.replace(/\/+$/, "") || routePath;
+  }
+  const joined = `${head}/${routePath}`.replace(/\/{2,}/g, "/");
   return joined.length > 1 ? joined.replace(/\/+$/, "") : joined;
 }
 

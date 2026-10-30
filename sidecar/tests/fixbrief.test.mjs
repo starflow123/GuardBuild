@@ -63,6 +63,34 @@ test("buildFixBrief: 白盒 IDOR 用真实证据生成 curl 与免 --url 的复�
   assert.doesNotMatch(brief.verify, /--url/);
   assert.ok(brief.inspect.length > 0);
   assert.ok(brief.fix.length > 0);
+  assert.match(brief.risk, /本轮已用跨身份请求复现/, "有 vulnerable 证据才可以说「已复现」");
+});
+
+test("buildFixBrief: 纯静态候选不得声称「本轮已复现」", () => {
+  const brief = buildFixBrief(
+    { kind: "idor-suspect", method: "GET", path: "/api/orders/:id", file: "src/orders.js", startLine: 42 },
+    {
+      mode: "whitebox",
+      baseUrl: "http://127.0.0.1:3000",
+      projectRoot: "D:/tmp/shop",
+      evidence: [{ verdict: "safe", method: "GET", endpoint: "/api/orders/7", identity: "bob" }],
+    }
+  );
+  assert.doesNotMatch(brief.risk, /已用跨身份请求复现/, "没有越权证据时不能写出复现字样");
+  assert.match(brief.risk, /本轮为静态线索，未经运行期请求复现/);
+  assert.match(brief.risk, /按客户端提供的对象 ID 取数但未校验归属/, "静态风险描述本身仍要保留");
+
+  const noEv = buildFixBrief(
+    { kind: "idor-suspect", method: "GET", path: "/api/orders/:id" },
+    { mode: "whitebox", evidence: [] }
+  );
+  assert.doesNotMatch(noEv.risk, /已用跨身份请求复现/, "无任何证据记录时同样只给静态结论");
+
+  const bb = buildFixBrief(
+    { type: "黑盒·跨用户读取（IDOR）/api/orders/3", path: "/api/orders/3" },
+    { mode: "blackbox", evidence: [] }
+  );
+  assert.match(bb.risk, /本轮已用跨身份请求复现/, "黑盒 finding 本身就是复现产物");
 });
 
 test("buildFixBrief: JWT 伪造令牌走 jwt 家族，复现命中已记录的受保护端点", () => {
@@ -232,4 +260,49 @@ test("buildReport: report.json 写入 summary.fixBriefs，markdown 渲染修复�
   assert.match(markdown, /## 修复简报（1）/);
   assert.match(markdown, /建议排查的代码形态/);
   assert.match(markdown, /修复后复测/);
+  assert.match(json.summary.fixBriefs[0].risk, /本轮已用跨身份请求复现/);
+});
+
+test("buildReport: 挂载前缀写进复现命令、扩展长度路径不进报告、无证据时不声称复现", () => {
+  const ctx = {
+    sessionId: "sess-mount",
+    gate: true,
+    targetConfig: null,
+    view: {
+      projectRoot: "\\\\?\\D:\\shop\\app",
+      projectName: "shop",
+      startedAt: 1,
+      state: "evidenced",
+      findings: [
+        {
+          id: "fi2",
+          method: "POST",
+          path: "/auth/:role/register",
+          routePath: "/:role/register",
+          file: "\\\\?\\D:\\shop\\app\\routes\\auth.js",
+          startLine: 182,
+          resource: "auth",
+          kind: "idor-suspect",
+          sinkCalls: [],
+          reason: "按对象 ID 取资源但未见归属校验（IDOR 静态线索）",
+        },
+      ],
+      evidence: [],
+      phases: {},
+      targets: { original: { url: "http://127.0.0.1:59448" } },
+      patch: null,
+      supabase: null,
+      blackbox: null,
+      acceptance: null,
+      llm: null,
+      error: null,
+    },
+  };
+  const { json, markdown } = buildReport(ctx, { outcome: "inconclusive", exitCode: 2 });
+  const brief = json.summary.fixBriefs[0];
+  assert.equal(brief.reproduce, `curl -X POST 'http://127.0.0.1:59448/auth/1/register'`, "要用挂载后的完整地址");
+  assert.doesNotMatch(brief.reproduce, /:\/\/[^/]*\/1\/register/, "不能把路由器内的相对地址当端点");
+  assert.match(brief.risk, /本轮为静态线索，未经运行期请求复现/);
+  assert.doesNotMatch(markdown, /\\\\\?\\/, "报告里不应出现 Windows 扩展长度路径前缀");
+  assert.match(markdown, /D:\/shop\/app|D:\\shop\\app/);
 });

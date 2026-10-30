@@ -283,7 +283,8 @@ function buildReproduce(finding, ctx) {
         : ` -H "Content-Type: application/json" -d '${typeof rawBody === "string" ? rawBody : JSON.stringify(rawBody)}'`;
     return `curl -X ${hit.method ?? "GET"}${auth}${body} '${base}${hit.endpoint}'`;
   }
-  const path = concretePath(finding.routePath ?? finding.path);
+  // path 是挂载后的完整地址，routePath 是路由器内的相对地址：优先用能直接 curl 的那个
+  const path = concretePath(finding.path ?? finding.routePath);
   if (!path || /^(table|env|file):/.test(path)) return null;
   return `curl -X ${finding.method ?? "GET"} '${base}${path}'`;
 }
@@ -296,13 +297,28 @@ function buildVerify(ctx) {
   return `guardbuild-headless.exe --project "${root}" --gate --report <输出目录>`;
 }
 
+/**
+ * 模板里的「（本轮已用…复现）」是对**本轮实际证据**的断言，不能对静态线索说出口：
+ * 白盒 report.summary.findings 里既有运行期已复现的项，也有纯静态候选（一次越权请求都没打过）。
+ * 因此把该子句从风险描述里拆出来，只有匹配到 vulnerable 证据时才拼回，否则明说未复现。
+ */
+const PROOF_CLAUSE = /（本轮已?([^）]*)）/;
+
+function renderRisk(risk, reproduced) {
+  const m = risk.match(PROOF_CLAUSE);
+  if (!m) return risk;
+  const base = risk.replace(m[0], "");
+  return reproduced ? `${base}（本轮已${m[1]}）` : `${base}（本轮为静态线索，未经运行期请求复现）`;
+}
+
 export function buildFixBrief(finding, ctx = {}) {
   const family = ctx.family ?? detectFamily(finding);
   const tpl = TEMPLATES[family] ?? TEMPLATES.generic;
+  const reproduced = ctx.mode === "blackbox" || !!matchEvidence(finding, ctx.evidence);
   return {
     family,
     familyLabel: tpl.label,
-    risk: tpl.risk,
+    risk: renderRisk(tpl.risk, reproduced),
     inspect: tpl.inspect,
     fix: tpl.fix,
     reproduce: buildReproduce(finding, { ...ctx, family }),

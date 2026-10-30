@@ -48,6 +48,11 @@ function truncate(v, n) {
   return s.length > n ? `${s.slice(0, n)}…` : s;
 }
 
+/** Host 在 Windows 上用 \\?\ 扩展长度路径遍历目录，文件定位会带上这个前缀：给人看的报告要剥掉 */
+function humanPath(v) {
+  return String(v ?? "").replace(/^\\\\\?\\/, "");
+}
+
 /** 归因结论的中文措辞（与 attribution.mjs 的 status 一一对应） */
 const ATTRIBUTION_LABELS = {
   blocked: "已翻转",
@@ -109,6 +114,9 @@ function headline(outcome, patchStatus, supabase, blackbox = null, errorCode = n
       }
       if (errorCode === "param_binding_unverified") {
         return "多段路径参数取值来源未通过实测（exit 2，无法证明）：已用真实对象试过字段映射，响应里没有可对应的字段，引擎不会猜";
+      }
+      if (errorCode === "static_routes_unverified") {
+        return "静态推断的路由经运行期实测全部不成立（exit 2，无法证明）：本轮发出的每个请求都落在不存在的地址上，没有打到目标就不能当作安全";
       }
       if (errorCode === "scout_routes_unverified") {
         return "模型给出的路由经运行期实测全部不成立（exit 2，无法证明）：本轮没有可打的真实接口，报告列出每条路由的实测状态码";
@@ -694,7 +702,7 @@ function renderFixBriefs(briefs) {
   ];
   for (const [i, b] of briefs.slice(0, MD_FIX_BRIEF_CAP).entries()) {
     const endpoint = [b.method, b.path].filter(Boolean).join(" ");
-    const loc = b.file ? inlineCode(`${b.file}${b.startLine ? `:${b.startLine}` : ""}`) : null;
+    const loc = b.file ? inlineCode(`${humanPath(b.file)}${b.startLine ? `:${b.startLine}` : ""}`) : null;
     lines.push(`### ${i + 1}. ${b.familyLabel}${endpoint ? `：${endpoint}` : ""}\n`);
     lines.push(`- 证据类型：${b.type}`);
     if (loc) lines.push(`- 位置：${loc}`);
@@ -729,7 +737,7 @@ function renderMarkdown(r) {
       "| 项目 | 值 |",
       "| --- | --- |",
       `| 生成时间 | ${fmtTime(r.generatedAt)} |`,
-      `| 目标项目 | ${esc(r.session.projectName)}（\`${esc(r.session.projectRoot)}\`） |`,
+      `| 目标项目 | ${esc(r.session.projectName)}（\`${esc(humanPath(r.session.projectRoot))}\`） |`,
       ...(bb ? [`| 扫描目标 | \`${esc(bb.url)}\` |`] : []),
       `| 会话 | ${esc(r.session.id)} |`,
       `| 终态 | ${esc(r.session.stateLabel)}（${esc(r.session.state)}） |`,
@@ -842,6 +850,24 @@ function renderMarkdown(r) {
     ].filter(Boolean);
     summaryLines.push(`- 资源契约自动发现：${bits.join(" · ")}（${sourceLabel}）`);
   }
+  const idr = r.summary.identities;
+  if (!bb && idr) {
+    const on = idr.loggedIn ?? [];
+    const sv = idr.sessionVerification;
+    const who = on.map((i) => `${esc(i.name)}→\`${esc(i.endpoint ?? "?")}\``).join("、");
+    const verify =
+      sv?.status === "verified"
+        ? `已回读验证（探针 \`${esc(sv.probePath ?? "?")}\`：${(sv.identities ?? [])
+            .slice(0, 4)
+            .map((c) => `${esc(c.identity)} 匿名 ${c.anonStatus}→会话 ${c.sessStatus}`)
+            .join("、")}）`
+        : sv?.status === "skipped"
+          ? `未回读（${esc(sv.reason ?? "无可用探针")}）`
+          : "未回读（登录未成功或异常中止）";
+    summaryLines.push(
+      `- 身份会话：${on.length}/${(idr.configured ?? []).length} 建立${who ? `（${who}）` : ""}；会话真实性：${verify}`
+    );
+  }
   if (!bb && r.llm?.used) {
     const applied = [
       r.llm.applied?.start ? "启动" : null,
@@ -870,7 +896,7 @@ function renderMarkdown(r) {
         "| 端点 | 位置 | 原因 |",
         "| --- | --- | --- |",
         ...r.summary.findings.map(
-          (f) => `| ${esc(f.method)} ${esc(f.path)} | ${esc(f.file)}:${esc(f.startLine)} | ${esc(f.reason)} |`
+          (f) => `| ${esc(f.method)} ${esc(f.path)} | ${esc(humanPath(f.file))}:${esc(f.startLine)} | ${esc(f.reason)} |`
         ),
         "",
       ].join("\n")
@@ -1117,6 +1143,26 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
             needsPagination: !!ctx._resourceContract.needsPagination,
             requestsUsed: ctx._resourceContract.requestsUsed ?? 0,
             applied: ctx._resourceContract.applied ?? [],
+          }
+        : null,
+      identities: ctx._identityReport
+        ? {
+            configured: ctx._identityReport.configured ?? [],
+            loggedIn: (ctx._identityReport.loggedIn ?? []).map((i) => ({
+              name: i.name,
+              role: i.role ?? null,
+              endpoint: i.endpoint ?? null,
+              credentialKind: i.credentialKind ?? null,
+            })),
+            sessionVerification: ctx._identityReport.sessionVerification
+              ? {
+                  status: ctx._identityReport.sessionVerification.status ?? null,
+                  probePath: ctx._identityReport.sessionVerification.probePath ?? null,
+                  loginEndpoint: ctx._identityReport.sessionVerification.loginEndpoint ?? null,
+                  reason: ctx._identityReport.sessionVerification.reason ?? null,
+                  identities: (ctx._identityReport.sessionVerification.identities ?? []).slice(0, 8),
+                }
+              : null,
           }
         : null,
     },

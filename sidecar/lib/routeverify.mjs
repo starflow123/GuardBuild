@@ -1,9 +1,11 @@
 /**
- * LLM 路由线索的运行期实测层（agent 兜底的第 3/4 关）。
+ * 路由地址的运行期实测层（agent 兜底的第 3/4 关，也是静态候选的证伪闸门）。
  *
  * 接入侦察只做静态把关（文件真实存在 + 路径能在文件里定位）。这对「模型编了一条
  * 看起来合理但目标根本没实现的路由」无能为力，而这类路由一旦进入候选队列，
  * 就会把模型断言（hasAuth / hasOwnerFilter）当成扫描结论。
+ * 同一把尺也用于静态分析拼出的地址：地址是从源码推断出来的，就必须能被实测否证，
+ * 否则拼错的前缀会一路走到「未复现 → 放行」。
  *
  * 本模块在目标真正跑起来、身份已登录之后，用真实 HTTP 请求复核每一条 LLM 路由：
  *   1. 存在性 —— 用发现到的真实资源 id 打一次；命中「不存在路由」基线形态即判不存在；
@@ -25,13 +27,42 @@ export const ABSENT_PROBE_PATH = "/__guardbuild_probe__/absent-route";
 const PROTECTED_STATUSES = new Set([401, 403, 407]);
 const ABSENT_STATUSES = new Set([404, 410]);
 
+/** 状态码是否属于「路由不存在」形态（供静态候选的实测证伪闸门复用同一把尺） */
+export function isAbsentStatus(status) {
+  return ABSENT_STATUSES.has(status);
+}
+
+const TRUNCATION_MARK = /…（截断，共 \d+ 字节）$/;
+
+/**
+ * 本轮全部请求是否都落在「路由不存在」形态上——静态/契约推断地址的实测证伪判据。
+ * 与模型路由那道闸共用同一把尺：判定只来自响应，传输由调用方负责。
+ *
+ * @param {Array<{method?:string,path:string,status?:number,body?:string}>} probes 已发出的请求与响应
+ * @param {{status?:number,body?:string}|null} baseline 绝对不存在路径的实测响应；
+ *        null＝基线不可用，仅按状态码判（此轮同样没证明触及目标）
+ * @returns {{missed: boolean, statuses: number[], attempted: string[]}}
+ */
+export function allRequestsMissed(probes, baseline) {
+  const list = Array.isArray(probes) ? probes : [];
+  if (list.length === 0) return { missed: false, statuses: [], attempted: [] };
+  const statuses = [...new Set(list.map((p) => p?.status).filter((s) => typeof s === "number"))];
+  const attempted = [...new Set(list.map((p) => `${p.method ?? "GET"} ${p.path}`))];
+  if (!list.every((p) => isAbsentStatus(p?.status))) return { missed: false, statuses, attempted };
+  // 资源级 404（路径存在、对象不存在）与路由级 404 通常不同形：只有同形才算「没打到接口」
+  const strip = (s) => String(s ?? "").replace(TRUNCATION_MARK, "").slice(0, 4000);
+  const sameShape =
+    !baseline || list.every((p) => sameBody({ body: strip(p.body) }, { body: strip(baseline.body) }));
+  return { missed: sameShape, statuses, attempted };
+}
+
 function normalizeBody(res) {
   const raw = typeof res?.body === "string" ? res.body : res?.body == null ? "" : String(res.body);
   return raw.trim().replace(/\s+/g, " ").slice(0, 4000);
 }
 
 /** 粗粒度同体判定：SPA catch-all 会对任意路径回同一份文档，用长度+首尾片段比对 */
-function sameBody(a, b) {
+export function sameBody(a, b) {
   const x = normalizeBody(a);
   const y = normalizeBody(b);
   if (!x || !y) return x === y;

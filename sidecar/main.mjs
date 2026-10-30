@@ -2125,6 +2125,31 @@ async function runBlackboxFlow(ctx, rawUrl) {
 
   const outcome = result.findings.length > 0 ? "vulnerable_unfixed" : "no_findings";
   const exitCode = result.findings.length > 0 ? 1 : 0;
+  if (result.loginBlocked) {
+    // 配了账号却登录不成＝身份族一条没打，把「跳过」写成「未发现」就是假绿灯
+    ctx.view.targets.blackbox = { url: baseUrl, role: "外部黑盒目标" };
+    ctx.view.blackbox = {
+      mode: "blackbox",
+      url: baseUrl,
+      routeCount: result.routes.length,
+      evidenceCount: result.evidence.length,
+      login: result.login,
+      reachable: true,
+      coverage: result.coverage ?? null,
+      outcome: "inconclusive",
+      exitCode: 2,
+    };
+    ctx.pushEvidence(result.evidence);
+    pushView(ctx);
+    throw new SessionError(
+      `黑盒目标登录未成功（${result.loginFailure?.code ?? "login_failed"}），依赖身份的用例族（越权 / CSRF / 业务流）全部未执行，无法证明目标安全`,
+      {
+        code: "blackbox_login_failed",
+        hint: `${result.loginFailure?.reason ?? ""}　本轮只打了匿名面。请在 guardbuild.json 配好可用的 login 契约与至少两个同角色测试账号后重跑；外部目标需授权后再取账号。`,
+        details: { login: result.login, routeCount: result.routes.length },
+      }
+    );
+  }
   ctx.view.targets.blackbox = { url: baseUrl, role: "外部黑盒目标" };
   ctx.view.phases.blackbox = result.summary;
   ctx.view.blackbox = {

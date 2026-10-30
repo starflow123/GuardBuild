@@ -40,7 +40,15 @@ import {
 } from "./graphqlwire.mjs";
 import { MAX_VARIANT_CASES, channelVariantFor, foreignObjectVariants, idEncodingVariants, rawTokenRequest, variantCaseId } from "./attackvariants.mjs";
 import { buildProbePlan, candKey } from "./planner.mjs";
-import { MAX_SCOUT_ROUTES, verifyScoutRoutes } from "./routeverify.mjs";
+import {
+  MAX_SCOUT_ROUTES,
+  verifyScoutRoutes,
+  allRequestsMissed,
+  isAbsentStatus,
+  looksDenied,
+  sameBody,
+  ABSENT_PROBE_PATH,
+} from "./routeverify.mjs";
 import {
   MAX_CONTRACT_REQUESTS,
   MAX_LIST_SLOTS,
@@ -204,13 +212,23 @@ async function httpJson(ctx, opts) {
   let res;
   try {
     const url = `${baseUrl.replace(/\/+$/, "")}${path}`;
-    const followed = await followRedirects(
-      (next) => ctx.rpc.request(RPC_TO_HOST.HTTP_REQUEST, { ...params, url: next }, { timeoutMs: 30_000 }),
-      url,
-      { method }
-    );
+    // 跳转链要像浏览器一样带上刚存下的会话：Host 在首个响应里就把凭据入库，
+    // 若跟随跳转的请求仍不带 Cookie/令牌，302 后的页面看上去永远是匿名形态。
+    let attached = identity ?? null;
+    const holder = storeCookieAs ?? storeAs;
+    const send = async (next) => {
+      const r = await ctx.rpc.request(
+        RPC_TO_HOST.HTTP_REQUEST,
+        attached ? { ...params, url: next, identityRef: attached } : { ...params, url: next },
+        { timeoutMs: 30_000 }
+      );
+      if (!attached && holder && r?.storedIdentity === holder) attached = holder;
+      return r;
+    };
+    const followed = await followRedirects(send, url, { method });
     res = followed.res;
     if (followed.hops.length) res = { ...res, redirects: followed.hops };
+    res = { ...res, finalUrl: followed.url };
   } catch (e) {
     throw new ProbeError(`请求 ${method} ${path} 失败：${e.message}`, {
       code: "probe_request_failed",
@@ -315,6 +333,12 @@ export function classifyLoginFailure(attempts) {
   const anyAuth = statuses.some((s) => s === 401 || s === 403);
   const allMissing = statuses.length > 0 && statuses.every((s) => s === 404 || s === 405);
   const allServerErr = statuses.length > 0 && statuses.every((s) => s >= 500);
+  if (attempts.some((a) => a.shape === "login-form")) {
+    return {
+      code: "login_form_rerendered",
+      hint: `登录端点返回 HTTP ${statuses[statuses.length - 1] ?? "?"}，但响应体仍是登录表单（含密码输入框）——凭据未被接受，会话没有建立（${tried.join("、")}）。GuardBuild 不会把这种响应记成登录成功：拿匿名会话去跑越权用例会全线被拒，最后错报成「未复现」。请核对 guardbuild.json 中 identities 的账号密码（测试账号是否已存在于目标库）与 login.bodyTemplate 字段名；若目标登录后仍返回带表单的页面（靠前端跳转），请改用可判定的 API 登录端点。`,
+    };
+  }
   if (allMissing) {
     return {
       code: "login_endpoint_missing",
@@ -339,135 +363,329 @@ export function classifyLoginFailure(attempts) {
   };
 }
 
+const LOGIN_FORM_WINDOW = 20000;
+
+/**
+ * 响应体是否仍是登录表单。真实项目的登录失败通常是 HTTP 200 + 原地重渲染的表单
+ * （带密码输入框、并照样下发会话 Cookie），不是 401；只按状态码判定会把匿名会话记成登录成功。
+ */
+export function rendersLoginForm(res) {
+  const body = typeof res?.body === "string" ? res.body : "";
+  if (!body) return false;
+  const window = body.length > LOGIN_FORM_WINDOW ? body.slice(0, LOGIN_FORM_WINDOW) : body;
+  return /<input[^>]+\btype\s*=\s*["']?password/i.test(window);
+}
+
+/**
+ * 响应是否绕回了登录页本身（原地 200 重渲染，或跳转链上出现登录路径）。
+ * 与「含密码输入框」合取才判失败：JSON API 登录成功也停在原路径，但没有表单。
+ */
+function bouncedToLogin(res, baseUrl, loginPath) {
+  const norm = (p) => {
+    if (typeof p !== "string" || !p) return null;
+    let pathname = p;
+    try {
+      pathname = new URL(p, baseUrl).pathname;
+    } catch {
+      /* 已是路径形态 */
+    }
+    const stripped = pathname.replace(/[?#].*$/, "").replace(/\/+$/, "");
+    return stripped || "/";
+  };
+  const want = norm(loginPath);
+  if (!want) return false;
+  const hops = (Array.isArray(res?.redirects) ? res.redirects : []).map((h) => norm(String(h).split(" ")[1]));
+  if (hops.includes(want)) return true;
+  return norm(res?.finalUrl) === want;
+}
+
+/** 会话视角下的「被拒绝」：状态码拒绝、JSON 拒绝信封，或响应体又是登录页 */
+function deniedForSession(res) {
+  if (!res) return false;
+  if (res.status === 401 || res.status === 403) return true;
+  return rendersLoginForm(res) || looksDenied(res.json);
+}
+
+/**
+ * 挑一个「已知需要登录、无路径参数、只读、非角色门禁」的 GET 路径，用来回读会话真伪。
+ * 排除 hasRoleGuard：角色不足时匿名与登录可能都是拒绝码，会把真实会话误判成无效。
+ */
+export function pickSessionProbePath(analysis, loginPath) {
+  const eps = Array.isArray(analysis?.endpoints) ? analysis.endpoints : [];
+  const isPublicish = (p) => /\/(login|signin|logout|register|signup|auth|token|health|ping|metrics)(\/|$)/i.test(p);
+  const hit = eps.find(
+    (e) =>
+      e.hasAuth === true &&
+      !e.hasRoleGuard &&
+      String(e.method).toUpperCase() === "GET" &&
+      typeof e.fullPath === "string" &&
+      e.fullPath.startsWith("/") &&
+      !e.fullPath.includes(":") &&
+      !e.fullPath.includes("*") &&
+      e.fullPath !== loginPath &&
+      !isPublicish(e.fullPath)
+  );
+  return hit?.fullPath ?? null;
+}
+
+/**
+ * 会话真实性回读：同一个受保护 GET，匿名与带会话各打一次。
+ * 只有「匿名被拒 + 会话也被拒 + 两者同形」才判定会话没有建立——
+ * 匿名不被拒说明该路径本来公开，读不出会话信息，不能据此否定身份。
+ */
+async function verifySessionAuthenticated(ctx, baseUrl, identity, probePath) {
+  let anon = null;
+  let sess = null;
+  try {
+    anon = await httpJson(ctx, { baseUrl, method: "GET", path: probePath, identity: null });
+    sess = await httpJson(ctx, { baseUrl, method: "GET", path: probePath, identity });
+  } catch {
+    return { checked: false, reason: "request_failed" };
+  }
+  const anonDenied = deniedForSession(anon);
+  const sessDenied = deniedForSession(sess);
+  return {
+    checked: true,
+    path: probePath,
+    anonStatus: anon?.status ?? null,
+    sessStatus: sess?.status ?? null,
+    untrusted: anonDenied && sessDenied && anon?.status === sess?.status && sameBody(anon, sess),
+  };
+}
+
+/**
+ * 登录成功后回读会话真伪：拿这个会话打一个静态确认需要登录的只读接口，
+ * 与匿名请求比较。「200 + Set-Cookie」不等于身份成立——用未认证会话跑越权，
+ * 全线被拒会被记成「已测未复现」放行，所以这里失败就终止本轮。
+ */
+async function assertSessionsAuthenticated(ctx, baseUrl, loggedIn, loginPath) {
+  const probePath = pickSessionProbePath(ctx.analysis, loginPath);
+  if (loggedIn.length === 0) return;
+  if (!probePath) {
+    // 没有可用探针就如实说明，不能既跳过又声称「身份已验证」
+    ctx._sessionVerify = {
+      status: "skipped",
+      probePath: null,
+      reason: "静态分析没有「无参数、只读、需登录」的接口可作探针",
+      identities: loggedIn.map((i) => i.name),
+    };
+    ctx.emit({
+      kind: "identity",
+      severity: SEVERITY.INFO,
+      message: "会话真实性回读未执行：静态分析没有「无参数、只读、需登录」的接口可作探针（越权用例仍按实际拒绝形态判定）",
+      data: { loginEndpoint: loginPath, probePath: null },
+    });
+    return;
+  }
+  const checked = [];
+  for (const ident of loggedIn) {
+    const v = await verifySessionAuthenticated(ctx, baseUrl, ident.name, probePath);
+    if (!v.checked) continue;
+    checked.push({ ...v, identity: ident.name });
+    if (v.untrusted) {
+      throw new ProbeError(
+        `身份「${ident.name}」的会话未通过鉴权回读：GET ${probePath} 与匿名请求同形（HTTP ${v.sessStatus}），该会话在目标上并未认证`,
+        {
+          code: "login_session_unverified",
+          hint: `登录接口按状态码看似成功，但用该会话回读一个静态分析确认需要登录的只读接口时，响应与匿名请求完全同形——会话没有真正建立（常见于凭据被拒后目标仍返回 200）。本轮不会带着未认证会话继续跑越权用例（那会把「全线被拒」错报成「未复现」）。请核对 guardbuild.json 的 identities 是否为目标库中已存在且密码正确的账号；若登录响应需按字段判定，请声明 login.credentialPath。`,
+          details: {
+            identity: ident.name,
+            probePath,
+            loginEndpoint: loginPath,
+            anonStatus: v.anonStatus,
+            sessStatus: v.sessStatus,
+          },
+        }
+      );
+    }
+  }
+  if (checked.length > 0) {
+    ctx._sessionVerify = {
+      status: "verified",
+      probePath,
+      loginEndpoint: loginPath,
+      identities: checked.map((c) => ({
+        identity: c.identity,
+        anonStatus: c.anonStatus,
+        sessStatus: c.sessStatus,
+      })),
+    };
+    ctx.emit({
+      kind: "identity",
+      severity: SEVERITY.INFO,
+      message: `会话真实性已回读验证：GET ${probePath} 匿名被拒（HTTP ${checked[0].anonStatus}），${checked.length} 个身份均读通（HTTP ${checked.map((c) => c.sessStatus).join("/")}）`,
+      data: { probePath, verified: checked.map((c) => c.sessStatus), loginEndpoint: loginPath },
+    });
+  }
+}
+
 /**
  * 所有身份登录（凭证直接存入 Host 保险库，不流经 Sidecar）。
- * 候选端点按序尝试：契约声明 > 静态分析 > /api/login；找到可用端点后固化回 plan。
+ * 每个身份按自己的候选序列取登录端点：identities[].loginPath（多角色应用如
+ * 组织者/参与者分别有 /auth/organiser/login 与 /auth/attendee/login）> 全局候选
+ * （契约声明 > 静态分析 > /api/login）。身份登录不成即终止本轮——
+ * 拿未认证会话继续跑，只会把「全线被拒」写成「已测未复现」。
  */
 export async function loginAll(ctx, baseUrl) {
   const cfg = ctx.loginConfig ?? null;
-  const candidates =
+  const sharedCandidates = (
     Array.isArray(ctx.plan.loginCandidates) && ctx.plan.loginCandidates.length
       ? ctx.plan.loginCandidates
-      : [ctx.plan.loginPath];
+      : [ctx.plan.loginPath]
+  ).filter(Boolean);
   const attempts = [];
+  const cookieAuth = cfg?.cookieAuth === true;
 
-  for (const path of candidates) {
-    const loggedIn = [];
-    let failed = false;
-    // 登录端点是 tRPC 过程（末段形如 auth.login）时，请求体形态（superjson 包裹与否）未知，
-    // 按变体检索到能用第一个身份取回凭据的形态后再为其余身份复用
+  /** 单个身份在一个候选端点上的登录尝试 */
+  const attemptLogin = async (ident, path) => {
     const isTrpcProc = looksLikeTrpcProcPath(path);
     // GraphQL 登录：同一 HTTP 端点上的 mutation，文档由静态分析出的登录字段（SDL）构造
     const gqlLogin = ctx.plan.graphql?.login ?? null;
     const isGqlLogin = !!gqlLogin?.field && path === gqlLogin.path && looksLikeGraphqlPath(path);
-    const cookieAuth = cfg?.cookieAuth === true;
     const formAuth = cfg?.encoding === "form";
-    for (const ident of ctx.identities) {
-      const bodyPlain = buildLoginBody(ident, cfg);
-      // Cookie 登录允许 3xx：登录接口常用 302 下发 Set-Cookie 并跳转
-      const loginOk = (r) =>
-        !!r &&
-        r.storedIdentity === ident.name &&
-        (cookieAuth ? r.status >= 200 && r.status < 400 : okStatus(r.status));
-      const gqlReq = isGqlLogin ? graphqlLoginRequest(gqlLogin, bodyPlain) : null;
-      if (isGqlLogin && !gqlReq) {
-        throw new ProbeError(`GraphQL 登录字段 ${gqlLogin.field} 的请求文档无法构造`, {
-          code: "graphql_login_shape",
-          hint: `登录 mutation 的入参形态受限于 SDL 声明（当前参数：${(gqlLogin.args ?? []).map((a) => a.name).join("、") || "无"}）；若入参为 input 对象，请在 guardbuild.json 的 login.path 指定 REST 登录端点`,
-        });
-      }
-      const wraps = isTrpcProc ? [true, false] : [false];
-      let res = null;
-      for (const wrap of wraps) {
-        const encoded =
-          gqlReq || isTrpcProc ? null : encodeLoginBody(bodyPlain, formAuth);
-        res = await httpJson(ctx, {
-          baseUrl,
-          method: "POST",
-          path,
-          body: gqlReq
-            ? gqlReq.body
-            : isTrpcProc
-              ? encodeInput(bodyPlain, wrap)
-              : encoded.body,
-          contentType: encoded?.contentType,
-          storeAs: cookieAuth ? null : ident.name,
-          storeCookieAs: cookieAuth ? ident.name : null,
-          credentialPath: cfg?.credentialPath ?? "token",
-          credentialPrefix: cfg?.credentialPrefix ?? "Bearer ",
-          credentialHeader: cfg?.credentialHeader ?? null,
-          graphql: !!gqlReq,
-        });
-        if (loginOk(res)) {
-          if (isTrpcProc && ctx._trpcWrap == null) {
-            ctx._trpcWrap = wrap;
-            ctx._trpcVariant = wrap ? 0 : 1;
-            ctx.emit({
-              kind: "identity",
-              severity: SEVERITY.INFO,
-              message: `tRPC 登录请求体形态确认：${wrap ? "superjson 包裹" : "裸 JSON"}`,
-              data: { wrap, endpoint: path },
-            });
-          }
-          break;
+    const bodyPlain = buildLoginBody(ident, cfg);
+    // Cookie 登录允许 3xx：登录接口常用 302 下发 Set-Cookie 并跳转
+    // 「200 + 仍是登录表单」不算成功——真实项目登录失败常渲染表单并照样下发会话 Cookie
+    const loginOk = (r) =>
+      !!r &&
+      r.storedIdentity === ident.name &&
+      (cookieAuth ? r.status >= 200 && r.status < 400 : okStatus(r.status)) &&
+      !(rendersLoginForm(r) && bouncedToLogin(r, baseUrl, path));
+    const gqlReq = isGqlLogin ? graphqlLoginRequest(gqlLogin, bodyPlain) : null;
+    if (isGqlLogin && !gqlReq) {
+      throw new ProbeError(`GraphQL 登录字段 ${gqlLogin.field} 的请求文档无法构造`, {
+        code: "graphql_login_shape",
+        hint: `登录 mutation 的入参形态受限于 SDL 声明（当前参数：${(gqlLogin.args ?? []).map((a) => a.name).join("、") || "无"}）；若入参为 input 对象，请在 guardbuild.json 的 login.path 指定 REST 登录端点`,
+      });
+    }
+    const wraps = isTrpcProc ? [true, false] : [false];
+    let res = null;
+    for (const wrap of wraps) {
+      const encoded = gqlReq || isTrpcProc ? null : encodeLoginBody(bodyPlain, formAuth);
+      res = await httpJson(ctx, {
+        baseUrl,
+        method: "POST",
+        path,
+        body: gqlReq ? gqlReq.body : isTrpcProc ? encodeInput(bodyPlain, wrap) : encoded.body,
+        contentType: encoded?.contentType,
+        storeAs: cookieAuth ? null : ident.name,
+        storeCookieAs: cookieAuth ? ident.name : null,
+        credentialPath: cfg?.credentialPath ?? "token",
+        credentialPrefix: cfg?.credentialPrefix ?? "Bearer ",
+        credentialHeader: cfg?.credentialHeader ?? null,
+        graphql: !!gqlReq,
+      });
+      if (loginOk(res)) {
+        if (isTrpcProc && ctx._trpcWrap == null) {
+          ctx._trpcWrap = wrap;
+          ctx._trpcVariant = wrap ? 0 : 1;
+          ctx.emit({
+            kind: "identity",
+            severity: SEVERITY.INFO,
+            message: `tRPC 登录请求体形态确认：${wrap ? "superjson 包裹" : "裸 JSON"}`,
+            data: { wrap, endpoint: path },
+          });
         }
-        if (isTrpcProc && inputRejected(res)) continue; // 形态问题，换下一种
         break;
       }
-      if (loginOk(res)) {
-        const user = pickUser(res.json, cfg);
-        ctx.emit({
-          kind: "identity",
-          severity: SEVERITY.INFO,
-          message: cookieAuth
-            ? `身份「${ident.name}」登录成功（${path}），会话 Cookie 已存入 Host 保险库（对 Sidecar 不可见）`
-            : `身份「${ident.name}」登录成功（${path}），令牌已存入 Host 保险库（响应中的 token 对 Sidecar 显示为 ***）`,
-          data: {
-            identity: ident.name,
-            user,
-            stored: true,
-            credentialKind: cookieAuth ? "cookie" : "token",
-            endpoint: path,
-          },
-        });
-        loggedIn.push({ ...ident, user });
-        continue;
-      }
-      attempts.push({ path, identity: ident.name, status: res.status });
-      const statusAccepted = cookieAuth ? res.status >= 200 && res.status < 400 : okStatus(res.status);
-      if (statusAccepted && res.storedIdentity !== ident.name) {
-        throw new ProbeError(
-          cookieAuth
-            ? `登录返回 HTTP ${res.status}，但响应未包含 Set-Cookie 会话`
-            : `登录返回 HTTP ${res.status}，但响应中未找到凭据字段「${cfg?.credentialPath ?? "token"}」`,
-          {
-            code: cookieAuth ? "cookie_missing" : "credential_path_missing",
-            hint: cookieAuth
-              ? "请确认登录接口确实通过 Set-Cookie 下发会话；若实际返回 JSON 令牌，请移除 login.cookieAuth 并检查 login.credentialPath"
-              : `请检查 guardbuild.json 的 login.credentialPath（当前为 "${cfg?.credentialPath ?? "token"}"）；嵌套令牌应写如 "authentication.token"`,
-          }
-        );
-      }
-      failed = true;
+      if (isTrpcProc && inputRejected(res)) continue; // 形态问题，换下一种
       break;
     }
-    if (!failed) {
-      ctx.plan.loginPath = path;
-      ctx.plan.loginCandidates = [path, ...candidates.filter((c) => c !== path)];
-      ctx._loginVerified = true;
-      ctx._loginEndpoint = path;
-      return loggedIn;
+    if (loginOk(res)) {
+      const user = pickUser(res.json, cfg);
+      ctx.emit({
+        kind: "identity",
+        severity: SEVERITY.INFO,
+        message: cookieAuth
+          ? `身份「${ident.name}」登录成功（${path}），会话 Cookie 已存入 Host 保险库（对 Sidecar 不可见）`
+          : `身份「${ident.name}」登录成功（${path}），令牌已存入 Host 保险库（响应中的 token 对 Sidecar 显示为 ***）`,
+        data: {
+          identity: ident.name,
+          user,
+          stored: true,
+          credentialKind: cookieAuth ? "cookie" : "token",
+          endpoint: path,
+        },
+      });
+      return { ok: true, entry: { ...ident, user }, endpoint: path };
+    }
+    attempts.push({
+      path,
+      identity: ident.name,
+      status: res.status,
+      shape: rendersLoginForm(res) && bouncedToLogin(res, baseUrl, path) ? "login-form" : null,
+    });
+    const statusAccepted = cookieAuth ? res.status >= 200 && res.status < 400 : okStatus(res.status);
+    if (statusAccepted && res.storedIdentity !== ident.name) {
+      throw new ProbeError(
+        cookieAuth
+          ? `登录返回 HTTP ${res.status}，但响应未包含 Set-Cookie 会话`
+          : `登录返回 HTTP ${res.status}，但响应中未找到凭据字段「${cfg?.credentialPath ?? "token"}」`,
+        {
+          code: cookieAuth ? "cookie_missing" : "credential_path_missing",
+          hint: cookieAuth
+            ? "请确认登录接口确实通过 Set-Cookie 下发会话；若实际返回 JSON 令牌，请移除 login.cookieAuth 并检查 login.credentialPath"
+            : `请检查 guardbuild.json 的 login.credentialPath（当前为 "${cfg?.credentialPath ?? "token"}"）；嵌套令牌应写如 "authentication.token"`,
+        }
+      );
+    }
+    return { ok: false };
+  };
+
+  const loggedIn = [];
+  const endpoints = [];
+  for (const ident of ctx.identities) {
+    const list = ident.loginPath
+      ? [ident.loginPath, ...sharedCandidates.filter((p) => p !== ident.loginPath)]
+      : sharedCandidates;
+    let done = false;
+    for (const path of list) {
+      const r = await attemptLogin(ident, path);
+      if (r.ok) {
+        loggedIn.push(r.entry);
+        endpoints.push(r.endpoint);
+        done = true;
+        break;
+      }
+    }
+    if (!done) {
+      const { code, hint } = classifyLoginFailure(attempts);
+      const tried = attempts
+        .filter((a) => a.identity === ident.name)
+        .map((a) => `${a.path}→HTTP ${a.status}`)
+        .join("，");
+      throw new ProbeError(
+        `身份「${ident.name}」无法在任何候选登录端点上建立会话（尝试：${tried || "无"}）`,
+        {
+          code,
+          hint: ident.loginPath
+            ? `该身份声明的 loginPath 为 ${ident.loginPath}；${hint ?? ""}`
+            : `${hint ?? ""}　多角色应用请为每个身份写 identities[].loginPath（如组织者用 /auth/organiser/login），否则角色不匹配的账号会被登录端点拒绝并回渲染登录表单。`,
+        }
+      );
     }
   }
 
-  const { code, hint } = classifyLoginFailure(attempts);
-  const last = attempts[attempts.length - 1];
-  // 逐个候选端点的实际状态码入消息：单端点框架（GraphQL）的登录失败最易被后一个 404 掩盖
-  const tried = attempts.map((a) => `${a.path}→HTTP ${a.status}`).join("，");
-  throw new ProbeError(`所有候选登录端点均失败（最后尝试 ${last.path}，HTTP ${last.status}；全部尝试：${tried}）`, {
-    code,
-    hint,
-  });
+  const path = endpoints[0];
+  ctx.plan.loginPath = path;
+  ctx.plan.loginCandidates = [path, ...sharedCandidates.filter((c) => c !== path)];
+  ctx._loginVerified = true;
+  ctx._loginEndpoint = path;
+  ctx._loginEndpoints = Object.fromEntries(ctx.identities.map((i, idx) => [i.name, endpoints[idx] ?? null]));
+  await assertSessionsAuthenticated(ctx, baseUrl, loggedIn, path);
+  // 报告的「身份基础」一节：谁的会话在哪个端点建立、真实性有没有回读过。
+  // 没有这一节，读者只能从「越权全部被拒」反推身份是不是真的成立。
+  ctx._identityReport = {
+    configured: ctx.identities.map((i) => i.name),
+    loggedIn: loggedIn.map((i) => ({
+      name: i.name,
+      role: i.role ?? null,
+      endpoint: ctx._loginEndpoints?.[i.name] ?? path,
+      credentialKind: ctx.loginConfig?.cookieAuth === true ? "cookie" : "token",
+    })),
+    sessionVerification: ctx._sessionVerify ?? null,
+  };
+  return loggedIn;
 }
 
 const ANON_PROBE_MAX_ID = 10;
@@ -3353,6 +3571,54 @@ export function postPhaseCases(orderedCases, { claimed = new Set(), preVerdicts 
   return { cases, variantSkipped };
 }
 
+/**
+ * 静态/契约来源地址的实测证伪闸门。LLM 路由一直有「打不通就丢弃」这一关，
+ * 从源码推断出的 fullPath 却没有：挂载前缀拼错时整轮请求全落在 404 上，
+ * 仍能走到「未复现 → 放行」。这里补齐对称性——本轮发出的每个请求都与
+ * 「绝对不存在的路径」同形时，判为未触及目标（inconclusive / exit 2）。
+ * 零额外成本：先只看已收集的状态码，全部不存在形态才补发那一次基线请求。
+ */
+async function assertTargetTouched(ctx, { baseUrl, evidence, phase }) {
+  if (phase !== "pre" || evidence.length === 0) return;
+  // 先只看已收集的状态码，全部不存在形态才补发那一次基线请求（正常轮次零额外成本）
+  if (!evidence.every((e) => isAbsentStatus(e.response?.status))) return;
+
+  let baseline = null;
+  try {
+    baseline = await httpJson(ctx, { baseUrl, method: "GET", path: ABSENT_PROBE_PATH, identity: null });
+  } catch {
+    baseline = null;
+  }
+  const verdict = allRequestsMissed(
+    evidence.map((e) => ({ method: e.method, path: e.endpoint, status: e.response?.status, body: e.response?.body })),
+    baseline
+  );
+  if (!verdict.missed) return;
+
+  ctx.routeExistence = {
+    touched: false,
+    total: evidence.length,
+    statuses: verdict.statuses,
+    baselineStatus: baseline?.status ?? null,
+    attempted: verdict.attempted,
+  };
+  ctx.emit({
+    kind: "discovery",
+    severity: SEVERITY.WARN,
+    message: `本轮 ${evidence.length} 个请求全部落在「路由不存在」形态（与不存在路径基线 ${ABSENT_PROBE_PATH} 同形），未触及目标接口`,
+    phase,
+    data: { attempted: verdict.attempted.slice(0, 12), statuses: verdict.statuses, baselineStatus: baseline?.status ?? null },
+  });
+  throw new ProbeError(
+    `全部 ${evidence.length} 条用例打到的地址在目标上都不存在（HTTP ${verdict.statuses.join("/")}，与不存在路径基线同形），无法证明目标安全`,
+    {
+      code: "static_routes_unverified",
+      hint: `静态推断的请求路径与目标实际接口不符是最常见原因（如挂载前缀被重复拼接）。本轮尝试的地址：${verdict.attempted.slice(0, 6).join("；")}。请在 guardbuild.json 用 routes / openapi.file 声明真实接口，或校正路由声明与挂载点的对应关系后重跑；本轮没有打到目标，不能据此判定安全`,
+      details: { attempted: verdict.attempted, statuses: verdict.statuses, baselineStatus: baseline?.status ?? null, total: evidence.length },
+    }
+  );
+}
+
 export async function runPhase(ctx, { phase, baseUrl }) {
   ctx._lastDecisionSeq = 0;
   ctx.emit({
@@ -3455,13 +3721,6 @@ export async function runPhase(ctx, { phase, baseUrl }) {
     });
   }
 
-  const attackSlots = cases.filter((c) => c.category === CASE_CATEGORY.ATTACK);
-  if (attackSlots.length === 0) {
-    throw new ProbeError("未能构建任何攻击用例（身份或资源发现不足）", {
-      code: "no_attack_cases",
-      hint: "攻击用例需要：至少一个普通用户身份 + 可填充的对象资源（来自列表接口或匿名探测），请检查 guardbuild.json 的身份配置与目标项目的资源可发现性",
-    });
-  }
   const plannedSlots = [
     { slot: "readCandidate", prefix: "attack-read-foreign", count: planCandidates(ctx, "read").length },
     { slot: "cancelCandidate", prefix: "attack-cancel-foreign", count: planCandidates(ctx, "cancel").length },
@@ -3490,6 +3749,27 @@ export async function runPhase(ctx, { phase, baseUrl }) {
     });
   } else if (phase === "pre") {
     ctx._unverifiedSlots = [];
+  }
+
+  const attackSlots = cases.filter((c) => c.category === CASE_CATEGORY.ATTACK);
+  if (attackSlots.length === 0) {
+    // 一个攻击用例都没构造出来＝没有向目标发出越权请求，覆盖未建立（不是「测过没复现」）。
+    // 把槽位实测数放进错误详情，报告才能区分「缺数据」与「缺契约」，用户才知道下一步补什么。
+    throw new ProbeError(
+      `未能构建任何攻击用例（身份或资源发现不足；有候选的槽位：${
+        plannedSlots.length ? plannedSlots.map((s) => `${s.slot}×${s.count}`).join("、") : "无"
+      }）`,
+      {
+        code: "no_attack_cases",
+        hint: "攻击用例需要：至少一个普通用户身份 + 可填充的对象资源（来自列表接口或匿名探测），请检查 guardbuild.json 的身份配置与目标项目的资源可发现性",
+        details: {
+          plannedSlots,
+          skippedSlots: skipped.map((s) => s.slot),
+          casesBuilt: cases.length,
+          identities: ctx.identities.map((i) => i.name),
+        },
+      }
+    );
   }
 
   const evidence = [];
@@ -3626,6 +3906,9 @@ export async function runPhase(ctx, { phase, baseUrl }) {
       hint: "请确认目标服务仍在运行；若探测过程中目标崩溃或阻塞，请修复后重试",
     });
   }
+
+  // 全部请求都落在不存在的地址上＝本轮没打到目标，不能进「未复现 → 放行」
+  await assertTargetTouched(ctx, { baseUrl, evidence, phase });
 
   const counts = { vulnerable: 0, blocked: 0, passed: 0, regressed: 0, inconclusive: 0 };
   for (const e of evidence) counts[e.verdict] = (counts[e.verdict] ?? 0) + 1;

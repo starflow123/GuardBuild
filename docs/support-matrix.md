@@ -93,11 +93,12 @@ GuardBuild 是一个面向 Vibe Coding 开发者的本地安全 Agent：先启�
 | --- | --- | --- |
 | 0 | `no_candidates` / `not_reproducible` | 已扫描但无可探测候选，或攻击在真实实例上打不通——**不是执行失败，也不是「系统安全」的证明** |
 | 1 | `vulnerable_unfixed` / `patchStatus=verified` / `verify_failed` | 漏洞证据成立（附补丁或人工修复指引） |
-| 2 | `inconclusive`（`no_endpoints` / `attack_inconclusive` / `plan_incomplete` / `scout_routes_unverified` / `no_list_endpoint` / `param_binding_unverified`）/ `failed` / `aborted` / `timeout` | 无法证明覆盖，或契约、环境、内部错误、超时、中断 |
+| 2 | `inconclusive`（`no_endpoints` / `attack_inconclusive` / `plan_incomplete` / `scout_routes_unverified` / `static_routes_unverified` / `no_list_endpoint` / `param_binding_unverified` / `blackbox_login_failed` / `no_attack_cases`）/ `failed`（含 `login_form_rerendered` / `login_session_unverified`）/ `aborted` / `timeout` | 无法证明覆盖，或契约、环境、内部错误、超时、中断 |
 
 - `no_candidates`（exit 0）：路由已识别，但没有候选同时命中「静态形状 + 攻击用例」，界面显示「已扫描 · 无安全候选」并列出支持清单。
 - `not_reproducible`（exit 0）：静态有线索、攻击已发出但打不通，显示「已测未复现 · 未证明安全」。
-- `inconclusive`（exit 2）：**没测到 ≠ 安全**。未识别到任何路由（`no_endpoints`）、计划用例因身份 / 资源 / 运行期契约不足被跳过（`attack_inconclusive`）、候选端点缺少可寻址参数（`plan_incomplete`）、模型侦察给出的路由在真实运行实例上逐条打完全部不成立（`scout_routes_unverified`）、定位不到按归属过滤的列表接口（`no_list_endpoint`）、多段路径参数取值来源实测不出（`param_binding_unverified`）都归这一档，门禁不放行，报告给出对应的契约补齐字段。
+- `inconclusive`（exit 2）：**没测到 ≠ 安全**。未识别到任何路由（`no_endpoints`）、静态分析给出的路由在真实实例上逐条打完全部不成立（`static_routes_unverified`，多见于挂载前缀/路径拼接类适配问题）、计划用例因身份 / 资源 / 运行期契约不足被跳过（`attack_inconclusive`）、候选端点缺少可寻址参数（`plan_incomplete`）、模型侦察给出的路由在真实运行实例上逐条打完全部不成立（`scout_routes_unverified`）、定位不到按归属过滤的列表接口（`no_list_endpoint`）、多段路径参数取值来源实测不出（`param_binding_unverified`）、纯黑盒模式契约里配了账号但一个身份都登不上（`blackbox_login_failed`，身份族用例整族未执行）、登录与路由都正常却一个攻击用例都构造不出来（`no_attack_cases`，测试账号名下没有可读回的对象数据）都归这一档，门禁不放行，报告给出对应的契约补齐字段。
+- `failed` 中的登录两类（exit 2）：目标把「密码错误」渲染成 HTTP 200 + 登录表单（`login_form_rerendered`），或状态码可接受、凭据也取到了，但拿静态分析已知的「无参数、只读、需登录」接口做鉴权回读时匿名与带会话的响应同形同码被拒（`login_session_unverified`）。两类都是**会话没建立**，若按状态码判定就会被记成登录成功、随后所有越权用例拿匿名会话打，产出假的「未复现」。分开登录入口的应用要用 `identities[].loginPath` 为每个身份指定端点；找不到可回读的探针接口时引擎不做判定，但会在报告里写明「会话真实性回读未执行」。
 
 ## 精度口径
 

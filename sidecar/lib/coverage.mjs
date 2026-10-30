@@ -105,6 +105,20 @@ const OUTCOME_PRESENTATION = {
     stateLabel: "模型路由全部未命中 · 无法证明",
     hint: "静态分析没有候选，接入侦察给出的路由在真实运行实例上逐条打了一次、全部不成立（exit 2）：模型的断言没有变成覆盖，本轮不能判定安全。报告列出每条路由的实测状态码与不存在路径基线；请在 guardbuild.json 用 routes / openapi.file 声明真实接口，或让侦察的证据包含更多路由定义代码后重跑。",
   },
+  static_routes_unverified: {
+    outcome: "inconclusive",
+    kind: "inconclusive",
+    title: "静态推断的路由未通过运行期实测（无法证明）",
+    stateLabel: "路由地址全部未命中 · 无法证明",
+    hint: "本轮发出的每一个请求都落在「路由不存在」形态上（与不存在路径基线同形，exit 2）：静态从源码推断出的请求地址没有打到目标真实接口，覆盖没有建立，不能据此判定安全。最常见原因是挂载前缀与路由声明的对应关系判断有误，请在 guardbuild.json 用 routes / openapi.file 声明真实接口后重跑。",
+  },
+  no_attack_cases: {
+    outcome: "inconclusive",
+    kind: "inconclusive",
+    title: "未能构造攻击用例（无法证明）",
+    stateLabel: "无攻击用例 · 无法证明",
+    hint: "登录与路由都正常，但一个攻击用例都没能构造出来（exit 2）：越权类用例需要「另一个身份名下真实存在的对象」，而本轮既没从列表接口读到资源，匿名 ID 探测也没找到可见对象——测试账号名下没有数据就会这样。这既不是执行失败也不是「无漏洞」：没有向目标发出越权请求，覆盖没有建立。请在 guardbuild.json 用 responses/listEndpoint 声明列表接口与主键/归属字段，或先在目标里给两个测试账号各造一条数据后重跑。",
+  },
   attack_not_reproducible: {
     outcome: "not_reproducible",
     kind: "clean",
@@ -125,6 +139,27 @@ const OUTCOME_PRESENTATION = {
     title: "工作区已变化，补丁未写回",
     stateLabel: "补丁未写回 · 工作区已变化",
     hint: "Host 在写回预检（git apply --check）阶段拒绝，原文件未被修改：补丁生成基线与当前工作区代码不再一致。补丁仍保留在隔离 worktree，可重跑会话按最新代码重新生成，或自行合并 report.md 中的 Diff。",
+  },
+  login_form_rerendered: {
+    outcome: "failed",
+    kind: "failed",
+    title: "登录未通过（目标把失败渲染成 200 表单）",
+    stateLabel: "身份未建立 · 执行失败",
+    hint: "登录接口返回 HTTP 200，但响应体仍是带密码输入框的登录页：凭据没有被接受，会话并未建立（exit 2）。这不是「已测未复现」——引擎不会拿未认证会话去跑越权用例，那只会得到全线被拒的假象。请核对 identities 是否为目标库中已存在且密码正确的账号，以及 login.bodyTemplate 的字段名。",
+  },
+  login_session_unverified: {
+    outcome: "failed",
+    kind: "failed",
+    title: "会话未通过鉴权回读（身份不可信）",
+    stateLabel: "身份未建立 · 执行失败",
+    hint: "登录响应看似成功，但用该会话回读一个静态确认需要登录的只读接口时，响应与匿名请求同形（exit 2）：这个身份在目标上并没有认证。带着它跑越权只会全线被拒，进而被误判成「未复现」。请核对账号密码与目标库实际状态，或用 login.credentialPath 声明可判定的凭据字段。",
+  },
+  blackbox_login_failed: {
+    outcome: "inconclusive",
+    kind: "inconclusive",
+    title: "黑盒身份族未执行（无法证明）",
+    stateLabel: "身份探测未执行 · 无法证明",
+    hint: "契约里配置了登录身份，但黑盒目标登录未成功（exit 2）：越权 / CSRF / 业务流这些依赖身份的探测族一条都没打，本轮只覆盖匿名面，不能当作「测过且干净」。请在 guardbuild.json 配好 login 与至少两个同角色测试账号后重跑。",
   },
   failed: {
     outcome: "failed",

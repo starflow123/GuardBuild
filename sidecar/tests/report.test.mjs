@@ -203,3 +203,54 @@ test("gate 未写回：报告不出现写回/回滚段，仍给出隔离补丁�
   assert.doesNotMatch(markdown, /写回后复核/);
   assert.match(markdown, /gate 未写回原工作区/);
 });
+
+test("身份基础：会话建立端点与回读结论写进 report.json 与 markdown", () => {
+  const ctx = ctxFor({ patchStatus: "verified" });
+  ctx._identityReport = {
+    configured: ["att1", "org1"],
+    loggedIn: [
+      { name: "att1", role: "attendee", endpoint: "/auth/attendee/login", credentialKind: "cookie" },
+      { name: "org1", role: "organiser", endpoint: "/auth/organiser/login", credentialKind: "cookie" },
+    ],
+    sessionVerification: {
+      status: "verified",
+      probePath: "/api/me",
+      loginEndpoint: "/auth/attendee/login",
+      identities: [
+        { identity: "att1", anonStatus: 401, sessStatus: 200 },
+        { identity: "org1", anonStatus: 401, sessStatus: 200 },
+      ],
+    },
+  };
+  const { json, markdown } = buildReport(ctx, { outcome: "vulnerable", exitCode: 1 });
+  assert.equal(json.summary.identities.loggedIn.length, 2);
+  assert.equal(json.summary.identities.sessionVerification.status, "verified");
+  assert.match(markdown, /身份会话：2\/2 建立（att1→`\/auth\/attendee\/login`、org1→`\/auth\/organiser\/login`）/);
+  assert.match(markdown, /会话真实性：已回读验证（探针 `\/api\/me`：att1 匿名 401→会话 200、org1 匿名 401→会话 200）/);
+});
+
+test("身份基础：回读未执行时如实标注原因，不写成已验证", () => {
+  const ctx = ctxFor({ patchStatus: "verified" });
+  ctx._identityReport = {
+    configured: ["u1", "u2", "u3"],
+    loggedIn: [{ name: "u1", role: null, endpoint: "/login", credentialKind: "token" }],
+    sessionVerification: {
+      status: "skipped",
+      probePath: null,
+      reason: "静态分析没有「无参数、只读、需登录」的接口可作探针",
+      identities: ["u1"],
+    },
+  };
+  const { json, markdown } = buildReport(ctx, { outcome: "vulnerable", exitCode: 1 });
+  assert.equal(json.summary.identities.sessionVerification.status, "skipped");
+  assert.match(markdown, /身份会话：1\/3 建立/);
+  assert.match(markdown, /会话真实性：未回读（静态分析没有/);
+  assert.doesNotMatch(markdown, /会话真实性：已回读验证/);
+});
+
+test("未建立任何会话：身份段不出现，报告不臆造身份结论", () => {
+  const ctx = ctxFor({ patchStatus: "pending_review" });
+  const { json, markdown } = buildReport(ctx, { outcome: "vulnerable", exitCode: 1 });
+  assert.equal(json.summary.identities, null);
+  assert.doesNotMatch(markdown, /身份会话/);
+});

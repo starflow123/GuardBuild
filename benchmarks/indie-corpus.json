@@ -1,0 +1,75 @@
+{
+  "version": 2,
+  "title": "真实项目基准（强制白盒层，本批只跑公开项目）",
+  "note": [
+    "自建 fixture 与自建靶场都是「配好的」：不挂双前缀、路径短、登录走 JSON、守卫写法单一。",
+    "接入层缺陷（挂载前缀重复拼接 #174、表单 Cookie 登录假成功 #175、Windows 长路径 worktree #176、",
+    "崩溃原文不展示 #177、静态误报与 SSR 资源发现 #178）只会在陌生人的真实工程里暴露。",
+    "这一层还强制走白盒链路：只跑黑盒的基准不建 worktree，长路径 bug 会一路绿灯。",
+    "判据是结构性的（绿灯必须有测量支撑），不预测结论方向；项目缺失或依赖没装就跳过，不判失败。",
+    "personal=true 的条目是用户自己的项目，默认不跑（2026-10-30 起：先把公开层跑稳，产品成熟后再回测）；",
+    "需要时显式 GUARDBUILD_INDIE_PERSONAL=1 才纳入，且这些条目只作历史参照，不作为回归闸。"
+  ],
+  "realDirEnv": "GUARDBUILD_INDIE_DIR",
+  "defaultRealDir": "D:/AiAgent/dogfood",
+  "targets": [
+    {
+      "id": "juice-shop",
+      "name": "OWASP Juice Shop（NestJS + Express，深路径 node_modules）",
+      "dir": "juice-shop",
+      "groundTruth": "2026-10-21 Run H：注入式 IDOR 靶点全链路闭环；静态识别 5 个漏洞文件。2026-10-30：白盒 gate 在 git worktree add 报 Filename too long（#176）",
+      "requires": ["guardbuild.json", "node_modules", "build/app.js", "dogfood-ready-hook.cjs"],
+      "needsContract": true,
+      "minFindings": 3,
+      "expectedExits": [0, 1, 2],
+      "timeoutMs": 1200000
+    },
+    {
+      "id": "vuln-express",
+      "name": "vuln-express（公开漏洞 Express 靶场，TypeORM + JWT，多角色身份）",
+      "dir": "vuln-express",
+      "groundTruth": "上游声明的漏洞靶场；本地 guardbuild.json 用 /v1/user/token + credentialPath=jwt，3 个身份（1 admin / 2 普通）。本层只断言绿灯是否有测量支撑，不预判结论方向",
+      "requires": ["guardbuild.json", "node_modules", "src/server.js"],
+      "needsContract": true,
+      "minFindings": 1,
+      "expectedExits": [0, 1, 2],
+      "timeoutMs": 420000
+    },
+    {
+      "id": "event-manager",
+      "personal": true,
+      "name": "Event Manager（Express + SQLite，EJS SSR，表单/Cookie 多角色登录）",
+      "dir": "indie/event-manager",
+      "groundTruth": "2026-10-30 实测轮：/auth/:role/* 被当资源 ID 造成 11 条候选中 10 条误报；SSR 无 JSON 列表接口",
+      "requires": ["guardbuild.json", "node_modules", "index.js"],
+      "needsContract": true,
+      "minFindings": 1,
+      "expectedExits": [1, 2],
+      "timeoutMs": 420000
+    },
+    {
+      "id": "solotour-crm",
+      "personal": true,
+      "name": "SoloTour CRM（Express + JWT，同一文件既 app.use('/api') 又声明全路径路由）",
+      "dir": "indie/solotour-crm",
+      "groundTruth": "2026-10-30 实测轮：双前缀使 3 条 JWT 用例全打 /api/api/*，exit 0 假绿灯；curl 对照 /api/bookings 200 vs /api/api/bookings 404",
+      "requires": ["guardbuild.json", "node_modules", "package.json"],
+      "needsContract": true,
+      "minFindings": 1,
+      "expectedExits": [0, 1, 2],
+      "timeoutMs": 420000
+    },
+    {
+      "id": "iptv_player",
+      "personal": true,
+      "name": "iptv_player（Express + better-sqlite3）",
+      "dir": "indie/iptv_player",
+      "groundTruth": "2026-10-30 实测轮：无契约；better-sqlite3 缺 win32/node22 预编译包，依赖装不起来 → 动态层未覆盖",
+      "requires": ["guardbuild.json", "node_modules"],
+      "needsContract": true,
+      "minFindings": 1,
+      "expectedExits": [0, 1, 2],
+      "timeoutMs": 420000
+    }
+  ]
+}

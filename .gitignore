@@ -38,6 +38,7 @@ guardbuild-data/
 .benchmark/
 .benchmark-blackbox/
 .benchmark-realworld/
+.benchmark-indie/
 
 # 分发构建产物：随包 Node 由 scripts/prepare-runtime.mjs 生成
 src-tauri/runtime/

@@ -1,0 +1,19 @@
+{
+  "version": "gb-recipe-1",
+  "family": "sqli-injection",
+  "title": "SQL 注入：沿计划声明的注入通道打永真/报错载荷，行差或数据库报错特征作证",
+  "steps": [
+    {
+      "id": "attack-sql-injection",
+      "action": "payload.inject",
+      "path": "{slot:sqliPath}",
+      "param": "{plan.param}",
+      "payloadSet": "sqli-default",
+      "identity": "attacker",
+      "note": "不声明 method：本族的方法由计划的注入通道决定（body→POST，query/params→GET）。参数名也不写死，只声明从计划的哪一个字段取；计划没给参数名时由执行器用默认名。同一槽位有多个候选时引擎按候选排名逐条展开（用例 id 后缀 -2/-3），配方不写候选数"
+    }
+  ],
+  "verdict": {
+    "rule": "attack-repro"
+  }
+}

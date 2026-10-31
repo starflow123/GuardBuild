@@ -101,14 +101,14 @@ export const ACTIONS = [
     desc: "在已声明的参数上放注入载荷（SQL / 命令 / 布尔差量），报错与差量都算证据",
     params: ["method", "path", "query", "param", "payloadSet", "identity"],
     required: ["path", "param"],
-    anchor: { file: "sidecar/lib/probe.mjs", token: "attack-sql-injection" },
+    anchor: { file: "sidecar/lib/probe.mjs", token: "function injectionReq" },
   },
   {
     name: "fs.traverse",
     desc: "路径穿越：用无害 canary 文件是否存在来判定",
     params: ["method", "path", "param", "canary"],
     required: ["path", "param"],
-    anchor: { file: "sidecar/lib/probe.mjs", token: "attack-path-traversal" },
+    anchor: { file: "sidecar/lib/probe.mjs", token: "function traversalAttemptPath" },
   },
   {
     name: "net.canary",

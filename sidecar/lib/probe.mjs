@@ -46,7 +46,9 @@ import {
   ownTargetFor,
   ownershipReadbacks,
   requestSteps,
+  resolvePlanField,
   resolveRole,
+  resolveRolePreferred,
   variantAxisSteps,
 } from "./recipes.mjs";
 import { buildProbePlan, candKey } from "./planner.mjs";
@@ -3376,6 +3378,12 @@ export function buildCases(ctx, targets) {
   const readAttack = baselineStep("idor-read");
   const visibleRecipe = loadRecipe("idor-read-owner-visible");
   const readActor = resolveRole(targets, identityRole(readAttack.step));
+  // SQL 注入族与路径穿越族的结构也来自配方（M1-5b 放量）：槽位、参数名引用、载荷集名字、
+  // canary、判据名任一对不上，装载阶段就整族抛错，不退回去用写死的形状冒充「照常跑通」。
+  const sqliAttack = baselineStep("sqli-injection", "payload.inject");
+  const travAttack = baselineStep("path-traversal", "fs.traverse");
+  const sqliActor = resolveRolePreferred(targets, identityRole(sqliAttack.step));
+  const travIdentity = resolveRolePreferred(targets, "victim")?.name ?? null;
   // 交叉证明挂不挂，看配方有没有声明归属人复读（uses 指向基线步骤；
   // 同一入口的其它候选与变体写法沿用同一条声明——它们验的是同一个洞）
   const readCrossProof = ownershipReadbacks(readAttack.recipe).some((s) => s.uses === readAttack.step.id);
@@ -3648,21 +3656,24 @@ export function buildCases(ctx, targets) {
   }
 
   // —— 路径穿越攻击用例：对逐条 payload 尝试，命中泄露证据即停（无修复策略，仅取证）——
-  for (const [i, cand] of planCandidates(ctx, "traversal").entries()) {
+  for (const [i, cand] of planCandidates(ctx, travAttack.kind).entries()) {
     const routePath = candPath(cand);
     if (!routePath) continue;
-    const trav = cand.traversal ?? {};
+    const travRef = cand[travAttack.kind];
+    const trav = {
+      ...travRef,
+      param: resolvePlanField(travAttack.step.param, travRef, "path-traversal", "穿越注入点"),
+    };
     const suffix = i === 0 ? "" : `-${i + 1}`;
-    const travIdentity = victim?.name ?? attacker?.name ?? null;
     const firstAttempt = traversalAttemptPath(routePath, trav, TRAVERSAL_PAYLOADS[0], false);
     cases.push({
-      id: `attack-path-traversal${suffix}`,
+      id: `${travAttack.step.id}${suffix}`,
       candidateKey: candKey(cand),
       category: CASE_CATEGORY.ATTACK,
       unfixable: true,
       name: `路径穿越读取服务器文件（${routePath}${trav.param ? ` · 参数 ${trav.param}` : ""}）`,
       identity: travIdentity,
-      method: "GET",
+      method: travAttack.step.method ?? "GET",
       path: firstAttempt,
       routeKey: cand.routeKeys?.[0] ?? null,
       expect: "路径穿越读取应被拒绝（400/403/404），不得回读目标文件内容",
@@ -4329,16 +4340,21 @@ export function buildCases(ctx, targets) {
   }
 
   // —— SQL 注入用例：随机基线 vs 布尔/报错载荷（无修复模板，仅取证）——
-  for (const [i, cand] of planCandidates(ctx, "sqli").entries()) {
-    const injection = cand.sqli;
+  for (const [i, cand] of planCandidates(ctx, sqliAttack.kind).entries()) {
+    const injectionRef = cand[sqliAttack.kind];
     const routePath = candPath(cand);
-    if (!routePath || !injection) continue;
+    if (!routePath || !injectionRef) continue;
+    // 参数名取自配方声明的那个计划字段（配方永远写不出参数名字面量）
+    const injection = {
+      ...injectionRef,
+      param: resolvePlanField(sqliAttack.step.param, injectionRef, "sqli-injection", "SQL 注入点"),
+    };
     const suffix = i === 0 ? "" : `-${i + 1}`;
     const firstReq = injectionReq(cand, injection, SQLI_PAYLOADS[0]);
     if (!firstReq) continue;
-    const injIdentity = attacker?.name ?? victim?.name ?? null;
+    const injIdentity = sqliActor?.name ?? null;
     cases.push({
-      id: `attack-sql-injection${suffix}`,
+      id: `${sqliAttack.step.id}${suffix}`,
       candidateKey: candKey(cand),
       category: CASE_CATEGORY.ATTACK,
       unfixable: true,
@@ -4890,9 +4906,13 @@ export async function runPhase(ctx, { phase, baseUrl }) {
   const allCases = buildCases(ctx, targets);
   // 路径穿越会把不存在的路径打到文件读取接口，SSRF 会让目标主动发起外部请求；
   // 个别实现会同步阻塞事件循环。排在最后，避免一条挂起的用例拖掉整轮注入取证。
+  // 注入/穿越两族的用例前缀与候选种类都取自配方声明：改 id 时排序与「计划有候选却没建用例」的
+  // 诊断跟着走，不会静默失配（失配的表现是挂起用例排到最前、或整族被当成「没测到」）
+  const travBaseline = baselineStep("path-traversal", "fs.traverse");
+  const sqliBaseline = baselineStep("sqli-injection", "payload.inject");
   const isSlow = (c) =>
     c.category === CASE_CATEGORY.ATTACK &&
-    (c.id.startsWith("attack-path-traversal") ||
+    (c.id.startsWith(travBaseline.step.id) ||
       c.id.startsWith("attack-ssrf") ||
       c.id.startsWith("attack-upload") ||
       c.id.startsWith("attack-jwt-forge") ||
@@ -4940,8 +4960,8 @@ export async function runPhase(ctx, { phase, baseUrl }) {
     { slot: "readCandidate", prefix: "attack-read-foreign", count: planCandidates(ctx, "read").length },
     { slot: "cancelCandidate", prefix: "attack-cancel-foreign", count: planCandidates(ctx, "cancel").length },
     { slot: "unauthReadCandidate", prefix: "attack-anonymous-read", count: planCandidates(ctx, "unauthRead").length },
-    { slot: "traversalCandidate", prefix: "attack-path-traversal", count: planCandidates(ctx, "traversal").length },
-    { slot: "sqliCandidate", prefix: "attack-sql-injection", count: planCandidates(ctx, "sqli").length },
+    { slot: "traversalCandidate", prefix: travBaseline.step.id, count: planCandidates(ctx, travBaseline.kind).length },
+    { slot: "sqliCandidate", prefix: sqliBaseline.step.id, count: planCandidates(ctx, sqliBaseline.kind).length },
     { slot: "cmdiCandidate", prefix: "attack-command-injection", count: planCandidates(ctx, "cmdi").length },
     { slot: "ssrfCandidate", prefix: "attack-ssrf", count: planCandidates(ctx, "ssrf").length },
     { slot: "uploadCandidate", prefix: "attack-upload", count: planCandidates(ctx, "upload").length },

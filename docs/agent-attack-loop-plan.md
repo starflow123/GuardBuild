@@ -133,5 +133,13 @@ M6  16 经验库写出去 → 17 读进来
   - 等价性不是靠「测试还绿」声称的：`scripts/recipe-snapshot.mjs` 在改代码**之前**把 6 种计划形状（REST 路径参数 / 查询参数 / GraphQL / 多候选 / 无对照对象 / 身份缺失）下这一族每条用例的全部字段固化成 `benchmarks/idor-read-golden.json`，**含 `verify`/`crossProof`/`contract` 闭包的源码文本**；改完重跑，6 形状逐条 deep-equal 全等（41 条用例，含条数、id、路径、方法、变体轴、`requiresPreRepro`）。判据是冻结项，动它必须是一次刻意的重快照。
   - 实测：sidecar 单测 588/588（新增 12 条配方测试）；白盒基准 25/25 召回 · 误报 0/25 · 退出码 14/14 · 绿名单 39 键 0 回退；黑盒 46/46 · 误报 0 · 终态/退出码 25/25 · 绿名单 71 键 0 回退；`e2e` 46/46、`e2e:gate` 53/53、`e2e:contract` 22/22。
   - 顺带补的一处口径耦合：变体轴词表改成从 `attackvariants.mjs` 的 `VARIANT_AXES` 单点导出（用例 id 的还原正则由它生成），否则配方写一条新轴、`variantBaseCaseId` 不认，基准统计会把它当成两个不同用例。
-  - 还剩：只试点了**一族**（计划里的三族里 SQL 注入、敏感文件泄露两族未动，留给 M5 一起收）；配方被拒收目前只表现为该轮扫描抛错，还没接进事件流与失败账本，落点是第 9 项；`readback.ownership` 的 `uses` 只到「族内基线步骤」这一粒度，同族其它用例沿用——想要逐步绑定得等第 6 项判卷器有独立身份。
+  - 还剩：~~只试点了**一族**（SQL 注入、敏感文件泄露两族未动，留给 M5 一起收）~~ → 本项留下的这一条已由下面的 5b 收掉；配方被拒收目前只表现为该轮扫描抛错，还没接进事件流与失败账本，落点是第 9 项；`readback.ownership` 的 `uses` 只到「族内基线步骤」这一粒度，同族其它用例沿用——想要逐步绑定得等第 6 项判卷器有独立身份。
+- 2026-10-31 M1 第 5b 项完成（放量另两族：SQL 注入 + 敏感文件泄露，仍是纯等价重构）：`sidecar/recipes/sqli-injection.json`、`path-traversal.json` 两张表，`probe.mjs` 里这两族的用例构建改从配方读结构。上一项「只试点一族」的缺口在这里闭合，M1 只剩第 13 项探索区。
+  - 新增的三类**冻结名字引用**（第 5 项没有的东西）：载荷集（`sqli-default`/`traversal-default`）、canary（`package.json`）、参数名引用（`{plan.param}`）。它们进拒收清单的理由跟前几类不同——闭包是按模块常量名写死的，配方若能用别的名字，报告就会写「按 X 载荷打的」而实际发的仍是那一套。`PAYLOAD_SETS`/`CANARY_FILES`/`PLAN_FIELDS` 三张字典都带锚点回读 `probe.mjs`，`FAMILY_SHAPE` 还挡住了「配方写 POST 而执行器只发 GET」这类方法与实发不一致。
+  - 等价性证据同第 5 项做法：改代码**之前**先出 `benchmarks/sqli-injection-golden.json`（7 形状 / 8 条：query、body、params、无参数名、多候选、无注入点、身份缺席）与 `benchmarks/path-traversal-golden.json`（6 形状 / 7 条：query、params、无参数名、多候选、无路由、双身份缺席），含 `send`/`verify`/`crossProof`/`impact` 闭包源码文本；改完重跑逐条 deep-equal 全等。`--family` 参数在这一项加进快照脚本，M5 放量每族都用它。
+  - 诚实记录：放量这一轮**先红了一次**。601 条单测全绿、两份金快照全等，但 `runPhase` 里的慢用例排序（`isSlow`）和「计划有候选却没建用例」诊断（`plannedSlots`）还写死着 `attack-path-traversal` 字面量，而它已搬进配方——白盒基准 14/14 全崩才把它暴露出来。修法是这两处也走 `baselineStep()`，从此改 id 会跟着走而不会静默失配。那次坏掉代码产生的产物已清掉（26 条 bogus 账本条目删除、绿名单回退到未污染版本），没让它进历史。
+  - 顺带一处表元数据变更：`payload.inject` 与 `fs.traverse` 的锚点从「用例 id 字面量」挪到执行代码里的函数名（`function injectionReq` / `function traversalAttemptPath`）——锚点指向的字面量随重构进了配方，`checkAnchors()` 当场判红。这是锚点机制该有的表现，也定下 M5 的规则：每配方化一族，该族动作的锚点都要一并挪。
+  - 实测：sidecar 单测 601/601（新增 `recipe-sqli-traversal.test.mjs` 13 条）；白盒 25/25 召回 · 误报 0/25 · 退出码 14/14 · 绿名单 39 键 0 回退；黑盒 46/46 · 误报 0/46 · 退出码/终态 25/25 · 绿名单 71 键 0 回退；真实项目层（仅公开项目）2/2 终态合规 · 绿名单 2 键 0 回退；`e2e` 46/46、`e2e:gate` 53/53、`e2e:contract` 22/22。
+  - 这一层没证明的东西要说清：真实项目层里 `vuln-express` 本轮**一个攻击请求都没打到**（终态 failed，原因是目标连接被拒——已有缺陷 #181 的形状），它过的是「不撒谎」这道闸，不是「测得出」那道闸。
+  - 还剩：其余十族仍是专用代码（M5 第 199 项）；`fs.traverse` 在动作表里没有 `identity` 参数，所以穿越族用哪个身份是执行器写死的「首选 victim、缺席退回 attacker」，配方声明不了——要放开得扩表并走人批；配方被拒收仍未接进事件流与失败账本（第 9 项）。
 - 后续每项完成在此追加一行，写清"做到哪、验证到什么、还剩什么"。

@@ -1,0 +1,19 @@
+{
+  "version": "gb-recipe-1",
+  "family": "path-traversal",
+  "title": "敏感文件泄露：把用户可控的文件名逐级 ../ 打到服务器上的 package.json 并回读",
+  "steps": [
+    {
+      "id": "attack-path-traversal",
+      "action": "fs.traverse",
+      "method": "GET",
+      "path": "{slot:traversalPath}",
+      "param": "{plan.param}",
+      "canary": "package.json",
+      "note": "canary 是判据的一部分：泄露证据就是回读内容与该文件本机内容的特征字段一致，所以它只能引用执行器真正比对的那个名字。method 由执行器写死为 GET（声明别的值会在这里被拒收，而不是报告里写 POST、实发 GET）。用哪个身份发不在动作表的 fs.traverse 参数里，因此配方不声明——它由引擎按既有优先级解析"
+    }
+  ],
+  "verdict": {
+    "rule": "attack-repro"
+  }
+}

@@ -81,30 +81,47 @@ Host 侧 `http.request` 的参数结构体没开 `deny_unknown_fields`，sidecar
 
 按红线 3 的同一口径：能写「退回」的角色很多，能写「通过」的只有判卷器。
 
-## 八、表现在有消费方（M1 第 5 项）
+## 八、表现在有消费方（M1 第 5 项 + 5b 放量）
 
-装载器：`sidecar/lib/recipes.mjs` · 试点配方：`sidecar/recipes/idor-read.json`、`idor-read-owner-visible.json` · 单测：`sidecar/tests/recipe-idor-read.test.mjs`
+装载器：`sidecar/lib/recipes.mjs` · 试点配方：`sidecar/recipes/idor-read.json`、`idor-read-owner-visible.json`、`sqli-injection.json`、`path-traversal.json` · 单测：`sidecar/tests/recipe-idor-read.test.mjs`、`recipe-sqli-traversal.test.mjs`
 
-`buildCases` 在建越权读一族之前先 `loadRecipe`。**校验不过就整族抛错**，不会「跳过那一步照常跑」——后者正是「配方说打了、执行器没打」的另一种形态。
+`buildCases` 在建这些族之前先 `loadRecipe`。**校验不过就整族抛错**，不会「跳过那一步照常跑」——后者正是「配方说打了、执行器没打」的另一种形态。
 
 分工（这是「纯等价重构」能不能成立的判据）：
 
 | 进配方（表格里填的字） | 留在写死代码里 |
 | --- | --- |
 | 有哪几条打法、按什么顺序展开 | 每条打法具体怎么发（`candRequest`、线协议、路径填充） |
-| 用哪个**角色**（`attacker`/`victim`），不打凭据也不打账号名 | 角色→本次扫描选定的身份对象 |
-| 打哪个计划槽位（`{slot:readPath}`） | 槽位→计划里真取哪一类候选 |
+| 用哪个**角色**（`attacker`/`victim`），不打凭据也不打账号名 | 角色→本次扫描选定的身份对象；主身份缺席时退回哪一个 |
+| 打哪个计划槽位（`{slot:readPath}`/`{slot:sqliPath}`/`{slot:traversalPath}`） | 槽位→计划里真取哪一类候选 |
+| 参数名引用计划的哪一个字段（`{plan.param}`） | 参数缺省时的默认名、请求怎么拼装 |
+| 引用哪个载荷集 / 哪个 canary（只有名字） | 载荷集本体（`SQLI_PAYLOADS`/`TRAVERSAL_PAYLOADS`）、特征字段集 `PKG_MARKERS` |
 | 变体沿哪几条轴、要不要修复前复现 | 每条轴怎么展开、每轴最多几条、总配额 `MAX_VARIANT_CASES` |
 | 声明「归属人复读」（`readback.ownership` + `uses`） | 复读怎么取证、缺项怎么判回归 |
-| 引用哪条判据（`verdict.rule`，只有名字） | 判据本体（`verifyAttack` / `verifyBusiness` 等闭包） |
+| 引用哪条判据（`verdict.rule`，只有名字） | 判据本体（`verifyAttack` / `sqliProof` / `traversalLeak` 等闭包） |
 | — | 用例名与 `expect` 文案：能改写「什么算期望结果」的文本，等于让提议者改判据 |
 
-装载时额外四条拒收（都在 `validateRecipe` 之后，先讲表填错、再讲引擎没这个器官）：轴名不在 `VARIANT_AXES` 词表内、`verdict.rule` 与真正执行它的代码不符（`VERDICT_IMPL` 带锚点）、槽位换不出候选种类、配方族还没接入判卷实现。
+装载时额外六条拒收（都在 `validateRecipe` 之后，先讲表填错、再讲引擎没这个器官）：轴名不在 `VARIANT_AXES` 词表内、`verdict.rule` 与真正执行它的代码不符（`VERDICT_IMPL` 带锚点）、槽位换不出候选种类、`path` 写成字面路径而不是计划槽位引用、`{plan.x}` 引用了引擎不读的字段、声明的方法/载荷集/canary 与执行器实际用的不一致（`FAMILY_SHAPE`/`PAYLOAD_SETS`/`CANARY_FILES`，都带锚点）。
+
+最后三条是 5b 才需要的：注入与穿越两族没有变体轴，但有「冻结项的名字」——**载荷集和 canary 不是可调参数**。放行一个不存在的载荷集名，报告里就会写「按 timeout-blind 打的」，实际发的仍是写死那四条，又是一块假绿灯。同理 `fs.traverse` 的泄露判据是按 `package.json` 的特征字段写的，配方若把 canary 改成 `/etc/passwd`，被拒收才是对的。
 
 等价性证明（第 5 项的验收原文是「同靶场同代码新旧逐条同结论」）：
-`scripts/recipe-snapshot.mjs` 在 6 种计划形状（REST 路径参数 / 查询参数 / GraphQL / 多候选 / 无对照对象 / 身份缺失）下固化每一条用例的**全部字段**，含 `verify`/`crossProof`/`contract` 闭包的源码文本，落在 `benchmarks/idor-read-golden.json`。快照是在改代码**之前**生成的；改完重跑，6 个形状逐条 deep-equal 全等。判据是冻结项，动它必须是一次刻意的重快照，不能是重构的副作用。
+`scripts/recipe-snapshot.mjs --family <族> --write benchmarks/<族>-golden.json` 在若干计划形状下固化每一条用例的**全部字段**，含 `send`/`verify`/`crossProof`/`impact`/`contract` 闭包的源码文本。快照是在改代码**之前**生成的；改完重跑，逐条 deep-equal 全等才算「纯等价」：
 
-这一族的实测：白盒基准 25/25（绿名单 39 键、回退 0）、黑盒 46/46（绿名单 71 键、回退 0）、`e2e` 46/46、`e2e:gate` 53/53、`e2e:contract` 22/22、单测 588/588。
+| 族 | 形状数 | 用例条数 | 形状覆盖 |
+| --- | --- | --- | --- |
+| 越权读 | 6 | 41 | REST 路径参数 / 查询参数 / GraphQL / 多候选 / 无对照对象 / 身份缺失 |
+| SQL 注入 | 7 | 8 | query / body / params 三种注入通道 / 计划未给参数名 / 多候选 / 候选无注入声明 / 攻击身份缺席 |
+| 路径穿越 | 6 | 7 | query / params / 计划未给参数名 / 多候选 / 无路由 / 无身份 |
 
-**还剩什么**：其余十族仍是专用代码（第 199 项，M5）；配方被拒收目前只会让当次扫描抛错，还没接进事件流与失败账本，那是第 9 项能力请求单要做的落点。
+判据是冻结项，动它必须是一次刻意的重快照，不能是重构的副作用。
+
+放量这一轮**先红了一次**，值得记下来：`plannedSlots`（「计划里有候选却没建出用例」的诊断）和慢用例排序都在 `runPhase` 里，不在 `buildCases` 作用域内，我把配方变量写在了 `buildCases` 里，于是真实扫描整轮 `travAttack is not defined`。601 条单测全绿、两份金快照全等，**基准层 14/14 全崩**才把它暴露出来——这就是「绿灯要有测量支撑」的那条线在起作用。顺带把这两处的前缀与候选种类也改成从配方取（改 id 时排序与诊断跟着走，不会静默失配）。
+
+改一处表的锚点：`payload.inject` 与 `fs.traverse` 的 anchor 原本指向用例 id 字面量（`attack-sql-injection`/`attack-path-traversal`），这两族的 id 现在住在配方里，锚点随之改成执行函数（`injectionReq`/`traversalAttemptPath`）。锚点自检（第六节）先于本次修改把这一点报成红，这是它该干的事：**后续每配方化一族，该族动作的锚点都要一并从 id 字面量挪到执行代码**，否则表会退化成指向一堆配方数据。
+
+实测：单测 601/601（新增 13 条）、白盒基准、黑盒基准、`e2e` 46/46、`e2e:gate`、`e2e:contract` 见 §九 与 README 基线行。
+
+**还剩什么**：其余十族仍是专用代码（第 199 项，M5）；配方被拒收目前只会让当次扫描抛错，还没接进事件流与失败账本，那是第 9 项能力请求单要做的落点；穿越族的身份位（`victim→attacker`）还写死在代码里——`fs.traverse` 的参数表不含 `identity`，要把它交给配方得先扩表，扩表是注册动作参数，要人批，不在等价重构里顺手做。
+
 

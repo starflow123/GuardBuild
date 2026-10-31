@@ -1,0 +1,151 @@
+{
+  "query": [
+    {
+      "id": "attack-sql-injection",
+      "candidateKey": "undefined /api/products",
+      "category": "attack",
+      "unfixable": true,
+      "name": "SQL 注入（/api/products · 参数 keyword）",
+      "identity": "alice",
+      "method": "GET",
+      "path": "/api/products?keyword='%20OR%201%3D1%20--%20",
+      "body": null,
+      "routeKey": "product.list",
+      "expect": "注入载荷不得改变查询结果或泄露额外数据（应被参数化/校验拦截）",
+      "send": "fn:async (c, baseUrl) => {\n        let benign = null;\n        try {\n          const benignReq = injectionReq(cand, injection, shortId(\"q\"));\n          benign = await httpJson(c, { baseUrl, ...benignReq, identity: injIdentity });\n        } catch {\n          /* 基线失败不阻断：以攻击响应的行数差/报错特征为主 */\n        }\n        let last = null;\n        let lastReq = firstReq;\n        let hit = null;\n        let hitReq = null;\n        let proof = null;\n        let firstErr = null;\n        for (const payload of SQLI_PAYLOADS) {\n          const req = injectionReq(cand, injection, payload);\n          try {\n            const res = await httpJson(c, { baseUrl, ...req, identity: injIdentity });\n            last = res;\n            lastReq = req;\n            const p = sqliProof(res, benign, payload);\n            if (p.hit) {\n              hit = res;\n              hitReq = req;\n              proof = p;\n              break;\n            }\n            proof = proof ?? p;\n          } catch (e) {\n            if (!firstErr) firstErr = e;\n          }\n        }\n        if (!last) {\n          throw firstErr ?? new ProbeError(`SQL 注入探测请求全部失败（${routePath}）`, { code: \"probe_request_failed\" });\n        }\n        const chosen = hit ?? last;\n        chosen._sqliProof = proof ?? { hit: false, payload: SQLI_PAYLOADS[0] };\n        return { res: chosen, path: (hitReq ?? lastReq).path, method: (hitReq ?? lastReq).method };\n      }",
+      "verify": "fn:(res, phase) => {\n        const p = res._sqliProof ?? {};\n        const detail = p.hit\n          ? `证据：${\n              p.errorSignature\n                ? \"注入请求触发数据库报错特征\"\n                : p.singleLeak\n                  ? \"正常值未命中（404/400），注入后独占返回对象\"\n                  : `注入后返回 ${p.attackCount} 行（正常查询 ${p.baseCount} 行）`\n            }，载荷 ${p.payload}`\n          : \"\";\n        if (phase === \"pre\" && p.hit) {\n          return { verdict: VERDICT.VULNERABLE, actual: `HTTP ${res.status}，SQL 注入被放行。${detail}` };\n        }\n        return verifyAttack(res, phase, detail, p.hit);\n      }",
+      "crossProof": "fn:(res) => {\n        const p = res._sqliProof ?? {};\n        if (!p.hit) return null;\n        return {\n          note: p.errorSignature\n            ? `注入请求独有数据库报错特征，确认输入进入 SQL 解析（载荷 ${p.payload}）`\n            : p.singleLeak\n              ? `基线查询该值明确未命中，注入载荷后返回了对象，确认 WHERE 条件被绕过（载荷 ${p.payload}）`\n              : `注入后行数由 ${p.baseCount ?? \"未知\"} 增至 ${p.attackCount}，确认查询条件被绕过`,\n        };\n      }",
+      "impact": "fn:(res) =>\n        res._sqliProof?.hit ? \"可通过 SQL 注入绕过查询条件读取数据库数据或触发数据库错误\" : null"
+    }
+  ],
+  "body": [
+    {
+      "id": "attack-sql-injection",
+      "candidateKey": "POST /api/login",
+      "category": "attack",
+      "unfixable": true,
+      "name": "SQL 注入（/api/login · 参数 username）",
+      "identity": "alice",
+      "method": "POST",
+      "path": "/api/login",
+      "body": "{\"username\":\"' OR 1=1 -- \"}",
+      "routeKey": "auth.login",
+      "expect": "注入载荷不得改变查询结果或泄露额外数据（应被参数化/校验拦截）",
+      "send": "fn:async (c, baseUrl) => {\n        let benign = null;\n        try {\n          const benignReq = injectionReq(cand, injection, shortId(\"q\"));\n          benign = await httpJson(c, { baseUrl, ...benignReq, identity: injIdentity });\n        } catch {\n          /* 基线失败不阻断：以攻击响应的行数差/报错特征为主 */\n        }\n        let last = null;\n        let lastReq = firstReq;\n        let hit = null;\n        let hitReq = null;\n        let proof = null;\n        let firstErr = null;\n        for (const payload of SQLI_PAYLOADS) {\n          const req = injectionReq(cand, injection, payload);\n          try {\n            const res = await httpJson(c, { baseUrl, ...req, identity: injIdentity });\n            last = res;\n            lastReq = req;\n            const p = sqliProof(res, benign, payload);\n            if (p.hit) {\n              hit = res;\n              hitReq = req;\n              proof = p;\n              break;\n            }\n            proof = proof ?? p;\n          } catch (e) {\n            if (!firstErr) firstErr = e;\n          }\n        }\n        if (!last) {\n          throw firstErr ?? new ProbeError(`SQL 注入探测请求全部失败（${routePath}）`, { code: \"probe_request_failed\" });\n        }\n        const chosen = hit ?? last;\n        chosen._sqliProof = proof ?? { hit: false, payload: SQLI_PAYLOADS[0] };\n        return { res: chosen, path: (hitReq ?? lastReq).path, method: (hitReq ?? lastReq).method };\n      }",
+      "verify": "fn:(res, phase) => {\n        const p = res._sqliProof ?? {};\n        const detail = p.hit\n          ? `证据：${\n              p.errorSignature\n                ? \"注入请求触发数据库报错特征\"\n                : p.singleLeak\n                  ? \"正常值未命中（404/400），注入后独占返回对象\"\n                  : `注入后返回 ${p.attackCount} 行（正常查询 ${p.baseCount} 行）`\n            }，载荷 ${p.payload}`\n          : \"\";\n        if (phase === \"pre\" && p.hit) {\n          return { verdict: VERDICT.VULNERABLE, actual: `HTTP ${res.status}，SQL 注入被放行。${detail}` };\n        }\n        return verifyAttack(res, phase, detail, p.hit);\n      }",
+      "crossProof": "fn:(res) => {\n        const p = res._sqliProof ?? {};\n        if (!p.hit) return null;\n        return {\n          note: p.errorSignature\n            ? `注入请求独有数据库报错特征，确认输入进入 SQL 解析（载荷 ${p.payload}）`\n            : p.singleLeak\n              ? `基线查询该值明确未命中，注入载荷后返回了对象，确认 WHERE 条件被绕过（载荷 ${p.payload}）`\n              : `注入后行数由 ${p.baseCount ?? \"未知\"} 增至 ${p.attackCount}，确认查询条件被绕过`,\n        };\n      }",
+      "impact": "fn:(res) =>\n        res._sqliProof?.hit ? \"可通过 SQL 注入绕过查询条件读取数据库数据或触发数据库错误\" : null"
+    }
+  ],
+  "params": [
+    {
+      "id": "attack-sql-injection",
+      "candidateKey": "undefined /api/items/:id",
+      "category": "attack",
+      "unfixable": true,
+      "name": "SQL 注入（/api/items/:id · 参数 id）",
+      "identity": "alice",
+      "method": "GET",
+      "path": "/api/items/'%20OR%201%3D1%20--%20",
+      "body": null,
+      "routeKey": "item.get",
+      "expect": "注入载荷不得改变查询结果或泄露额外数据（应被参数化/校验拦截）",
+      "send": "fn:async (c, baseUrl) => {\n        let benign = null;\n        try {\n          const benignReq = injectionReq(cand, injection, shortId(\"q\"));\n          benign = await httpJson(c, { baseUrl, ...benignReq, identity: injIdentity });\n        } catch {\n          /* 基线失败不阻断：以攻击响应的行数差/报错特征为主 */\n        }\n        let last = null;\n        let lastReq = firstReq;\n        let hit = null;\n        let hitReq = null;\n        let proof = null;\n        let firstErr = null;\n        for (const payload of SQLI_PAYLOADS) {\n          const req = injectionReq(cand, injection, payload);\n          try {\n            const res = await httpJson(c, { baseUrl, ...req, identity: injIdentity });\n            last = res;\n            lastReq = req;\n            const p = sqliProof(res, benign, payload);\n            if (p.hit) {\n              hit = res;\n              hitReq = req;\n              proof = p;\n              break;\n            }\n            proof = proof ?? p;\n          } catch (e) {\n            if (!firstErr) firstErr = e;\n          }\n        }\n        if (!last) {\n          throw firstErr ?? new ProbeError(`SQL 注入探测请求全部失败（${routePath}）`, { code: \"probe_request_failed\" });\n        }\n        const chosen = hit ?? last;\n        chosen._sqliProof = proof ?? { hit: false, payload: SQLI_PAYLOADS[0] };\n        return { res: chosen, path: (hitReq ?? lastReq).path, method: (hitReq ?? lastReq).method };\n      }",
+      "verify": "fn:(res, phase) => {\n        const p = res._sqliProof ?? {};\n        const detail = p.hit\n          ? `证据：${\n              p.errorSignature\n                ? \"注入请求触发数据库报错特征\"\n                : p.singleLeak\n                  ? \"正常值未命中（404/400），注入后独占返回对象\"\n                  : `注入后返回 ${p.attackCount} 行（正常查询 ${p.baseCount} 行）`\n            }，载荷 ${p.payload}`\n          : \"\";\n        if (phase === \"pre\" && p.hit) {\n          return { verdict: VERDICT.VULNERABLE, actual: `HTTP ${res.status}，SQL 注入被放行。${detail}` };\n        }\n        return verifyAttack(res, phase, detail, p.hit);\n      }",
+      "crossProof": "fn:(res) => {\n        const p = res._sqliProof ?? {};\n        if (!p.hit) return null;\n        return {\n          note: p.errorSignature\n            ? `注入请求独有数据库报错特征，确认输入进入 SQL 解析（载荷 ${p.payload}）`\n            : p.singleLeak\n              ? `基线查询该值明确未命中，注入载荷后返回了对象，确认 WHERE 条件被绕过（载荷 ${p.payload}）`\n              : `注入后行数由 ${p.baseCount ?? \"未知\"} 增至 ${p.attackCount}，确认查询条件被绕过`,\n        };\n      }",
+      "impact": "fn:(res) =>\n        res._sqliProof?.hit ? \"可通过 SQL 注入绕过查询条件读取数据库数据或触发数据库错误\" : null"
+    }
+  ],
+  "no-param-name": [
+    {
+      "id": "attack-sql-injection",
+      "candidateKey": "undefined /api/search",
+      "category": "attack",
+      "unfixable": true,
+      "name": "SQL 注入（/api/search · 参数 ?）",
+      "identity": "alice",
+      "method": "GET",
+      "path": "/api/search?q='%20OR%201%3D1%20--%20",
+      "body": null,
+      "routeKey": "search.get",
+      "expect": "注入载荷不得改变查询结果或泄露额外数据（应被参数化/校验拦截）",
+      "send": "fn:async (c, baseUrl) => {\n        let benign = null;\n        try {\n          const benignReq = injectionReq(cand, injection, shortId(\"q\"));\n          benign = await httpJson(c, { baseUrl, ...benignReq, identity: injIdentity });\n        } catch {\n          /* 基线失败不阻断：以攻击响应的行数差/报错特征为主 */\n        }\n        let last = null;\n        let lastReq = firstReq;\n        let hit = null;\n        let hitReq = null;\n        let proof = null;\n        let firstErr = null;\n        for (const payload of SQLI_PAYLOADS) {\n          const req = injectionReq(cand, injection, payload);\n          try {\n            const res = await httpJson(c, { baseUrl, ...req, identity: injIdentity });\n            last = res;\n            lastReq = req;\n            const p = sqliProof(res, benign, payload);\n            if (p.hit) {\n              hit = res;\n              hitReq = req;\n              proof = p;\n              break;\n            }\n            proof = proof ?? p;\n          } catch (e) {\n            if (!firstErr) firstErr = e;\n          }\n        }\n        if (!last) {\n          throw firstErr ?? new ProbeError(`SQL 注入探测请求全部失败（${routePath}）`, { code: \"probe_request_failed\" });\n        }\n        const chosen = hit ?? last;\n        chosen._sqliProof = proof ?? { hit: false, payload: SQLI_PAYLOADS[0] };\n        return { res: chosen, path: (hitReq ?? lastReq).path, method: (hitReq ?? lastReq).method };\n      }",
+      "verify": "fn:(res, phase) => {\n        const p = res._sqliProof ?? {};\n        const detail = p.hit\n          ? `证据：${\n              p.errorSignature\n                ? \"注入请求触发数据库报错特征\"\n                : p.singleLeak\n                  ? \"正常值未命中（404/400），注入后独占返回对象\"\n                  : `注入后返回 ${p.attackCount} 行（正常查询 ${p.baseCount} 行）`\n            }，载荷 ${p.payload}`\n          : \"\";\n        if (phase === \"pre\" && p.hit) {\n          return { verdict: VERDICT.VULNERABLE, actual: `HTTP ${res.status}，SQL 注入被放行。${detail}` };\n        }\n        return verifyAttack(res, phase, detail, p.hit);\n      }",
+      "crossProof": "fn:(res) => {\n        const p = res._sqliProof ?? {};\n        if (!p.hit) return null;\n        return {\n          note: p.errorSignature\n            ? `注入请求独有数据库报错特征，确认输入进入 SQL 解析（载荷 ${p.payload}）`\n            : p.singleLeak\n              ? `基线查询该值明确未命中，注入载荷后返回了对象，确认 WHERE 条件被绕过（载荷 ${p.payload}）`\n              : `注入后行数由 ${p.baseCount ?? \"未知\"} 增至 ${p.attackCount}，确认查询条件被绕过`,\n        };\n      }",
+      "impact": "fn:(res) =>\n        res._sqliProof?.hit ? \"可通过 SQL 注入绕过查询条件读取数据库数据或触发数据库错误\" : null"
+    }
+  ],
+  "multi-candidates": [
+    {
+      "id": "attack-sql-injection",
+      "candidateKey": "undefined /api/products",
+      "category": "attack",
+      "unfixable": true,
+      "name": "SQL 注入（/api/products · 参数 keyword）",
+      "identity": "alice",
+      "method": "GET",
+      "path": "/api/products?keyword='%20OR%201%3D1%20--%20",
+      "body": null,
+      "routeKey": "product.list",
+      "expect": "注入载荷不得改变查询结果或泄露额外数据（应被参数化/校验拦截）",
+      "send": "fn:async (c, baseUrl) => {\n        let benign = null;\n        try {\n          const benignReq = injectionReq(cand, injection, shortId(\"q\"));\n          benign = await httpJson(c, { baseUrl, ...benignReq, identity: injIdentity });\n        } catch {\n          /* 基线失败不阻断：以攻击响应的行数差/报错特征为主 */\n        }\n        let last = null;\n        let lastReq = firstReq;\n        let hit = null;\n        let hitReq = null;\n        let proof = null;\n        let firstErr = null;\n        for (const payload of SQLI_PAYLOADS) {\n          const req = injectionReq(cand, injection, payload);\n          try {\n            const res = await httpJson(c, { baseUrl, ...req, identity: injIdentity });\n            last = res;\n            lastReq = req;\n            const p = sqliProof(res, benign, payload);\n            if (p.hit) {\n              hit = res;\n              hitReq = req;\n              proof = p;\n              break;\n            }\n            proof = proof ?? p;\n          } catch (e) {\n            if (!firstErr) firstErr = e;\n          }\n        }\n        if (!last) {\n          throw firstErr ?? new ProbeError(`SQL 注入探测请求全部失败（${routePath}）`, { code: \"probe_request_failed\" });\n        }\n        const chosen = hit ?? last;\n        chosen._sqliProof = proof ?? { hit: false, payload: SQLI_PAYLOADS[0] };\n        return { res: chosen, path: (hitReq ?? lastReq).path, method: (hitReq ?? lastReq).method };\n      }",
+      "verify": "fn:(res, phase) => {\n        const p = res._sqliProof ?? {};\n        const detail = p.hit\n          ? `证据：${\n              p.errorSignature\n                ? \"注入请求触发数据库报错特征\"\n                : p.singleLeak\n                  ? \"正常值未命中（404/400），注入后独占返回对象\"\n                  : `注入后返回 ${p.attackCount} 行（正常查询 ${p.baseCount} 行）`\n            }，载荷 ${p.payload}`\n          : \"\";\n        if (phase === \"pre\" && p.hit) {\n          return { verdict: VERDICT.VULNERABLE, actual: `HTTP ${res.status}，SQL 注入被放行。${detail}` };\n        }\n        return verifyAttack(res, phase, detail, p.hit);\n      }",
+      "crossProof": "fn:(res) => {\n        const p = res._sqliProof ?? {};\n        if (!p.hit) return null;\n        return {\n          note: p.errorSignature\n            ? `注入请求独有数据库报错特征，确认输入进入 SQL 解析（载荷 ${p.payload}）`\n            : p.singleLeak\n              ? `基线查询该值明确未命中，注入载荷后返回了对象，确认 WHERE 条件被绕过（载荷 ${p.payload}）`\n              : `注入后行数由 ${p.baseCount ?? \"未知\"} 增至 ${p.attackCount}，确认查询条件被绕过`,\n        };\n      }",
+      "impact": "fn:(res) =>\n        res._sqliProof?.hit ? \"可通过 SQL 注入绕过查询条件读取数据库数据或触发数据库错误\" : null"
+    },
+    {
+      "id": "attack-sql-injection-2",
+      "candidateKey": "POST /api/login",
+      "category": "attack",
+      "unfixable": true,
+      "name": "SQL 注入（/api/login · 参数 username）",
+      "identity": "alice",
+      "method": "POST",
+      "path": "/api/login",
+      "body": "{\"username\":\"' OR 1=1 -- \"}",
+      "routeKey": "auth.login",
+      "expect": "注入载荷不得改变查询结果或泄露额外数据（应被参数化/校验拦截）",
+      "send": "fn:async (c, baseUrl) => {\n        let benign = null;\n        try {\n          const benignReq = injectionReq(cand, injection, shortId(\"q\"));\n          benign = await httpJson(c, { baseUrl, ...benignReq, identity: injIdentity });\n        } catch {\n          /* 基线失败不阻断：以攻击响应的行数差/报错特征为主 */\n        }\n        let last = null;\n        let lastReq = firstReq;\n        let hit = null;\n        let hitReq = null;\n        let proof = null;\n        let firstErr = null;\n        for (const payload of SQLI_PAYLOADS) {\n          const req = injectionReq(cand, injection, payload);\n          try {\n            const res = await httpJson(c, { baseUrl, ...req, identity: injIdentity });\n            last = res;\n            lastReq = req;\n            const p = sqliProof(res, benign, payload);\n            if (p.hit) {\n              hit = res;\n              hitReq = req;\n              proof = p;\n              break;\n            }\n            proof = proof ?? p;\n          } catch (e) {\n            if (!firstErr) firstErr = e;\n          }\n        }\n        if (!last) {\n          throw firstErr ?? new ProbeError(`SQL 注入探测请求全部失败（${routePath}）`, { code: \"probe_request_failed\" });\n        }\n        const chosen = hit ?? last;\n        chosen._sqliProof = proof ?? { hit: false, payload: SQLI_PAYLOADS[0] };\n        return { res: chosen, path: (hitReq ?? lastReq).path, method: (hitReq ?? lastReq).method };\n      }",
+      "verify": "fn:(res, phase) => {\n        const p = res._sqliProof ?? {};\n        const detail = p.hit\n          ? `证据：${\n              p.errorSignature\n                ? \"注入请求触发数据库报错特征\"\n                : p.singleLeak\n                  ? \"正常值未命中（404/400），注入后独占返回对象\"\n                  : `注入后返回 ${p.attackCount} 行（正常查询 ${p.baseCount} 行）`\n            }，载荷 ${p.payload}`\n          : \"\";\n        if (phase === \"pre\" && p.hit) {\n          return { verdict: VERDICT.VULNERABLE, actual: `HTTP ${res.status}，SQL 注入被放行。${detail}` };\n        }\n        return verifyAttack(res, phase, detail, p.hit);\n      }",
+      "crossProof": "fn:(res) => {\n        const p = res._sqliProof ?? {};\n        if (!p.hit) return null;\n        return {\n          note: p.errorSignature\n            ? `注入请求独有数据库报错特征，确认输入进入 SQL 解析（载荷 ${p.payload}）`\n            : p.singleLeak\n              ? `基线查询该值明确未命中，注入载荷后返回了对象，确认 WHERE 条件被绕过（载荷 ${p.payload}）`\n              : `注入后行数由 ${p.baseCount ?? \"未知\"} 增至 ${p.attackCount}，确认查询条件被绕过`,\n        };\n      }",
+      "impact": "fn:(res) =>\n        res._sqliProof?.hit ? \"可通过 SQL 注入绕过查询条件读取数据库数据或触发数据库错误\" : null"
+    },
+    {
+      "id": "attack-sql-injection-3",
+      "candidateKey": "undefined /api/items/:id",
+      "category": "attack",
+      "unfixable": true,
+      "name": "SQL 注入（/api/items/:id · 参数 id）",
+      "identity": "alice",
+      "method": "GET",
+      "path": "/api/items/'%20OR%201%3D1%20--%20",
+      "body": null,
+      "routeKey": "item.get",
+      "expect": "注入载荷不得改变查询结果或泄露额外数据（应被参数化/校验拦截）",
+      "send": "fn:async (c, baseUrl) => {\n        let benign = null;\n        try {\n          const benignReq = injectionReq(cand, injection, shortId(\"q\"));\n          benign = await httpJson(c, { baseUrl, ...benignReq, identity: injIdentity });\n        } catch {\n          /* 基线失败不阻断：以攻击响应的行数差/报错特征为主 */\n        }\n        let last = null;\n        let lastReq = firstReq;\n        let hit = null;\n        let hitReq = null;\n        let proof = null;\n        let firstErr = null;\n        for (const payload of SQLI_PAYLOADS) {\n          const req = injectionReq(cand, injection, payload);\n          try {\n            const res = await httpJson(c, { baseUrl, ...req, identity: injIdentity });\n            last = res;\n            lastReq = req;\n            const p = sqliProof(res, benign, payload);\n            if (p.hit) {\n              hit = res;\n              hitReq = req;\n              proof = p;\n              break;\n            }\n            proof = proof ?? p;\n          } catch (e) {\n            if (!firstErr) firstErr = e;\n          }\n        }\n        if (!last) {\n          throw firstErr ?? new ProbeError(`SQL 注入探测请求全部失败（${routePath}）`, { code: \"probe_request_failed\" });\n        }\n        const chosen = hit ?? last;\n        chosen._sqliProof = proof ?? { hit: false, payload: SQLI_PAYLOADS[0] };\n        return { res: chosen, path: (hitReq ?? lastReq).path, method: (hitReq ?? lastReq).method };\n      }",
+      "verify": "fn:(res, phase) => {\n        const p = res._sqliProof ?? {};\n        const detail = p.hit\n          ? `证据：${\n              p.errorSignature\n                ? \"注入请求触发数据库报错特征\"\n                : p.singleLeak\n                  ? \"正常值未命中（404/400），注入后独占返回对象\"\n                  : `注入后返回 ${p.attackCount} 行（正常查询 ${p.baseCount} 行）`\n            }，载荷 ${p.payload}`\n          : \"\";\n        if (phase === \"pre\" && p.hit) {\n          return { verdict: VERDICT.VULNERABLE, actual: `HTTP ${res.status}，SQL 注入被放行。${detail}` };\n        }\n        return verifyAttack(res, phase, detail, p.hit);\n      }",
+      "crossProof": "fn:(res) => {\n        const p = res._sqliProof ?? {};\n        if (!p.hit) return null;\n        return {\n          note: p.errorSignature\n            ? `注入请求独有数据库报错特征，确认输入进入 SQL 解析（载荷 ${p.payload}）`\n            : p.singleLeak\n              ? `基线查询该值明确未命中，注入载荷后返回了对象，确认 WHERE 条件被绕过（载荷 ${p.payload}）`\n              : `注入后行数由 ${p.baseCount ?? \"未知\"} 增至 ${p.attackCount}，确认查询条件被绕过`,\n        };\n      }",
+      "impact": "fn:(res) =>\n        res._sqliProof?.hit ? \"可通过 SQL 注入绕过查询条件读取数据库数据或触发数据库错误\" : null"
+    }
+  ],
+  "no-injection": [],
+  "attacker-missing": [
+    {
+      "id": "attack-sql-injection",
+      "candidateKey": "undefined /api/products",
+      "category": "attack",
+      "unfixable": true,
+      "name": "SQL 注入（/api/products · 参数 keyword）",
+      "identity": "bob",
+      "method": "GET",
+      "path": "/api/products?keyword='%20OR%201%3D1%20--%20",
+      "body": null,
+      "routeKey": "product.list",
+      "expect": "注入载荷不得改变查询结果或泄露额外数据（应被参数化/校验拦截）",
+      "send": "fn:async (c, baseUrl) => {\n        let benign = null;\n        try {\n          const benignReq = injectionReq(cand, injection, shortId(\"q\"));\n          benign = await httpJson(c, { baseUrl, ...benignReq, identity: injIdentity });\n        } catch {\n          /* 基线失败不阻断：以攻击响应的行数差/报错特征为主 */\n        }\n        let last = null;\n        let lastReq = firstReq;\n        let hit = null;\n        let hitReq = null;\n        let proof = null;\n        let firstErr = null;\n        for (const payload of SQLI_PAYLOADS) {\n          const req = injectionReq(cand, injection, payload);\n          try {\n            const res = await httpJson(c, { baseUrl, ...req, identity: injIdentity });\n            last = res;\n            lastReq = req;\n            const p = sqliProof(res, benign, payload);\n            if (p.hit) {\n              hit = res;\n              hitReq = req;\n              proof = p;\n              break;\n            }\n            proof = proof ?? p;\n          } catch (e) {\n            if (!firstErr) firstErr = e;\n          }\n        }\n        if (!last) {\n          throw firstErr ?? new ProbeError(`SQL 注入探测请求全部失败（${routePath}）`, { code: \"probe_request_failed\" });\n        }\n        const chosen = hit ?? last;\n        chosen._sqliProof = proof ?? { hit: false, payload: SQLI_PAYLOADS[0] };\n        return { res: chosen, path: (hitReq ?? lastReq).path, method: (hitReq ?? lastReq).method };\n      }",
+      "verify": "fn:(res, phase) => {\n        const p = res._sqliProof ?? {};\n        const detail = p.hit\n          ? `证据：${\n              p.errorSignature\n                ? \"注入请求触发数据库报错特征\"\n                : p.singleLeak\n                  ? \"正常值未命中（404/400），注入后独占返回对象\"\n                  : `注入后返回 ${p.attackCount} 行（正常查询 ${p.baseCount} 行）`\n            }，载荷 ${p.payload}`\n          : \"\";\n        if (phase === \"pre\" && p.hit) {\n          return { verdict: VERDICT.VULNERABLE, actual: `HTTP ${res.status}，SQL 注入被放行。${detail}` };\n        }\n        return verifyAttack(res, phase, detail, p.hit);\n      }",
+      "crossProof": "fn:(res) => {\n        const p = res._sqliProof ?? {};\n        if (!p.hit) return null;\n        return {\n          note: p.errorSignature\n            ? `注入请求独有数据库报错特征，确认输入进入 SQL 解析（载荷 ${p.payload}）`\n            : p.singleLeak\n              ? `基线查询该值明确未命中，注入载荷后返回了对象，确认 WHERE 条件被绕过（载荷 ${p.payload}）`\n              : `注入后行数由 ${p.baseCount ?? \"未知\"} 增至 ${p.attackCount}，确认查询条件被绕过`,\n        };\n      }",
+      "impact": "fn:(res) =>\n        res._sqliProof?.hit ? \"可通过 SQL 注入绕过查询条件读取数据库数据或触发数据库错误\" : null"
+    }
+  ]
+}

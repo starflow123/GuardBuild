@@ -1,0 +1,125 @@
+{
+  "query": [
+    {
+      "id": "attack-path-traversal",
+      "candidateKey": "undefined /api/download",
+      "category": "attack",
+      "unfixable": true,
+      "name": "路径穿越读取服务器文件（/api/download · 参数 name）",
+      "identity": "bob",
+      "method": "GET",
+      "path": "/api/download?name=../package.json",
+      "routeKey": "files.get",
+      "expect": "路径穿越读取应被拒绝（400/403/404），不得回读目标文件内容",
+      "send": "fn:async (c, baseUrl) => {\n        // 本机 package.json 的 name 值用作交叉证据：回读内容须与本机文件一致\n        let localName = null;\n        try {\n          const root = String(c.projectRoot ?? \"\").replace(/[\\\\/]+$/, \"\");\n          const rd = await c.rpc.request(RPC_TO_HOST.FS_READ, {\n            token: c.tokens.project,\n            path: `${root}/package.json`,\n            redact: true,\n          });\n          localName = JSON.parse(rd.content)?.name ?? null;\n        } catch {\n          /* 无本地文件则仅用通用特征 */\n        }\n        let last = null;\n        let lastPath = firstAttempt;\n        let firstErr = null;\n        let hit = null;\n        let hitPath = null;\n        for (const payload of TRAVERSAL_PAYLOADS) {\n          for (const encoded of [false, true]) {\n            const p = traversalAttemptPath(routePath, trav, payload, encoded);\n            try {\n              const res = await httpJson(c, { baseUrl, method: \"GET\", path: p, identity: travIdentity });\n              last = res;\n              lastPath = p;\n              if (traversalLeak(res.body, localName)) {\n                hit = res;\n                hitPath = p;\n                break;\n              }\n            } catch (e) {\n              if (!firstErr) firstErr = e;\n            }\n          }\n          if (hit) break;\n        }\n        if (!last) throw firstErr ?? new ProbeError(`路径穿越探测请求全部失败（${routePath}）`, { code: \"probe_request_failed\" });\n        const chosen = hit ?? last;\n        chosen._traversalProof = { localName, matched: !!hit, attemptPath: hitPath ?? lastPath };\n        return { res: chosen, path: hitPath ?? lastPath, method: \"GET\" };\n      }",
+      "verify": "fn:(res, phase) => {\n        const localName = res._traversalProof?.localName ?? null;\n        const leaked = traversalLeak(res.body, localName);\n        const detail = leaked\n          ? `证据：响应体含 package.json 特征字段${localName ? `（项目名 ${localName} 与本机一致）` : \"\"}，实际请求 ${res._traversalProof?.attemptPath ?? \"\"}`\n          : \"\";\n        return verifyAttack(res, phase, detail, leaked);\n      }",
+      "crossProof": "fn:(res) => {\n        const proof = res._traversalProof;\n        if (!proof?.matched || !proof.localName) return null;\n        return { note: `回读内容与本机 package.json 一致（项目名 ${proof.localName}），确证服务器任意文件读取` };\n      }",
+      "impact": "fn:(res) =>\n        traversalLeak(res.body, res._traversalProof?.localName ?? null)\n          ? \"可通过 ../ 穿越读取服务器任意文件（源码、配置、密钥等敏感信息）\"\n          : null"
+    }
+  ],
+  "params": [
+    {
+      "id": "attack-path-traversal",
+      "candidateKey": "undefined /static/:name",
+      "category": "attack",
+      "unfixable": true,
+      "name": "路径穿越读取服务器文件（/static/:name · 参数 name）",
+      "identity": "bob",
+      "method": "GET",
+      "path": "/static/../package.json",
+      "routeKey": "static.get",
+      "expect": "路径穿越读取应被拒绝（400/403/404），不得回读目标文件内容",
+      "send": "fn:async (c, baseUrl) => {\n        // 本机 package.json 的 name 值用作交叉证据：回读内容须与本机文件一致\n        let localName = null;\n        try {\n          const root = String(c.projectRoot ?? \"\").replace(/[\\\\/]+$/, \"\");\n          const rd = await c.rpc.request(RPC_TO_HOST.FS_READ, {\n            token: c.tokens.project,\n            path: `${root}/package.json`,\n            redact: true,\n          });\n          localName = JSON.parse(rd.content)?.name ?? null;\n        } catch {\n          /* 无本地文件则仅用通用特征 */\n        }\n        let last = null;\n        let lastPath = firstAttempt;\n        let firstErr = null;\n        let hit = null;\n        let hitPath = null;\n        for (const payload of TRAVERSAL_PAYLOADS) {\n          for (const encoded of [false, true]) {\n            const p = traversalAttemptPath(routePath, trav, payload, encoded);\n            try {\n              const res = await httpJson(c, { baseUrl, method: \"GET\", path: p, identity: travIdentity });\n              last = res;\n              lastPath = p;\n              if (traversalLeak(res.body, localName)) {\n                hit = res;\n                hitPath = p;\n                break;\n              }\n            } catch (e) {\n              if (!firstErr) firstErr = e;\n            }\n          }\n          if (hit) break;\n        }\n        if (!last) throw firstErr ?? new ProbeError(`路径穿越探测请求全部失败（${routePath}）`, { code: \"probe_request_failed\" });\n        const chosen = hit ?? last;\n        chosen._traversalProof = { localName, matched: !!hit, attemptPath: hitPath ?? lastPath };\n        return { res: chosen, path: hitPath ?? lastPath, method: \"GET\" };\n      }",
+      "verify": "fn:(res, phase) => {\n        const localName = res._traversalProof?.localName ?? null;\n        const leaked = traversalLeak(res.body, localName);\n        const detail = leaked\n          ? `证据：响应体含 package.json 特征字段${localName ? `（项目名 ${localName} 与本机一致）` : \"\"}，实际请求 ${res._traversalProof?.attemptPath ?? \"\"}`\n          : \"\";\n        return verifyAttack(res, phase, detail, leaked);\n      }",
+      "crossProof": "fn:(res) => {\n        const proof = res._traversalProof;\n        if (!proof?.matched || !proof.localName) return null;\n        return { note: `回读内容与本机 package.json 一致（项目名 ${proof.localName}），确证服务器任意文件读取` };\n      }",
+      "impact": "fn:(res) =>\n        traversalLeak(res.body, res._traversalProof?.localName ?? null)\n          ? \"可通过 ../ 穿越读取服务器任意文件（源码、配置、密钥等敏感信息）\"\n          : null"
+    }
+  ],
+  "no-param-name": [
+    {
+      "id": "attack-path-traversal",
+      "candidateKey": "undefined /api/read",
+      "category": "attack",
+      "unfixable": true,
+      "name": "路径穿越读取服务器文件（/api/read）",
+      "identity": "bob",
+      "method": "GET",
+      "path": "/api/read?file=../package.json",
+      "routeKey": "read.get",
+      "expect": "路径穿越读取应被拒绝（400/403/404），不得回读目标文件内容",
+      "send": "fn:async (c, baseUrl) => {\n        // 本机 package.json 的 name 值用作交叉证据：回读内容须与本机文件一致\n        let localName = null;\n        try {\n          const root = String(c.projectRoot ?? \"\").replace(/[\\\\/]+$/, \"\");\n          const rd = await c.rpc.request(RPC_TO_HOST.FS_READ, {\n            token: c.tokens.project,\n            path: `${root}/package.json`,\n            redact: true,\n          });\n          localName = JSON.parse(rd.content)?.name ?? null;\n        } catch {\n          /* 无本地文件则仅用通用特征 */\n        }\n        let last = null;\n        let lastPath = firstAttempt;\n        let firstErr = null;\n        let hit = null;\n        let hitPath = null;\n        for (const payload of TRAVERSAL_PAYLOADS) {\n          for (const encoded of [false, true]) {\n            const p = traversalAttemptPath(routePath, trav, payload, encoded);\n            try {\n              const res = await httpJson(c, { baseUrl, method: \"GET\", path: p, identity: travIdentity });\n              last = res;\n              lastPath = p;\n              if (traversalLeak(res.body, localName)) {\n                hit = res;\n                hitPath = p;\n                break;\n              }\n            } catch (e) {\n              if (!firstErr) firstErr = e;\n            }\n          }\n          if (hit) break;\n        }\n        if (!last) throw firstErr ?? new ProbeError(`路径穿越探测请求全部失败（${routePath}）`, { code: \"probe_request_failed\" });\n        const chosen = hit ?? last;\n        chosen._traversalProof = { localName, matched: !!hit, attemptPath: hitPath ?? lastPath };\n        return { res: chosen, path: hitPath ?? lastPath, method: \"GET\" };\n      }",
+      "verify": "fn:(res, phase) => {\n        const localName = res._traversalProof?.localName ?? null;\n        const leaked = traversalLeak(res.body, localName);\n        const detail = leaked\n          ? `证据：响应体含 package.json 特征字段${localName ? `（项目名 ${localName} 与本机一致）` : \"\"}，实际请求 ${res._traversalProof?.attemptPath ?? \"\"}`\n          : \"\";\n        return verifyAttack(res, phase, detail, leaked);\n      }",
+      "crossProof": "fn:(res) => {\n        const proof = res._traversalProof;\n        if (!proof?.matched || !proof.localName) return null;\n        return { note: `回读内容与本机 package.json 一致（项目名 ${proof.localName}），确证服务器任意文件读取` };\n      }",
+      "impact": "fn:(res) =>\n        traversalLeak(res.body, res._traversalProof?.localName ?? null)\n          ? \"可通过 ../ 穿越读取服务器任意文件（源码、配置、密钥等敏感信息）\"\n          : null"
+    }
+  ],
+  "multi-candidates": [
+    {
+      "id": "attack-path-traversal",
+      "candidateKey": "undefined /api/download",
+      "category": "attack",
+      "unfixable": true,
+      "name": "路径穿越读取服务器文件（/api/download · 参数 name）",
+      "identity": "bob",
+      "method": "GET",
+      "path": "/api/download?name=../package.json",
+      "routeKey": "files.get",
+      "expect": "路径穿越读取应被拒绝（400/403/404），不得回读目标文件内容",
+      "send": "fn:async (c, baseUrl) => {\n        // 本机 package.json 的 name 值用作交叉证据：回读内容须与本机文件一致\n        let localName = null;\n        try {\n          const root = String(c.projectRoot ?? \"\").replace(/[\\\\/]+$/, \"\");\n          const rd = await c.rpc.request(RPC_TO_HOST.FS_READ, {\n            token: c.tokens.project,\n            path: `${root}/package.json`,\n            redact: true,\n          });\n          localName = JSON.parse(rd.content)?.name ?? null;\n        } catch {\n          /* 无本地文件则仅用通用特征 */\n        }\n        let last = null;\n        let lastPath = firstAttempt;\n        let firstErr = null;\n        let hit = null;\n        let hitPath = null;\n        for (const payload of TRAVERSAL_PAYLOADS) {\n          for (const encoded of [false, true]) {\n            const p = traversalAttemptPath(routePath, trav, payload, encoded);\n            try {\n              const res = await httpJson(c, { baseUrl, method: \"GET\", path: p, identity: travIdentity });\n              last = res;\n              lastPath = p;\n              if (traversalLeak(res.body, localName)) {\n                hit = res;\n                hitPath = p;\n                break;\n              }\n            } catch (e) {\n              if (!firstErr) firstErr = e;\n            }\n          }\n          if (hit) break;\n        }\n        if (!last) throw firstErr ?? new ProbeError(`路径穿越探测请求全部失败（${routePath}）`, { code: \"probe_request_failed\" });\n        const chosen = hit ?? last;\n        chosen._traversalProof = { localName, matched: !!hit, attemptPath: hitPath ?? lastPath };\n        return { res: chosen, path: hitPath ?? lastPath, method: \"GET\" };\n      }",
+      "verify": "fn:(res, phase) => {\n        const localName = res._traversalProof?.localName ?? null;\n        const leaked = traversalLeak(res.body, localName);\n        const detail = leaked\n          ? `证据：响应体含 package.json 特征字段${localName ? `（项目名 ${localName} 与本机一致）` : \"\"}，实际请求 ${res._traversalProof?.attemptPath ?? \"\"}`\n          : \"\";\n        return verifyAttack(res, phase, detail, leaked);\n      }",
+      "crossProof": "fn:(res) => {\n        const proof = res._traversalProof;\n        if (!proof?.matched || !proof.localName) return null;\n        return { note: `回读内容与本机 package.json 一致（项目名 ${proof.localName}），确证服务器任意文件读取` };\n      }",
+      "impact": "fn:(res) =>\n        traversalLeak(res.body, res._traversalProof?.localName ?? null)\n          ? \"可通过 ../ 穿越读取服务器任意文件（源码、配置、密钥等敏感信息）\"\n          : null"
+    },
+    {
+      "id": "attack-path-traversal-2",
+      "candidateKey": "undefined /static/:name",
+      "category": "attack",
+      "unfixable": true,
+      "name": "路径穿越读取服务器文件（/static/:name · 参数 name）",
+      "identity": "bob",
+      "method": "GET",
+      "path": "/static/../package.json",
+      "routeKey": "static.get",
+      "expect": "路径穿越读取应被拒绝（400/403/404），不得回读目标文件内容",
+      "send": "fn:async (c, baseUrl) => {\n        // 本机 package.json 的 name 值用作交叉证据：回读内容须与本机文件一致\n        let localName = null;\n        try {\n          const root = String(c.projectRoot ?? \"\").replace(/[\\\\/]+$/, \"\");\n          const rd = await c.rpc.request(RPC_TO_HOST.FS_READ, {\n            token: c.tokens.project,\n            path: `${root}/package.json`,\n            redact: true,\n          });\n          localName = JSON.parse(rd.content)?.name ?? null;\n        } catch {\n          /* 无本地文件则仅用通用特征 */\n        }\n        let last = null;\n        let lastPath = firstAttempt;\n        let firstErr = null;\n        let hit = null;\n        let hitPath = null;\n        for (const payload of TRAVERSAL_PAYLOADS) {\n          for (const encoded of [false, true]) {\n            const p = traversalAttemptPath(routePath, trav, payload, encoded);\n            try {\n              const res = await httpJson(c, { baseUrl, method: \"GET\", path: p, identity: travIdentity });\n              last = res;\n              lastPath = p;\n              if (traversalLeak(res.body, localName)) {\n                hit = res;\n                hitPath = p;\n                break;\n              }\n            } catch (e) {\n              if (!firstErr) firstErr = e;\n            }\n          }\n          if (hit) break;\n        }\n        if (!last) throw firstErr ?? new ProbeError(`路径穿越探测请求全部失败（${routePath}）`, { code: \"probe_request_failed\" });\n        const chosen = hit ?? last;\n        chosen._traversalProof = { localName, matched: !!hit, attemptPath: hitPath ?? lastPath };\n        return { res: chosen, path: hitPath ?? lastPath, method: \"GET\" };\n      }",
+      "verify": "fn:(res, phase) => {\n        const localName = res._traversalProof?.localName ?? null;\n        const leaked = traversalLeak(res.body, localName);\n        const detail = leaked\n          ? `证据：响应体含 package.json 特征字段${localName ? `（项目名 ${localName} 与本机一致）` : \"\"}，实际请求 ${res._traversalProof?.attemptPath ?? \"\"}`\n          : \"\";\n        return verifyAttack(res, phase, detail, leaked);\n      }",
+      "crossProof": "fn:(res) => {\n        const proof = res._traversalProof;\n        if (!proof?.matched || !proof.localName) return null;\n        return { note: `回读内容与本机 package.json 一致（项目名 ${proof.localName}），确证服务器任意文件读取` };\n      }",
+      "impact": "fn:(res) =>\n        traversalLeak(res.body, res._traversalProof?.localName ?? null)\n          ? \"可通过 ../ 穿越读取服务器任意文件（源码、配置、密钥等敏感信息）\"\n          : null"
+    },
+    {
+      "id": "attack-path-traversal-3",
+      "candidateKey": "undefined /api/read",
+      "category": "attack",
+      "unfixable": true,
+      "name": "路径穿越读取服务器文件（/api/read）",
+      "identity": "bob",
+      "method": "GET",
+      "path": "/api/read?file=../package.json",
+      "routeKey": "read.get",
+      "expect": "路径穿越读取应被拒绝（400/403/404），不得回读目标文件内容",
+      "send": "fn:async (c, baseUrl) => {\n        // 本机 package.json 的 name 值用作交叉证据：回读内容须与本机文件一致\n        let localName = null;\n        try {\n          const root = String(c.projectRoot ?? \"\").replace(/[\\\\/]+$/, \"\");\n          const rd = await c.rpc.request(RPC_TO_HOST.FS_READ, {\n            token: c.tokens.project,\n            path: `${root}/package.json`,\n            redact: true,\n          });\n          localName = JSON.parse(rd.content)?.name ?? null;\n        } catch {\n          /* 无本地文件则仅用通用特征 */\n        }\n        let last = null;\n        let lastPath = firstAttempt;\n        let firstErr = null;\n        let hit = null;\n        let hitPath = null;\n        for (const payload of TRAVERSAL_PAYLOADS) {\n          for (const encoded of [false, true]) {\n            const p = traversalAttemptPath(routePath, trav, payload, encoded);\n            try {\n              const res = await httpJson(c, { baseUrl, method: \"GET\", path: p, identity: travIdentity });\n              last = res;\n              lastPath = p;\n              if (traversalLeak(res.body, localName)) {\n                hit = res;\n                hitPath = p;\n                break;\n              }\n            } catch (e) {\n              if (!firstErr) firstErr = e;\n            }\n          }\n          if (hit) break;\n        }\n        if (!last) throw firstErr ?? new ProbeError(`路径穿越探测请求全部失败（${routePath}）`, { code: \"probe_request_failed\" });\n        const chosen = hit ?? last;\n        chosen._traversalProof = { localName, matched: !!hit, attemptPath: hitPath ?? lastPath };\n        return { res: chosen, path: hitPath ?? lastPath, method: \"GET\" };\n      }",
+      "verify": "fn:(res, phase) => {\n        const localName = res._traversalProof?.localName ?? null;\n        const leaked = traversalLeak(res.body, localName);\n        const detail = leaked\n          ? `证据：响应体含 package.json 特征字段${localName ? `（项目名 ${localName} 与本机一致）` : \"\"}，实际请求 ${res._traversalProof?.attemptPath ?? \"\"}`\n          : \"\";\n        return verifyAttack(res, phase, detail, leaked);\n      }",
+      "crossProof": "fn:(res) => {\n        const proof = res._traversalProof;\n        if (!proof?.matched || !proof.localName) return null;\n        return { note: `回读内容与本机 package.json 一致（项目名 ${proof.localName}），确证服务器任意文件读取` };\n      }",
+      "impact": "fn:(res) =>\n        traversalLeak(res.body, res._traversalProof?.localName ?? null)\n          ? \"可通过 ../ 穿越读取服务器任意文件（源码、配置、密钥等敏感信息）\"\n          : null"
+    }
+  ],
+  "no-route": [],
+  "no-identity": [
+    {
+      "id": "attack-path-traversal",
+      "candidateKey": "undefined /api/download",
+      "category": "attack",
+      "unfixable": true,
+      "name": "路径穿越读取服务器文件（/api/download · 参数 name）",
+      "identity": null,
+      "method": "GET",
+      "path": "/api/download?name=../package.json",
+      "routeKey": "files.get",
+      "expect": "路径穿越读取应被拒绝（400/403/404），不得回读目标文件内容",
+      "send": "fn:async (c, baseUrl) => {\n        // 本机 package.json 的 name 值用作交叉证据：回读内容须与本机文件一致\n        let localName = null;\n        try {\n          const root = String(c.projectRoot ?? \"\").replace(/[\\\\/]+$/, \"\");\n          const rd = await c.rpc.request(RPC_TO_HOST.FS_READ, {\n            token: c.tokens.project,\n            path: `${root}/package.json`,\n            redact: true,\n          });\n          localName = JSON.parse(rd.content)?.name ?? null;\n        } catch {\n          /* 无本地文件则仅用通用特征 */\n        }\n        let last = null;\n        let lastPath = firstAttempt;\n        let firstErr = null;\n        let hit = null;\n        let hitPath = null;\n        for (const payload of TRAVERSAL_PAYLOADS) {\n          for (const encoded of [false, true]) {\n            const p = traversalAttemptPath(routePath, trav, payload, encoded);\n            try {\n              const res = await httpJson(c, { baseUrl, method: \"GET\", path: p, identity: travIdentity });\n              last = res;\n              lastPath = p;\n              if (traversalLeak(res.body, localName)) {\n                hit = res;\n                hitPath = p;\n                break;\n              }\n            } catch (e) {\n              if (!firstErr) firstErr = e;\n            }\n          }\n          if (hit) break;\n        }\n        if (!last) throw firstErr ?? new ProbeError(`路径穿越探测请求全部失败（${routePath}）`, { code: \"probe_request_failed\" });\n        const chosen = hit ?? last;\n        chosen._traversalProof = { localName, matched: !!hit, attemptPath: hitPath ?? lastPath };\n        return { res: chosen, path: hitPath ?? lastPath, method: \"GET\" };\n      }",
+      "verify": "fn:(res, phase) => {\n        const localName = res._traversalProof?.localName ?? null;\n        const leaked = traversalLeak(res.body, localName);\n        const detail = leaked\n          ? `证据：响应体含 package.json 特征字段${localName ? `（项目名 ${localName} 与本机一致）` : \"\"}，实际请求 ${res._traversalProof?.attemptPath ?? \"\"}`\n          : \"\";\n        return verifyAttack(res, phase, detail, leaked);\n      }",
+      "crossProof": "fn:(res) => {\n        const proof = res._traversalProof;\n        if (!proof?.matched || !proof.localName) return null;\n        return { note: `回读内容与本机 package.json 一致（项目名 ${proof.localName}），确证服务器任意文件读取` };\n      }",
+      "impact": "fn:(res) =>\n        traversalLeak(res.body, res._traversalProof?.localName ?? null)\n          ? \"可通过 ../ 穿越读取服务器任意文件（源码、配置、密钥等敏感信息）\"\n          : null"
+    }
+  ]
+}

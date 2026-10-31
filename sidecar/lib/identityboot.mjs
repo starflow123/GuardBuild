@@ -20,8 +20,17 @@ import { randomBytes } from "node:crypto";
 const SIGNUP_SEGMENT = /^(?:register|registration|signup|sign-up|sign_up|create-account|createuser|create-user|join)$/i;
 /** 「建号」的近义动词段：users/create、accounts/new 这类 REST 形状，单段正则覆盖不到 */
 const SIGNUP_CREATION_VERB = /^(?:create|add|new|insert|signups?|registrations?)$/i;
-/** 明显不是建号的路径片段（找回密码/第三方登录/验证邮箱都不该被当注册打） */
+/** 明显不该被当注册接口打的路径（找回密码/第三方登录/验证邮箱都不该被发建号请求） */
 const SIGNUP_EXCLUDE = /login|signin|logout|password|recover|reset|verify|activate|oauth|sso|token|refresh|2fa|otp|magic/i;
+
+/**
+ * 策略线：这类写接口接收「注册体」是危险的（撞找回密码＝改口令）。
+ * 静态候选与 agent 编号菜单共用这一条——菜单里根本没有它，模型也就选不到，
+ * 不靠提示词求它别乱发写请求。
+ */
+export function signupPolicyExcluded(p) {
+  return SIGNUP_EXCLUDE.test(String(p ?? ""));
+}
 
 /** 模板占位符填充：`{name}`/`{username}`/`{email}`/`{password}`/`{canary}`，递归处理对象与数组 */
 export function fillTemplate(value, values) {

@@ -78,8 +78,29 @@ import {
   registerBody,
   resolveRegisterEndpoint,
   seedBody,
+  signupCandidates,
 } from "./identityboot.mjs";
 import { chat as llmChat, isEnabled as llmIsEnabled, parseJson as llmParseJson } from "./llm.mjs";
+import {
+  askRegisterAgent,
+  buildRegisterMenu,
+  cacheKeyFor,
+  enrichMenuWithHandlers,
+  patchAgentCache,
+  readAgentCache,
+  selfBootAgentEnabled,
+  selfBootBudget,
+  selfBootModelCallable,
+  writeAgentCache,
+} from "./selfbootagent.mjs";
+import {
+  attributeCanary,
+  canaryBody,
+  extractBodyFields,
+  readHandlerSource,
+  seedWriteCandidates,
+  showsCanary,
+} from "./seedobserve.mjs";
 
 export class ProbeError extends Error {
   constructor(message, { code = "probe_failed", hint = null, details = null } = {}) {
@@ -557,8 +578,9 @@ async function assertSessionsAuthenticated(ctx, baseUrl, loggedIn, loginPath) {
 
 /**
  * 身份自举（#179）：沙箱目标每次从空库启动，「两个各自名下有数据的账号」只能由引擎造。
- * 注册端点的来源与登录端点同一套优先级：契约 register.path > 静态识别的唯一建号候选；
- * 两个以上候选意味着在建号语义上猜测，宁可不测也要显式失败。
+ * 这一层只负责**确定性来源**的注册端点：契约 register.path > 静态识别的唯一建号候选；
+ * 两者都打不中时不在这里猜——交给 #182 的 agent 编号菜单（见 loginAll 里的候选队列），
+ * 兜底也没能实测出一个能建立会话的端点时，仍然显式 inconclusive（exit 2）。
  */
 function registerPlan(ctx) {
   // 纯黑盒目标是外部在跑的实例：引擎不向它发注册请求（建号属于对他人系统的写操作，
@@ -596,6 +618,34 @@ function registerValues(ident) {
   };
 }
 
+/** 注册端点来源的读者口径（报告/事件里要说清「这个端点是谁定的」） */
+function sourceLabel(source) {
+  return source === "contract"
+    ? "契约 register.path"
+    : source === "static"
+      ? "静态建号形状"
+      : source === "agent"
+        ? "兜底代理提议、引擎实跑采纳"
+        : String(source ?? "未知");
+}
+
+/** 候选端点的身份：同一路径配不同字段模板是两次不同的实测，不能互相顶替 */
+function candidateKey(cand) {
+  if (!cand) return "";
+  return `${cand.method} ${cand.path} ${JSON.stringify(cand.bodyTemplate ?? null)}`;
+}
+
+/**
+ * 留给纠偏轮的目标报错文本：引擎口令一律剔除、截断，且只存在于内存
+ * （不进事件流、审计、报告，也不进磁盘缓存）。
+ */
+function scrubForAgent(text, secret) {
+  const raw = typeof text === "string" ? text : text == null ? "" : String(text);
+  const masked = secret ? raw.split(String(secret)).join("***") : raw;
+  const flat = masked.replace(/\s+/g, " ").trim();
+  return flat.length > 240 ? `${flat.slice(0, 240)}…` : flat;
+}
+
 /**
  * 把引擎自生成的口令登记进 Host 的 protected 保险库：只用于脱敏，不作为请求头凭证，
  * 也不出现在 credential.list。这样即使目标把凭据回显在响应里，流出 Host 的文本也已被掩码。
@@ -615,11 +665,16 @@ async function protectGeneratedSecret(ctx, identity, value) {
 }
 
 /** 所有身份登录失败时的归因补充：自举试过但没换来会话，读者要能看到注册这一层的真实结果 */
-function bootstrapSuffix(boot, reg) {
+function bootstrapSuffix(boot, reg, agent = null) {
+  const agentNote = agent?.tried?.length
+    ? `；注册兜底代理试过 ${agent.tried.map((c) => `${c.endpoint}→${c.verdict}`).join("、")}`
+    : agent?.fallback
+      ? `；注册兜底代理未给出可用端点（${agent.fallback}）`
+      : "";
   if (reg) {
-    return `（已尝试 ${boot.method} ${boot.path} 自举：${reg.verdict ?? reg.reason}，HTTP ${reg.status ?? "—"}）`;
+    return `（已尝试 ${boot.method ?? "POST"} ${boot.path ?? reg.endpoint ?? "—"} 自举：${reg.verdict ?? reg.reason}，HTTP ${reg.status ?? "—"}${agentNote}）`;
   }
-  if (boot.available) return "";
+  if (boot.available) return agentNote ? `（契约/静态端点之外${agentNote}）` : "";
   const why =
     boot.reason === "disabled"
       ? "被契约显式关闭（register.enabled=false）"
@@ -628,7 +683,7 @@ function bootstrapSuffix(boot, reg) {
         : boot.reason === "static-ambiguous"
           ? `静态识别到 ${boot.candidates.length} 个建号候选，引擎不猜`
           : "静态未识别到注册路由";
-  return `（身份自举未参与：${why}；可在 guardbuild.json 声明 register.path 后重跑）`;
+  return `（身份自举未参与：${why}${agentNote}；可在 guardbuild.json 声明 register.path，或开启 register.agent 让模型在编号菜单里提议、由引擎实跑采纳后重跑）`;
 }
 
 /**
@@ -770,11 +825,263 @@ export async function loginAll(ctx, baseUrl) {
   };
 
   /**
-   * 用目标自己的注册接口建一个身份。口令省略时由引擎随机生成并登记进 Host 保险库；
-   * 判定只看目标响应（2xx＝已建号，409/「已存在」＝库里有，其余＝这一轮身份不成立）。
+   * #182 注册端点/字段名的 agent 兜底。状态是**每次 loginAll 一份**（修复前后各一轮）：
+   * 菜单惰性构建，只有契约与静态端点都没换来会话时才问模型；模型只报编号与「字段名 → 占位符」，
+   * 采纳与否由引擎实跑（注册 2xx/409 → 登录建立会话）决定，会话真实性仍由回读闸门把关。
    */
-  const registerOne = async (ident, trigger) => {
-    if (!boot.available) return { attempted: false, reason: bootstrap.unavailableReason };
+  const regCfg = ctx.registerConfig ?? {};
+  const agentEnabled = selfBootAgentEnabled(ctx);
+  // 缓存键里的 model 取契约声明值（与 scout 同一口径）：模型回显的实际型号不参与键，
+  // 否则同一份提案在「契约没写 model」的两次运行里会算成两个键，缓存永远命不中。
+  const cacheModel = ctx.llmConfig?.model ?? null;
+  const agentState = {
+    enabled: agentEnabled,
+    callable: selfBootModelCallable(ctx),
+    budget: selfBootBudget(ctx),
+    menu: null,
+    exhausted: false,
+    queue: [],
+    askedRounds: 0,
+    cacheLoaded: false,
+    cacheKey: null,
+    cacheFile: null,
+    failedKeys: new Set(),
+    failures: [],
+    adopted: null,
+    meta: {
+      enabled: agentEnabled,
+      callable: selfBootModelCallable(ctx),
+      blackboxForbidden: !!ctx.blackboxUrl,
+      rounds: 0,
+      asked: false,
+      source: null,
+      fallback: null,
+      menuSize: 0,
+      tried: [],
+      adoptedEndpoint: null,
+      ignored: [],
+      droppedFields: [],
+      invalid: [],
+      cacheHit: false,
+      cacheVerified: false,
+      model: null,
+      rejected: null,
+      durationMs: 0,
+    },
+  };
+  bootstrap.agent = agentState.meta;
+
+  /** 身份形状（只给键名，不给值）：模型据此知道引擎能填哪几个占位符 */
+  const identityShapeOf = (i) =>
+    i.fields && typeof i.fields === "object" && !Array.isArray(i.fields)
+      ? Object.keys(i.fields)
+      : [i.username ? "username" : null, i.email ? "email" : null, "password"].filter(Boolean);
+  const identityShape = (ctx.identities ?? []).map((i) => ({ name: i.name, fields: identityShapeOf(i) }));
+
+  const makeAgentCandidate = (c) => ({
+    path: c.path,
+    method: c.method ?? regCfg.method ?? "POST",
+    encoding: regCfg.encoding ?? "json",
+    headers: regCfg.headers ?? {},
+    // 模型没给可用模板时回落到契约模板，再由 registerBody 落到引擎默认体——绝不猜字段名
+    bodyTemplate: c.bodyTemplate ?? regCfg.bodyTemplate ?? null,
+    seed: regCfg.seed ?? [],
+    source: "agent",
+  });
+
+  async function loadAgentMenu() {
+    if (agentState.menu || agentState.exhausted) return agentState.menu;
+    const staticHits = signupCandidates(ctx.analysis).map((c) => c.path);
+    const menu = buildRegisterMenu(ctx.analysis, {
+      maxMenu: agentState.budget.maxMenu,
+      staticHits,
+    });
+    if (!menu.items.length) {
+      agentState.exhausted = true;
+      agentState.meta.fallback = "no_post_candidates";
+      return null;
+    }
+    await enrichMenuWithHandlers(ctx, menu);
+    agentState.menu = menu;
+    agentState.meta.menuSize = menu.items.length;
+    return menu;
+  }
+
+  /** 取下一个待试的 agent 候选：磁盘缓存优先，用完才调模型（最多 budget.rounds 轮，纠偏轮带实测失败） */
+  async function nextAgentCandidate() {
+    const st = agentState;
+    if (!st.enabled || st.exhausted) return null;
+    let guard = 0;
+    while (!st.queue.length && guard++ < st.budget.rounds + 2) {
+      const menu = await loadAgentMenu();
+      if (!menu) {
+        st.exhausted = true;
+        return null;
+      }
+      if (!st.cacheLoaded) {
+        st.cacheLoaded = true;
+        st.cacheKey = cacheKeyFor(cacheModel, menu);
+        const hit = readAgentCache(ctx, st.cacheKey, menu, { requireVerified: ctx.gate === true });
+        if (hit) {
+          st.cacheFile = hit.file;
+          st.meta.cacheHit = true;
+          st.meta.source = "cache";
+          st.queue = hit.candidates
+            .map(makeAgentCandidate)
+            .filter((c) => !st.failedKeys.has(candidateKey(c)));
+        }
+      }
+      if (st.queue.length) break;
+      if (!st.callable) {
+        if (!st.meta.fallback) st.meta.fallback = ctx.gate === true ? "gate_forbids_model_call" : "agent_not_enabled";
+        st.exhausted = true;
+        return null;
+      }
+      if (st.askedRounds >= st.budget.rounds) {
+        st.exhausted = true;
+        return null;
+      }
+      const round = st.askedRounds + 1;
+      const res = await askRegisterAgent(ctx, {
+        menu,
+        round,
+        priorAttempts: st.failures,
+        identityShape,
+        getToken: ctx.llm?.getToken,
+        model: ctx.llmConfig?.model ?? null,
+        budget: st.budget,
+        chatImpl: llmChat,
+      });
+      st.askedRounds = round;
+      st.meta.asked = true;
+      st.meta.rounds = round;
+      st.meta.durationMs += res.meta.durationMs ?? 0;
+      st.meta.model = res.meta.model ?? st.meta.model;
+      st.meta.ignored = [...st.meta.ignored, ...(res.meta.ignored ?? [])];
+      st.meta.droppedFields = [...st.meta.droppedFields, ...(res.meta.droppedFields ?? [])];
+      st.meta.invalid = [...st.meta.invalid, ...(res.meta.invalid ?? [])];
+      st.meta.rejected = res.meta.rejected ?? st.meta.rejected;
+      st.meta.fallback = res.meta.fallback ?? null;
+      st.meta.source = res.meta.fallback ? st.meta.source : "model";
+      if (!st.cacheKey) st.cacheKey = cacheKeyFor(st.meta.model, menu);
+      const fresh = res.candidates
+        .map(makeAgentCandidate)
+        .filter((c) => !st.failedKeys.has(candidateKey(c)));
+      if (!fresh.length) {
+        if (!res.meta.fallback) st.meta.fallback = "already_tried";
+        continue;
+      }
+      st.queue = fresh;
+      ctx.emit({
+        kind: "selfboot",
+        severity: SEVERITY.INFO,
+        message: `注册兜底代理第 ${round} 轮提议 ${fresh.length} 个候选端点（${fresh.map((c) => c.path).join("、")}）；模型只选端点与字段名，是否采用由引擎实跑注册与登录决定`,
+        data: {
+          round,
+          candidates: fresh.map((c) => ({ endpoint: c.path, fields: c.bodyTemplate ? Object.keys(c.bodyTemplate) : null })),
+          menuSize: st.meta.menuSize,
+          ignoredKeys: st.meta.ignored,
+          droppedFields: st.meta.droppedFields,
+        },
+      });
+    }
+    return st.queue.shift() ?? null;
+  }
+
+  /** 采纳后把提案落盘并标记为已实测；gate 之后只能复用带这个标记的提案 */
+  function markCandidateAdopted(cand, reg) {
+    const st = agentState;
+    if (cand.source !== "agent") return;
+    st.meta.adoptedEndpoint = cand.path;
+    // 端点归因即时回写：采纳之后还有第二个身份要建号，那一步失败时报告也得说清「用的是哪个、谁定的」
+    bootstrap.endpoint = cand.path;
+    bootstrap.endpointSource = cand.source;
+    bootstrap.method = cand.method;
+    bootstrap.unavailableReason = null;
+    // 采纳的那一条也进实跑轨迹：只列失败候选，读者就没法核对「采纳是实测出来的」
+    if (!st.meta.tried.some((t) => t.verdict === "adopted" && t.endpoint === cand.path)) {
+      st.meta.tried.push({ endpoint: cand.path, verdict: "adopted", status: reg?.status ?? null });
+    }
+    if (!st.cacheKey) return;
+    if (st.cacheFile) {
+      if (patchAgentCache(st.cacheFile, { endpoint: true, session: true })) st.meta.cacheVerified = true;
+      return;
+    }
+    const saved = writeAgentCache(
+      ctx,
+      st.cacheKey,
+      [{ path: cand.path, bodyTemplate: cand.bodyTemplate }],
+      { model: st.meta.model, rounds: st.askedRounds, verified: { endpoint: true, session: true } }
+    );
+    if (saved) {
+      st.cacheFile = saved.file;
+      st.meta.cacheVerified = true;
+    }
+  }
+
+  /** agent 候选失败要记的三样：不再重试的键、纠偏轮的实测证据、报告里的可审计轨迹 */
+  function noteAgentFailure(cand, verdict, status, excerpt) {
+    if (cand.source !== "agent") return;
+    agentState.failedKeys.add(candidateKey(cand));
+    agentState.failures.push({ path: cand.path, method: cand.method, verdict, status: status ?? null, excerpt: excerpt ?? null });
+    agentState.meta.tried.push({ endpoint: cand.path, verdict, status: status ?? null });
+  }
+
+  /**
+   * 一个候选端点上的完整自举：注册被目标接受**且**能建立会话，两步都实测通过才算数。
+   * 任一步不中就换下一个候选（含 agent 提案），全不中由调用方回显式 inconclusive。
+   */
+  const tryCandidate = async (ident, cand, trigger) => {
+    const reg = await registerOne(ident, trigger, cand);
+    if (reg.verdict !== "created" && reg.verdict !== "exists") {
+      noteAgentFailure(cand, reg.verdict ?? reg.reason ?? "failed", reg.status ?? null, reg.excerpt ?? null);
+      return { ok: false, accepted: false, reg, cand };
+    }
+    const entry = await tryLogin(ident);
+    if (!entry) {
+      // 纠偏轮要看得见「注册被收下、但换不来会话」——只说 login_rejected 模型无从判断这是假建号端点
+      const last = attempts.filter((a) => a.identity === ident.name).at(-1);
+      noteAgentFailure(
+        cand,
+        "login_rejected",
+        reg.status ?? null,
+        `注册返回 HTTP ${reg.status ?? "—"}，但随后 ${last?.path ?? "登录端点"} → HTTP ${last?.status ?? "—"}：该端点没有换来可用会话`
+      );
+      return { ok: false, accepted: true, reg, cand };
+    }
+    if (!agentState.adopted) agentState.adopted = cand;
+    markCandidateAdopted(cand, reg);
+    return { ok: true, entry, reg, cand };
+  };
+
+  /**
+   * 候选序列：已验证过的端点优先（同一目标只有一个注册接口）> 契约/静态 > agent 提案（惰性）。
+   * 返回最后一次失败的信息，调用方据此区分「压根没找到端点」与「找到了但目标不认」。
+   */
+  const bootstrapIdentity = async (ident, trigger) => {
+    const queue = [];
+    if (agentState.adopted) queue.push(agentState.adopted);
+    if (boot.available && candidateKey(boot) !== candidateKey(agentState.adopted)) queue.push(boot);
+    let triedAny = false;
+    let last = { accepted: false, reg: null, cand: null };
+    for (;;) {
+      const cand = queue.shift() ?? (await nextAgentCandidate());
+      if (!cand) break;
+      triedAny = true;
+      const out = await tryCandidate(ident, cand, trigger);
+      if (out.ok) return out;
+      last = out;
+    }
+    return { ok: false, triedAny, accepted: last.accepted, reg: last.reg, cand: last.cand };
+  };
+
+  /**
+   * 用目标自己的注册接口建一个身份（cand 为本轮的一个候选端点）。
+   * 口令省略时由引擎随机生成并登记进 Host 保险库；判定只看目标响应
+   * （2xx＝已建号，409/「已存在」＝库里有，其余＝这一轮身份不成立）。
+   */
+  const registerOne = async (ident, trigger, cand) => {
+    if (!cand) return { attempted: false, reason: bootstrap.unavailableReason };
     let generated = false;
     if (ident.password == null) {
       ident.password = generateTestPassword();
@@ -782,7 +1089,7 @@ export async function loginAll(ctx, baseUrl) {
       bootstrap.secretProtection[ident.name] = await protectGeneratedSecret(ctx, ident.name, ident.password);
     }
     const values = registerValues(ident);
-    const { body, unresolved } = registerBody(ident, boot, values);
+    const { body, unresolved } = registerBody(ident, cand, values);
     if (unresolved.length) {
       const entry = {
         name: ident.name,
@@ -791,31 +1098,48 @@ export async function loginAll(ctx, baseUrl) {
         status: null,
         generated,
         fields: unresolved,
+        endpoint: cand.path,
+        endpointSource: cand.source,
       };
       bootstrap.accounts.push(entry);
       ctx.emit({
         kind: "identity",
         severity: SEVERITY.WARN,
-        message: `身份「${ident.name}」未发起注册：register.bodyTemplate 里有引擎填不出的占位符 {${unresolved.join("、")}}`,
-        data: { identity: ident.name, endpoint: boot.path, unresolved: unresolved },
+        message: `身份「${ident.name}」未发起注册：${cand.source === "agent" ? "兜底代理给出的字段模板" : "register.bodyTemplate"} 里有引擎填不出的占位符 {${unresolved.join("、")}}`,
+        data: { identity: ident.name, endpoint: cand.path, unresolved: unresolved, endpointSource: cand.source },
       });
-      return { attempted: false, reason: "template_unresolved", fields: unresolved, generated };
+      return {
+        attempted: false,
+        reason: "template_unresolved",
+        fields: unresolved,
+        generated,
+        endpoint: cand.path,
+        excerpt: `请求体模板里这些占位符引擎填不出来：${unresolved.join("、")}`,
+      };
     }
-    const encoded = encodeLoginBody(body, boot.encoding === "form");
+    const encoded = encodeLoginBody(body, cand.encoding === "form");
     let res = null;
     try {
       res = await httpJson(ctx, {
         baseUrl,
-        method: boot.method,
-        path: boot.path,
+        method: cand.method,
+        path: cand.path,
         body: encoded.body,
         contentType: encoded.contentType,
-        extraHeaders: boot.headers,
+        extraHeaders: cand.headers,
       });
     } catch (e) {
-      const entry = { name: ident.name, trigger, verdict: "request_failed", status: null, generated };
+      const entry = { name: ident.name, trigger, verdict: "request_failed", status: null, generated, endpoint: cand.path, endpointSource: cand.source };
       bootstrap.accounts.push(entry);
-      return { attempted: true, verdict: "request_failed", status: null, error: e.message, generated };
+      return {
+        attempted: true,
+        verdict: "request_failed",
+        status: null,
+        error: e.message,
+        generated,
+        endpoint: cand.path,
+        excerpt: String(e.message).slice(0, 240),
+      };
     }
     const { verdict, status } = classifyRegisterResponse(res);
     // 身份只写了 username 时，注册用的是引擎派生的邮箱；建号成功后把同一个邮箱记回身份，
@@ -823,32 +1147,34 @@ export async function loginAll(ctx, baseUrl) {
     if ((verdict === "created" || verdict === "exists") && ident.email == null && values.email) {
       ident.email = values.email;
     }
-    bootstrap.accounts.push({ name: ident.name, trigger, verdict, status, generated, endpoint: boot.path });
+    bootstrap.accounts.push({ name: ident.name, trigger, verdict, status, generated, endpoint: cand.path, endpointSource: cand.source });
+    // 只有失败时才把目标的报错文本留给纠偏轮：口令已剔除、截断，且不进事件流/审计/报告
+    const excerpt = verdict === "created" || verdict === "exists" ? null : scrubForAgent(res.body, values.password);
     ctx.emit({
       kind: "identity",
       severity: verdict === "created" || verdict === "exists" ? SEVERITY.INFO : SEVERITY.WARN,
       message:
         verdict === "created"
-          ? `已用目标自己的注册接口建立身份「${ident.name}」（${boot.method} ${boot.path} → HTTP ${status}）${generated ? "；口令由引擎随机生成，只进 Host 保险库（不落配置/报告/证据库）" : ""}`
+          ? `已用目标自己的注册接口建立身份「${ident.name}」（${cand.method} ${cand.path} → HTTP ${status}；端点来源：${sourceLabel(cand.source)}）${generated ? "；口令由引擎随机生成，只进 Host 保险库（不落配置/报告/证据库）" : ""}`
           : verdict === "exists"
             ? `注册接口报告该账号已存在（HTTP ${status}），直接按声明口令登录`
-            : `注册未建立身份「${ident.name}」（${boot.method} ${boot.path} → HTTP ${status}）`,
+            : `注册未建立身份「${ident.name}」（${cand.method} ${cand.path} → HTTP ${status}；端点来源：${sourceLabel(cand.source)}）`,
       data: {
         identity: ident.name,
-        endpoint: boot.path,
-        endpointSource: boot.source,
+        endpoint: cand.path,
+        endpointSource: cand.source,
         status,
         verdict,
         passwordSource: generated ? "engine-generated" : "declared",
       },
     });
-    return { attempted: true, verdict, status, generated };
+    return { attempted: true, verdict, status, generated, endpoint: cand.path, excerpt };
   };
 
   /** 契约声明的种子写入：只往「该身份自己名下」写对象，状态码不成功就显式失败 */
-  const seedFor = async (ident) => {
+  const seedFor = async (ident, cand) => {
     const values = registerValues(ident);
-    for (const step of boot.seed ?? []) {
+    for (const step of cand?.seed ?? []) {
       values.canary = generateCanary();
       const prepared = seedBody(step, values);
       if (!prepared) {
@@ -864,7 +1190,7 @@ export async function loginAll(ctx, baseUrl) {
           }
         );
       }
-      const encoded = encodeLoginBody(prepared.body, boot.encoding === "form");
+      const encoded = encodeLoginBody(prepared.body, cand.encoding === "form");
       const res = await httpJson(ctx, {
         baseUrl,
         method: step.method,
@@ -872,7 +1198,7 @@ export async function loginAll(ctx, baseUrl) {
         identity: ident.name,
         body: encoded.body,
         contentType: encoded.contentType,
-        extraHeaders: boot.headers,
+        extraHeaders: cand.headers,
       });
       const { verdict, status } = classifySeedResponse(res);
       bootstrap.seeds.push({ identity: ident.name, method: step.method, path: step.path, status, verdict });
@@ -911,41 +1237,123 @@ export async function loginAll(ctx, baseUrl) {
 
   const loggedIn = [];
   const endpoints = [];
+
+  // 报告的「身份基础」一节：谁的会话在哪个端点建立、真实性有没有回读过。
+  // 没有这一节，读者只能从「越权全部被拒」反推身份是不是真的成立。
+  // 取用即读（getter）：自举/登录中途失败也要留在报告里——「测不了」的那一轮同样得能自证。
+  // 明细（注册端点、账号、种子、兜底代理）来自 ctx._identityBootstrap，报告层单独按白名单展开。
+  ctx._identityReport = {
+    configured: ctx.identities.map((i) => i.name),
+    get loggedIn() {
+      return loggedIn.map((i) => ({
+        name: i.name,
+        role: i.role ?? null,
+        endpoint: ctx._loginEndpoints?.[i.name] ?? endpoints[0] ?? null,
+        credentialKind: ctx.loginConfig?.cookieAuth === true ? "cookie" : "token",
+      }));
+    },
+    get sessionVerification() {
+      return ctx._sessionVerify ?? null;
+    },
+  };
+
+  /** 给「测不了」的提示补上兜底代理这一层的真实状态（开了没中/根本没开），读者才知道下一步做什么 */
+  const agentHintNote = () => {
+    const m = agentState.meta;
+    if (!agentState.enabled) {
+      return "　注册兜底代理未开启：在 guardbuild.json 写 register.agent:true（或环境变量 GUARDBUILD_LLM_SELFBOOT=1）后，模型可在引擎给出的 POST 路由编号菜单里提议端点与字段名，是否采用仍由引擎实跑决定。";
+    }
+    if (m.adoptedEndpoint) return `　注册兜底代理已采纳 ${m.adoptedEndpoint}（来源：${m.source}）。`;
+    const bits = [
+      m.tried.length ? `实跑过 ${m.tried.map((t) => `${t.endpoint}→${t.verdict}`).join("、")}` : null,
+      m.tried.length ? null : m.fallback ? `未给出可用端点（${m.fallback}）` : null,
+      // 试过之后模型没再给新候选（纠偏轮出错/拒答）也是事实，不能只留「实跑过」
+      m.tried.length && m.fallback && m.fallback !== "already_tried" ? `后续轮次未给出新候选（${m.fallback}）` : null,
+      m.ignored.length ? `丢弃的越界键：${m.ignored.join("、")}` : null,
+      m.droppedFields.length ? `丢弃的字段映射：${m.droppedFields.join("、")}` : null,
+    ].filter(Boolean);
+    return bits.length ? `　${bits.join("；")}。` : "";
+  };
+
   for (const ident of ctx.identities) {
     const mustRegister = ident.password == null;
-    if (mustRegister && !boot.available) {
-      throw new ProbeError(
-        `身份「${ident.name}」省略了 password，但引擎未能确定注册端点，无法自举该身份`,
-        {
-          code: "identity_bootstrap_unavailable",
-          hint:
-            bootstrap.unavailableReason === "blackbox"
-              ? "纯黑盒模式不会向外部目标发注册请求（建号属于对他人系统的写操作，超出探测授权）。请为该身份提供已存在的测试账号口令，或改用白盒模式让引擎在沙箱内自举。"
-              : `省略 identities[].password 意味着「口令由引擎随机生成、走目标自己的注册接口」，因此必须知道那个接口在哪（本轮判定依据：${bootstrap.unavailableReason}${bootstrap.candidates.length ? `，静态候选：${bootstrap.candidates.join("、")}` : ""}）。请在 guardbuild.json 声明 register.path（必要时配 register.bodyTemplate），或改为显式提供已存在的账号口令。`,
-          details: { identity: ident.name, reason: bootstrap.unavailableReason, candidates: bootstrap.candidates },
-        }
-      );
-    }
     let reg = null;
+    let entry = null;
+    let via = null;
     if (mustRegister) {
-      reg = await registerOne(ident, "no-declared-password");
-      if (reg.verdict !== "created" && reg.verdict !== "exists") {
+      if (!boot.available && !agentState.enabled) {
         throw new ProbeError(
-          `身份「${ident.name}」自举失败：${boot.method} ${boot.path} → ${reg.verdict ?? reg.reason}${reg.status ? ` (HTTP ${reg.status})` : ""}`,
+          `身份「${ident.name}」省略了 password，但引擎未能确定注册端点，无法自举该身份`,
           {
-            code: "identity_bootstrap_failed",
-            hint: `口令省略的身份必须先建号才能登录。注册接口没能接受引擎构造的请求体（多为字段名/校验规则不符）：请在 guardbuild.json 声明 register.bodyTemplate（支持 {email}/{username}/{password}/{name}），并确认目标允许公开注册。本轮按「测不了」处理，不会改用匿名探测再报「未发现漏洞」。`,
-            details: { identity: ident.name, endpoint: boot.path, verdict: reg.verdict ?? reg.reason, status: reg.status ?? null },
+            code: "identity_bootstrap_unavailable",
+            hint:
+              bootstrap.unavailableReason === "blackbox"
+                ? "纯黑盒模式不会向外部目标发注册请求（建号属于对他人系统的写操作，超出探测授权）。请为该身份提供已存在的测试账号口令，或改用白盒模式让引擎在沙箱内自举。"
+                : `省略 identities[].password 意味着「口令由引擎随机生成、走目标自己的注册接口」，因此必须知道那个接口在哪（本轮判定依据：${bootstrap.unavailableReason}${bootstrap.candidates.length ? `，静态候选：${bootstrap.candidates.join("、")}` : ""}）。请在 guardbuild.json 声明 register.path（必要时配 register.bodyTemplate），或改为显式提供已存在的账号口令。${agentHintNote()}`,
+            details: { identity: ident.name, reason: bootstrap.unavailableReason, candidates: bootstrap.candidates },
           }
         );
       }
-    }
-    let entry = await tryLogin(ident);
-    // 声明了口令、目标却不认：很可能是空库沙箱里根本没这个账号。走一次注册再试，
-    // 仍不成才报错——中间不做任何「当成已防护」的推断。
-    if (!entry && !mustRegister && boot.available) {
-      reg = await registerOne(ident, "login-rejected");
-      if (reg.verdict === "created" || reg.verdict === "exists") entry = await tryLogin(ident);
+      const out = await bootstrapIdentity(ident, "no-declared-password");
+      if (out.ok) {
+        reg = out.reg;
+        entry = out.entry;
+        via = out.cand;
+      } else if (out.accepted) {
+        // 注册被目标接受、但所有登录候选都不认：归因留在登录层，不改判成「找不到注册接口」
+        reg = out.reg;
+        via = out.cand;
+      } else if (!out.triedAny) {
+        throw new ProbeError(
+          `身份「${ident.name}」省略了 password，但引擎未能确定注册端点，无法自举该身份`,
+          {
+            code: "identity_bootstrap_unavailable",
+            hint:
+              bootstrap.unavailableReason === "blackbox"
+                ? "纯黑盒模式不会向外部目标发注册请求（建号属于对他人系统的写操作，超出探测授权）。请为该身份提供已存在的测试账号口令，或改用白盒模式让引擎在沙箱内自举。"
+                : `省略 identities[].password 意味着「口令由引擎随机生成、走目标自己的注册接口」，因此必须知道那个接口在哪（本轮判定依据：${bootstrap.unavailableReason}${bootstrap.candidates.length ? `，静态候选：${bootstrap.candidates.join("、")}` : ""}）。请在 guardbuild.json 声明 register.path（必要时配 register.bodyTemplate），或改为显式提供已存在的账号口令。${agentHintNote()}`,
+            details: {
+              identity: ident.name,
+              reason: bootstrap.unavailableReason,
+              candidates: bootstrap.candidates,
+              agent: { fallback: agentState.meta.fallback, menuSize: agentState.meta.menuSize, asked: agentState.meta.asked },
+            },
+          }
+        );
+      } else {
+        const last = out.reg ?? {};
+        throw new ProbeError(
+          `身份「${ident.name}」自举失败：${out.cand?.method ?? "POST"} ${out.cand?.path ?? "—"} → ${last.verdict ?? last.reason ?? "failed"}${last.status ? ` (HTTP ${last.status})` : ""}`,
+          {
+            code: "identity_bootstrap_failed",
+            hint: `口令省略的身份必须先建号才能登录。注册接口没能接受引擎构造的请求体（多为字段名/校验规则不符）：请在 guardbuild.json 声明 register.bodyTemplate（支持 {email}/{username}/{password}/{name}），并确认目标允许公开注册。本轮按「测不了」处理，不会改用匿名探测再报「未发现漏洞」。${agentHintNote()}`,
+            details: {
+              identity: ident.name,
+              endpoint: out.cand?.path ?? null,
+              endpointSource: out.cand?.source ?? null,
+              verdict: last.verdict ?? last.reason ?? null,
+              status: last.status ?? null,
+            },
+          }
+        );
+      }
+    } else {
+      entry = await tryLogin(ident);
+      // 声明了口令、目标却不认：很可能是空库沙箱里根本没这个账号。走一次注册再试，
+      // 仍不成才报错——中间不做任何「当成已防护」的推断。
+      if (!entry && (boot.available || agentState.enabled)) {
+        const out = await bootstrapIdentity(ident, "login-rejected");
+        if (out.ok) {
+          reg = out.reg;
+          entry = out.entry;
+          via = out.cand;
+        } else if (out.reg && (out.reg.verdict === "created" || out.reg.verdict === "exists")) {
+          reg = out.reg;
+          via = out.cand;
+        } else {
+          reg = out.reg ?? reg;
+        }
+      }
     }
     if (!entry) {
       const { code, hint } = classifyLoginFailure(attempts);
@@ -954,7 +1362,7 @@ export async function loginAll(ctx, baseUrl) {
         .map((a) => `${a.path}→HTTP ${a.status}`)
         .join("，");
       throw new ProbeError(
-        `身份「${ident.name}」无法在任何候选登录端点上建立会话（尝试：${tried || "无"}）${bootstrapSuffix(boot, reg)}`,
+        `身份「${ident.name}」无法在任何候选登录端点上建立会话（尝试：${tried || "无"}）${bootstrapSuffix(boot, reg, agentState.meta)}`,
         {
           code: reg ? "identity_bootstrap_failed" : code,
           hint: `${
@@ -965,14 +1373,15 @@ export async function loginAll(ctx, baseUrl) {
             reg?.verdict === "exists"
               ? "　注册接口说该账号已存在、但声明的口令登不进去：多半是目标库里的账号来自上一轮/外部种子且口令不同，请改用真实口令或在 prepare 步骤里重置数据库。"
               : ""
-          }`,
+          }${agentHintNote()}`,
         }
       );
     }
     loggedIn.push(entry.entry);
     endpoints.push(entry.endpoint);
     // 只给「本轮新建的账号」造数据：库里本来就有对象（或上一轮已写过）就不重复写。
-    if (reg?.verdict === "created" && (boot.seed?.length ?? 0) > 0) await seedFor(ident);
+    const seedCand = via ?? (boot.available ? boot : null);
+    if (reg?.verdict === "created" && (seedCand?.seed?.length ?? 0) > 0) await seedFor(ident, seedCand);
   }
 
   const path = endpoints[0];
@@ -982,38 +1391,6 @@ export async function loginAll(ctx, baseUrl) {
   ctx._loginEndpoint = path;
   ctx._loginEndpoints = Object.fromEntries(ctx.identities.map((i, idx) => [i.name, endpoints[idx] ?? null]));
   await assertSessionsAuthenticated(ctx, baseUrl, loggedIn, path);
-  // 报告的「身份基础」一节：谁的会话在哪个端点建立、真实性有没有回读过。
-  // 没有这一节，读者只能从「越权全部被拒」反推身份是不是真的成立。
-  ctx._identityReport = {
-    configured: ctx.identities.map((i) => i.name),
-    loggedIn: loggedIn.map((i) => ({
-      name: i.name,
-      role: i.role ?? null,
-      endpoint: ctx._loginEndpoints?.[i.name] ?? path,
-      credentialKind: ctx.loginConfig?.cookieAuth === true ? "cookie" : "token",
-    })),
-    sessionVerification: ctx._sessionVerify ?? null,
-    // 身份从哪来：声明的账号 / 引擎在本轮沙箱里现注册出来的账号（含造了几条数据）
-    bootstrap: {
-      endpoint: bootstrap.endpoint,
-      endpointSource: bootstrap.endpointSource,
-      unavailableReason: bootstrap.unavailableReason,
-      accounts: bootstrap.accounts.map((a) => ({
-        name: a.name,
-        trigger: a.trigger,
-        verdict: a.verdict ?? a.reason ?? null,
-        status: a.status ?? null,
-        passwordSource: a.generated ? "engine-generated" : "declared",
-      })),
-      seeds: bootstrap.seeds.map((s) => ({
-        identity: s.identity,
-        endpoint: s.path,
-        verdict: s.verdict,
-        status: s.status ?? null,
-      })),
-      secretProtection: bootstrap.secretProtection,
-    },
-  };
   return loggedIn;
 }
 
@@ -1750,10 +2127,21 @@ async function discoverResources(ctx, baseUrl, loggedIn) {
     // 最后一条回退：SSR/HTML 应用没有 JSON 列表接口，对象 ID 只能从登录后的页面链接里抓
     const viaHtml = await discoverViaHtmlPages(ctx, baseUrl, loggedIn);
     if (viaHtml) return viaHtml;
-    throw new ProbeError("静态分析未能定位列表接口，无法发现资源归属", {
-      code: "no_list_endpoint",
-      hint: "当前策略要求目标项目存在按归属过滤的列表接口（如 GET /api/orders），或至少一个无鉴权单体资源接口（如 GET /api/users/:id，用于匿名探测回退）。静态找不到时可在 guardbuild.json 用 listEndpoint 显式声明列表端点（可带分页/过滤查询参数），或在 routes 里补充路由",
-    });
+    // 「找不到列表接口」和「列表找到了但两个身份看到同一批对象」是两件事：
+    // 后者是实测出来的事实，报成前者会把读者引去声明一个照样没用的 listEndpoint。
+    const notScoped = (ctx._resourceContract?.tried ?? []).filter((t) => /^ids_(?:identical|partial)$/.test(String(t.outcome ?? "")));
+    const shared = [...new Set(notScoped.map((t) => t.slot).filter(Boolean))];
+    throw new ProbeError(
+      notScoped.length
+        ? `列表接口未按归属过滤（实测：${shared.join("、")} 在两个身份下返回同一批对象），名下对象无从确定`
+        : "静态分析未能定位列表接口，无法发现资源归属",
+      {
+        code: "no_list_endpoint",
+        hint: notScoped.length
+          ? "跨归属用例的前提是「这条对象在 A 名下、B 看不见」。实测两个身份的同一路径返回同一批条目时这个前提不成立，引擎按「测不了」收场，不会把人人可见的条目当成某人名下对象。若目标本就按租户/角色共享数据，这种共享语义不在本轮检测范围内；若另有真正按归属过滤的列表，请在 guardbuild.json 用 listEndpoint 指过去。"
+          : "当前策略要求目标项目存在按归属过滤的列表接口（如 GET /api/orders），或至少一个无鉴权单体资源接口（如 GET /api/users/:id，用于匿名探测回退）。静态找不到时可在 guardbuild.json 用 listEndpoint 显式声明列表端点（可带分页/过滤查询参数），或在 routes 里补充路由",
+      }
+    );
   }
   const byUser = {};
   const listReq = slotRequest(ctx.plan.listEndpoint);
@@ -1783,6 +2171,195 @@ async function discoverResources(ctx, baseUrl, loggedIn) {
     if (viaHtml) return viaHtml;
   }
   return { byUser, anonymousItems: [], anonTargets: [] };
+}
+
+/** 通道未定时最多试几条集合端点做复读（每条都要两身份对拉，成本要封住） */
+const MAX_SEED_CHANNELS = 3;
+
+/**
+ * #183 种子数据写入端点的观测兜底：契约没写 `register.seed` 时，引擎自己找一个
+ * 「会把对象落在当前会话名下」的写接口，让越权用例有真实的受害对象。
+ *
+ * 为什么这一层不交给模型：「哪个写接口会把对象归属到该身份」是**运行期事实**，
+ * 源码里读不出来（中间件注入租户、模型默认 owner、 ORM 作用域都能改变归属）。
+ * 采纳的唯一依据是复读：写入方本人的按归属列表里要能看见本次 canary，且其他身份看不见。
+ * 所有人都看得见＝列表没按归属过滤，判为 unattributed 并丢弃——宁可有缺口，
+ * 也不造出「对象有归属」这个假前提（那会让越权用例的意义整个塌掉）。
+ *
+ * 这一层跑在资源发现之前：列表契约的实测判定本身要求「两个身份各自名下有对象」，
+ * 而对象正是这一层造出来的；先造数据，列表端点/主键再交给双身份对拉实测去定。
+ *
+ * 边界：只给本轮引擎注册、且名下确实没有对象的账号发写入；纯黑盒目标一律不参与
+ * （对他人系统发写请求超出探测授权）；候选来自确定性规则，字段名取自该端点处理函数源码。
+ * 失败不抛错：归属对象造不出来时，相关用例会因资源不足记进 `_unverifiedSlots`，
+ * 本轮照旧是「测不了」（exit 2），不会被说成「没问题」。
+ */
+export async function observeSeedWrites(ctx, { baseUrl, byUser, loggedIn }) {
+  const out = { byUser, attributed: 0, blocked: null };
+  const boot = ctx._identityBootstrap?.byPhase?.[ctx._probePhase ?? "pre"];
+  if (!boot || ctx.blackboxUrl) return out;
+  const createdNames = new Set((boot.accounts ?? []).filter((a) => a.verdict === "created").map((a) => a.name));
+  const seededNames = new Set((boot.seeds ?? []).filter((s) => s.verdict === "written").map((s) => s.identity));
+  const nonAdmin = (loggedIn ?? []).filter((i) => i.role !== "admin");
+  const need = nonAdmin.filter(
+    (i) => createdNames.has(i.name) && !seededNames.has(i.name) && (byUser[i.name] ?? []).length === 0
+  );
+  if (need.length === 0) return out;
+  if (nonAdmin.length < 2) {
+    // 只有一个普通身份时，「别人看不见」这条判据无从验证，复读归因不成立：
+    // 不发无人能对证的写请求，也不把这条对象当成越权用例的受害对象。
+    out.blocked = "single_identity";
+    boot.seedObservation = { attempted: false, blocked: out.blocked, identities: need.map((i) => i.name) };
+    ctx.emit({
+      kind: "identity",
+      severity: SEVERITY.WARN,
+      message: `种子数据观测兜底未参与：只有 1 个普通身份，无法证明列表按归属过滤（需要两个身份对拉）。跨归属用例本来也 requires 两个不同用户；请声明 register.seed 或补充第二个身份`,
+      data: { blocked: out.blocked, identities: need.map((i) => i.name) },
+    });
+    return out;
+  }
+
+  const record = (patch) => {
+    boot.seeds.push({ identity: patch.identity, method: patch.method, path: patch.path, ...patch });
+  };
+  // 复读归因要先有一条「本人看得见、别人看不见」的读取通道。通道还没被定下来时
+  // （契约没写 listEndpoint、静态也没定出列表端点）不把这条路直接关掉：用静态枚举出的
+  // 集合形态 GET 端点当候选通道，靠本次 canary 是否只出现在调用方列表里选定它——
+  // 通道同样由实测证据选定，不是猜出来的。选定并写入后，列表/主键仍交给
+  // ensureResourceContract 用双身份对拉实测决定。
+  const channels = (ctx.plan?.listEndpoint
+    ? [{ method: ctx.plan.listEndpoint.method ?? "GET", path: ctx.plan.listEndpoint.path, query: ctx.plan.listEndpoint.query ?? null }]
+    : listSlotsForDiscovery(ctx)
+        .slice(0, MAX_SEED_CHANNELS)
+        .map((s) => ({ method: s.method ?? "GET", path: s.path, query: s.extraQuery ?? null }))
+  ).filter((c) => c.path);
+  if (channels.length === 0) {
+    // 一条读取通道都没有，复读归因无从做起：这条路诚实关闭，不去发无人能对证的写请求
+    out.blocked = "no_list_endpoint";
+    boot.seedObservation = { attempted: false, blocked: out.blocked, identities: need.map((i) => i.name) };
+    ctx.emit({
+      kind: "identity",
+      severity: SEVERITY.WARN,
+      message: `种子数据观测兜底未参与：本轮没有可用的列表接口（\`${need.length}\` 个新建账号名下没有对象）。越权用例缺少受害对象时会按「测不了」收场，请在 guardbuild.json 声明 listEndpoint 或 register.seed`,
+      data: { blocked: out.blocked, identities: need.map((i) => i.name) },
+    });
+    return out;
+  }
+  const cands = seedWriteCandidates(ctx.analysis, { listPath: channels[0].path, registerPath: boot.endpoint }).filter(
+    (c) => !c.graphql && !c.trpc
+  );
+  if (cands.length === 0) {
+    out.blocked = "no_write_candidates";
+    boot.seedObservation = { attempted: false, blocked: out.blocked, listEndpoint: channels[0].path, identities: need.map((i) => i.name) };
+    ctx.emit({
+      kind: "identity",
+      severity: SEVERITY.WARN,
+      message: `种子数据观测兜底未参与：静态没有「要求会话、集合形态」的写接口可试（列表 \`${channels[0].path}\`）。新建账号名下没有对象，越权用例将按「测不了」收场；请在 guardbuild.json 的 register.seed 声明写入端点与字段`,
+      data: { blocked: out.blocked, listEndpoint: channels[0].path, identities: need.map((i) => i.name) },
+    });
+    return out;
+  }
+
+  const readList = async (name, ch) => {
+    const req = slotRequest(ch);
+    const r = await httpJson(ctx, {
+      baseUrl,
+      method: req?.method ?? "GET",
+      path: req?.path ?? ch.path,
+      identity: name,
+      body: req?.body ?? null,
+      graphql: req?.graphql ?? false,
+    });
+    return extractListItems(r.json, listPathFor(ctx, req?.graphql ?? false)) ?? [];
+  };
+
+  boot.seedObservation = {
+    attempted: true,
+    // 单通道时就是它；多通道时等实际读到 canary 的那条被记下来（选定权在复读，不在路径长相）
+    listEndpoint: channels.length === 1 ? channels[0].path : null,
+    channels: channels.map((c) => c.path),
+    candidates: cands.map((c) => c.path),
+    identities: need.map((i) => i.name),
+  };
+  for (const ident of need) {
+    for (const cand of cands) {
+      const fields = extractBodyFields(await readHandlerSource(ctx, cand));
+      if (fields.length === 0) {
+        record({ identity: ident.name, method: cand.method, path: cand.path, verdict: "no_body_fields", source: "observed" });
+        continue;
+      }
+      const canary = generateCanary();
+      const body = canaryBody(fields, canary);
+      const w = await httpJson(ctx, {
+        baseUrl,
+        method: cand.method,
+        path: cand.path,
+        identity: ident.name,
+        body: JSON.stringify(body),
+        contentType: "application/json",
+      });
+      const cls = classifySeedResponse(w);
+      const status = cls.status;
+      if (cls.verdict !== "written") {
+        record({ identity: ident.name, method: cand.method, path: cand.path, status: cls.status, verdict: cls.verdict, fields, source: "observed" });
+        continue;
+      }
+      // 逐条候选通道复读：只有本次 canary 真实出现在该身份列表里，这条通道才作数
+      let att = { verdict: "absent", ownerSeen: false, othersSeen: [] };
+      let ownerItems = [];
+      let channelUsed = null;
+      for (const ch of channels) {
+        ownerItems = await readList(ident.name, ch);
+        if (!showsCanary(ownerItems, canary)) continue;
+        const others = {};
+        for (const other of nonAdmin) {
+          if (other.name === ident.name) continue;
+          others[other.name] = await readList(other.name, ch);
+        }
+        att = attributeCanary({ ownerItems, otherItemsByOwner: others, canary });
+        channelUsed = ch.path;
+        break;
+      }
+      // attributed 才记成 written：报告的「写入 N 条」只数有复读证据的
+      record({
+        identity: ident.name,
+        method: cand.method,
+        path: cand.path,
+        status,
+        verdict: att.verdict === "attributed" ? "written" : att.verdict,
+        fields,
+        ownerSeen: att.ownerSeen,
+        othersSeen: att.othersSeen,
+        readBackVia: channelUsed,
+        source: "observed",
+      });
+      if (att.verdict === "attributed") {
+        if (boot.seedObservation.listEndpoint !== channelUsed) boot.seedObservation.listEndpoint = channelUsed;
+        byUser[ident.name] = ownerItems;
+        out.attributed += 1;
+        ctx.emit({
+          kind: "identity",
+          severity: SEVERITY.INFO,
+          message: `已为身份「${ident.name}」写入种子数据（${cand.method} ${cand.path} → HTTP ${status}；端点由本轮实跑选定，字段取自该端点处理函数）：本人经 ${channelUsed} 回读到标记 ${canary}，其余 ${nonAdmin.length - 1} 个身份均未见`,
+          data: { identity: ident.name, endpoint: cand.path, status, fields, attribution: att.verdict, readBackVia: channelUsed, source: "observed" },
+        });
+        break;
+      }
+      ctx.emit({
+        kind: "identity",
+        severity: SEVERITY.WARN,
+        message:
+          att.verdict === "unattributed"
+            ? `写入成功但无法归属：标记 ${canary} 同时出现在 ${(att.othersSeen.map((n) => `「${n}」`).join("、"))} 的列表里，说明该列表未按归属过滤，本轮不把它当「名下对象」用（${cand.method} ${cand.path}）`
+            : `写入返回 HTTP ${status}，但「${ident.name}」本人的列表回读不到标记 ${canary}（${cand.method} ${cand.path}）：该接口没有把对象落在该身份名下`,
+        data: { identity: ident.name, endpoint: cand.path, status, fields, attribution: att.verdict, source: "observed" },
+      });
+    }
+  }
+  if (out.attributed > 0) {
+    out.byUser = { ...byUser };
+  }
+  return out;
 }
 
 /**
@@ -4224,6 +4801,10 @@ export async function runPhase(ctx, { phase, baseUrl }) {
   await negotiateTrpcInput(ctx, baseUrl, loggedIn);
   await confirmGraphqlEndpoint(ctx, baseUrl, loggedIn);
   await negotiateGraphqlCast(ctx, baseUrl, loggedIn);
+  // #183 契约没写 register.seed 时，观测式兜底先给新建账号造出名下对象：
+  // 列表契约的双身份实测要求「各自名下有对象」，这一层补的就是那个前提，
+  // 所以它必须跑在资源发现之前，造完再由发现层实测决定列表端点与主键。
+  await observeSeedWrites(ctx, { baseUrl, byUser: {}, loggedIn });
   let { byUser, anonymousItems, anonTargets } = await discoverResources(ctx, baseUrl, loggedIn);
   ctx._resourceById = indexResources(ctx, byUser, anonymousItems);
   // LLM 侦察线索只有在真实实例上打通过才算攻击面；丢弃的路由会让计划重建，

@@ -890,17 +890,56 @@ function renderMarkdown(r) {
         .map((a) => `${esc(a.name)}：${esc(a.verdict ?? "—")}${a.status ? ` (HTTP ${a.status})` : ""}`)
         .join("、");
       const generated = (firstPhase?.accounts ?? []).filter((a) => a.passwordSource === "engine-generated").length;
+      // #183：数据是契约声明写的，还是本轮引擎实跑复读选定的写接口造的——读者要能分清
+      const obsSeeds = (firstPhase?.seeds ?? []).filter((s) => s.source === "observed");
+      const obsWritten = obsSeeds.filter((s) => s.verdict === "written").length;
+      const obsEndpoint = [...new Set(obsSeeds.filter((s) => s.verdict === "written").map((s) => s.endpoint))].join("、");
+      const obsVia = [...new Set(obsSeeds.filter((s) => s.verdict === "written").map((s) => s.readBackVia).filter(Boolean))].join("、");
       summaryLines.push(
         `- 身份自举：本轮由目标注册接口 \`${esc(firstPhase?.endpoint ?? "?")}\`（${esc(firstPhase?.endpointSource ?? "—")}）建号 ${ib.registered} 个${
           generated ? `，其中 ${generated} 个口令由引擎随机生成、只进 Host 保险库（不落配置/报告/证据库）` : ""
-        }；写入测试数据 ${ib.seeded} 条。判定明细：${detail}`
+        }；写入测试数据 ${ib.seeded} 条${
+          obsWritten > 0
+            ? `，其中 ${obsWritten} 条经观测选定（\`${esc(obsEndpoint)}\`${obsVia ? ` → 复读 \`${esc(obsVia)}\`` : ""}：写入后本人列表回读到标记、其他身份未见）`
+            : ""
+        }。判定明细：${detail}`
       );
+      const so = firstPhase?.seedObservation;
+      if (so && (so.attempted === false || obsSeeds.length > 0)) {
+        const bits =
+          so.attempted === false
+            ? [`未参与（${esc(so.blocked ?? "—")}）`]
+            : obsSeeds
+                .filter((s) => s.verdict !== "written")
+                .map((s) => `${esc(s.identity)}→\`${esc(s.endpoint)}\`：${esc(s.verdict ?? "—")}`);
+        summaryLines.push(
+          `- 种子数据观测兜底：${bits.join("；")}${
+            so.attempted === false
+              ? ""
+              : "；未通过复读归因的写入不会被当成「名下对象」用，相关越权用例将按「测不了」收场"
+          }`
+        );
+      }
     } else if (firstPhase?.unavailableReason === "static-ambiguous") {
       // 登录本轮靠声明口令成功了，但静态看到了多个建号候选：读者需要知道引擎没有猜、
       // 因此「换空库重跑」时这条路并不会自动生效。
       summaryLines.push(
         `- 身份自举：未参与（静态识别到 ${(firstPhase.candidates ?? []).length} 个建号候选，引擎不猜：${esc((firstPhase.candidates ?? []).join("、"))}）；需要自举时请在 guardbuild.json 声明 register.path`
       );
+    }
+    // #182 注册兜底代理：问过模型没有、采纳了哪个端点、没采纳的原因——都只写引擎侧事实
+    const ra = firstPhase?.registerAgent;
+    if (ra?.used) {
+      const bits = [
+        ra.source === "cache" ? "复用已实测验证的缓存提案" : `问过模型 ${ra.rounds ?? 0} 轮`,
+        `候选菜单 ${ra.menuSize ?? 0} 个 POST 路由`,
+        ra.adoptedEndpoint ? `采纳 \`${esc(ra.adoptedEndpoint)}\`` : "未采纳任何端点",
+        ra.fallback ? `原因 ${esc(ra.fallback)}` : null,
+        (ra.tried ?? []).length ? `实跑判定 ${ra.tried.map((t) => `${esc(t.endpoint)}→${esc(t.verdict ?? "—")}`).join("、")}` : null,
+        (ra.ignoredKeys ?? []).length ? `丢弃越界键 ${esc(ra.ignoredKeys.join("、"))}` : null,
+        (ra.droppedFields ?? []).length ? `丢弃非法字段映射 ${ra.droppedFields.length} 处` : null,
+      ].filter(Boolean);
+      summaryLines.push(`- 注册兜底代理：${bits.join("；")}（模型只选端点与字段名，采纳由引擎实跑注册+登录决定）`);
     }
   }
   if (!bb && r.llm?.used) {
@@ -1251,6 +1290,8 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
                   trigger: a.trigger ?? null,
                   verdict: a.verdict ?? a.reason ?? null,
                   status: a.status ?? null,
+                  endpoint: a.endpoint ?? p.endpoint ?? null,
+                  endpointSource: a.endpointSource ?? p.endpointSource ?? null,
                   passwordSource: a.generated ? "engine-generated" : "declared",
                   unresolvedFields: a.fields ?? null,
                 })),
@@ -1259,8 +1300,45 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
                   endpoint: s.path,
                   verdict: s.verdict,
                   status: s.status ?? null,
+                  // contract＝契约 register.seed 声明的；observed＝#183 本轮实跑复读选定的
+                  source: s.source ?? "contract",
+                  // 观测兜底经哪条读取通道复读选定（通道本身也是实测选出来的，不是写死的）
+                  readBackVia: s.readBackVia ?? null,
+                  fields: (s.fields ?? []).slice(0, 6),
+                  ownerSeen: s.ownerSeen ?? null,
+                  othersSeen: (s.othersSeen ?? []).slice(0, 6),
                 })),
+                // #183 观测兜底这一层自身的经过：有没有参与、被什么挡住、试了哪些写接口
+                seedObservation: p.seedObservation
+                  ? {
+                      attempted: p.seedObservation.attempted === true,
+                      blocked: p.seedObservation.blocked ?? null,
+                      listEndpoint: p.seedObservation.listEndpoint ?? null,
+                      channels: (p.seedObservation.channels ?? []).slice(0, 4),
+                      candidates: (p.seedObservation.candidates ?? []).slice(0, 6),
+                      identities: (p.seedObservation.identities ?? []).slice(0, 8),
+                    }
+                  : null,
                 secretProtection: p.secretProtection ?? {},
+                // #182 注册兜底代理：只留引擎侧事实（端点、实跑判定、被丢掉的键名）。
+                // 模型原文（note）与目标报错文本一律不进报告；口令从来不在这些字段里。
+                registerAgent: p.agent
+                  ? {
+                      enabled: p.agent.enabled === true,
+                      used: p.agent.asked === true || p.agent.cacheHit === true,
+                      source: p.agent.source ?? null,
+                      rounds: p.agent.rounds ?? 0,
+                      fallback: p.agent.fallback ?? null,
+                      menuSize: p.agent.menuSize ?? 0,
+                      tried: (p.agent.tried ?? []).slice(0, 8),
+                      adoptedEndpoint: p.agent.adoptedEndpoint ?? null,
+                      ignoredKeys: (p.agent.ignored ?? []).slice(0, 12),
+                      droppedFields: (p.agent.droppedFields ?? []).slice(0, 12),
+                      cacheHit: p.agent.cacheHit === true,
+                      cacheVerified: p.agent.cacheVerified === true,
+                      model: p.agent.model ?? null,
+                    }
+                  : null,
               });
               const phases = Object.values(byPhase).map(clean);
               return {

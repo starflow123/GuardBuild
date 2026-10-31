@@ -1,0 +1,10 @@
+{
+  "name": "selfboot-odd-shop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "OddSelfBootShop - 换场景靶场：注册端点/字段名与写数据端点都不走 REST 惯例，验证自举的 agent 兜底（#182）与观测兜底（#183）",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

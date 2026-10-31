@@ -33,6 +33,7 @@ guardbuild-data/
 .demo-shape/
 .demo-ssr/
 .demo-selfboot/
+.demo-selfboot-odd/
 .demo-attackplan/
 .demo-package/
 .demo-install/

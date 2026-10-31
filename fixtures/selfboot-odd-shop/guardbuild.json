@@ -1,0 +1,24 @@
+{
+  "_note": "换场景自举靶场（#182/#183）：注册端点 POST /api/huiyuan/add（字段 mail/pwd/nick）与写数据端点 POST /api/xiadan（字段 mingcheng）都不走 REST 惯例，契约里故意不写 register.path 也不写 register.seed。identities 省略口令 → 引擎只能靠 agent 兜底找到建号接口、靠观测兜底造出名下对象。register.agent:true 表示允许问模型，但采纳权在引擎实跑（注册→登录→会话回读）。GB_ODD_BOOT=0 关注册（exit 2）；GB_ODD_HARDENED=1 加归属校验（exit 0）；GB_ODD_LEAKY_LIST=1 列表不分归属（写入成功也归不了属 → exit 2）。",
+  "start": {
+    "cmd": "node",
+    "args": ["server.js"],
+    "env": { "PORT": "0" },
+    "readyPattern": "已就绪",
+    "readyTimeoutMs": 20000
+  },
+  "login": {
+    "path": "/api/huiyuan/login",
+    "bodyTemplate": { "mail": "{email}", "pwd": "{password}" },
+    "credentialPath": "token"
+  },
+  "register": {
+    "agent": true
+  },
+  "identities": [
+    { "name": "alice", "username": "alice", "role": "user" },
+    { "name": "bob", "username": "bob", "role": "user" }
+  ],
+  "llm": { "enabled": false },
+  "scopes": ["project.read", "worktree.write", "proc.spawn", "net.probe"]
+}

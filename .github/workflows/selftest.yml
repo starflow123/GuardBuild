@@ -98,6 +98,9 @@ jobs:
       - name: 身份与数据自举 E2E（空库靶场：引擎注册建号 + seed 造数据 + 口令不落产物 + 四类测不了终态）
         run: node scripts/e2e-selfboot.mjs
 
+      - name: 自举换场景 E2E（非标准注册形态：兜底代理提议 + 引擎实跑采纳 + 观测种子 + 已验证缓存复用）
+        run: node scripts/e2e-selfboot-odd.mjs
+
       - name: 黑盒外部模式 E2E（真实 HTTP 目标 + Cookie 会话鉴权，本机回环）
         run: node scripts/e2e-blackbox.mjs
 

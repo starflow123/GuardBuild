@@ -31,6 +31,10 @@
  *   请求头凭证、不进 credential.list、不落配置/报告/证据库）。准备不成立就显式 inconclusive，
  *   绝不静默退回匿名探测再报「未发现漏洞」；未声明 register.path 时只从静态识别的 POST 路由里
  *   按形状挑，挑不出来就如实报「未能确定注册端点」。黑盒模式不做自举（对第三方站点写库越界）。
+ * register.agent（默认关）＝自举的 agent 兜底：静态词表打不中/多候选/字段名对不上时，模型只在
+ *   引擎给出的编号菜单（本轮全部 POST 路由 + 源码片段）里选端点，并只报「字段名 → {email}/{password}」
+ *   映射；采纳由引擎实跑裁决（注册 2xx/409 → 登录建立会话 → 会话回读）。gate 不调模型，只复用
+ *   交互轮已实测验证过的缓存提案。也可用环境变量 GUARDBUILD_LLM_SELFBOOT=1 开启。
  * prepare 步骤在目标进程启动前按序执行（依赖安装、构建等），在 worktree 中同样复跑。
  * bootstrap 是「有界启动代理」（S3-full）：目标起不来时按引擎生成的动作菜单逐步处理（装依赖/构建/换启动候选）。
  *   默认关闭、gate 模式结构性禁用；命令行始终由引擎拼装，模型只报编号；预算耗尽即回退确定性契约，不伪造成功。
@@ -185,6 +189,21 @@ export function normalizeRegister(raw) {
         })
         .filter(Boolean)
     : [];
+  const agentOf = (v) => {
+    if (v === true || v === false) return v;
+    if (v && typeof v === "object" && !Array.isArray(v)) {
+      const num = (x) => (Number.isFinite(x) ? Math.floor(x) : undefined);
+      const out = { enabled: v.enabled !== false };
+      const maxPicks = num(v.maxPicks);
+      const maxMenu = num(v.maxMenu);
+      const rounds = num(v.rounds);
+      if (maxPicks !== undefined) out.maxPicks = maxPicks;
+      if (maxMenu !== undefined) out.maxMenu = maxMenu;
+      if (rounds !== undefined) out.rounds = rounds;
+      return out;
+    }
+    return null;
+  };
   return {
     enabled: raw.enabled !== false,
     path: trimPath(raw.path),
@@ -199,6 +218,8 @@ export function normalizeRegister(raw) {
         : "json",
     headers: templateOf(raw.headers) ?? {},
     seed,
+    // agent 兜底开关（#182）：缺省不写＝跟随 llm.enabled / GUARDBUILD_LLM_SELFBOOT；显式 false 才永久关闭
+    agent: agentOf(raw.agent),
   };
 }
 

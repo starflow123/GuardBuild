@@ -117,7 +117,8 @@ npm run test:rust      # Rust Host
   "register": {
     "path": "/api/register",
     "bodyTemplate": { "email": "{email}", "username": "{username}", "password": "{password}" },
-    "seed": [{ "method": "POST", "path": "/api/orders", "bodyTemplate": { "title": "{canary}" } }]
+    "seed": [{ "method": "POST", "path": "/api/orders", "bodyTemplate": { "title": "{canary}" } }],
+    "agent": true
   },
   "responses": {
     "list": "data.items",
@@ -155,7 +156,8 @@ npm run test:rust      # Rust Host
 - `prepare`：目标启动前按序执行的前置命令（安装依赖 / 构建），`cwd` 相对项目根；在「原始工作区」与「隔离 worktree」各执行一次——修复阶段的验收不依赖原工作区的构建产物
 - `login`：登录契约——`path` 指定登录端点（优先级高于静态分析候选），`loginPaths` 给出多角色/多端点应用的候选序列；`bodyTemplate` 适配非 `username` 的请求体形状，值支持 `{name}` / `{username}` / `{email}` / `{password}` 占位符；`credentialPath` 支持点路径（如 `authentication.token`），`credentialHeader` / `credentialPrefix` 缺省为 `Authorization` / `Bearer `；`encoding: "form"` 以 `application/x-www-form-urlencoded` 提交；`cookieAuth: true` 表示会话鉴权——登录响应可返回 3xx，`Set-Cookie` 由 Host 收进保险库并在后续请求以 `Cookie` 头注入（`credentialPath` 不填），Cookie 明文不会回到 Sidecar/报告
 - **登录真实性判定（会话/表单登录）**：HTTP 状态码不作为成功的充分条件。两类「假成功」会被识破并终止本轮，而不是降级成匿名继续打：① 响应仍是登录表单（含密码输入框）且请求或重定向链落回登录路径 → `login_form_rerendered`；② 状态码可接受且拿到凭据，但用一个静态分析已知的「无参数、只读、需登录」接口做鉴权回读，匿名与带会话的响应同形且同码被拒 → `login_session_unverified`。找不到可回读的探针接口时不做判定，但会在事件流与报告里写明「会话真实性回读未执行」，不谎称已验证。报告摘要固定给出「身份会话：N/M 建立（身份→登录端点）；会话真实性：…」一行（结构化数据在 `summary.identities`），越权全部被拒时读者据此即可判断身份到底有没有成立。纯黑盒模式若契约里配了身份却登录不成，终态是 `blackbox_login_failed`（无法证明，exit 2），不会输出「未发现漏洞」
-- **身份与测试数据自举（`register`）**：`identities[].password` 省略（或为 `null`）表示「这个账号本机不存在，请引擎现注册」。端点来源只有两条：契约 `register.path`，或静态分析里**唯一**命中的建号接口（`/register`、`/signup`、`POST /users/create` 这类形态）——候选多于一个直接判 `static-ambiguous` 不猜，纯黑盒目标一律不发注册请求（给别人的系统建号属于写操作，不在探测授权内）。`bodyTemplate` 支持 `{name}` / `{username}` / `{email}` / `{password}`，编码与请求头沿用 `login` 的 `encoding` / `headers`；模板里出现引擎不认识的占位符（如 `{csrf}`）就整条拒发并判「测不了」，绝不把字面量发出去。口令由引擎随机生成（18 位，满足常见复杂度、剔除易混字符），**只进 Host 的脱敏保险库**：不写回 `guardbuild.json`、不进凭据注入清单、不出现在事件流 / `report.json` / `report.md` / 证据库任何一处。注册只回邮箱时，同一个邮箱会记回该身份用于随后的登录（否则「号建了却登不进去」）；登录仍要过上面两道真实性判定，自举不豁免。建好号后按 `register.seed`（最多 8 步）给每个账号写入名下对象，`{canary}` 是本轮随机生成的种子标识——它会出现在越权取证正文里，所以「账号是现注册的、数据是现造的」在报告里可核对。任一环节不成立都是显式「测不了」（`identity_bootstrap_unavailable` / `identity_bootstrap_failed` / `identity_seed_failed`，终态 `inconclusive`、exit 2），不会退回匿名探测再报「未发现漏洞」；`register.enabled: false` 可关掉自举。报告正文一行「身份自举：…」，结构化数据在 `summary.identities.bootstrap`（含端点与来源、每个账号的判定与状态码、每条 seed 写入的结果、口令保护回执）
+- **身份自举（`register`）**：`identities[].password` 省略（或为 `null`）表示「这个账号本机不存在，请引擎现注册」。注册端点三层来源，前一成立就不用后一层：① 契约 `register.path`；② 静态分析里**唯一**命中的建号接口（`/register`、`/signup`、`POST /users/create` 这类形态；候选多于一个判 `static-ambiguous`，引擎不猜）；③ **注册兜底代理**（`register.agent`）——两层都打不中（词表不认识的命名如 `/api/huiyuan/add`、字段名对不上、多候选）时，引擎把本轮识别到的**全部 POST 路由**编成号菜单（附处理函数源码片段：字段名的唯一可靠来源）交给模型，模型只能回「选第几号 + 字段名 → `{email}`/`{password}` 映射」，端点/方法/请求体/判定想改也改不动（越界键丢弃并记进 `ignoredKeys`）；**采纳由引擎实跑裁决**：注册 2xx/409 → 用新凭据真登上 → 会话回读（#175）三重都过才算，两轮不中即 `identity_bootstrap_failed`。策略线在引擎侧：找回密码/重置一类端点根本不进菜单，模型看不到也就选不到；纯黑盒目标一律不自举（对第三方站点写库越界）。开关：缺省跟随 `llm.enabled`，也可 `register.agent: true` 单开或 `GUARDBUILD_LLM_SELFBOOT=1`，`register.agent: false` 永久关闭；提案按「项目指纹 + 方法路径行号 + 版本 + 模型」落磁盘缓存，**CI gate 模式结构上禁止调用模型**（0 次出站），只复用标注为已实测验证的缓存，复用前再实跑复核一次，复核不过照样按「测不了」收场。`bodyTemplate` 支持 `{name}` / `{username}` / `{email}` / `{password}`，编码与请求头沿用 `login` 的 `encoding` / `headers`；模板里出现引擎不认识的占位符（如 `{csrf}`）就整条拒发并判「测不了」，绝不把字面量发出去。口令由引擎随机生成（18 位，满足常见复杂度、剔除易混字符），**只进 Host 的脱敏保险库**：不写回 `guardbuild.json`、不进凭据注入清单、不出现在事件流 / `report.json` / `report.md` / 证据库 / 磁盘缓存任何一处。注册只回邮箱时，同一个邮箱会记回该身份用于随后的登录（否则「号建了却登不进去」）；`register.enabled: false` 可关掉自举。
+- **名下测试数据从哪来（`register.seed` 与观测发现）**：越权用例的前提是「这条对象在 A 名下、B 看不见」，所以建完号还得有数据。两条来源：① 契约 `register.seed`（最多 8 步，`{canary}` 是本轮随机生成的种子标识）；② 契约没写时，引擎从静态分析里挑「集合形状的 POST」当候选写接口，真写一条带 canary 的记录，再用回读通道复述一遍——**通道也是实测选的**：候选是静态识别到的无参数 GET 集合端点（最多 3 条），只有「本人回读到 canary、其余每个非管理身份都回读不到」才判定归因成功，`unattributed` / `absent` 的写入直接丢弃，绝不当成「某人名下对象」用（回 201 但什么都没落下的端点就是这样被识破的）。观测层跑在资源契约发现**之前**：先用真实数据把列表喂给双身份对拉，主键/归属字段才测得出来，而不是先猜端点再找数据。归因至少需要 2 个非管理身份，单身份环境记 `single_identity` 不参与。任一环节不成立都是显式「测不了」（`identity_bootstrap_unavailable` / `identity_bootstrap_failed` / `identity_seed_failed` / `no_list_endpoint`，终态 `inconclusive`、exit 2），不会退回匿名探测再报「未发现漏洞」；`no_list_endpoint` 会区分两种实测事实：「静态与契约都没定位到列表接口」与「列表接口存在但两个身份返回同一批对象（未按归属过滤）」，hint 给的是后者就不是前者的修法。报告正文一行「身份自举：…（端点来源 / 观测选定条数 → 复读通道）」，结构化数据在 `summary.identities.bootstrap`（端点与来源 `contract` / `static` / `agent` / `cache`、每个账号的判定与状态码、每条 seed 的 `source` / `fields` / `readBackVia` / `ownerSeen` / `othersSeen`、`seedObservation` 的通道与候选清单、`registerAgent` 的轮次/菜单大小/轨迹/丢弃键/缓存命中与复核、口令保护回执）
 - `responses`：声明列表 / 单体资源在响应 JSON 中的位置（点路径，如 `data.items`），以及资源主键与归属字段（`id` / `owner`，同样支持点路径）；不声明时先自适应推断，再由**资源契约自动发现**兜底——引擎用两个测试身份的真实请求对拉（逐个候选集合端点 × 常见分页参数），只有「同一字段在两个身份的列表里互斥」才认定主键、「同身份内恒定、两身份之间不同」才认定归属，单体响应的实体包装（`{ meta, record }` 之类）也用真实回读实测；结论写入报告 `summary.resourceContract` 并缓存（按提交指纹，复用时仍先真实复核）。仍发现不了才回落「无法证明」终态
 - `listEndpoint`：显式声明「按归属过滤的资源列表接口」（`method` / `path` / `query` / `resource`），优先于自动发现。用于自动发现试不出（自造分页键名等）、或想跳过发现请求直接固定接口的项目；`query` 的值会随发现请求一起发送
 - `routes`：补充静态分析看不到的接口（手写分发表、动态注册）；对象级路由可声明 `idField` / `ownerField`（按路由覆盖 `responses`），多段路径（`/orgs/:orgId/orders/:orderId`）用 `params` 给每个参数声明取值来源：字段名简写（取资源对象同名字段）、`{ "from": "item", "field": "org_id" }` 或 `{ "from": "const", "value": "v2" }`。未声明 `params` 时引擎会先实测兜底——用本人列表里的真实对象逐参数找同名字段并真实回读验证（命中即视为可寻址）；实测不出的候选才判「取值来源未通过实测」，报告按「无法证明」exit 2（`param_binding_unverified`）处理，而不是静默跳过或猜着打
@@ -169,7 +171,7 @@ npm run test:rust      # Rust Host
 - 多数 Node / Python 项目可零启动契约接入（自动探测 `npm run start` / `dev` / `uvicorn` 等）；启动来源与依据见事件流与报告 `start` / `startSource` 字段，接不上时优先看诊断事件里的 `hint`
 - 服务依赖构建产物（`tsc` / 打包）→ 把构建命令放进 `prepare`，gate 与桌面模式都会在启动前执行，无需手工预生成
 - 登录不是 `/api/login`、不是 `{username, password}`、token 不在顶层 → 用 `login` 契约显式声明；引擎先后尝试「契约声明 → 静态分析候选 → `/api/login`」，成功后固化优先级
-- 沙箱每次从空库启动、库里根本没有测试账号 → 用 `register` 让引擎走目标自己的注册接口建号（`identities` 里省略 `password`），再用 `register.seed` 给每个新账号写一条名下对象；写不进（接口按角色开放）就在报告里看到 `identity_seed_failed`，而不是「越权全部被拒 → 判定未复现」的假绿灯
+- 沙箱每次从空库启动、库里根本没有测试账号 → 用 `register` 让引擎走目标自己的注册接口建号（`identities` 里省略 `password`）；接口不叫 `/register`、字段不叫 `password` 时开 `register.agent`，由模型在编号菜单里提议、引擎实跑采纳。数据同样两层：写 `register.seed` 就按契约写，没写则引擎观测选定（真写一条带 canary 的记录再用回读通道复述，本人可见、其他身份不可见才算名下对象）。造不出账号或归不出名下对象时，报告给的是 `identity_bootstrap_*` / `identity_seed_failed` / `no_list_endpoint` 的「测不了」（exit 2），而不是「越权全部被拒 → 判定未复现」的假绿灯
 - 列表 / 单体不在响应顶层（如 `{ "code": 0, "data": { "items": [] } }`）→ 多数情况**无需声明**：资源契约自动发现会用两个身份的真实请求实测出列表数组、主键、归属与实体包装（报告 `summary.resourceContract` 可查）；形状歧义（多个对象数组、自造分页键名）导致发现失败时再用 `responses` / `listEndpoint` 显式声明
 - 资源主键 / 归属字段不叫 `id` / `ownerId`（如 `order_id` / `created_by_uid`）→ `responses.id` / `responses.owner`，或按路由用 `routes[].idField` / `ownerField` 覆盖；声明后归属比对与越权取证都按这些字段读
 - 列表接口需要分页 / 过滤参数才返回数据（缺参数直接 400）→ 常见分页键名（`page` / `size` / `pageSize` / `limit` / `offset` / `per_page` 等）自动发现会逐个试；自造键名再用 `listEndpoint` 显式声明并把 `query` 参数一并给出；显式声明优先级最高
@@ -206,7 +208,7 @@ npm run e2e:llm                # 本机 mock DeepSeek 演练，无需真实密�
 - 可观测：事件流与视图 `llm` 字段记录 model / 证据文件 / 路由数 / 应用与验证结果 / token 用量 / **逐候选启动记录**（命令、结果、诊断、耗时）；报告 `report.json` 与 `report.md` 的「LLM 接入侦察」段同步记录缓存来源、实际启动/登录验证与被拒绝的启动方式；GUI 增加「LLM 接入侦察」面板
 - 侦察缓存：结果写入 `GUARDBUILD_DATA_DIR/scout/<项目哈希>/<证据哈希>.json`，**不写入被检项目**；有效期 7 天、每个项目最多 20 份；缓存键包含模型与证据树/文件内容，源码或契约变化会自动失效；载入时重新跑结构白名单与路由可定位校验，并再次实际启动/登录验证；上次整体启动验证失败时不再复用该候选队列，实际验证通过的候选会提到队列最前；缓存只含脱敏契约，不含密钥、提示词或身份凭证
 - 无密钥复用：同一项目命中磁盘缓存时，即使未设置 `DEEPSEEK_API_KEY` 也能复用侦察契约并完成实际验证，事件流与视图标记 `cacheSource=disk`
-- 环境变量：`DEEPSEEK_API_KEY`（必需）、`DEEPSEEK_BASE_URL`（测试/代理端点）、`DEEPSEEK_MODEL`（缺省 `deepseek-chat`）；Host 启动 Sidecar 时只透传这三个与 `GUARDBUILD_LLM_SCOUT` / `GUARDBUILD_LLM_PATCH`，不会进入目标进程环境
+- 环境变量：`DEEPSEEK_API_KEY`（必需）、`DEEPSEEK_BASE_URL`（测试/代理端点）、`DEEPSEEK_MODEL`（缺省 `deepseek-chat`）；Host 启动 Sidecar 时只透传白名单 `SIDECAR_ENV_PASSTHROUGH` 里的 `DEEPSEEK_*` 与 `GUARDBUILD_LLM_*` 开关（新增开关必须同步登记，由 `cargo test` 的转发覆盖测试守住），不会进入目标进程环境
 
 ### 可选：LLM 编码代理（补丁意图 + 自动双重验收）
 
@@ -235,6 +237,28 @@ npm run e2e:llm-patch          # 本机 mock DeepSeek 四轮演练，无需真�
 - 可观测：视图与报告的补丁对象新增 `strategy: "llm-coding-agent"`、`autoVerify`、`llm`（模型 / token 用量 / 采纳与拒绝统计 / 涉及文件与补丁数 / `toolRounds` + `toolCalls` 只读自查留痕）、`fixLoop`（`maxRounds` / `attempts` / `resolvedRound` / 逐轮 `verdict` 与失败用例）；`report.md` 新增「LLM 编码代理（补丁意图）」章节（含「只读自查 N 轮，M 次调用」一行）与逐轮修复循环记录，并逐条列出被拒绝的意图与原因；GUI 在补丁面板展示同一份统计与轮次
 - 无密钥 / 未开启：编码代理整体关闭，行为回落到「模板能补就补，补不动就 `vulnerable_unfixed` + exit 1 交人工」，零模型调用、零外发
 - 回归：`npm run e2e:llm-patch`（73 断言，gate 四轮：守规矩模型 → 自动验收通过 exit 1 且全程不进 `patch_review`；不守规矩模型 → 越界与歧义锚点被拒、双重验收拦下 `verify_failed`；无密钥 → 零外发 + `vulnerable_unfixed`；先只读自查的模型 → read 取数层 + list 目录被代执行并脱敏回灌、read `guardbuild.json` 被路径守卫拒绝，补丁仍只落候选文件且逐候选归因通过），靶场为 `fixtures/llm-patch-shop`（其取数形态经静态校验确认两条确定性模板都补不动）；`npm run e2e:fix-agent`（24 断言，本地模式两轮：首轮故意漏修 → 第二轮收到失败用例 + 隔离实例日志尾部 + 上一轮 diff 后补齐 → `writeback_pending`，含失败轮 worktree 清理与逐轮审计）
+
+### 可选：自举兜底代理（注册端点与字段模板）+ 观测选定种子数据（`register.agent`）
+
+「沙箱库是空的、账号和数据都得引擎自己造」这件事，确定性路径只有两条：契约写死 `register.path`，或静态建号词表**唯一**命中。项目把注册接口叫 `/api/huiyuan/add`、字段叫 `mail`/`pwd` 时，两条都打不中——但「静态打不中」不等于「该放弃」，也不等于「让模型说了算」。这一层的分工是：**模型只在引擎给的受限菜单里提议，是否成立由实跑裁决**。
+
+```json
+{ "register": { "agent": true } }
+```
+
+```bash
+export DEEPSEEK_API_KEY=...    # 也可用 GUARDBUILD_LLM_SELFBOOT=1 临时开启（缺省跟随 llm.enabled）
+npm run e2e:selfboot-odd       # 本机 mock DeepSeek 八轮演练，无需真实密钥
+```
+
+- 菜单来源与策略线：本轮静态识别到的**全部** POST 路由（上限 24 条，`maxMenu` 可调 5–24），先减去引擎策略禁止发建号体的那批（`login` / `signin` / `logout` / `password` / `recover` / `reset` / `verify` / `activate` / `oauth` / `sso` / `token` / `refresh` / `2fa` / `otp` / `magic` 一律**不进菜单**——模型选不到，是因为它根本看不见，而不是靠提示词请求自律）；静态词表命中的排在前面并带标记（模型能看到「形状已像」这条线索，但结论仍要自己给）。每条只带 `method` / `path` / 定义位置（`file:startLine`）+ 处理函数源码片段（单文件 900 字符、单轮最多 8 个文件）——字段名的唯一可靠来源，源码里写 `req.body.mail` 才猜得出 `mail`
+- 输出形状约束：模型只能返回 `{"picks":[3],"templates":{"3":{"mail":"{email}","pwd":"{password}","nickname":"{name}"}},"note":"一句话理由"}`。挑编号，不能指定方法/URL/常量值/请求头/身份；模板值只能是 `{name}` / `{username}` / `{email}` / `{password}` 四种占位符之一，**缺 `{password}` 映射的模板直接视为不可用**（记进 `droppedFields`），因此请求内容里不会出现任何模型编造的常量；越界键（`payload` / `method` / `verdict` / `identity` / `headers` / `url` 等）整键丢弃并记 `ignoredKeys`；`note` 不进事件流、审计库、报告与缓存
+- 采纳闸门（三轮实测，缺一不采纳）：注册响应 2xx/409 → 用这组新凭据在真实登录端点上登进去 → 再过 #175 的会话真实性回读。全过才把端点记为 `endpointSource: "agent"`；纠偏轮只回灌上一轮的**实跑结果**（状态码、是否拿到会话、被判不可用的原因）而不是模型自己的说法，上限 2 轮（`rounds` 1–2）；菜单里没有可选端点记 `no_post_candidates`，都不中就 `identity_bootstrap_failed` / `identity_bootstrap_unavailable`，一律 exit 2
+- 观测选定种子数据（同样「模型不裁决」）：契约没写 `register.seed` 时，引擎把静态识别到的「集合形状 POST」当候选写接口，逐个真实写入一条带 `gbseed-<随机>` 标记的记录，再用回读通道复述——**通道也是实测选的**：候选是静态识别的无参数 GET 集合端点（最多 3 条），逐条试到「本人看得到标记、其余每个非管理身份都看不到」为止；只有 `attributed` 算数，`unattributed`（别人也看得到，即列表未按归属过滤）与 `absent`（回 201 但名下根本没有）一律丢弃，绝不当成「某人名下对象」。归因需要至少 2 个非管理身份，单身份环境记 `single_identity` 不参与；这一层**从不抛异常**，测不出数据就把决定权交回资源发现阶段，最终按 `no_list_endpoint` / `no_attack_cases` 诚实收场。跑在资源契约发现**之前**：先有真实数据，主键与归属字段才测得出来
+- gate / CI：结构性禁止调用模型（0 次外发），只复用磁盘缓存里标记为「已实测验证」的提案，复用前**再实跑复核一次**，复核不过照样按「测不了」；缓存路径 `GUARDBUILD_DATA_DIR/selfboot/<项目根哈希>/<键>.json`，键含层版本 `gb-selfboot-1` + 模型 + 逐条 `method path file:startLine`，内容不含口令、模型原文与响应体
+- 口令边界：引擎随机生成的 18 位口令只进 Host 的脱敏保险库，e2e 用哨兵逐轮复扫 `report.json` / `report.md` / stdout / stderr / 审计库全表 / 磁盘缓存，八轮零残留
+- 可观测：报告 `summary.identities.bootstrap` 新增 `endpointSource`（`contract` / `static` / `agent` / `cache`）、`registerAgent`（`enabled` / `used` / `rounds` / `menuSize` / `tried` 逐条端点+状态+裁决 / `ignoredKeys` / `droppedFields` / `cacheHit` / `cacheVerified` / `fallback`）、`seedObservation`（`attempted` / `blocked` / `channels` / `candidates` / `identities`）与每条 seed 的 `source` / `fields` / `readBackVia` / `ownerSeen` / `othersSeen`；正文「身份自举：…」一行写明端点由谁选定、几条数据经观测归因、经哪条通道复读
+- 回归：`npm run e2e:selfboot-odd`（52 断言，八轮）靶场为 `fixtures/selfboot-odd-shop`（注册叫 `/api/huiyuan/add`、字段叫 `mail`/`pwd`/`nick`、下单叫 `/api/xiadan`，两个词表都打不中；另设陷阱 `POST /api/feedback` 回 201 却什么都不落在名下，和长得像写接口但被策略线排除的 `POST /api/mima/reset`）：① agent 采纳 + 观测造数 → 越权复现 exit 1；② `register.agent: false` → 0 次模型调用 + `identity_bootstrap_unavailable`；③ 开 agent 但无密钥 → `llm_unavailable`、0 次外发；④ 模型只选陷阱端点 → 两轮纠偏都不中 → `identity_bootstrap_failed`；⑤ `GB_ODD_LEAKY_LIST=1` 列表未按归属过滤 → 写入全判 `unattributed` → `no_list_endpoint`（报错给的是「两个身份返回同一批对象」这个实测事实）；⑥⑦ gate 冷跑 0 次调用 / gate 复用已验证缓存并复核通过 → 仍 exit 1；⑧ 全轮产物哨兵复扫
 
 ## 精度基准（固定标注靶场）
 
@@ -266,9 +290,9 @@ npm run e2e:llm-patch          # 本机 mock DeepSeek 四轮演练，无需真�
 - 跳过 ≠ 失败：本机没有这份第三方代码是常态，未实跑的靶场不进指标；`--require=<id>` 可把指定靶场的跳过判为失败，防止 CI 里「全跳过也全绿」的空转
 - 标注口径：阳性只写实测证实过的用例（上游声明的漏洞清单 + 逐行核对源码）；否定断言只写「结构上不可能」的用例族；未被标注覆盖的发现列入「未标注」供人工核对，不直接算误报
 - 用法：`npm run benchmark:realworld`（默认靶场根 `D:/AiAgent/dogfood`，可用 `GUARDBUILD_REAL_DIR` 覆盖；`--only=<id>` 单跑）
-- 成本：单轮约 6 分钟（VulnAPI ≈ 340s，Juice Shop ≈ 16s），且需本机预装第三方代码与依赖，因此**尚未接入 CI**，作为本地/夜间可选项
+- 成本：单轮约 6 分钟（2026-10-31 复跑：VulnAPI 344.8s，Juice Shop 11.6s），且需本机预装第三方代码与依赖，因此**尚未接入 CI**，作为本地/夜间可选项
 - 产物：`.benchmark-realworld/benchmark-report.json` / `.md`
-- 当前基线（2026-10-25）：2 个靶场 · 用例召回 3/3 · 明令禁止命中 0 · 未标注 0 · 退出码一致 2/2 · 零模型调用
+- 当前基线（2026-10-31 复跑，结果与 2026-10-25 一致）：2 个靶场 · 用例召回 3/3 · 明令禁止命中 0 · 未标注 0 · 退出码一致 2/2 · 零模型调用（VulnAPI 命中 2/2、路由 60；Juice Shop 命中 1/1、路由 23）
 
 ### 真实项目白盒基准（绿灯必须有测量支撑）
 
@@ -293,6 +317,7 @@ npm run e2e:llm-patch          # 本机 mock DeepSeek 四轮演练，无需真�
 - 用法：`npm run benchmark:indie`（默认项目根 `D:/AiAgent/dogfood`，`GUARDBUILD_INDIE_DIR` 覆盖；`--only=<id>` 单跑、`--keep` 保留产物）
 - 产物：`.benchmark-indie/benchmark-report.json` / `.md`（逐项目退出码、静态候选、攻击用例数、404/405 占比、身份会话数、真实性回读结论与规则命中明细）
 - 首跑（2026-10-30 22:37，提交 `bb00923`，产物 `.benchmark-indie/reports/`）：juice-shop 静态候选 6、exit 2、终态 `target_not_ready`（`no_ready_output`——目标在启动自检里卡在 alchemy.com / localhost:11434 的外部依赖告警，从未输出就绪行）；vuln-express 静态候选 12、身份 3/3、exit 2、终态 `probe_request_failed`（首条上传用例后目标进程即消失）。两个公开靶场都没能打出一条攻击，这一层的当前价值是「把没测到钉在报告上」，对应缺口见 #181
+- 复跑（2026-10-31，本批回归时顺带复核）：**juice-shop 静态候选 8、20 条攻击用例打到目标、复现 5 条、身份 3/3 会话经回读验证、exit 1**（`vulnerable_unfixed`）——上次挡住整轮的 `no_ready_output` 本轮未复现，具体是哪一批改动让它就绪的没有单独定位，只记录差异；vuln-express 仍 exit 2 `probe_request_failed`（首条上传用例把目标进程打崩，连接被拒），即 #181 未修的缺口，本轮如实列出而不是判成「未复现」
 
 ## 纯黑盒外部扫描（已运行 / 沙箱中的目标）
 
@@ -374,11 +399,11 @@ guardbuild-headless --url https://staging.example.com --project ./my-project --g
 | --- | --- | --- |
 | 0 | `no_candidates` / `not_reproducible` | 已测未复现：完成了扫描与路由识别但没有可探测候选，或攻击在真实实例上打不通——**不等于系统安全** |
 | 1 | `vulnerable`（附已验证补丁）/ `vulnerable_unfixed` | 漏洞证据成立：`patchStatus: verified`（通过双重验收）、`verify_failed`（修复未通过验收，附证据），或 `vulnerable_unfixed`（攻击已复现但候选无可自动修复端点，需人工修复） |
-| 2 | `inconclusive`（`no_endpoints` / `attack_inconclusive` / `plan_incomplete` / `scout_routes_unverified`）/ `failed` / `aborted` / `timeout` | 无法证明覆盖（未识别到路由 / 攻击用例未跑全 / 候选无法构造探测请求 / 模型路由实测全部落空），或执行失败（契约 / 环境 / 内部错误 / 超时 / 中断） |
+| 2 | `inconclusive`（`no_endpoints` / `attack_inconclusive` / `plan_incomplete` / `scout_routes_unverified` / `no_list_endpoint` / `identity_bootstrap_unavailable` / `identity_bootstrap_failed`）/ `failed` / `aborted` / `timeout` | 无法证明覆盖（未识别到路由 / 攻击用例未跑全 / 候选无法构造探测请求 / 模型路由实测全部落空 / 名下对象无从确定 / 身份与测试数据自不起来），或执行失败（契约 / 环境 / 内部错误 / 超时 / 中断） |
 
 - 输出：`verdict`、`exit-code`、`patch-hash`；报告目录含 `report.json`、`report.md`、`gate.json`（GB_GATE 裁决行）、`gate.log`
 - **exit 0 / 1 都是完成取证的正常终态**：`no_candidates` 表示已识别出 HTTP 路由但没有候选同时命中「静态形状 + 攻击用例」（覆盖边界，由 `sidecar/lib/coverage.mjs` 统一给出并写进报告「结论与建议」），`not_reproducible` 表示静态有候选但攻击在真实实例上打不通；两者都**不是执行失败**，桌面界面按中性提示渲染（状态标签分别为「已扫描 · 无安全候选」「已测未复现 · 未证明安全」），报告文案明确写出「不等于安全」
-- **「没测到」不放行**：未识别到任何路由（`no_endpoints`）、计划中的用例因身份 / 资源 / 运行期契约不足被跳过（`attack_inconclusive`）、候选端点缺少可寻址参数（`plan_incomplete`）、接入侦察给出的路由在真实实例上被逐条实测否掉且再无其它候选（`scout_routes_unverified`）、省略口令的身份没能建出账号（`identity_bootstrap_unavailable` / `identity_bootstrap_failed`）或账号名下写不进数据（`identity_seed_failed`）都归为 `inconclusive`，退出码 **2**——引擎无法证明覆盖，就不当作安全结论；补齐 `routes` / `openapi.file` / `identities` / `register` / `listEndpoint` / `responses` / `routes[].params` 后重跑
+- **「没测到」不放行**：未识别到任何路由（`no_endpoints`）、计划中的用例因身份 / 资源 / 运行期契约不足被跳过（`attack_inconclusive`）、候选端点缺少可寻址参数（`plan_incomplete`）、接入侦察给出的路由在真实实例上被逐条实测否掉且再无其它候选（`scout_routes_unverified`）、省略口令的身份没能建出账号（`identity_bootstrap_unavailable` / `identity_bootstrap_failed`）、账号名下写不进或归不出数据（`identity_seed_failed` / `no_list_endpoint`）都归为 `inconclusive`，退出码 **2**——引擎无法证明覆盖，就不当作安全结论；补齐 `routes` / `openapi.file` / `identities` / `register`（或开 `register.agent`）/ `listEndpoint` / `responses` / `routes[].params` 后重跑
 - **写回预检被拒也不是执行失败**：授权写回时若原工作区已变化，Host 在 `git apply --check` 阶段原子拒绝（先预检后落盘，不会写到一半）。Sidecar 把 Host 的 JSON-RPC 数字码归一为符号码 `conflict`，界面呈现「补丁未写回 · 工作区已变化」而非「执行出错」，报告明确写出原文件未被修改、补丁仍在隔离 worktree，并给出「按当前代码重跑会话」与「自行合并报告中的 Diff」两条落地路径
 - gate 语义：无人工交互；作用域仅按 `guardbuild.json.scopes` 预声明签发（审批留痕 `via: gate-policy`）；`workspace.write` 被结构性禁止，**不修改被测工作区**，只输出已验证补丁供人工应用
 

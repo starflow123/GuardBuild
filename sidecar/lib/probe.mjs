@@ -39,6 +39,16 @@ import {
   graphqlShapeRejected,
 } from "./graphqlwire.mjs";
 import { MAX_VARIANT_CASES, channelVariantFor, foreignObjectVariants, idEncodingVariants, rawTokenRequest, variantCaseId } from "./attackvariants.mjs";
+import {
+  baselineStep,
+  identityRole,
+  loadRecipe,
+  ownTargetFor,
+  ownershipReadbacks,
+  requestSteps,
+  resolveRole,
+  variantAxisSteps,
+} from "./recipes.mjs";
 import { buildProbePlan, candKey } from "./planner.mjs";
 import {
   MAX_SCOUT_ROUTES,
@@ -3321,10 +3331,57 @@ export async function rateLimitCheck(ctx, baseUrl, loggedIn) {
   }
 }
 
+/**
+ * 变体轴的展开器：配方挑轴（顺序、要不要修复前复现），这里定「怎么展开」。
+ * 轴词表在 attackvariants（用例 id 的还原规则也在那里）——加一条轴＝注册一个展开器，
+ * 属于能力增长，走能力请求单；配方写出词表外的轴会在装载时就被拒收。
+ * 每轴的内部条数上限（他人对象数、ID 写法数）同样留在代码里：那是执行预算，不是表的格子。
+ */
+const VARIANT_AXIS_BUILDERS = {
+  obj: (ctx, { primaryRead, targets, targetId }) =>
+    foreignObjectVariants(targets.victimItems, targetId, targets.attackerOwnIds ?? new Set()).map((v) => ({
+      label: v.label,
+      targetId: resourceIdOf(ctx, v.item),
+      req: candRequest(ctx, primaryRead, resourceIdOf(ctx, v.item)),
+    })),
+  enc: (ctx, { primaryRead, targetId }) =>
+    idEncodingVariants(targetId).map((v) => ({
+      label: `ID ${v.label}「${v.token}」`,
+      targetId,
+      req: rawTokenRequest(primaryRead, v.token) ?? candRequest(ctx, primaryRead, v.token),
+    })),
+  chan: (ctx, { primaryRead, targetId }) => {
+    const channel = channelVariantFor(primaryRead);
+    if (!channel) return [];
+    const sep = channel.base.includes("?") ? "&" : "?";
+    return [
+      {
+        label: channel.label,
+        targetId,
+        req: {
+          method: primaryRead.method ?? "GET",
+          path: `${channel.base}${sep}${channel.param}=${encodeURIComponent(String(targetId))}`,
+          body: null,
+        },
+      },
+    ];
+  },
+};
+
 /** 构建一个阶段内的全部用例（攻击 + 业务），攻击目标对象由发现阶段确定 */
 export function buildCases(ctx, targets) {
+  // 越权读一族的结构来自配方（sidecar/recipes/idor-read*.json）。装载即过动作表校验：
+  // 表外动作、词表外的变体轴、与实际判卷代码不符的判据名都在这里抛出，
+  // 不会退回写死的结构冒充「照常跑通」——那正是一块新的假绿灯。
+  const readAttack = baselineStep("idor-read");
+  const visibleRecipe = loadRecipe("idor-read-owner-visible");
+  const readActor = resolveRole(targets, identityRole(readAttack.step));
+  // 交叉证明挂不挂，看配方有没有声明归属人复读（uses 指向基线步骤；
+  // 同一入口的其它候选与变体写法沿用同一条声明——它们验的是同一个洞）
+  const readCrossProof = ownershipReadbacks(readAttack.recipe).some((s) => s.uses === readAttack.step.id);
+
   // 每类候选 top-K 逐一构建攻击用例；首个候选保持基名（兼容既有报告/测试/e2e）
-  const readCands = planCandidates(ctx, "read");
+  const readCands = planCandidates(ctx, readAttack.kind);
   const cancelCands = planCandidates(ctx, "cancel");
   const unauthCands = planCandidates(ctx, "unauthRead");
   const readPath = candPath(readCands[0]);
@@ -3345,19 +3402,19 @@ export function buildCases(ctx, targets) {
   // —— 攻击用例（仅在计划中存在对应端点且身份/目标齐备时构建，不虚构回退路径）——
   for (const [i, cand] of readCands.entries()) {
     const path = candPath(cand);
-    if (!path || !targets.readTarget || !attacker || !victim) continue;
+    if (!path || !targets.readTarget || !readActor || !victim) continue;
     const readTarget = targets.readTarget;
     const suffix = i === 0 ? "" : `-${i + 1}`;
     const multi = readCands.length > 1 ? `（${path}）` : "";
     const candLabel = resourceLabelOf(cand.resource ?? ctx.plan?.resource);
     const req = candRequest(ctx, cand, resourceIdOf(ctx, readTarget));
     cases.push({
-      id: `attack-read-foreign${suffix}`,
+      id: `${readAttack.step.id}${suffix}`,
       candidateKey: candKey(cand),
       category: CASE_CATEGORY.ATTACK,
-      name: `${attacker.name} 读取 ${victim.name} 的${candLabel} #${resourceIdOf(ctx, readTarget)}${multi}`,
-      identity: attacker.name,
-      method: req.method ?? "GET",
+      name: `${readActor.name} 读取 ${victim.name} 的${candLabel} #${resourceIdOf(ctx, readTarget)}${multi}`,
+      identity: readActor.name,
+      method: req.method ?? readAttack.step.method ?? "GET",
       path: req.path,
       body: req.body,
       graphql: req.graphql ?? null,
@@ -3381,7 +3438,7 @@ export function buildCases(ctx, targets) {
             : "";
         return verifyAttack(res, phase, detail, leaked || html?.leaked === true);
       },
-      crossProof: (res) => {
+      crossProof: readCrossProof ? (res) => {
         const o = extractEntity(res.json, entityPathFor(ctx, cand.graphql));
         if (o && String(resourceIdOf(ctx, o)) === String(resourceIdOf(ctx, readTarget))) {
           const ownerOk = !victim.user?.id || ownerOf(ctx, o, cand.ownerField) === victim.user.id;
@@ -3397,7 +3454,7 @@ export function buildCases(ctx, targets) {
         return {
           note: `页面正文交叉证明：攻击响应含 ${victim.name} 本人会话下 ${html.link} 独有的 ${html.markers.length} 个片段（${html.markers.slice(0, 6).join("、")}${html.markers.length > 6 ? "…" : ""}）`,
         };
-      },
+      } : null,
       impact: (res) =>
         okStatus(res.status)
           ? ctx._htmlPages?.baseline?.has(String(resourceIdOf(ctx, readTarget)))
@@ -3411,54 +3468,35 @@ export function buildCases(ctx, targets) {
   // 只对首要读候选展开：基线用例可能「碰巧」因补丁只挡住了那一个对象、那一种写法而通过。
   // 变体带 requiresPreRepro：修复前没复现的（该目标本就不认这种写法）不参与修复后验收。
   const primaryRead = readCands[0];
-  if (primaryRead && targets.readTarget && attacker && victim) {
+  if (primaryRead && targets.readTarget && readActor && victim) {
     const candLabel = resourceLabelOf(primaryRead.resource ?? ctx.plan?.resource);
     const targetId = resourceIdOf(ctx, targets.readTarget);
+    // 轴的顺序与条数配额：顺序由配方声明（决定用例编号怎么分），
+    // 总数上限 MAX_VARIANT_CASES 与每轴内部展开几条留在引擎里（预算，不是表的格子）
     const variants = [];
-    for (const v of foreignObjectVariants(
-      targets.victimItems,
-      targetId,
-      targets.attackerOwnIds ?? new Set()
-    )) {
-      variants.push({
-        axis: "obj",
-        label: v.label,
-        targetId: resourceIdOf(ctx, v.item),
-        req: candRequest(ctx, primaryRead, resourceIdOf(ctx, v.item)),
-      });
-    }
-    for (const v of idEncodingVariants(targetId)) {
-      const req = rawTokenRequest(primaryRead, v.token) ?? candRequest(ctx, primaryRead, v.token);
-      variants.push({ axis: "enc", label: `ID ${v.label}「${v.token}」`, targetId, req });
-    }
-    const channel = channelVariantFor(primaryRead);
-    if (channel) {
-      const sep = channel.base.includes("?") ? "&" : "?";
-      variants.push({
-        axis: "chan",
-        label: channel.label,
-        targetId,
-        req: { method: primaryRead.method ?? "GET", path: `${channel.base}${sep}${channel.param}=${encodeURIComponent(String(targetId))}`, body: null },
-      });
+    for (const spec of variantAxisSteps(readAttack.recipe)) {
+      for (const item of VARIANT_AXIS_BUILDERS[spec.axis](ctx, { primaryRead, targets, targetId })) {
+        variants.push({ ...item, axis: spec.axis, requiresPreRepro: spec.requiresPreRepro });
+      }
     }
     const axisSeq = {};
     for (const v of variants.slice(0, MAX_VARIANT_CASES)) {
       if (!v.req?.path) continue;
       axisSeq[v.axis] = (axisSeq[v.axis] ?? 0) + 1;
-      const caseId = variantCaseId("attack-read-foreign", v.axis, axisSeq[v.axis]);
+      const caseId = variantCaseId(readAttack.step.id, v.axis, axisSeq[v.axis]);
       cases.push({
         id: caseId,
         candidateKey: candKey(primaryRead),
         category: CASE_CATEGORY.ATTACK,
-        name: `变体·${v.label}：${attacker.name} 读取 ${victim.name} 的${candLabel}`,
-        identity: attacker.name,
+        name: `变体·${v.label}：${readActor.name} 读取 ${victim.name} 的${candLabel}`,
+        identity: readActor.name,
         method: v.req.method ?? "GET",
         path: v.req.path,
         body: v.req.body,
         graphql: v.req.graphql ?? null,
         routeKey: primaryRead.routeKeys?.[0] ?? readKey,
         variant: { axis: v.axis, label: v.label },
-        requiresPreRepro: true,
+        requiresPreRepro: v.requiresPreRepro === true,
         expect: `同一越权入口的变体应被拒绝（401/403/404），补丁不能只挡住基线写法`,
         verify: (res, phase) => {
           const o = extractEntity(res.json, entityPathFor(ctx, primaryRead.graphql));
@@ -3474,7 +3512,7 @@ export function buildCases(ctx, targets) {
               : "";
           return verifyAttack(res, phase, detail, leaked || html?.leaked === true);
         },
-        crossProof: (res) => {
+        crossProof: readCrossProof ? (res) => {
           const o = extractEntity(res.json, entityPathFor(ctx, primaryRead.graphql));
           if (o && String(resourceIdOf(ctx, o)) === String(v.targetId)) {
             if (victim.user?.id && ownerOf(ctx, o, primaryRead.ownerField) !== victim.user.id) return null;
@@ -3483,7 +3521,7 @@ export function buildCases(ctx, targets) {
           const html = htmlLeakEvidence(ctx, res, v.targetId);
           if (!html?.leaked) return null;
           return { note: `变体「${v.label}」同样拿到 ${victim.name} 本人页面的 ${html.markers.length} 个独有片段，补丁只挡住了部分写法` };
-        },
+        } : null,
         impact: (res) =>
           okStatus(res.status) ? `换一种写法即可绕过补丁继续越权读取他人${candLabel}` : null,
       });
@@ -4456,7 +4494,7 @@ export function buildCases(ctx, targets) {
   // —— 业务用例（回归防线）——
   // 正向断言：修复不得把「本人可见」一并关掉，也不得靠删字段/返回空壳来伪装「攻击已阻断」。
   // 字段契约以修复前的响应为基线（runPhase 在 pre 阶段记录），修复后缺字段即判回归。
-  const ownerReadCase = (id, ident, ownTarget) => {
+  const ownerReadCase = (id, ident, ownTarget, step, withContract) => {
     const ownId = resourceIdOf(ctx, ownTarget);
     const req = candRequest(ctx, readCands[0], ownId);
     const entityOf = (res) => extractEntity(res.json, entityPathFor(ctx, readCands[0]?.graphql));
@@ -4465,20 +4503,21 @@ export function buildCases(ctx, targets) {
       category: CASE_CATEGORY.BUSINESS,
       name: `${ident.name} 读取自己的${label} #${ownId}`,
       identity: ident.name,
-      method: req.method ?? "GET",
+      method: req.method ?? step?.method ?? "GET",
       path: req.path,
       body: req.body,
       graphql: req.graphql ?? null,
       routeKey: readKey,
       expect: `本人${label}应正常可见（200，内容不减少：JSON 比字段、页面比正文独有片段）`,
       // 「修复前本人看到什么」的基线：JSON 用字段名，页面用「只在本人页面出现的正文片段」
-      contract: (res) => {
+      // 挂不挂契约看配方有没有声明归属人复读——没有复读，就没有「修复后不许少内容」的对照物
+      contract: withContract ? (res) => {
         if (looksHtml(res)) {
           const e = htmlLeakEvidence(ctx, res, ownId);
           return e ? e.hit : [];
         }
         return Object.keys(entityOf(res) ?? {});
-      },
+      } : null,
       verify: (res) => {
         if (looksHtml(res)) {
           // 修复前阶段还没有「记录下来的契约」——本人可见内容就从这次响应自己取证
@@ -4513,14 +4552,16 @@ export function buildCases(ctx, targets) {
     };
   };
 
-  const own = targets.ownReadTarget;
-  if (readPath && own && attacker) {
-    cases.push(ownerReadCase("business-read-own", attacker, own));
-  }
-
-  // 受害人侧正向断言：补丁常见错误是「只放行 attacker 名下」这类按身份写死的判断
-  if (readPath && targets.victimOwnTarget && victim) {
-    cases.push(ownerReadCase("business-read-own-victim", victim, targets.victimOwnTarget));
+  // 本人可见正向断言：哪几个身份各读自己名下的哪个对象，来自配方（idor-read-owner-visible）。
+  // 受害人侧那条是补丁「按身份写死放行名单」这类写坏方式的探针。
+  const visibleSteps = requestSteps(visibleRecipe);
+  const visibleReadback = ownershipReadbacks(visibleRecipe).some((s) => s.uses === visibleSteps[0]?.id);
+  for (const step of visibleSteps) {
+    const role = identityRole(step);
+    const ident = resolveRole(targets, role);
+    const ownTarget = ownTargetFor(targets, role);
+    if (!readPath || !ident || !ownTarget) continue;
+    cases.push(ownerReadCase(step.id, ident, ownTarget, step, visibleReadback));
   }
 
   if (listPath && attacker) {
@@ -4676,6 +4717,8 @@ export function buildCases(ctx, targets) {
     });
   }
 
+  // 匿名回读本人对象应被 401 拒绝：这一条与配方无关，它验的是认证入口本身
+  const own = targets.ownReadTarget;
   if (readPath && own) {
     const anonReq = candRequest(ctx, readCands[0], resourceIdOf(ctx, own));
     cases.push({

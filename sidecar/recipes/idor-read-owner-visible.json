@@ -1,0 +1,33 @@
+{
+  "version": "gb-recipe-1",
+  "family": "idor-read",
+  "title": "本人可见正向断言：修复不得把「本人能看到自己的对象」一并关掉",
+  "steps": [
+    {
+      "id": "business-read-own",
+      "action": "request.as",
+      "method": "GET",
+      "path": "{slot:readPath}",
+      "identity": "attacker",
+      "note": "attacker 读自己名下的对象（攻击用例打的是别人的对象，两条不能互相顶替）"
+    },
+    {
+      "id": "business-read-own-victim",
+      "action": "request.as",
+      "method": "GET",
+      "path": "{slot:readPath}",
+      "identity": "victim",
+      "note": "受害人读自己名下的对象：补丁最常见的写坏方式是按身份写死放行名单，只放行发起攻击的那个身份"
+    },
+    {
+      "id": "business-read-own-proof",
+      "action": "readback.ownership",
+      "uses": "business-read-own",
+      "field": "{plan.ownerField}",
+      "note": "复读比对修复前记下的字段/正文契约，缺项即判回归"
+    }
+  ],
+  "verdict": {
+    "rule": "business-regress"
+  }
+}

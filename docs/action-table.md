@@ -80,3 +80,31 @@ Host 侧 `http.request` 的参数结构体没开 `deny_unknown_fields`，sidecar
 `validateRecipe` 只否决，不给通过背书。`ok: true` 的全文含义是「这张表没填错」，**不包含**「这条配方打得中漏洞」。后者是第 6 项判卷器拿考卷（漏洞版 / 加固版 / 干净对照）验出来的。
 
 按红线 3 的同一口径：能写「退回」的角色很多，能写「通过」的只有判卷器。
+
+## 八、表现在有消费方（M1 第 5 项）
+
+装载器：`sidecar/lib/recipes.mjs` · 试点配方：`sidecar/recipes/idor-read.json`、`idor-read-owner-visible.json` · 单测：`sidecar/tests/recipe-idor-read.test.mjs`
+
+`buildCases` 在建越权读一族之前先 `loadRecipe`。**校验不过就整族抛错**，不会「跳过那一步照常跑」——后者正是「配方说打了、执行器没打」的另一种形态。
+
+分工（这是「纯等价重构」能不能成立的判据）：
+
+| 进配方（表格里填的字） | 留在写死代码里 |
+| --- | --- |
+| 有哪几条打法、按什么顺序展开 | 每条打法具体怎么发（`candRequest`、线协议、路径填充） |
+| 用哪个**角色**（`attacker`/`victim`），不打凭据也不打账号名 | 角色→本次扫描选定的身份对象 |
+| 打哪个计划槽位（`{slot:readPath}`） | 槽位→计划里真取哪一类候选 |
+| 变体沿哪几条轴、要不要修复前复现 | 每条轴怎么展开、每轴最多几条、总配额 `MAX_VARIANT_CASES` |
+| 声明「归属人复读」（`readback.ownership` + `uses`） | 复读怎么取证、缺项怎么判回归 |
+| 引用哪条判据（`verdict.rule`，只有名字） | 判据本体（`verifyAttack` / `verifyBusiness` 等闭包） |
+| — | 用例名与 `expect` 文案：能改写「什么算期望结果」的文本，等于让提议者改判据 |
+
+装载时额外四条拒收（都在 `validateRecipe` 之后，先讲表填错、再讲引擎没这个器官）：轴名不在 `VARIANT_AXES` 词表内、`verdict.rule` 与真正执行它的代码不符（`VERDICT_IMPL` 带锚点）、槽位换不出候选种类、配方族还没接入判卷实现。
+
+等价性证明（第 5 项的验收原文是「同靶场同代码新旧逐条同结论」）：
+`scripts/recipe-snapshot.mjs` 在 6 种计划形状（REST 路径参数 / 查询参数 / GraphQL / 多候选 / 无对照对象 / 身份缺失）下固化每一条用例的**全部字段**，含 `verify`/`crossProof`/`contract` 闭包的源码文本，落在 `benchmarks/idor-read-golden.json`。快照是在改代码**之前**生成的；改完重跑，6 个形状逐条 deep-equal 全等。判据是冻结项，动它必须是一次刻意的重快照，不能是重构的副作用。
+
+这一族的实测：白盒基准 25/25（绿名单 39 键、回退 0）、黑盒 46/46（绿名单 71 键、回退 0）、`e2e` 46/46、`e2e:gate` 53/53、`e2e:contract` 22/22、单测 588/588。
+
+**还剩什么**：其余十族仍是专用代码（第 199 项，M5）；配方被拒收目前只会让当次扫描抛错，还没接进事件流与失败账本，那是第 9 项能力请求单要做的落点。
+

@@ -107,12 +107,15 @@ export function rawTokenRequest(cand, token) {
   return { method: cand.method ?? "GET", path: path.replace(paramSeg[0], token), body: null };
 }
 
+/** 变体轴的词表：配方只能从这里挑，新增一条轴＝注册一个新展开器（走能力请求单） */
+export const VARIANT_AXES = ["obj", "enc", "chan"];
+
 /** 变体用例 id：基名 + 轴 + 序号，便于报告归组与「修复前是否复现」比对 */
 export function variantCaseId(baseId, axis, index) {
   return `${baseId}-${axis}${index}`;
 }
 
-const VARIANT_AXIS_RE = /-(?:obj|enc|chan)\d+$/;
+const VARIANT_AXIS_RE = new RegExp(`-(?:${VARIANT_AXES.join("|")})\\d+$`);
 
 /** 变体 caseId 还原为语料标注的基名（基准按基名统计召回，变体不另立标注） */
 export function variantBaseCaseId(caseId) {

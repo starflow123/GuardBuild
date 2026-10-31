@@ -1,0 +1,52 @@
+{
+  "version": "gb-recipe-1",
+  "family": "idor-read",
+  "title": "越权读取他人对象：一条基线打法 + 三条同源变体轴 + 归属人复读",
+  "steps": [
+    {
+      "id": "attack-read-foreign",
+      "action": "request.as",
+      "method": "GET",
+      "path": "{slot:readPath}",
+      "identity": "attacker",
+      "note": "以 attacker 身份读 victim 名下的对象。目标对象由发现阶段选定（targets.readTarget）；计划里同一槽位有多个候选时，引擎按候选排名逐条展开，配方不写候选数"
+    },
+    {
+      "id": "attack-read-foreign-obj",
+      "action": "request.variant",
+      "uses": "attack-read-foreign",
+      "axis": "obj",
+      "label": "换成受害人名下的另一个对象",
+      "requiresPreRepro": true,
+      "note": "打穿只发生在一个对象上＝归属判断可能是按 id 白名单写的"
+    },
+    {
+      "id": "attack-read-foreign-enc",
+      "action": "request.variant",
+      "uses": "attack-read-foreign",
+      "axis": "enc",
+      "label": "换 ID 的写法（前导零 / 空白），服务端仍解析为同一对象",
+      "requiresPreRepro": true,
+      "note": "补丁只比对了字符串形式的 id 时，这一轴会仍然打穿"
+    },
+    {
+      "id": "attack-read-foreign-chan",
+      "action": "request.variant",
+      "uses": "attack-read-foreign",
+      "axis": "chan",
+      "label": "换参数通道（路径段 → 查询参数）",
+      "requiresPreRepro": true,
+      "note": "补丁挂在路由中间件、而取值走查询参数解析时，这一轴会仍然打穿"
+    },
+    {
+      "id": "attack-read-foreign-proof",
+      "action": "readback.ownership",
+      "uses": "attack-read-foreign",
+      "field": "{plan.ownerField}",
+      "note": "交叉证明由归属人自己复读同一对象，不看状态码"
+    }
+  ],
+  "verdict": {
+    "rule": "attack-repro"
+  }
+}

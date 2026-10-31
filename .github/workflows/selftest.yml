@@ -50,10 +50,10 @@ jobs:
       - name: Sidecar 单元测试
         run: node --test "sidecar/tests/**/*.test.mjs"
 
-      - name: gate 演练（7 轮裁决 + 报告产物）
+      - name: gate 演练（多轮终态裁决 + 报告产物 + 退出码一致）
         run: node scripts/e2e-gate.mjs
 
-      - name: 主工作流 E2E（38 断言）
+      - name: 主工作流 E2E（回环全流程 + 登录/越权/修复复验）
         run: node scripts/e2e-headless.mjs
 
       - name: Supabase 适配器 E2E（RLS 探测 + 密钥暴露，本机 mock）
@@ -122,7 +122,7 @@ jobs:
       - name: 分发布局 E2E（随包 node 在 PATH 无 node 时跑通 gate）
         run: node scripts/e2e-package.mjs
 
-      - name: 精度基准（13 个标注靶场：漏报 / 误报 / 退出码一致性）
+      - name: 精度基准（14 个标注靶场：漏报 / 误报 / 退出码一致性）
         run: node scripts/benchmark.mjs
 
       - name: 黑盒精度基准（25 个标注靶场：用例族召回 / 误报 / 写与破坏性探测开关 / 路由发现来源 / 退出码）

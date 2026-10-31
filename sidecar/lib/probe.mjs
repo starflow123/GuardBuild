@@ -63,6 +63,13 @@ import {
   validateExtras,
   writeContractCache,
 } from "./rescontract.mjs";
+import {
+  distinctiveMarkers,
+  extractPageIds,
+  looksHtml,
+  markersInText,
+  pageText,
+} from "./html.mjs";
 import { chat as llmChat, isEnabled as llmIsEnabled, parseJson as llmParseJson } from "./llm.mjs";
 
 export class ProbeError extends Error {
@@ -720,6 +727,189 @@ async function discoverViaAnonymousProbe(ctx, baseUrl, cand) {
   return anonymousItems;
 }
 
+/* ------------------------ SSR / HTML 页面的资源发现与取证 ------------------------ */
+
+// 页面发现每一步都是真实请求（读入口页 → 抓链接 → 回读本人页面正文），
+// 所以预算收紧：拿不到归属对照就判 inconclusive，绝不靠猜 ID 造用例。
+const MAX_HTML_IDENTITIES = 2;
+const MAX_HTML_ENTRY_PAGES = 4;
+const MAX_HTML_IDS_PER_IDENTITY = 3;
+const MAX_HTML_BASELINE_PAGES = 6;
+
+/** 候选路由里带路径参数的 REST 模板：页面链接只有填满它们才算资源，不猜 ID 命名 */
+function htmlTemplates(ctx) {
+  const out = [];
+  for (const kind of ["read", "cancel", "unauthRead"]) {
+    for (const c of planCandidates(ctx, kind)) {
+      if (c?.graphql || c?.trpc) continue;
+      const p = candPath(c);
+      if (p && /:[A-Za-z_]\w*/.test(p) && !out.includes(p)) out.push(p);
+    }
+  }
+  return out;
+}
+
+/** 入口页候选：首页 + 每条模板「参数段之前」的父路径 + 静态已知的无参数 GET 路由 */
+export function htmlEntryPages(ctx, templates) {
+  const out = [];
+  const push = (p) => {
+    if (!p || out.includes(p) || out.length >= MAX_HTML_ENTRY_PAGES) return;
+    out.push(p);
+  };
+  push("/");
+  for (const t of templates ?? []) {
+    const cut = String(t).slice(0, String(t).indexOf(":")).replace(/\/+$/, "");
+    push(cut || "/");
+  }
+  for (const e of ctx?.analysis?.endpoints ?? []) {
+    if (e?.graphql || e?.trpc) continue;
+    if ((e.method ?? "GET") !== "GET") continue;
+    const p = e.fullPath ?? e.path;
+    if (!p || /:/.test(p)) continue;
+    push(p);
+  }
+  return out;
+}
+
+/** 页面发现的资源对象：主键同时写成契约字段名，让 resourceIdOf 与 JSON 发现走同一条路 */
+function htmlResourceItem(ctx, id) {
+  const keys = new Set(["id"]);
+  const declared = respPath(ctx, "id");
+  if (declared && !declared.includes(".")) keys.add(declared);
+  return Object.fromEntries([...keys].map((k) => [k, id]));
+}
+
+/**
+ * 无 JSON 列表接口时的发现回退（传统 SSR 应用：列表是 HTML 页，详情也是 HTML 页）。
+ * 登录身份各自读入口页 → 按候选路由模板抓页面链接里的对象 ID → 回读这些对象在
+ * 「自己会话」下的正文，作为后续越权取证的归属基线。
+ * 返回与 JSON 发现同形的 { byUser, anonymousItems, anonTargets }，并把正文写进
+ * ctx._htmlPages（baseline: id → {id,link,owner,text}，byIdentity: 身份 → 同类数组）。
+ */
+export async function discoverViaHtmlPages(ctx, baseUrl, loggedIn) {
+  const templates = htmlTemplates(ctx);
+  if (templates.length === 0) return null;
+  const users = (loggedIn ?? []).filter((i) => i.role !== "admin").slice(0, MAX_HTML_IDENTITIES);
+  if (users.length === 0) return null;
+  const entries = htmlEntryPages(ctx, templates);
+  let requests = 0;
+
+  const byIdentity = new Map();
+  const ownerById = new Map();
+  for (const ident of users) {
+    const found = [];
+    const seen = new Set();
+    for (const p of entries) {
+      let res = null;
+      try {
+        res = await httpJson(ctx, { baseUrl, method: "GET", path: p, identity: ident.name });
+        requests += 1;
+      } catch {
+        continue; // 入口页打不开只是少一个来源，不构成结论
+      }
+      if (!looksHtml(res)) continue;
+      for (const item of extractPageIds(res.body, templates)) {
+        if (seen.has(String(item.id)) || found.length >= MAX_HTML_IDS_PER_IDENTITY) continue;
+        seen.add(String(item.id));
+        found.push({ ...item, text: null });
+        if (!ownerById.has(String(item.id))) ownerById.set(String(item.id), ident.name);
+      }
+      if (found.length >= MAX_HTML_IDS_PER_IDENTITY) break;
+    }
+    byIdentity.set(ident.name, found);
+  }
+
+  const total = [...byIdentity.values()].reduce((n, l) => n + l.length, 0);
+  if (total === 0) {
+    ctx.emit({
+      kind: "discovery",
+      severity: SEVERITY.WARN,
+      message: `HTML 页面资源未发现对象（入口页 ${entries.join("、")} 已试过 ${requests} 次请求，链接里没有能填满候选路由的 ID）`,
+      data: { mode: "html-pages", entries, requestsUsed: requests, templates },
+    });
+    return null;
+  }
+
+  // 归属基线：只取「该身份自己会话下」的页面正文，别人的页面正文不能当本人的证据
+  const baseline = new Map();
+  for (const [name, list] of byIdentity) {
+    for (const item of list) {
+      if (baseline.size >= MAX_HTML_BASELINE_PAGES) break;
+      if (baseline.has(String(item.id))) continue;
+      let res = null;
+      try {
+        res = await httpJson(ctx, { baseUrl, method: "GET", path: item.link, identity: name });
+        requests += 1;
+      } catch {
+        continue;
+      }
+      if (!okStatus(res.status) || !looksHtml(res)) continue;
+      const text = pageText(res.body);
+      if (!text) continue;
+      item.text = text;
+      baseline.set(String(item.id), { ...item, owner: name });
+    }
+  }
+  ctx._htmlPages = { baseline, byIdentity, entries, requestsUsed: requests };
+
+  const byUser = {};
+  for (const [name, list] of byIdentity) byUser[name] = list.map((x) => htmlResourceItem(ctx, x.id));
+  const noText = users.filter((u) => (byIdentity.get(u.name) ?? []).every((x) => !x.text));
+  ctx.emit({
+    kind: "discovery",
+    severity: baseline.size > 0 ? SEVERITY.INFO : SEVERITY.WARN,
+    message:
+      baseline.size > 0
+        ? `资源发现（HTML 页面回退）：从 ${entries.length} 个入口页的链接里发现 ${total} 个${resourceLabel(ctx)}，已回读 ${baseline.size} 页本人正文作为归属基线（共 ${requests} 次请求）`
+        : `资源发现（HTML 页面回退）：发现 ${total} 个${resourceLabel(ctx)}对象，但本人页面正文全部回读失败，越权取证将只能判 inconclusive`,
+    data: {
+      mode: "html-pages",
+      entries,
+      requestsUsed: requests,
+      counts: Object.fromEntries(byIdentity.entries().map(([n, l]) => [n, l.length])),
+      baselines: [...baseline.keys()],
+    },
+  });
+  if (noText.length > 0 && baseline.size > 0) {
+    ctx.emit({
+      kind: "discovery",
+      severity: SEVERITY.WARN,
+      message: `身份「${noText.map((u) => u.name).join("、")}」名下页面没有回读到本人正文，其相关越权用例缺少归属对照`,
+      data: { identities: noText.map((u) => u.name) },
+    });
+  }
+  return { byUser, anonymousItems: [], anonTargets: [] };
+}
+
+/**
+ * HTML 越权取证：响应是页面时没有 JSON 字段可比对，证据改为
+ * 「受害人本人页面上独有、且原样出现在这次响应正文里的内容片段」。
+ * 对照物缺失（攻击者名下没有可比页面）时返回 null —— 没有对照组就没有归属证明，
+ * 由上层判 inconclusive，绝不把「页面结构相似」当成越权成功。
+ */
+function htmlLeakEvidence(ctx, res, targetId) {
+  const pages = ctx._htmlPages;
+  const base = pages?.baseline?.get(String(targetId));
+  if (!base?.text || !looksHtml(res)) return null;
+  const controls = [];
+  for (const [name, list] of pages.byIdentity) {
+    if (name === base.owner) continue; // 本人其它页面同样属于「本人内容」，不能拿来当对照
+    for (const p of list) if (String(p.id) !== String(targetId) && p.text) controls.push(p.text);
+  }
+  if (controls.length === 0) return null;
+  const markers = distinctiveMarkers(base.text, controls);
+  if (markers.length === 0) {
+    return { leaked: false, markers: [], hit: [], link: base.link, reason: "no-unique-content" };
+  }
+  const { hit, all } = markersInText(markers, pageText(res.body));
+  return { leaked: all, markers, hit, link: base.link, owner: base.owner, reason: all ? null : "partial" };
+}
+
+/** 越权取证的正向描述：片段清单进 detail，读者能在报告里逐字核对 */
+function htmlLeakDetail(e) {
+  return `证据：${e.owner} 自己会话下的页面（${e.link}）独有的 ${e.markers.length} 个内容片段，全部出现在这次响应正文里：${e.markers.slice(0, 8).join("、")}`;
+}
+
 /**
  * 计划槽位读取：多候选数组（planner top-K）优先，回退单槽位（兼容旧计划对象）。
  * kind: "read" | "cancel" | "unauthRead"
@@ -1212,6 +1402,11 @@ async function discoverResources(ctx, baseUrl, loggedIn) {
         const items = await discoverViaAnonymousProbe(ctx, baseUrl, cand);
         if (items.length > 0) anonTargets.push({ path: p, item: items[0] });
       }
+      // 匿名 ID 探测要求响应是 JSON 对象；SSR 应用返回页面时它一无所获，改走页面链接发现
+      if (anonTargets.length === 0) {
+        const viaHtml = await discoverViaHtmlPages(ctx, baseUrl, loggedIn);
+        if (viaHtml) return viaHtml;
+      }
       return { byUser: {}, anonymousItems: anonTargets.map((t) => t.item), anonTargets };
     }
     if (
@@ -1230,6 +1425,9 @@ async function discoverResources(ctx, baseUrl, loggedIn) {
       });
       return { byUser: {}, anonymousItems: [], anonTargets: [] };
     }
+    // 最后一条回退：SSR/HTML 应用没有 JSON 列表接口，对象 ID 只能从登录后的页面链接里抓
+    const viaHtml = await discoverViaHtmlPages(ctx, baseUrl, loggedIn);
+    if (viaHtml) return viaHtml;
     throw new ProbeError("静态分析未能定位列表接口，无法发现资源归属", {
       code: "no_list_endpoint",
       hint: "当前策略要求目标项目存在按归属过滤的列表接口（如 GET /api/orders），或至少一个无鉴权单体资源接口（如 GET /api/users/:id，用于匿名探测回退）。静态找不到时可在 guardbuild.json 用 listEndpoint 显式声明列表端点（可带分页/过滤查询参数），或在 routes 里补充路由",
@@ -1255,6 +1453,12 @@ async function discoverResources(ctx, baseUrl, loggedIn) {
       message: `资源发现：「${ident.name}」名下可见 ${items.length} 个${resourceLabel(ctx)}`,
       data: { identity: ident.name, count: items.length, ids: items.map((o) => resourceIdOf(ctx, o)) },
     });
+  }
+  // 列表接口存在但按 JSON 取不到任何条目（列表其实渲染成页面）：再用页面链接发现兜一次
+  const listed = Object.keys(byUser);
+  if (listed.length > 0 && listed.every((name) => (byUser[name] ?? []).length === 0)) {
+    const viaHtml = await discoverViaHtmlPages(ctx, baseUrl, loggedIn);
+    if (viaHtml) return viaHtml;
   }
   return { byUser, anonymousItems: [], anonTargets: [] };
 }
@@ -2265,25 +2469,41 @@ export function buildCases(ctx, targets) {
         const leaked = o && String(resourceIdOf(ctx, o)) === String(resourceIdOf(ctx, readTarget));
         // 跨端点 id 串号防护：如果 attacker 自己列表里就有这个 id，说明是自己的资源，不是越权
         const isOwnResource = leaked && targets.attackerOwnIds?.has(String(resourceIdOf(ctx, readTarget)));
-        const detail = leaked
-          ? `证据：返回${candLabel} #${resourceIdOf(ctx, o)}（归属 ${ownerOf(ctx, o, cand.ownerField)}，金额 ${o.amount}，状态 ${o.status}）${isOwnResource ? "（但该 id 在 attacker 自己列表中，疑似串号）" : ""}`
-          : "";
         if (isOwnResource) {
           // 不算越权：attacker 本来就能访问自己的资源
           return { verdict: "inconclusive", actual: `目标 #${resourceIdOf(ctx, readTarget)} 在 attacker 自己的资源列表中，疑似跨端点 id 串号，不计为越权` };
         }
-        return verifyAttack(res, phase, detail, leaked);
+        // JSON 响应比对字段；页面响应没有字段可比，改用正文归属证据
+        const html = leaked ? null : htmlLeakEvidence(ctx, res, resourceIdOf(ctx, readTarget));
+        const detail = leaked
+          ? `证据：返回${candLabel} #${resourceIdOf(ctx, o)}（归属 ${ownerOf(ctx, o, cand.ownerField)}，金额 ${o.amount}，状态 ${o.status}）`
+          : html?.leaked
+            ? htmlLeakDetail(html)
+            : "";
+        return verifyAttack(res, phase, detail, leaked || html?.leaked === true);
       },
       crossProof: (res) => {
         const o = extractEntity(res.json, entityPathFor(ctx, cand.graphql));
-        if (!o || String(resourceIdOf(ctx, o)) !== String(resourceIdOf(ctx, readTarget))) return null;
-        const ownerOk = !victim.user?.id || ownerOf(ctx, o, cand.ownerField) === victim.user.id;
-        if (!ownerOk) return null;
+        if (o && String(resourceIdOf(ctx, o)) === String(resourceIdOf(ctx, readTarget))) {
+          const ownerOk = !victim.user?.id || ownerOf(ctx, o, cand.ownerField) === victim.user.id;
+          if (ownerOk) {
+            return {
+              note: `响应对象 #${resourceIdOf(ctx, o)} 与请求目标一致，归属 ${ownerOf(ctx, o, cand.ownerField)}${victim.user?.id ? "（与受害人身份一致）" : ""}`,
+            };
+          }
+        }
+        const html = htmlLeakEvidence(ctx, res, resourceIdOf(ctx, readTarget));
+        if (!html?.leaked) return null;
         return {
-          note: `响应对象 #${resourceIdOf(ctx, o)} 与请求目标一致，归属 ${ownerOf(ctx, o, cand.ownerField)}${victim.user?.id ? "（与受害人身份一致）" : ""}`,
+          note: `页面正文交叉证明：攻击响应含 ${victim.name} 本人会话下 ${html.link} 独有的 ${html.markers.length} 个片段（${html.markers.slice(0, 6).join("、")}${html.markers.length > 6 ? "…" : ""}）`,
         };
       },
-      impact: (res) => (okStatus(res.status) ? `可读取他人${candLabel}详情及字段（id/userId/amount/address 等）` : null),
+      impact: (res) =>
+        okStatus(res.status)
+          ? ctx._htmlPages?.baseline?.has(String(resourceIdOf(ctx, readTarget)))
+            ? `可读取他人${candLabel}页面正文（页面渲染的完整内容，无字段级隔离）`
+            : `可读取他人${candLabel}详情及字段（id/userId/amount/address 等）`
+          : null,
     });
   }
 
@@ -2346,16 +2566,23 @@ export function buildCases(ctx, targets) {
           if (leaked && targets.attackerOwnIds?.has(String(v.targetId))) {
             return { verdict: "inconclusive", actual: `目标 #${v.targetId} 在 attacker 自己的资源列表中，疑似跨端点 id 串号，不计为越权` };
           }
+          const html = leaked ? null : htmlLeakEvidence(ctx, res, v.targetId);
           const detail = leaked
             ? `证据：变体写法仍返回${candLabel} #${resourceIdOf(ctx, o)}（归属 ${ownerOf(ctx, o, primaryRead.ownerField)}），补丁只挡住了部分入口`
-            : "";
-          return verifyAttack(res, phase, detail, leaked);
+            : html?.leaked
+              ? `证据：变体写法仍拿到 ${html.owner} 本人页面（${html.link}）独有的 ${html.markers.length} 个内容片段，补丁只挡住了部分入口`
+              : "";
+          return verifyAttack(res, phase, detail, leaked || html?.leaked === true);
         },
         crossProof: (res) => {
           const o = extractEntity(res.json, entityPathFor(ctx, primaryRead.graphql));
-          if (!o || String(resourceIdOf(ctx, o)) !== String(v.targetId)) return null;
-          if (victim.user?.id && ownerOf(ctx, o, primaryRead.ownerField) !== victim.user.id) return null;
-          return { note: `变体「${v.label}」命中的对象 #${resourceIdOf(ctx, o)} 归属 ${ownerOf(ctx, o, primaryRead.ownerField)}（与受害人一致）` };
+          if (o && String(resourceIdOf(ctx, o)) === String(v.targetId)) {
+            if (victim.user?.id && ownerOf(ctx, o, primaryRead.ownerField) !== victim.user.id) return null;
+            return { note: `变体「${v.label}」命中的对象 #${resourceIdOf(ctx, o)} 归属 ${ownerOf(ctx, o, primaryRead.ownerField)}（与受害人一致）` };
+          }
+          const html = htmlLeakEvidence(ctx, res, v.targetId);
+          if (!html?.leaked) return null;
+          return { note: `变体「${v.label}」同样拿到 ${victim.name} 本人页面的 ${html.markers.length} 个独有片段，补丁只挡住了部分写法` };
         },
         impact: (res) =>
           okStatus(res.status) ? `换一种写法即可绕过补丁继续越权读取他人${candLabel}` : null,
@@ -3330,31 +3557,59 @@ export function buildCases(ctx, targets) {
   // 正向断言：修复不得把「本人可见」一并关掉，也不得靠删字段/返回空壳来伪装「攻击已阻断」。
   // 字段契约以修复前的响应为基线（runPhase 在 pre 阶段记录），修复后缺字段即判回归。
   const ownerReadCase = (id, ident, ownTarget) => {
-    const req = candRequest(ctx, readCands[0], resourceIdOf(ctx, ownTarget));
+    const ownId = resourceIdOf(ctx, ownTarget);
+    const req = candRequest(ctx, readCands[0], ownId);
     const entityOf = (res) => extractEntity(res.json, entityPathFor(ctx, readCands[0]?.graphql));
     return {
       id,
       category: CASE_CATEGORY.BUSINESS,
-      name: `${ident.name} 读取自己的${label} #${resourceIdOf(ctx, ownTarget)}`,
+      name: `${ident.name} 读取自己的${label} #${ownId}`,
       identity: ident.name,
       method: req.method ?? "GET",
       path: req.path,
       body: req.body,
       graphql: req.graphql ?? null,
       routeKey: readKey,
-      expect: `本人${label}应正常可见（200，且归属本人、字段不减少）`,
-      contract: (res) => Object.keys(entityOf(res) ?? {}),
-      verify: (res) =>
-        verifyBusiness(res, 200, () => {
+      expect: `本人${label}应正常可见（200，内容不减少：JSON 比字段、页面比正文独有片段）`,
+      // 「修复前本人看到什么」的基线：JSON 用字段名，页面用「只在本人页面出现的正文片段」
+      contract: (res) => {
+        if (looksHtml(res)) {
+          const e = htmlLeakEvidence(ctx, res, ownId);
+          return e ? e.hit : [];
+        }
+        return Object.keys(entityOf(res) ?? {});
+      },
+      verify: (res) => {
+        if (looksHtml(res)) {
+          // 修复前阶段还没有「记录下来的契约」——本人可见内容就从这次响应自己取证
+          // （发现阶段已按本人会话回读过页面，独有片段是现成的对照）；
+          // 修复后阶段一律以修复前记下的契约为准，缺项即判回归。
+          const recorded = ctx._ownerContract?.get(id) ?? [];
+          const base = recorded.length > 0 ? recorded : (htmlLeakEvidence(ctx, res, ownId)?.hit ?? []);
+          const body = pageText(res.body ?? "");
+          if (base.length === 0 && okStatus(res.status)) {
+            return {
+              verdict: VERDICT.INCONCLUSIVE,
+              actual: `HTTP ${res.status}，本人${label}页面可读，但没有可比对的独有内容片段（该页正文未在发现阶段回读到，或没有另一身份的页面作对照），无法证明内容未被删减`,
+            };
+          }
+          return verifyBusiness(res, 200, () => {
+            const missing = base.filter((k) => !body.includes(k));
+            if (missing.length) return `FAIL:本人页面内容契约缺失 ${missing.slice(0, 6).join("、")}（不得删减本人可见内容来冒充修复）`;
+            return `本人页面正文 ${body.length} 字，内容契约 ${base.length} 项全部保留`;
+          });
+        }
+        return verifyBusiness(res, 200, () => {
           const o = entityOf(res);
           if (!o) return `FAIL:响应缺少${label}对象`;
-          if (String(resourceIdOf(ctx, o)) !== String(resourceIdOf(ctx, ownTarget))) return `FAIL:返回了错误的${label} #${resourceIdOf(ctx, o)}`;
+          if (String(resourceIdOf(ctx, o)) !== String(ownId)) return `FAIL:返回了错误的${label} #${resourceIdOf(ctx, o)}`;
           if (ownerOf(ctx, o) !== ident.user?.id) return `FAIL:${label}归属异常 ${ownerOf(ctx, o)}`;
           const base = ctx._ownerContract?.get(id) ?? [];
           const missing = base.filter((k) => !(k in o));
           if (missing.length) return `FAIL:字段契约缺失 ${missing.join("、")}（不得删减本人可见内容来冒充修复）`;
           return `返回${label} #${resourceIdOf(ctx, o)}，归属 ${ownerOf(ctx, o)}，字段 ${Object.keys(o).length} 项`;
-        }),
+        });
+      },
     };
   };
 
@@ -3539,6 +3794,18 @@ export function buildCases(ctx, targets) {
         if (res.status === 403) return { verdict: VERDICT.PASSED, actual: "HTTP 403，认证拦截生效" };
         if (res.graphqlDenied) {
           return { verdict: VERDICT.PASSED, actual: `HTTP ${res.status} + GraphQL 拒绝（语义拒绝），认证拦截生效` };
+        }
+        // 页面应用的「未登录即拒」写成 302 → 登录页：跟随跳转后是 200 的登录表单。
+        // 只按状态码判会把这种正常拒绝写成「认证被绕过」的假回归；
+        // 但仍要求响应里没有本人页面的独有内容——真有内容就是放行，照旧判回归。
+        if (looksHtml(res) && rendersLoginForm(res)) {
+          const e = htmlLeakEvidence(ctx, res, resourceIdOf(ctx, own));
+          if (!e?.leaked) {
+            return {
+              verdict: VERDICT.PASSED,
+              actual: `HTTP ${res.status} + 登录页（未登录被重定向回登录表单），认证拦截生效，响应内未见详情内容片段`,
+            };
+          }
         }
         return { verdict: VERDICT.REGRESSED, actual: `HTTP ${res.status}（预期 401/403），认证被绕过或异常放行` };
       },

@@ -14,6 +14,8 @@ import {
   filterSourceFiles,
   collectFileAuthGuards,
   analyzeProject,
+  mwGuardKind,
+  resourcePathParams,
 } from "../lib/analyzer.mjs";
 import { parsePortFromLine, stripAnsi } from "../lib/readyline.mjs";
 import { methodStyleOps, expressStyleOps, findRecordDecisionBlock, buildProbePlan } from "../lib/planner.mjs";
@@ -1396,6 +1398,127 @@ test("collectFileAuthGuards: \\\\?\\ 扩展前缀路径（真实 Host 形态）�
   assert.equal(g.mountPrefixes.get(geo), "/api/geo-projects");
   assert.ok(!g.mountGuarded.has(cap), "无鉴权中间件的挂载不应标记为受保护");
   assert.equal(g.mountPrefixes.get(cap), "/api/captcha", "无鉴权挂载也应记录前缀（用于还原完整路径）");
+});
+
+// —— #178 静态误报：守卫的工厂调用形态 + 枚举型路径参数 ——
+
+test("mwGuardKind: 裸标识符 / 成员链 / 工厂调用三种守卫形态都分类", () => {
+  assert.equal(mwGuardKind("authenticate"), "auth", "裸标识符认证守卫");
+  assert.equal(mwGuardKind("authHandler.requireLogin"), "auth", "成员链认证守卫");
+  assert.equal(mwGuardKind("requireRole('organiser')"), "role", "带参工厂调用是真实项目最常见的写法");
+  assert.equal(mwGuardKind('checkPermission(["read"])'), "role", "参数是数组也不影响归类");
+  assert.equal(mwGuardKind("passport.authenticate('jwt')"), "auth", "成员链 + 带参");
+  assert.equal(mwGuardKind("cors()"), null, "非守卫中间件不该被认成认证");
+  assert.equal(mwGuardKind('"/api/x"'), null, "挂载路径不参与守卫判定");
+});
+
+test("collectFileAuthGuards: 工厂调用的角色守卫既算「要登录」也记为角色守卫", () => {
+  const files = [
+    {
+      path: "D:/p/app.js",
+      content: [
+        'const eventRoutes = require("./routes/events");',
+        'const reportRoutes = require("./routes/reports");',
+        "app.use('/api/events', requireRole('organiser'), eventRoutes);",
+        'app.use("/api/reports", reportRoutes);',
+      ].join("\n"),
+    },
+    { path: "D:/p/routes/events.js", content: 'router.get("/:id", h);' },
+    { path: "D:/p/routes/reports.js", content: 'router.use(requireRole("viewer"));\nrouter.get("/:id", h);' },
+  ];
+  const g = collectFileAuthGuards(files);
+  assert.ok(g.mountGuarded.has("D:/p/routes/events.js"), "角色守卫挂载同样证明端点要求登录");
+  assert.ok(g.roleGuarded.has("D:/p/routes/events.js"), "角色守卫要单独记账（可见范围受角色限制）");
+  assert.ok(g.selfGuarded.has("D:/p/routes/reports.js"), "router.use(requireRole(...)) 文件级守卫");
+  assert.ok(g.roleGuarded.has("D:/p/routes/reports.js"));
+  assert.ok(!g.roleGuarded.has("D:/p/app.js"), "无守卫的挂载不该被记成角色保护");
+});
+
+test("resourcePathParams: 枚举型参数不算对象主键，歧义名一律保留（不制造漏报）", () => {
+  assert.deepEqual(resourcePathParams("/api/orders/:id"), ["id"]);
+  assert.deepEqual(resourcePathParams("/api/orders/:orderId/status"), ["orderId"]);
+  assert.deepEqual(resourcePathParams("/auth/:role/login"), [], ":role 选的是登录流派，不是受害对象");
+  assert.deepEqual(resourcePathParams("/api/reports/:type/summary"), []);
+  assert.deepEqual(resourcePathParams("/api/orgs/:orgId/members/:memberId"), ["orgId", "memberId"]);
+  assert.deepEqual(resourcePathParams("/api/files/:name"), ["name"], "按名寻址可能是真 IDOR，不进黑名单");
+  assert.deepEqual(resourcePathParams("/api/users/:id/roles/:role"), ["id"], "有对象参数就仍算可寻址");
+});
+
+test("analyzeProject: 角色守卫下的 :id 路由报越权候选，不再报匿名可读（真实项目误报形态）", async () => {
+  const R = "D:/p";
+  const contents = new Map([
+    [
+      `${R}/app.js`,
+      [
+        'const eventRoutes = require("./routes/events");',
+        "app.use('/api/events', requireRole('organiser'), eventRoutes);",
+      ].join("\n"),
+    ],
+    [
+      `${R}/routes/events.js`,
+      [
+        "router.get('/:id', async (req, res) => {",
+        "  const event = await Event.findOne({ where: { id: req.params.id } });",
+        "  res.json(event);",
+        "});",
+      ].join("\n"),
+    ],
+  ]);
+  const ctx = {
+    projectRoot: R,
+    tokens: { project: "tok" },
+    rpc: {
+      request: async (method, params) => {
+        if (method === "fs.list") {
+          return { entries: [...contents.keys()].map((p) => ({ path: p, kind: "file", size: 300 })) };
+        }
+        if (method === "fs.read") return { content: contents.get(params.path), size: 300, redacted: false, redactions: [] };
+        throw new Error(`不应调用 ${method}`);
+      },
+    },
+  };
+  const a = await analyzeProject(ctx);
+  const ep = a.endpoints.find((e) => e.fullPath === "/api/events/:id");
+  assert.ok(ep, "应解析出挂载后的 /api/events/:id");
+  assert.equal(ep.hasAuth, true, "守卫在挂载点上，端点确实要求登录");
+  const cand = a.candidates.find((c) => c.fullPath === "/api/events/:id");
+  assert.ok(cand, "同角色跨对象的越权面仍是候选（不能因为认出了角色守卫就整体抑制）");
+  assert.equal(cand.kind, "idor-suspect", "认不出守卫时它被报成 no-auth-suspect（匿名可读），是本轮修掉的误报");
+});
+
+test("analyzeProject: 只有枚举型参数的路由不产越权候选（同文件真对象路由仍产）", async () => {
+  const R = "D:/r";
+  const contents = new Map([
+    [
+      `${R}/reports.js`,
+      [
+        'app.get("/api/reports/:type/summary", async (req, res) => {',
+        "  const row = await Report.findOne({ where: { type: req.params.type } });",
+        "  res.json(row);",
+        "});",
+        'app.get("/api/reports/:id", async (req, res) => {',
+        "  const row = await Report.findByPk(req.params.id);",
+        "  res.json(row);",
+        "});",
+      ].join("\n"),
+    ],
+  ]);
+  const ctx = {
+    projectRoot: R,
+    tokens: { project: "tok" },
+    rpc: {
+      request: async (method, params) => {
+        if (method === "fs.list") return { entries: [{ path: `${R}/reports.js`, kind: "file", size: 300 }] };
+        if (method === "fs.read") return { content: contents.get(params.path), size: 300, redacted: false, redactions: [] };
+        throw new Error(`不应调用 ${method}`);
+      },
+    },
+  };
+  const a = await analyzeProject(ctx);
+  assert.ok(a.endpoints.some((e) => e.path === "/api/reports/:type/summary"), "枚举型路由仍应出现在端点清单里（只是不作候选）");
+  const kinds = a.candidates.map((c) => c.fullPath);
+  assert.ok(!kinds.includes("/api/reports/:type/summary"), "换 :type 只是换一类报表，不构成越权读他人对象");
+  assert.ok(kinds.includes("/api/reports/:id"), "同文件按 :id 寻址的路由仍是候选，规则没有整体关掉这一族");
 });
 
 test("analyzeProject: 挂载前缀还原完整请求路径（fullPath）", async () => {

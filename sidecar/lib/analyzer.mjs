@@ -105,6 +105,19 @@ const ANCHOR_METHOD = /^\s*if\s*\(\s*method\s*===\s*["'`]([A-Za-z]+)["'`]/;
 // 认证中间件命名启发式（authRequired / authenticate / requireLogin / verifyToken / jwt…）
 const AUTH_MW_NAME = /auth|token|guard|login|jwt|permission/i;
 
+// 枚举/流程型路径参数名：它们选的是「哪一类/哪一步」，不是「哪一个对象」。
+// 拿它当对象主键填进越权用例，换值只会 400/404（真实项目里 POST /auth/:role/login 一次贡献 7 条候选）。
+// 只列名字几乎不可能指代单个归属对象的；有歧义的（name/key/slug/code/username）一律不算，
+// 以免把真正的按名寻址 IDOR 抑制成漏报。
+const NON_RESOURCE_PARAM =
+  /^(?:roles?|types?|kinds?|actions?|ops?|opname|modes?|formats?|langs?|languages?|locales?|versions?|providers?|strategies|schemes?|tabs?|sorts?|directions?|currenc(?:y|ies)|units?|ext(?:ension)?|mimes?|statuses?|states?|steps?|levels?|depths?)$/i;
+
+/** 路径里能指代单个对象的参数名；全是枚举型参数时返回空（该路由不可按对象寻址） */
+export function resourcePathParams(path) {
+  const names = [...String(path ?? "").matchAll(/:([A-Za-z_]\w*)/g)].map((m) => m[1]);
+  return names.filter((n) => !NON_RESOURCE_PARAM.test(n));
+}
+
 /** 按顶层逗号切分调用参数（忽略括号/引号内的逗号） */
 function splitArgsTopLevel(s) {
   const out = [];
@@ -173,9 +186,25 @@ const collectRouteCalls = (text) => collectMemberCalls(text, "get|post|put|patch
 
 const isStringLit = (a) => /^["'`][^"'`]*["'`]$/.test(a);
 const isBareIdent = (a) => /^[A-Za-z_$][\w$]*$/.test(a);
-// 认证中间件引用：裸标识符或成员访问链（authenticate / authHandler.isAuthenticated），名称含认证语义
-const isAuthMwRef = (a) =>
-  /^[A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*$/.test(a) && AUTH_MW_NAME.test(a);
+
+// 守卫中间件的三种书写形态都要认：裸标识符（authenticate）、成员链（authHandler.requireLogin）、
+// 带参工厂调用（requireRole('organiser')）。第三种在真实项目里最常见——守卫是工厂返回的闭包，
+// 只认前两种会把「挂载点已经挡了未登录」的路由报成匿名可读候选（误报）。
+const MW_REF = /^([A-Za-z_$][\w$]*(?:\s*\.\s*[A-Za-z_$][\w$]*)*)\s*(?:\([\s\S]*\))?$/;
+// 角色/权限守卫：既证明要登录，又把可见范围限制在某一角色内
+const ROLE_MW_NAME = /requirerole|checkrole|ensurerole|hasrole|protectrole|\brole\b|roles?\s*\(|permission|authoriz|restrictto/i;
+
+/** 中间件引用的守卫类别：'role' > 'auth' > null（名字不含守卫语义） */
+export function mwGuardKind(arg) {
+  const m = MW_REF.exec(String(arg ?? "").trim());
+  if (!m) return null;
+  const ref = m[1];
+  if (ROLE_MW_NAME.test(ref)) return "role";
+  return AUTH_MW_NAME.test(ref) ? "auth" : null;
+}
+
+// 认证中间件引用：裸标识符、成员访问链或工厂调用，名称含认证/授权语义
+const isAuthMwRef = (a) => mwGuardKind(a) !== null;
 
 /** IIFE require 挂载目标：require("./routes/app")() → "./routes/app"；非该形态返回 null */
 function iifeRequireTarget(a) {
@@ -251,17 +280,19 @@ function resolveModuleCandidates(dir, spec) {
 /**
  * 跨文件识别路由文件的鉴权守卫：
  *  - 挂载级：app.use("/api/x", authRequired, router)，router 经 require/import 解析到具体文件
- *  - 文件级：router.use(authenticate)（无路径的全局中间件）
- * 返回 { mountGuarded, selfGuarded, mountPrefixes, diag }：
- *  - mountGuarded / selfGuarded 为归一化路径集合
+ *  - 文件级：router.use(authenticate)、router.use(requireRole('organiser'))（无路径的全局中间件）
+ * 返回 { mountGuarded, selfGuarded, roleGuarded, mountPrefixes, diag }：
+ *  - mountGuarded / selfGuarded 为归一化路径集合（认证类与角色类守卫都算「要登录」）
+ *  - roleGuarded：其中由角色/权限守卫保护的那批（角色守卫既要求登录，又限定可见范围）
  *  - mountPrefixes：目标文件 → 首个挂载点前缀（无论该挂载点是否带鉴权中间件）
  */
 export function collectFileAuthGuards(files) {
   const known = new Set(files.map((f) => normalizePath(f.path)));
   const mountGuarded = new Set();
   const selfGuarded = new Set();
+  const roleGuarded = new Set();
   const mountPrefixes = new Map();
-  const diag = { mountsWithAuth: 0, resolvedModules: 0 };
+  const diag = { mountsWithAuth: 0, resolvedModules: 0, mountsWithRoleGuard: 0 };
   for (const f of files) {
     const filePath = normalizePath(f.path);
     const content = f.content ?? "";
@@ -271,16 +302,21 @@ export function collectFileAuthGuards(files) {
       // tRPC 构建器链（protectedProcedure.use(isAuthed)）不是 Express 挂载：
       // 其鉴权在区块链上判定，不能据此把整个路由文件标为受保护（否则公开过程会被误判有认证）
       if (/procedure/i.test(call.obj)) continue;
-      // router.use(authenticate)：无路径的全局认证中间件 → 本文件整体受保护
-      if (call.args.length >= 1 && isBareIdent(call.args[0]) && AUTH_MW_NAME.test(call.args[0])) {
+      // router.use(authenticate) / router.use(requireRole('organiser'))：
+      // 无路径的全局守卫 → 本文件整体受保护（工厂调用形态同样算守卫，参数只是角色名）
+      const fileGuard = mwGuardKind(call.args[0]);
+      if (call.args.length >= 1 && fileGuard && !isStringLit(call.args[0])) {
         selfGuarded.add(filePath);
+        if (fileGuard === "role") roleGuarded.add(filePath);
         continue;
       }
       if (!isStringLit(call.args[0])) continue;
       const mountPath = call.args[0].slice(1, -1);
       const middlewares = call.args.slice(1);
-      const hasAuth = middlewares.some(isAuthMwRef);
+      const kinds = middlewares.map(mwGuardKind).filter(Boolean);
+      const hasAuth = kinds.length > 0;
       if (hasAuth) diag.mountsWithAuth += 1;
+      if (kinds.includes("role")) diag.mountsWithRoleGuard += 1;
       // 挂载目标：IIFE 形态（app.use("/app", require("./routes/app")())）优先；
       // 否则取最后一个 bare ident（router 变量）并跨文件解析，失败时回退同文件检查
       let mountTarget = null;
@@ -304,16 +340,18 @@ export function collectFileAuthGuards(files) {
           mountGuarded.add(mountTarget);
           diag.resolvedModules += 1;
         }
+        if (kinds.includes("role")) roleGuarded.add(mountTarget);
         continue;
       }
       // 同文件内定义的 router（const router = express.Router()）→ 保守视为整文件受保护
       if (target && new RegExp(`(?:const|let|var|function)\\s+${target}\\b`).test(content)) {
         if (!mountPrefixes.has(filePath)) mountPrefixes.set(filePath, mountPath);
         if (hasAuth) selfGuarded.add(filePath);
+        if (kinds.includes("role")) roleGuarded.add(filePath);
       }
     }
   }
-  return { mountGuarded, selfGuarded, mountPrefixes, diag };
+  return { mountGuarded, selfGuarded, roleGuarded, mountPrefixes, diag };
 }
 
 // —— 跨文件 handler 引用：router.get("/x", authMw, appHandler.x) 的实体在别的文件 ——
@@ -613,6 +651,9 @@ export async function analyzeProject(ctx) {
     const normFile = normalizePath(s.file);
     const path = s.declaredPath ?? eps[0]?.path ?? null;
     const hasPathParam = /:[A-Za-z_]\w*/.test(path ?? "");
+    // 可寻址只认「指代对象」的参数段：/orders/:id 可寻址，/auth/:role/login 的 :role 换值
+    // 只是在换登录流派，不是换受害对象——按它构造越权用例必然测不出证据（且报告里是纯噪声）。
+    const hasResourceParam = resourcePathParams(path).length > 0;
     // GraphQL 区块已带 declaredPath（完整端点），且 sink 判定走 s.graphql，不再做查询参数定位；
     // Python 区块的查询参数来自签名/request.args 等，由适配器直接携带
     const queryParam =
@@ -628,9 +669,9 @@ export async function analyzeProject(ctx) {
     const hasOwnerGuard = OWNER_GUARD.test(s.text) || s.ownerGuard === true;
     const hasRoleGuard = ROLE_GUARD.test(s.text) || s.roleGuard === true;
     const hasOwnerFilter = OWNER_FILTER.test(s.text) || s.ownerFilter === true;
-    // 可寻址性：路径参数 / 查询参数 / tRPC 标量输入字段 / GraphQL 单标量 ID 参数——
+    // 可寻址性：指代对象的路径参数 / 查询参数 / tRPC 标量输入字段 / GraphQL 单标量 ID 参数——
     // 不可寻址的对象无法动态复现，不作越权候选
-    const addressable = hasPathParam || !!queryParam || !!s.trpc?.addressable || !!s.graphql?.addressable;
+    const addressable = hasResourceParam || !!queryParam || !!s.trpc?.addressable || !!s.graphql?.addressable;
     // 列表形态（归属过滤 + 无对象引用参数）：findFirst/单查族也常用于「取列表首条」，
     // 无可寻址参数时不可被动态寻址，抑制为噪声而非 IDOR 候选
     const listShaped = hasOwnerFilter && !addressable;
@@ -797,6 +838,7 @@ export async function analyzeProject(ctx) {
     sections: sections.length,
     mountAuthFiles: authGuards.mountGuarded.size,
     selfAuthFiles: authGuards.selfGuarded.size,
+    roleGuardFiles: authGuards.roleGuarded.size,
     mountPrefixFiles: authGuards.mountPrefixes.size,
     handlerSections: handlerScan.sections.length,
     handlerRefsResolved: handlerScan.diag.handlerResolved,
@@ -927,7 +969,8 @@ export async function analyzeProject(ctx) {
     seen.add(key);
     endpoints.push(ep);
     // 外部线索没有代码 sink，直接按"带认证但未见归属校验"报候选；动态 probe 会实际验证
-    const addressable = /:[A-Za-z_]\w*/.test(ep.path) || !!ep.queryParam;
+    // 同样的「枚举型参数不算可寻址」规则：手工契约/OpenAPI 里的 /auth/{role}/login 不是对象端点
+    const addressable = resourcePathParams(ep.path).length > 0 || !!ep.queryParam;
     if (addressable) {
       candidates.push({ ...ep, kind: ep.hasAuth ? "idor-suspect" : "no-auth-suspect" });
     }

@@ -1,0 +1,6 @@
+{
+  "name": "ssr-shop",
+  "private": true,
+  "type": "module",
+  "description": "服务端渲染靶场：全站只有 HTML 页面，没有 JSON 列表接口；/notes/:id 只验登录不验归属"
+}

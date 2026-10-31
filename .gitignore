@@ -31,6 +31,7 @@ guardbuild-data/
 .demo-bizlogic/
 .demo-contract/
 .demo-shape/
+.demo-ssr/
 .demo-attackplan/
 .demo-package/
 .demo-install/

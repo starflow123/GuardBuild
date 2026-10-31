@@ -82,7 +82,7 @@ npm run e2e:attackplan # 攻击规划代理演练（40 断言，本机 mock Deep
 npm run e2e:llm        # LLM 接入侦察演练（61 断言，本机 mock DeepSeek：候选逐个启动、全灭回退、无密钥磁盘缓存复用，含模型编造路由被运行期实测拦下）
 npm run e2e:llm-patch  # LLM 编码代理补丁演练（73 断言，本机 mock：守规矩 / 不守规矩 / 无密钥 / 先只读自查四轮）
 npm run e2e:fix-agent  # 本地修复循环演练（21 断言：首轮漏修 → 失败证据+运行日志回传 → 第二轮通过）
-npm run benchmark      # 精度基准（12 个标注靶场：漏报 / 误报 / 退出码一致性）
+npm run benchmark      # 精度基准（13 个标注靶场：漏报 / 误报 / 退出码一致性）
 npm run benchmark:blackbox  # 黑盒精度基准（25 个标注靶场：用例族召回 / 误报 / 写与破坏性探测开关 / 退出码）
 npm run benchmark:realworld # 第三方真实靶场基准（可选开启：本机备好的上游真代码，缺则自动跳过）
 npm run benchmark:indie  # 真实项目白盒基准（强制白盒链路 + 假绿灯结构审计；本批只跑公开条目）
@@ -166,6 +166,7 @@ npm run test:rust      # Rust Host
 - 列表 / 单体不在响应顶层（如 `{ "code": 0, "data": { "items": [] } }`）→ 多数情况**无需声明**：资源契约自动发现会用两个身份的真实请求实测出列表数组、主键、归属与实体包装（报告 `summary.resourceContract` 可查）；形状歧义（多个对象数组、自造分页键名）导致发现失败时再用 `responses` / `listEndpoint` 显式声明
 - 资源主键 / 归属字段不叫 `id` / `ownerId`（如 `order_id` / `created_by_uid`）→ `responses.id` / `responses.owner`，或按路由用 `routes[].idField` / `ownerField` 覆盖；声明后归属比对与越权取证都按这些字段读
 - 列表接口需要分页 / 过滤参数才返回数据（缺参数直接 400）→ 常见分页键名（`page` / `size` / `pageSize` / `limit` / `offset` / `per_page` 等）自动发现会逐个试；自造键名再用 `listEndpoint` 显式声明并把 `query` 参数一并给出；显式声明优先级最高
+- 全站只有 HTML 页面、没有 JSON 列表接口的服务端渲染应用 → 无需声明：身份登录后从入口页链接里按候选路由模板抓对象 ID，越权证据改为「受害人本人会话页面里独有、且原样出现在攻击响应正文里的内容片段」（英文按词、中文按汉字二元组，须全部命中）；拿不到对照页面时判 `inconclusive`，不会把页面结构相似当成越权成功
 - 路由是手写分发表 / 正则（静态适配器认不出），或多段路径参数（`/orgs/:orgId/orders/:orderId`）→ 用 `routes` 显式声明，多段路径给 `params` 绑定取值来源；未声明时引擎会用本人列表里的真实对象实测参数取值（真实回读验证），实测不出才落「无法构造探测请求 / 取值来源未通过实测」（exit 2），不会被伪装成「已测无问题」
 - 登录失败会给出归因：凭据错误（401/403）、端点不存在（404/405）、服务端异常（5xx），并提示检查契约对应字段
 - Windows 上 `npm` / `npx` 等 `.cmd` shim 自动解析（沿 `PATH` × `PATHEXT` 查找），契约里直接写 `npm` / `npx` 即可
@@ -237,7 +238,7 @@ npm run e2e:llm-patch          # 本机 mock DeepSeek 四轮演练，无需真�
 - 判定：任一靶场漏报、误报、退出码不一致或执行失败，基准即以非零码退出；新增适配器/探测能力时在语料追加标注条目并保持全绿
 - 干净对照：`fixtures/clean-shop` 的对象接口把归属校验封装在辅助函数中（静态看起来可疑、运行期真实拒绝），用于验证「动态澄清静态误报」与 exit 0 路径
 - 产物：`.benchmark/benchmark-report.json` / `.benchmark/benchmark-report.md`（逐靶场漏报、误报、静态命中与裁决）；CI 每次自测都会执行并上传
-- 当前基线（2026-10-24）：12 个靶场 · 动态召回 23/23 · 误报 0/23 · 退出码一致 12/12 · 静态召回 23/23 · 零模型调用
+- 当前基线（2026-10-31）：13 个靶场 · 动态召回 24/24 · 误报 0/24 · 退出码一致 13/13 · 静态召回 24/24 · 零模型调用
 
 ### 黑盒精度基准
 

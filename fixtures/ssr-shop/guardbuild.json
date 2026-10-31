@@ -1,0 +1,22 @@
+{
+  "_note": "服务端渲染（SSR）靶场：全站只有 HTML 页面，没有 JSON 列表接口；/notes/:id 只验登录不验归属。GB_SSR_HARDENED=1 时运行期用 src/access.js 的 helper 补归属校验（静态候选仍在，结论由实测给出）。",
+  "start": {
+    "cmd": "node",
+    "args": ["server.js"],
+    "env": { "PORT": "0" },
+    "readyPattern": "已就绪",
+    "readyTimeoutMs": 20000
+  },
+  "login": {
+    "path": "/login",
+    "encoding": "form",
+    "cookieAuth": true,
+    "bodyTemplate": { "email": "{email}", "password": "{password}" }
+  },
+  "identities": [
+    { "name": "alice", "email": "alice@ssr.shop", "password": "alice123", "role": "user" },
+    { "name": "bob", "email": "bob@ssr.shop", "password": "bob123", "role": "user" }
+  ],
+  "llm": { "enabled": false },
+  "scopes": ["project.read", "worktree.write", "proc.spawn", "net.probe"]
+}

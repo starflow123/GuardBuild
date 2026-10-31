@@ -127,6 +127,15 @@
       ]
     },
     {
+      "id": "ssr-shop",
+      "fixture": "fixtures/ssr-shop",
+      "expectedExit": 1,
+      "expectedVulnerableCases": ["attack-read-foreign"],
+      "expectedStatic": [
+        { "kind": "idor-suspect", "method": "GET", "path": "/notes/:id" }
+      ]
+    },
+    {
       "id": "clean-shop",
       "fixture": "fixtures/clean-shop",
       "expectedExit": 0,

@@ -92,6 +92,9 @@ jobs:
       - name: Python 适配器 E2E（FastAPI 真实 uvicorn + 越权/匿名/修复三分支）
         run: node scripts/e2e-python.mjs
 
+      - name: SSR 页面越权 E2E（全站只有 HTML：页面链接发现 + 正文归属取证 + 跨文件加固对照）
+        run: node scripts/e2e-ssr.mjs
+
       - name: 黑盒外部模式 E2E（真实 HTTP 目标 + Cookie 会话鉴权，本机回环）
         run: node scripts/e2e-blackbox.mjs
 
@@ -116,7 +119,7 @@ jobs:
       - name: 分发布局 E2E（随包 node 在 PATH 无 node 时跑通 gate）
         run: node scripts/e2e-package.mjs
 
-      - name: 精度基准（12 个标注靶场：漏报 / 误报 / 退出码一致性）
+      - name: 精度基准（13 个标注靶场：漏报 / 误报 / 退出码一致性）
         run: node scripts/benchmark.mjs
 
       - name: 黑盒精度基准（25 个标注靶场：用例族召回 / 误报 / 写与破坏性探测开关 / 路由发现来源 / 退出码）

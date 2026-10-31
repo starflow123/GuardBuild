@@ -26,16 +26,26 @@
  *   node scripts/benchmark-indie.mjs --only=vuln-express
  *   node scripts/benchmark-indie.mjs --require=juice-shop
  *   GUARDBUILD_INDIE_DIR=D:/AiAgent/dogfood node scripts/benchmark-indie.mjs
+ *
+ * 闭环：失败按规则编号（R0–R5）归档进 benchmarks/failure-ledger.jsonl（suite=indie），
+ * 绿名单只收靶场级键（这一层没有逐用例标注）。personal=true 的项目一律不写账本、
+ * 不写绿名单——项目名会进公开仓库，隐私边界优先于统计完整性。
  */
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { allEvidence, auditWhiteboxRun } from "../sidecar/lib/falsegreen.mjs";
+import { appendLedger, greenKeysOf, redactSecrets } from "../sidecar/lib/failureledger.mjs";
+import { gateAgainstBaseline } from "../sidecar/lib/regression.mjs";
+import { consoleLoopLines, loopSection } from "./lib/loopsummary.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const benchRoot = path.join(repoRoot, ".benchmark-indie");
 const corpusPath = path.join(repoRoot, "benchmarks", "indie-corpus.json");
+const SUITE = "indie";
+const ledgerPath = path.join(repoRoot, "benchmarks", "failure-ledger.jsonl");
+const baselinePath = path.join(repoRoot, "benchmarks", "green-baseline.json");
 
 function argValue(name) {
   const hit = process.argv.slice(2).find((a) => a.startsWith(`${name}=`));
@@ -44,6 +54,7 @@ function argValue(name) {
 const only = new Set((argValue("--only") ?? "").split(",").map((s) => s.trim()).filter(Boolean));
 const mustRun = new Set((argValue("--require") ?? "").split(",").map((s) => s.trim()).filter(Boolean));
 const keep = process.argv.includes("--keep");
+const rebaseline = process.argv.includes("--rebaseline");
 
 function resolveHeadlessBin() {
   if (process.env.GUARDBUILD_HEADLESS_BIN) return process.env.GUARDBUILD_HEADLESS_BIN;
@@ -194,6 +205,42 @@ function skipResult(target, reason) {
   };
 }
 
+/** 白盒真实层的结构性规则 → 账本五类。R3/R5 是「没测到 / 没认出」，不是「跑挂了」 */
+const RULE_CATEGORY = {
+  R0: "broken_run",
+  R1: "broken_run",
+  R2: "missed",
+  R3: "inconclusive",
+  R4: "not_ready",
+  R5: "missed",
+};
+
+/** 这一层没有逐用例标注，失败以规则编号归档；个人项目一律不写（项目名会进公开仓库） */
+function ledgerRecordsFor(target, result, rootDir) {
+  if (target?.personal) return [];
+  // 本机项目根的绝对路径会跟着账本进仓库，统一换成占位
+  const hideRoot = (s) => (rootDir ? String(s ?? "").split(String(rootDir)).join("<项目根>") : String(s ?? ""));
+  const base = {
+    suite: SUITE,
+    target: result.id,
+    exit: { actual: result.exit ?? null, expected: (result.expectedExits ?? [0, 1, 2]).join("/") },
+    outcome: { actual: result.outcome ?? null, expected: result.expectedExits ?? null },
+    durationMs: result.durationMs ?? null,
+    evidence: null,
+    corpus: { expectedExits: result.expectedExits ?? null },
+  };
+  if (result.skipped) {
+    return [{ ...base, caseKey: "-", category: "not_ready", cause: "skipped_on_host", detail: hideRoot(redactSecrets(result.skipReason ?? "项目缺失或依赖未准备")) }];
+  }
+  return (result.failures ?? []).map((f) => ({
+    ...base,
+    caseKey: f.rule,
+    category: RULE_CATEGORY[f.rule] ?? "broken_run",
+    cause: f.rule.toLowerCase(),
+    detail: hideRoot(redactSecrets(f.text)),
+  }));
+}
+
 function buildMarkdown(meta, results) {
   const run = results.filter((r) => !r.skipped);
   const skipped = results.filter((r) => r.skipped);
@@ -252,6 +299,7 @@ function buildMarkdown(meta, results) {
     lines.push("跳过不计入失败，也不代表能力缺失——只有 `--require=<id>` 显式要求实跑时才会判红。");
     lines.push("");
   }
+  lines.push(...loopSection({ loop: meta.loop }));
   lines.push("## 口径");
   lines.push("");
   lines.push("- 这一层不预测结论方向：真实项目跑成 exit 0 / 1 / 2 都可能，允许集合写在 `benchmarks/indie-corpus.json`。");
@@ -323,12 +371,47 @@ async function main() {
   const requiredSkipped = skipped.filter((r) => mustRun.has(r.id));
   const pass = runResults.every((r) => r.pass) && requiredSkipped.length === 0;
   const gitHead = spawnSync("git", ["rev-parse", "--short", "HEAD"], { cwd: repoRoot, encoding: "utf8" }).stdout?.trim() || null;
+
+  const targetById = new Map(corpus.targets.map((t) => [t.id, t]));
+  const ledgerRecords = results.flatMap((r) => ledgerRecordsFor(targetById.get(r.id), r, indieDir));
+  const ledger = appendLedger({
+    filePath: ledgerPath,
+    records: ledgerRecords,
+    gitHead,
+    partial: only.size > 0,
+    cleanRun: pass && only.size === 0,
+    resolveSuite: SUITE,
+  });
+  // 绿名单同样只收公开项目；被跳过的本轮没跑，不参与回退比对
+  const baselineResults = results.filter((r) => !r.skipped && !targetById.get(r.id)?.personal);
+  const regression = gateAgainstBaseline({
+    filePath: baselinePath,
+    suite: SUITE,
+    currentKeys: greenKeysOf({ suite: SUITE, results: baselineResults }),
+    coveredTargets: new Set(baselineResults.map((r) => r.id)),
+    corpusVersion: corpus.version,
+    gitHead,
+    allPass: pass,
+    partial: only.size > 0,
+    rebaseline,
+  });
+  const loop = {
+    suite: SUITE,
+    ledger,
+    regression,
+    ledgerPath: path.relative(repoRoot, ledgerPath).replace(/\\/g, "/"),
+    baselinePath: path.relative(repoRoot, baselinePath).replace(/\\/g, "/"),
+  };
+  const gateOk = pass && regression.ok;
+
   const meta = {
     generatedAt: new Date().toISOString(),
     gitHead,
     corpusVersion: corpus.version,
     indieDir,
     pass,
+    gateOk,
+    loop,
     metrics: {
       targets: runResults.length,
       passed: runResults.filter((r) => r.pass).length,
@@ -356,13 +439,14 @@ async function main() {
       );
     }
   }
+  for (const line of consoleLoopLines(loop)) console.log(line);
   console.log(`[INDIE-BENCH] 报告：${path.join(benchRoot, "benchmark-report.md")}`);
   if (requiredSkipped.length) console.log(`[INDIE-BENCH] 未通过：要求实跑的项目被跳过 → ${requiredSkipped.map((r) => `${r.id}（${r.skipReason}）`).join("；")}`);
   if (pass && meta.metrics.noTraffic) {
     console.log(`[INDIE-BENCH] 终态全部合规，但 ${meta.metrics.noTraffic} 个项目一个攻击请求都没打到——这一层没有证明检测能力，只证明了不撒谎`);
   }
-  console.log(pass ? "[INDIE-BENCH] 实跑项目终态全部合规 ✅" : "[INDIE-BENCH] 存在未通过项目 ❌");
-  return pass;
+  console.log(gateOk ? "[INDIE-BENCH] 实跑项目终态全部合规 ✅" : "[INDIE-BENCH] 存在未通过项目或相对绿名单回退 ❌");
+  return gateOk;
 }
 
 main()

@@ -12,10 +12,14 @@
  * 口径：黑盒用例没有引擎生成的编号变体，caseId 即真实请求路径，因此本次不折叠变体。
  * 任何漏报、误报、退出码/终态不一致都会让基准非零退出。
  *
+ * 闭环两层（benchmarks/ 下进仓库）：failure-ledger.jsonl 五类归档、green-baseline.json
+ * 绿名单；相对绿名单回退任意一条即整轮否决。两套套件共享同一份账本，按 suite 隔离。
+ *
  * 用法:
  *   node scripts/benchmark-blackbox.mjs                # 全量
- *   node scripts/benchmark-blackbox.mjs --only=spa-shop
+ *   node scripts/benchmark-blackbox.mjs --only=spa-shop  # 局部跑：不更新绿名单，也不关账
  *   node scripts/benchmark-blackbox.mjs --keep         # 保留上一轮产物
+ *   node scripts/benchmark-blackbox.mjs --rebaseline   # 重建黑盒绿名单（仅整轮全绿时被接受）
  */
 import { spawn, spawnSync } from "node:child_process";
 import {
@@ -28,10 +32,16 @@ import {
 } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { appendLedger, classifyRun, greenKeysOf } from "../sidecar/lib/failureledger.mjs";
+import { gateAgainstBaseline } from "../sidecar/lib/regression.mjs";
+import { consoleLoopLines, loopSection } from "./lib/loopsummary.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const benchRoot = path.join(repoRoot, ".benchmark-blackbox");
 const corpusPath = path.join(repoRoot, "benchmarks", "blackbox-corpus.json");
+const SUITE = "blackbox";
+const ledgerPath = path.join(repoRoot, "benchmarks", "failure-ledger.jsonl");
+const baselinePath = path.join(repoRoot, "benchmarks", "green-baseline.json");
 
 function argValue(name) {
   const hit = process.argv.slice(2).find((a) => a.startsWith(`${name}=`));
@@ -40,6 +50,7 @@ function argValue(name) {
 
 const only = new Set((argValue("--only") ?? "").split(",").map((s) => s.trim()).filter(Boolean));
 const keep = process.argv.includes("--keep");
+const rebaseline = process.argv.includes("--rebaseline");
 
 function resolveHeadlessBin() {
   if (process.env.GUARDBUILD_HEADLESS_BIN) return process.env.GUARDBUILD_HEADLESS_BIN;
@@ -254,7 +265,7 @@ function buildMarkdown(meta, results, metrics) {
   lines.push(`- 生成时间：${meta.generatedAt}`);
   lines.push(`- 代码版本：${meta.gitHead || "unknown"}`);
   lines.push(`- 语料：\`benchmarks/blackbox-corpus.json\`（v${meta.corpusVersion}，${results.length} 个靶场）`);
-  lines.push(`- 判定：漏报 0 / 误报 0 / 退出码与终态全部一致 → ${meta.pass ? "通过" : "未通过"}`);
+  lines.push(`- 判定：漏报 0 / 误报 0 / 退出码与终态全部一致 / 绿名单不回退 → ${meta.gateOk ? "通过" : "未通过"}`);
   lines.push("");
   lines.push("## 汇总");
   lines.push("");
@@ -292,6 +303,7 @@ function buildMarkdown(meta, results, metrics) {
       lines.push("");
     }
   }
+  lines.push(...loopSection({ loop: meta.loop }));
   lines.push("## 说明");
   lines.push("");
   lines.push("- 漏洞用例召回：语料标注的 caseId 规则（支持尾部 * 前缀）在报告证据中判为 vulnerable 的比例。");
@@ -316,6 +328,7 @@ async function main() {
 
   console.log(`[BB-BENCH] ${targets.length} 个标注靶场，宿主 ${exe}`);
   const results = [];
+  const ledgerRecords = [];
   for (let i = 0; i < targets.length; i++) {
     const target = targets[i];
     process.stdout.write(`[BB-BENCH] ${i + 1}/${targets.length} ${target.id} …`);
@@ -327,6 +340,7 @@ async function main() {
       const run = await runScan(ws, started.port, target);
       const result = evaluate(target, run);
       results.push(result);
+      ledgerRecords.push(...classifyRun({ suite: SUITE, target, result, report: run.report, gate: run.gate }));
       const c = result.cases;
       console.log(
         ` exit=${result.exit.actual ?? "—"}/${result.exit.expected} 命中=${c.matched.length}/${c.expected.length} 漏报=${c.missed.length} 误报=${c.falsePositives.length} 路由=${result.discovery.routeCount} ${(result.durationMs / 1000).toFixed(1)}s ${result.pass ? "✓" : "✗"}`
@@ -339,7 +353,7 @@ async function main() {
         if (!result.outcome.ok) console.log(`        终态 ${result.outcome.actual ?? "—"} 不在 ${(result.outcome.expected ?? []).join("/")}`);
       }
     } catch (e) {
-      results.push({
+      const failed = {
         id: target.id,
         pass: false,
         durationMs: 0,
@@ -351,7 +365,11 @@ async function main() {
         discovery: { routeCount: 0, bySource: {}, openapiFound: false, openapiRouteCount: 0, frontendRouteCount: 0, frontendScripts: 0, frontendNextManifest: 0, seoRouteCount: 0 },
         reportPath: null,
         stderrTail: "",
-      });
+        // server 还没起来就在 makeWorkspace/startTarget 抛了 —— 归「起不来」
+        startupFailed: !server,
+      };
+      results.push(failed);
+      ledgerRecords.push(...classifyRun({ suite: SUITE, target, result: failed, report: null, gate: null }));
       console.log(` ✗ ${e.message}`);
     } finally {
       await stopTarget(server);
@@ -367,11 +385,42 @@ async function main() {
   const pass = results.length === targets.length && results.every((r) => r.pass);
 
   const gitHead = spawnSync("git", ["rev-parse", "--short", "HEAD"], { cwd: repoRoot, encoding: "utf8" }).stdout?.trim() || null;
+
+  const ledger = appendLedger({
+    filePath: ledgerPath,
+    records: ledgerRecords,
+    gitHead,
+    partial: only.size > 0,
+    cleanRun: pass && only.size === 0,
+    resolveSuite: SUITE,
+  });
+  const regression = gateAgainstBaseline({
+    filePath: baselinePath,
+    suite: SUITE,
+    currentKeys: greenKeysOf({ suite: SUITE, results }),
+    coveredTargets: new Set(results.map((r) => r.id)),
+    corpusVersion: corpus.version,
+    gitHead,
+    allPass: pass,
+    partial: only.size > 0,
+    rebaseline,
+  });
+  const loop = {
+    suite: SUITE,
+    ledger,
+    regression,
+    ledgerPath: path.relative(repoRoot, ledgerPath).replace(/\\/g, "/"),
+    baselinePath: path.relative(repoRoot, baselinePath).replace(/\\/g, "/"),
+  };
+  const gateOk = pass && regression.ok;
+
   const meta = {
     generatedAt: new Date().toISOString(),
     gitHead,
     corpusVersion: corpus.version,
     pass,
+    gateOk,
+    loop,
     metrics: { tp, fn, fp, exitOk, outcomeOk, targets: results.length, passed },
   };
   const jsonPath = path.join(benchRoot, "benchmark-report.json");
@@ -381,10 +430,11 @@ async function main() {
 
   console.log("");
   console.log(`[BB-BENCH] 召回 ${tp}/${tp + fn}（${pct(tp, tp + fn)}）· 误报 ${fp}/${tp + fp}（${pct(fp, tp + fp)}）· 退出码一致 ${exitOk}/${results.length} · 终态一致 ${outcomeOk}/${results.length}`);
+  for (const line of consoleLoopLines(loop)) console.log(line);
   console.log(`[BB-BENCH] 报告：${jsonPath}`);
   console.log(`[BB-BENCH]       ${mdPath}`);
-  console.log(pass ? "[BB-BENCH] 全部通过 ✅" : `[BB-BENCH] 未通过：${results.filter((r) => !r.pass).map((r) => r.id).join("、")} ❌`);
-  return pass;
+  console.log(gateOk ? "[BB-BENCH] 全部通过 ✅" : `[BB-BENCH] 未通过：${results.filter((r) => !r.pass).map((r) => r.id).join("、") || "回退否决"} ❌`);
+  return gateOk;
 }
 
 main()

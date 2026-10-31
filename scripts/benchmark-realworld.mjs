@@ -18,16 +18,25 @@
  *   node scripts/benchmark-realworld.mjs --only=vulnapi
  *   node scripts/benchmark-realworld.mjs --require=vulnapi
  *   GUARDBUILD_REAL_DIR=D:/AiAgent/dogfood node scripts/benchmark-realworld.mjs
+ *
+ * 闭环：同样记进 benchmarks/failure-ledger.jsonl（suite=realworld）并受绿名单回退否决；
+ * 因「这台机器没这份代码」被跳过的靶场记为「起不来」，不参与绿名单比对（没跑就不算回退）。
  */
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import net from "node:net";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { appendLedger, classifyRun, greenKeysOf } from "../sidecar/lib/failureledger.mjs";
+import { gateAgainstBaseline } from "../sidecar/lib/regression.mjs";
+import { consoleLoopLines, loopSection } from "./lib/loopsummary.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const benchRoot = path.join(repoRoot, ".benchmark-realworld");
 const corpusPath = path.join(repoRoot, "benchmarks", "realworld-corpus.json");
+const SUITE = "realworld";
+const ledgerPath = path.join(repoRoot, "benchmarks", "failure-ledger.jsonl");
+const baselinePath = path.join(repoRoot, "benchmarks", "green-baseline.json");
 
 function argValue(name) {
   const hit = process.argv.slice(2).find((a) => a.startsWith(`${name}=`));
@@ -36,6 +45,7 @@ function argValue(name) {
 const only = new Set((argValue("--only") ?? "").split(",").map((s) => s.trim()).filter(Boolean));
 const mustRun = new Set((argValue("--require") ?? "").split(",").map((s) => s.trim()).filter(Boolean));
 const keep = process.argv.includes("--keep");
+const rebaseline = process.argv.includes("--rebaseline");
 
 function resolveHeadlessBin() {
   if (process.env.GUARDBUILD_HEADLESS_BIN) return process.env.GUARDBUILD_HEADLESS_BIN;
@@ -307,6 +317,7 @@ function buildMarkdown(meta, results) {
     lines.push("跳过不计入失败，也不代表能力缺失——只有用 `--require=<id>` 显式要求实跑时才会判红。");
     lines.push("");
   }
+  lines.push(...loopSection({ loop: meta.loop }));
   lines.push("## 口径");
   lines.push("");
   lines.push("- 标注来自上游作者声明的漏洞清单与逐行源码核对；未标注发现只列出，不自动算误报。");
@@ -328,18 +339,33 @@ async function main() {
 
   console.log(`[RW-BENCH] ${targets.length} 个第三方靶场，宿主 ${exe}，靶场根 ${realDir}`);
   const results = [];
+  const ledgerRecords = [];
+  const recordSkip = (target, skipped, reason) =>
+    ledgerRecords.push(
+      ...classifyRun({
+        suite: SUITE,
+        target,
+        result: { ...skipped, startupFailed: true, startupCause: "skipped_on_host", skipReason: reason },
+        report: null,
+        gate: null,
+      })
+    );
   for (let i = 0; i < targets.length; i++) {
     const target = targets[i];
     const dir = path.join(realDir, target.dir);
     process.stdout.write(`[RW-BENCH] ${i + 1}/${targets.length} ${target.id} …`);
     if (!existsSync(dir)) {
-      results.push(skipResult(target, `目录不存在 ${dir}`));
+      const skipped = skipResult(target, `目录不存在 ${dir}`);
+      results.push(skipped);
+      recordSkip(target, skipped, skipped.skipReason);
       console.log(` ⊘ 目录不存在 ${dir}`);
       continue;
     }
     const missing = missingRequires(dir, target);
     if (missing.length) {
-      results.push(skipResult(target, `缺少 ${missing.join("、")}（依赖/构建产物未准备）`));
+      const skipped = skipResult(target, `缺少 ${missing.join("、")}（依赖/构建产物未准备）`);
+      results.push(skipped);
+      recordSkip(target, skipped, skipped.skipReason);
       console.log(` ⊘ 缺少 ${missing.join("、")}`);
       continue;
     }
@@ -351,6 +377,16 @@ async function main() {
       const run = await runScan(dir, started.port, target);
       const result = evaluate(target, run);
       results.push(result);
+      // 真实层的误报判据只有「结构上不可能存在的族」；未标注发现要人工核对，不进账本当误报
+      ledgerRecords.push(
+        ...classifyRun({
+          suite: SUITE,
+          target,
+          result: { ...result, cases: { ...result.cases, falsePositives: result.cases.forbiddenHits } },
+          report: run.report,
+          gate: null,
+        })
+      );
       const c = result.cases;
       console.log(
         ` exit=${result.exit.actual ?? "—"}/${result.exit.expected} 命中=${c.matched.length}/${c.expected.length} 漏报=${c.missed.length} 禁止族=${c.forbiddenHits.length} 未标注=${c.unlabeled.length} 路由=${result.discovery.routeCount} ${(result.durationMs / 1000).toFixed(1)}s ${result.pass ? "✓" : "✗"}`
@@ -362,7 +398,9 @@ async function main() {
       if (!result.outcome.ok) console.log(`        终态 ${result.outcome.actual ?? "—"} 不在 ${(result.outcome.expected ?? []).join("/")}`);
     } catch (e) {
       // 起不来多半是这台机器没装依赖，不是引擎回归 → 跳过，但把原因写清楚
-      results.push(skipResult(target, `启动失败：${e.message}`));
+      const skipped = skipResult(target, `启动失败：${e.message}`);
+      results.push(skipped);
+      recordSkip(target, skipped, skipped.skipReason);
       console.log(` ⊘ 启动失败：${e.message}`);
     } finally {
       await stopTarget(server);
@@ -381,12 +419,43 @@ async function main() {
   const pass = runResults.every((r) => r.pass) && requiredSkipped.length === 0;
 
   const gitHead = spawnSync("git", ["rev-parse", "--short", "HEAD"], { cwd: repoRoot, encoding: "utf8" }).stdout?.trim() || null;
+
+  const ledger = appendLedger({
+    filePath: ledgerPath,
+    records: ledgerRecords,
+    gitHead,
+    partial: only.size > 0,
+    cleanRun: pass && only.size === 0,
+    resolveSuite: SUITE,
+  });
+  const regression = gateAgainstBaseline({
+    filePath: baselinePath,
+    suite: SUITE,
+    currentKeys: greenKeysOf({ suite: SUITE, results: runResults }),
+    coveredTargets: new Set(runResults.map((r) => r.id)),
+    corpusVersion: corpus.version,
+    gitHead,
+    allPass: pass,
+    partial: only.size > 0,
+    rebaseline,
+  });
+  const loop = {
+    suite: SUITE,
+    ledger,
+    regression,
+    ledgerPath: path.relative(repoRoot, ledgerPath).replace(/\\/g, "/"),
+    baselinePath: path.relative(repoRoot, baselinePath).replace(/\\/g, "/"),
+  };
+  const gateOk = pass && regression.ok;
+
   const meta = {
     generatedAt: new Date().toISOString(),
     gitHead,
     corpusVersion: corpus.version,
     realDir,
     pass,
+    gateOk,
+    loop,
     metrics: { tp, fn, fp, unlabeled, exitOk, targets: runResults.length, passed, skipped: skipped.length },
   };
   writeFileSync(path.join(benchRoot, "benchmark-report.json"), JSON.stringify({ ...meta, results }, null, 2));
@@ -396,10 +465,11 @@ async function main() {
   console.log(
     `[RW-BENCH] 实跑 ${runResults.length}/${targets.length}（跳过 ${skipped.length}）· 召回 ${tp}/${tp + fn} · 禁止族命中 ${fp} · 未标注 ${unlabeled} · 退出码一致 ${exitOk}/${runResults.length}`
   );
+  for (const line of consoleLoopLines(loop)) console.log(line);
   console.log(`[RW-BENCH] 报告：${path.join(benchRoot, "benchmark-report.md")}`);
   if (requiredSkipped.length) console.log(`[RW-BENCH] 未通过：要求实跑的靶场被跳过 → ${requiredSkipped.map((r) => `${r.id}（${r.skipReason}）`).join("；")}`);
-  console.log(pass ? "[RW-BENCH] 实跑靶场全部通过 ✅" : "[RW-BENCH] 存在未通过靶场 ❌");
-  return pass;
+  console.log(gateOk ? "[RW-BENCH] 实跑靶场全部通过 ✅" : "[RW-BENCH] 存在未通过靶场或相对绿名单回退 ❌");
+  return gateOk;
 }
 
 main()

@@ -12,10 +12,15 @@
  * 都会让基准以非零退出，作为新增适配器/探测能力的回归闸门。
  * 引擎生成的同源变体（-objN/-encN/-chanN）折叠到其标注基名统计，不单独算误报。
  *
+ * 闭环两层（benchmarks/ 下进仓库）：
+ *   failure-ledger.jsonl  本轮不达标结果按五类归档，附脱敏后的原始请求/响应摘录
+ *   green-baseline.json   历史绿过的键；相对它回退任意一条即整轮否决（不看平均）
+ *
  * 用法:
  *   node scripts/benchmark.mjs                # 全量
- *   node scripts/benchmark.mjs --only=next-shop,clean-shop
+ *   node scripts/benchmark.mjs --only=next-shop,clean-shop   # 局部跑：不更新绿名单时间戳，也不关账
  *   node scripts/benchmark.mjs --keep         # 保留上一轮 .benchmark 产物
+ *   node scripts/benchmark.mjs --rebaseline   # 重建绿名单（仅在整轮全绿时被接受）
  */
 import { spawn, spawnSync } from "node:child_process";
 import {
@@ -29,10 +34,17 @@ import {
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { variantBaseCaseId } from "../sidecar/lib/attackvariants.mjs";
+import { appendLedger, classifyRun, greenKeysOf } from "../sidecar/lib/failureledger.mjs";
+import { gateAgainstBaseline } from "../sidecar/lib/regression.mjs";
+import { consoleLoopLines, loopSection } from "./lib/loopsummary.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const benchRoot = path.join(repoRoot, ".benchmark");
 const corpusPath = path.join(repoRoot, "benchmarks", "corpus.json");
+/** 闭环产物进仓库：账本累积失败历史，绿名单是「不许回退」的必过清单 */
+const SUITE = "whitebox";
+const ledgerPath = path.join(repoRoot, "benchmarks", "failure-ledger.jsonl");
+const baselinePath = path.join(repoRoot, "benchmarks", "green-baseline.json");
 
 function argValue(name) {
   const hit = process.argv.slice(2).find((a) => a.startsWith(`${name}=`));
@@ -41,6 +53,7 @@ function argValue(name) {
 
 const only = new Set((argValue("--only") ?? "").split(",").map((s) => s.trim()).filter(Boolean));
 const keep = process.argv.includes("--keep");
+const rebaseline = process.argv.includes("--rebaseline");
 
 /** 无头宿主可执行文件：GUARDBUILD_HEADLESS_BIN > target/debug > target/release（跨平台） */
 function resolveHeadlessBin() {
@@ -210,7 +223,7 @@ function buildMarkdown(meta, results, metrics) {
   lines.push(`- 生成时间：${meta.generatedAt}`);
   lines.push(`- 代码版本：${meta.gitHead || "unknown"}`);
   lines.push(`- 语料：\`benchmarks/corpus.json\`（v${meta.corpusVersion}，${results.length} 个靶场）`);
-  lines.push(`- 判定：漏报 0 / 误报 0 / 退出码全部一致 → ${meta.pass ? "通过" : "未通过"}`);
+  lines.push(`- 判定：漏报 0 / 误报 0 / 退出码全部一致 / 绿名单不回退 → ${meta.gateOk ? "通过" : "未通过"}`);
   lines.push("");
   lines.push("## 汇总");
   lines.push("");
@@ -247,6 +260,7 @@ function buildMarkdown(meta, results, metrics) {
       lines.push("");
     }
   }
+  lines.push(...loopSection({ loop: meta.loop }));
   lines.push("## 说明");
   lines.push("");
   lines.push("- 动态漏报：标注为 vulnerable 的攻击用例未出现在 pre 证据中，或未被判为 vulnerable。");
@@ -271,6 +285,7 @@ async function main() {
   console.log(`[BENCH] ${targets.length} 个标注靶场，宿主 ${exe}`);
   const results = [];
   const skipped = [];
+  const ledgerRecords = [];
   for (let i = 0; i < targets.length; i++) {
     const target = targets[i];
     const missing = (target.requires ?? []).filter((cmd) => !commandAvailable(cmd));
@@ -285,6 +300,7 @@ async function main() {
       const run = await runGate(target, ws);
       const result = evaluate(target, run);
       results.push(result);
+      ledgerRecords.push(...classifyRun({ suite: SUITE, target, result, report: run.report, gate: run.gate }));
       const dyn = result.dynamic;
       console.log(
         ` exit=${result.exit.actual ?? "—"}/${result.exit.expected} 复现=${dyn.matched.length}/${dyn.expected.length} 漏报=${dyn.missed.length} 误报=${dyn.falsePositives.length} 静态=${result.static.matched}/${result.static.expected} ${(result.durationMs / 1000).toFixed(1)}s ${result.pass ? "✓" : "✗"}`
@@ -295,7 +311,7 @@ async function main() {
         if (!result.exit.ok) console.log(`        退出码 ${result.exit.actual ?? "—"} != ${result.exit.expected}${result.exit.timedOut ? "（超时）" : ""}${result.exit.error ? `（${result.exit.error}）` : ""}`);
       }
     } catch (e) {
-      results.push({
+      const failed = {
         id: target.id,
         pass: false,
         durationMs: 0,
@@ -307,7 +323,11 @@ async function main() {
         businessRegressed: [],
         reportPath: null,
         stderrTail: "",
-      });
+        // 走到 catch 只可能是 makeWorkspace（git/复制）抛的：gate 还没开始跑
+        startupFailed: true,
+      };
+      results.push(failed);
+      ledgerRecords.push(...classifyRun({ suite: SUITE, target, result: failed, report: null, gate: null }));
       console.log(` ✗ ${e.message}`);
     }
   }
@@ -322,12 +342,46 @@ async function main() {
   const pass = results.length > 0 && results.every((r) => r.pass);
 
   const gitHead = spawnSync("git", ["rev-parse", "--short", "HEAD"], { cwd: repoRoot, encoding: "utf8" }).stdout?.trim() || null;
+
+  // 闭环两层：先把这一轮的不达标结果记进账本，再拿绿名单做「不许回退」否决。
+  // 账本只在整轮跑完（非 --only）时才把没再出现的条目判成已解决，局部跑没有资格关门。
+  const ledger = appendLedger({
+    filePath: ledgerPath,
+    records: ledgerRecords,
+    gitHead,
+    partial: only.size > 0,
+    cleanRun: pass && only.size === 0,
+    resolveSuite: SUITE,
+  });
+  const regression = gateAgainstBaseline({
+    filePath: baselinePath,
+    suite: SUITE,
+    currentKeys: greenKeysOf({ suite: SUITE, results }),
+    coveredTargets: new Set(results.map((r) => r.id)),
+    corpusVersion: corpus.version,
+    gitHead,
+    allPass: pass,
+    partial: only.size > 0,
+    rebaseline,
+  });
+  const loop = {
+    suite: SUITE,
+    ledger,
+    regression,
+    ledgerPath: path.relative(repoRoot, ledgerPath).replace(/\\/g, "/"),
+    baselinePath: path.relative(repoRoot, baselinePath).replace(/\\/g, "/"),
+  };
+  // 整轮通过 = 语料判定全绿 且 相对绿名单没有回退；后者是独立否决，不看平均
+  const gateOk = pass && regression.ok;
+
   const meta = {
     generatedAt: new Date().toISOString(),
     gitHead,
     corpusVersion: corpus.version,
     pass,
+    gateOk,
     skipped,
+    loop,
     metrics: { tp, fn, fp, exitOk, targets: results.length, staticMatched, staticExpected, passed },
   };
   const jsonPath = path.join(benchRoot, "benchmark-report.json");
@@ -338,10 +392,12 @@ async function main() {
   console.log("");
   console.log(`[BENCH] 动态召回 ${tp}/${tp + fn}（${pct(tp, tp + fn)}）· 误报 ${fp}/${tp + fp}（${pct(fp, tp + fp)}）· 退出码一致 ${exitOk}/${results.length} · 静态召回 ${staticMatched}/${staticExpected}`);
   if (skipped.length) console.log(`[BENCH] 跳过：${skipped.map((s) => `${s.id}（缺 ${s.missing.join("/")}）`).join("；")}`);
+  for (const line of consoleLoopLines(loop)) console.log(line);
   console.log(`[BENCH] 报告：${jsonPath}`);
   console.log(`[BENCH]       ${mdPath}`);
-  console.log(pass ? "[BENCH] 全部通过 ✅" : `[BENCH] 未通过：${results.filter((r) => !r.pass).map((r) => r.id).join("、")} ❌`);
-  return pass;
+  if (!regression.ok && pass) console.log(`[BENCH] 本轮全绿但相对绿名单回退：${regression.regressions.join("、")} ❌`);
+  console.log(gateOk ? "[BENCH] 全部通过 ✅" : `[BENCH] 未通过：${results.filter((r) => !r.pass).map((r) => r.id).join("、") || "回退否决"} ❌`);
+  return gateOk;
 }
 
 main()

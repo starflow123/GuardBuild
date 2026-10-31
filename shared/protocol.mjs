@@ -43,6 +43,7 @@ export const RPC_TO_HOST = {
   HTTP_REQUEST: "http.request",
   CREDENTIAL_LIST: "credential.list",
   CREDENTIAL_REVOKE: "credential.revoke",
+  CREDENTIAL_PROTECT: "credential.protect",
 
   REPORT_EMIT: "report.emit",
 };

@@ -70,6 +70,15 @@ import {
   markersInText,
   pageText,
 } from "./html.mjs";
+import {
+  classifyRegisterResponse,
+  classifySeedResponse,
+  generateCanary,
+  generateTestPassword,
+  registerBody,
+  resolveRegisterEndpoint,
+  seedBody,
+} from "./identityboot.mjs";
 import { chat as llmChat, isEnabled as llmIsEnabled, parseJson as llmParseJson } from "./llm.mjs";
 
 export class ProbeError extends Error {
@@ -174,6 +183,26 @@ export function resourceIdOf(ctx, obj, override = null) {
     if (v !== undefined && v !== null) return v;
   }
   return null;
+}
+
+function contentFieldOf(o) {
+  for (const key of ["title", "name", "note", "content", "description"]) {
+    const v = o?.[key];
+    if (typeof v === "string" && v.trim()) return [key, v.length > 60 ? `${v.slice(0, 60)}…` : v];
+  }
+  return null;
+}
+
+/** 越权读取的证据要点：只列响应里真实存在的字段。
+ *  此前硬编码「金额/状态」，目标没有这两个字段时正文写出 undefined，
+ *  也看不出这条对象是不是本轮实测写进目标的那一条——内容字段才是能比对归属的证据。 */
+function leakEvidenceFields(ctx, o, ownerField) {
+  const parts = [`归属 ${ownerOf(ctx, o, ownerField)}`];
+  if (o.amount !== undefined && o.amount !== null) parts.push(`金额 ${o.amount}`);
+  if (o.status !== undefined && o.status !== null) parts.push(`状态 ${o.status}`);
+  const content = contentFieldOf(o);
+  if (content) parts.push(`${content[0]} ${content[1]}`);
+  return parts.join("，");
 }
 
 /** 经 Host 发起一次 HTTP 请求（可携带保险库身份） */
@@ -527,11 +556,91 @@ async function assertSessionsAuthenticated(ctx, baseUrl, loggedIn, loginPath) {
 }
 
 /**
+ * 身份自举（#179）：沙箱目标每次从空库启动，「两个各自名下有数据的账号」只能由引擎造。
+ * 注册端点的来源与登录端点同一套优先级：契约 register.path > 静态识别的唯一建号候选；
+ * 两个以上候选意味着在建号语义上猜测，宁可不测也要显式失败。
+ */
+function registerPlan(ctx) {
+  // 纯黑盒目标是外部在跑的实例：引擎不向它发注册请求（建号属于对他人系统的写操作，
+  // 不在探测授权范围内）。黑盒身份必须是人已经准备好的账号。
+  if (ctx.blackboxUrl) return { available: false, reason: "blackbox", candidates: [] };
+  const cfg = ctx.registerConfig ?? null;
+  if (cfg && cfg.enabled === false) return { available: false, reason: "disabled", candidates: [] };
+  const resolved = resolveRegisterEndpoint(cfg, ctx.analysis);
+  if (!resolved.path) {
+    return { available: false, reason: resolved.source, candidates: resolved.candidates ?? [] };
+  }
+  return {
+    available: true,
+    path: resolved.path,
+    source: resolved.source,
+    method: cfg?.method ?? "POST",
+    encoding: cfg?.encoding ?? "json",
+    headers: cfg?.headers ?? {},
+    bodyTemplate: cfg?.bodyTemplate ?? null,
+    seed: cfg?.seed ?? [],
+  };
+}
+
+/** 注册/种子请求体共用的取值；身份没写 email 时按名字派生一个保留域名邮箱 */
+function registerValues(ident) {
+  const slug =
+    String(ident.username ?? ident.email ?? ident.name ?? "")
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, "") || "gbuser";
+  return {
+    name: ident.name,
+    username: ident.username ?? slug,
+    email: ident.email ?? `${slug}@guardbuild.test`,
+    password: ident.password,
+  };
+}
+
+/**
+ * 把引擎自生成的口令登记进 Host 的 protected 保险库：只用于脱敏，不作为请求头凭证，
+ * 也不出现在 credential.list。这样即使目标把凭据回显在响应里，流出 Host 的文本也已被掩码。
+ * 失败不阻断本轮（口令仍只存在于内存），但要在报告里如实标注「未被脱敏引擎保护」。
+ */
+async function protectGeneratedSecret(ctx, identity, value) {
+  try {
+    await ctx.rpc.request(
+      RPC_TO_HOST.CREDENTIAL_PROTECT,
+      { token: ctx.tokens.http ?? ctx.tokens.net, label: `password:${identity}`, value },
+      { timeoutMs: 10_000 }
+    );
+    return "ok";
+  } catch (e) {
+    return `failed：${e.message}`;
+  }
+}
+
+/** 所有身份登录失败时的归因补充：自举试过但没换来会话，读者要能看到注册这一层的真实结果 */
+function bootstrapSuffix(boot, reg) {
+  if (reg) {
+    return `（已尝试 ${boot.method} ${boot.path} 自举：${reg.verdict ?? reg.reason}，HTTP ${reg.status ?? "—"}）`;
+  }
+  if (boot.available) return "";
+  const why =
+    boot.reason === "disabled"
+      ? "被契约显式关闭（register.enabled=false）"
+      : boot.reason === "blackbox"
+        ? "纯黑盒模式不向外部目标发注册请求"
+        : boot.reason === "static-ambiguous"
+          ? `静态识别到 ${boot.candidates.length} 个建号候选，引擎不猜`
+          : "静态未识别到注册路由";
+  return `（身份自举未参与：${why}；可在 guardbuild.json 声明 register.path 后重跑）`;
+}
+
+/**
  * 所有身份登录（凭证直接存入 Host 保险库，不流经 Sidecar）。
  * 每个身份按自己的候选序列取登录端点：identities[].loginPath（多角色应用如
  * 组织者/参与者分别有 /auth/organiser/login 与 /auth/attendee/login）> 全局候选
  * （契约声明 > 静态分析 > /api/login）。身份登录不成即终止本轮——
  * 拿未认证会话继续跑，只会把「全线被拒」写成「已测未复现」。
+ *
+ * 登录不成时先做一次身份自举（register）：口令省略的身份必须先建号；声明了口令而目标不认，
+ * 就用同一份凭据走目标的注册接口再试一次登录。两条路都要「目标真实响应」说话，
+ * 任一环节不成立就抛错终止，绝不降级成匿名探测。
  */
 export async function loginAll(ctx, baseUrl) {
   const cfg = ctx.loginConfig ?? null;
@@ -614,7 +723,9 @@ export async function loginAll(ctx, baseUrl) {
           endpoint: path,
         },
       });
-      return { ok: true, entry: { ...ident, user }, endpoint: path };
+      // 会话条目不带口令：loggedIn 会流进目标选择、报告与视图，秘密只留在 ctx.identities 与保险库里
+      const { password: _drop, ...sessionIdentity } = ident;
+      return { ok: true, entry: { ...sessionIdentity, user }, endpoint: path };
     }
     attempts.push({
       path,
@@ -639,38 +750,229 @@ export async function loginAll(ctx, baseUrl) {
     return { ok: false };
   };
 
-  const loggedIn = [];
-  const endpoints = [];
-  for (const ident of ctx.identities) {
+  const boot = registerPlan(ctx);
+  const bootstrap = {
+    phase: ctx._probePhase ?? "pre",
+    endpoint: boot.available ? boot.path : null,
+    endpointSource: boot.available ? boot.source : null,
+    method: boot.available ? boot.method : null,
+    unavailableReason: boot.available ? null : boot.reason,
+    candidates: boot.available ? [] : boot.candidates,
+    accounts: [],
+    seeds: [],
+    secretProtection: {},
+  };
+  // 两轮（修复前 / 修复后）各一份：读者要能看出「这个实例也是引擎造的号」，
+  // 而不是只在第一轮造过就算数。
+  ctx._identityBootstrap = {
+    ...(ctx._identityBootstrap ?? {}),
+    byPhase: { ...(ctx._identityBootstrap?.byPhase ?? {}), [bootstrap.phase]: bootstrap },
+  };
+
+  /**
+   * 用目标自己的注册接口建一个身份。口令省略时由引擎随机生成并登记进 Host 保险库；
+   * 判定只看目标响应（2xx＝已建号，409/「已存在」＝库里有，其余＝这一轮身份不成立）。
+   */
+  const registerOne = async (ident, trigger) => {
+    if (!boot.available) return { attempted: false, reason: bootstrap.unavailableReason };
+    let generated = false;
+    if (ident.password == null) {
+      ident.password = generateTestPassword();
+      generated = true;
+      bootstrap.secretProtection[ident.name] = await protectGeneratedSecret(ctx, ident.name, ident.password);
+    }
+    const values = registerValues(ident);
+    const { body, unresolved } = registerBody(ident, boot, values);
+    if (unresolved.length) {
+      const entry = {
+        name: ident.name,
+        trigger,
+        verdict: "template_unresolved",
+        status: null,
+        generated,
+        fields: unresolved,
+      };
+      bootstrap.accounts.push(entry);
+      ctx.emit({
+        kind: "identity",
+        severity: SEVERITY.WARN,
+        message: `身份「${ident.name}」未发起注册：register.bodyTemplate 里有引擎填不出的占位符 {${unresolved.join("、")}}`,
+        data: { identity: ident.name, endpoint: boot.path, unresolved: unresolved },
+      });
+      return { attempted: false, reason: "template_unresolved", fields: unresolved, generated };
+    }
+    const encoded = encodeLoginBody(body, boot.encoding === "form");
+    let res = null;
+    try {
+      res = await httpJson(ctx, {
+        baseUrl,
+        method: boot.method,
+        path: boot.path,
+        body: encoded.body,
+        contentType: encoded.contentType,
+        extraHeaders: boot.headers,
+      });
+    } catch (e) {
+      const entry = { name: ident.name, trigger, verdict: "request_failed", status: null, generated };
+      bootstrap.accounts.push(entry);
+      return { attempted: true, verdict: "request_failed", status: null, error: e.message, generated };
+    }
+    const { verdict, status } = classifyRegisterResponse(res);
+    // 身份只写了 username 时，注册用的是引擎派生的邮箱；建号成功后把同一个邮箱记回身份，
+    // 否则随后按 login.bodyTemplate 的 {email} 登录会发空值，「号建了却登不进去」。
+    if ((verdict === "created" || verdict === "exists") && ident.email == null && values.email) {
+      ident.email = values.email;
+    }
+    bootstrap.accounts.push({ name: ident.name, trigger, verdict, status, generated, endpoint: boot.path });
+    ctx.emit({
+      kind: "identity",
+      severity: verdict === "created" || verdict === "exists" ? SEVERITY.INFO : SEVERITY.WARN,
+      message:
+        verdict === "created"
+          ? `已用目标自己的注册接口建立身份「${ident.name}」（${boot.method} ${boot.path} → HTTP ${status}）${generated ? "；口令由引擎随机生成，只进 Host 保险库（不落配置/报告/证据库）" : ""}`
+          : verdict === "exists"
+            ? `注册接口报告该账号已存在（HTTP ${status}），直接按声明口令登录`
+            : `注册未建立身份「${ident.name}」（${boot.method} ${boot.path} → HTTP ${status}）`,
+      data: {
+        identity: ident.name,
+        endpoint: boot.path,
+        endpointSource: boot.source,
+        status,
+        verdict,
+        passwordSource: generated ? "engine-generated" : "declared",
+      },
+    });
+    return { attempted: true, verdict, status, generated };
+  };
+
+  /** 契约声明的种子写入：只往「该身份自己名下」写对象，状态码不成功就显式失败 */
+  const seedFor = async (ident) => {
+    const values = registerValues(ident);
+    for (const step of boot.seed ?? []) {
+      values.canary = generateCanary();
+      const prepared = seedBody(step, values);
+      if (!prepared) {
+        bootstrap.seeds.push({ identity: ident.name, path: step.path, verdict: "skipped_no_body_template" });
+        continue;
+      }
+      if (prepared.unresolved.length) {
+        throw new ProbeError(
+          `身份「${ident.name}」的种子数据模板含引擎填不出的占位符 {${prepared.unresolved.join("、")}}（${step.method} ${step.path}）`,
+          {
+            code: "identity_seed_failed",
+            hint: "register.seed 的 bodyTemplate 只支持 {name}/{username}/{email}/{password}/{canary}；其余字段请写成常量。本轮没有造出数据，越权用例没有归属对象可比，引擎不会改用匿名探测蒙过去。",
+          }
+        );
+      }
+      const encoded = encodeLoginBody(prepared.body, boot.encoding === "form");
+      const res = await httpJson(ctx, {
+        baseUrl,
+        method: step.method,
+        path: step.path,
+        identity: ident.name,
+        body: encoded.body,
+        contentType: encoded.contentType,
+        extraHeaders: boot.headers,
+      });
+      const { verdict, status } = classifySeedResponse(res);
+      bootstrap.seeds.push({ identity: ident.name, method: step.method, path: step.path, status, verdict });
+      if (verdict !== "written") {
+        throw new ProbeError(
+          `身份「${ident.name}」的种子数据未能写入：${step.method} ${step.path} → HTTP ${status}`,
+          {
+            code: "identity_seed_failed",
+            hint:
+              verdict === "denied"
+                ? "登录看似成功、写入却被拒：说明这个会话在目标上并没有真正获得该身份（或该接口另有权限要求）。请核对 identities 的角色与 login.credentialPath；若该身份是引擎刚注册的，多半是目标按角色开放写入，请在 identities 里声明有写入权的账号。"
+                : `请核对 register.seed 的端点与字段名（当前 ${step.path}）。没有归属对象，越权用例就无从构造——本轮按「测不了」处理，不按「没问题」处理。`,
+          }
+        );
+      }
+      ctx.emit({
+        kind: "identity",
+        severity: SEVERITY.INFO,
+        message: `已为身份「${ident.name}」写入种子数据（${step.method} ${step.path} → HTTP ${status}）`,
+        data: { identity: ident.name, endpoint: step.path, status },
+      });
+    }
+  };
+
+  /** 按该身份的候选序列逐个试登录，成功返回会话条目 */
+  const tryLogin = async (ident) => {
     const list = ident.loginPath
       ? [ident.loginPath, ...sharedCandidates.filter((p) => p !== ident.loginPath)]
       : sharedCandidates;
-    let done = false;
     for (const path of list) {
       const r = await attemptLogin(ident, path);
-      if (r.ok) {
-        loggedIn.push(r.entry);
-        endpoints.push(r.endpoint);
-        done = true;
-        break;
+      if (r.ok) return r;
+    }
+    return null;
+  };
+
+  const loggedIn = [];
+  const endpoints = [];
+  for (const ident of ctx.identities) {
+    const mustRegister = ident.password == null;
+    if (mustRegister && !boot.available) {
+      throw new ProbeError(
+        `身份「${ident.name}」省略了 password，但引擎未能确定注册端点，无法自举该身份`,
+        {
+          code: "identity_bootstrap_unavailable",
+          hint:
+            bootstrap.unavailableReason === "blackbox"
+              ? "纯黑盒模式不会向外部目标发注册请求（建号属于对他人系统的写操作，超出探测授权）。请为该身份提供已存在的测试账号口令，或改用白盒模式让引擎在沙箱内自举。"
+              : `省略 identities[].password 意味着「口令由引擎随机生成、走目标自己的注册接口」，因此必须知道那个接口在哪（本轮判定依据：${bootstrap.unavailableReason}${bootstrap.candidates.length ? `，静态候选：${bootstrap.candidates.join("、")}` : ""}）。请在 guardbuild.json 声明 register.path（必要时配 register.bodyTemplate），或改为显式提供已存在的账号口令。`,
+          details: { identity: ident.name, reason: bootstrap.unavailableReason, candidates: bootstrap.candidates },
+        }
+      );
+    }
+    let reg = null;
+    if (mustRegister) {
+      reg = await registerOne(ident, "no-declared-password");
+      if (reg.verdict !== "created" && reg.verdict !== "exists") {
+        throw new ProbeError(
+          `身份「${ident.name}」自举失败：${boot.method} ${boot.path} → ${reg.verdict ?? reg.reason}${reg.status ? ` (HTTP ${reg.status})` : ""}`,
+          {
+            code: "identity_bootstrap_failed",
+            hint: `口令省略的身份必须先建号才能登录。注册接口没能接受引擎构造的请求体（多为字段名/校验规则不符）：请在 guardbuild.json 声明 register.bodyTemplate（支持 {email}/{username}/{password}/{name}），并确认目标允许公开注册。本轮按「测不了」处理，不会改用匿名探测再报「未发现漏洞」。`,
+            details: { identity: ident.name, endpoint: boot.path, verdict: reg.verdict ?? reg.reason, status: reg.status ?? null },
+          }
+        );
       }
     }
-    if (!done) {
+    let entry = await tryLogin(ident);
+    // 声明了口令、目标却不认：很可能是空库沙箱里根本没这个账号。走一次注册再试，
+    // 仍不成才报错——中间不做任何「当成已防护」的推断。
+    if (!entry && !mustRegister && boot.available) {
+      reg = await registerOne(ident, "login-rejected");
+      if (reg.verdict === "created" || reg.verdict === "exists") entry = await tryLogin(ident);
+    }
+    if (!entry) {
       const { code, hint } = classifyLoginFailure(attempts);
       const tried = attempts
         .filter((a) => a.identity === ident.name)
         .map((a) => `${a.path}→HTTP ${a.status}`)
         .join("，");
       throw new ProbeError(
-        `身份「${ident.name}」无法在任何候选登录端点上建立会话（尝试：${tried || "无"}）`,
+        `身份「${ident.name}」无法在任何候选登录端点上建立会话（尝试：${tried || "无"}）${bootstrapSuffix(boot, reg)}`,
         {
-          code,
-          hint: ident.loginPath
-            ? `该身份声明的 loginPath 为 ${ident.loginPath}；${hint ?? ""}`
-            : `${hint ?? ""}　多角色应用请为每个身份写 identities[].loginPath（如组织者用 /auth/organiser/login），否则角色不匹配的账号会被登录端点拒绝并回渲染登录表单。`,
+          code: reg ? "identity_bootstrap_failed" : code,
+          hint: `${
+            ident.loginPath
+              ? `该身份声明的 loginPath 为 ${ident.loginPath}；${hint ?? ""}`
+              : `${hint ?? ""}　多角色应用请为每个身份写 identities[].loginPath（如组织者用 /auth/organiser/login），否则角色不匹配的账号会被登录端点拒绝并回渲染登录表单。`
+          }${
+            reg?.verdict === "exists"
+              ? "　注册接口说该账号已存在、但声明的口令登不进去：多半是目标库里的账号来自上一轮/外部种子且口令不同，请改用真实口令或在 prepare 步骤里重置数据库。"
+              : ""
+          }`,
         }
       );
     }
+    loggedIn.push(entry.entry);
+    endpoints.push(entry.endpoint);
+    // 只给「本轮新建的账号」造数据：库里本来就有对象（或上一轮已写过）就不重复写。
+    if (reg?.verdict === "created" && (boot.seed?.length ?? 0) > 0) await seedFor(ident);
   }
 
   const path = endpoints[0];
@@ -691,6 +993,26 @@ export async function loginAll(ctx, baseUrl) {
       credentialKind: ctx.loginConfig?.cookieAuth === true ? "cookie" : "token",
     })),
     sessionVerification: ctx._sessionVerify ?? null,
+    // 身份从哪来：声明的账号 / 引擎在本轮沙箱里现注册出来的账号（含造了几条数据）
+    bootstrap: {
+      endpoint: bootstrap.endpoint,
+      endpointSource: bootstrap.endpointSource,
+      unavailableReason: bootstrap.unavailableReason,
+      accounts: bootstrap.accounts.map((a) => ({
+        name: a.name,
+        trigger: a.trigger,
+        verdict: a.verdict ?? a.reason ?? null,
+        status: a.status ?? null,
+        passwordSource: a.generated ? "engine-generated" : "declared",
+      })),
+      seeds: bootstrap.seeds.map((s) => ({
+        identity: s.identity,
+        endpoint: s.path,
+        verdict: s.verdict,
+        status: s.status ?? null,
+      })),
+      secretProtection: bootstrap.secretProtection,
+    },
   };
   return loggedIn;
 }
@@ -2476,7 +2798,7 @@ export function buildCases(ctx, targets) {
         // JSON 响应比对字段；页面响应没有字段可比，改用正文归属证据
         const html = leaked ? null : htmlLeakEvidence(ctx, res, resourceIdOf(ctx, readTarget));
         const detail = leaked
-          ? `证据：返回${candLabel} #${resourceIdOf(ctx, o)}（归属 ${ownerOf(ctx, o, cand.ownerField)}，金额 ${o.amount}，状态 ${o.status}）`
+          ? `证据：返回${candLabel} #${resourceIdOf(ctx, o)}（${leakEvidenceFields(ctx, o, cand.ownerField)}）`
           : html?.leaked
             ? htmlLeakDetail(html)
             : "";
@@ -2487,8 +2809,9 @@ export function buildCases(ctx, targets) {
         if (o && String(resourceIdOf(ctx, o)) === String(resourceIdOf(ctx, readTarget))) {
           const ownerOk = !victim.user?.id || ownerOf(ctx, o, cand.ownerField) === victim.user.id;
           if (ownerOk) {
+            const content = contentFieldOf(o);
             return {
-              note: `响应对象 #${resourceIdOf(ctx, o)} 与请求目标一致，归属 ${ownerOf(ctx, o, cand.ownerField)}${victim.user?.id ? "（与受害人身份一致）" : ""}`,
+              note: `响应对象 #${resourceIdOf(ctx, o)} 与请求目标一致，归属 ${ownerOf(ctx, o, cand.ownerField)}${victim.user?.id ? "（与受害人身份一致）" : ""}${content ? `，内容字段 ${content[0]}=${content[1]} 与本人列表中的该对象一致` : ""}`,
             };
           }
         }
@@ -3888,6 +4211,7 @@ async function assertTargetTouched(ctx, { baseUrl, evidence, phase }) {
 
 export async function runPhase(ctx, { phase, baseUrl }) {
   ctx._lastDecisionSeq = 0;
+  ctx._probePhase = phase;
   ctx.emit({
     kind: "phase",
     severity: SEVERITY.INFO,

@@ -10,10 +10,12 @@
 //!                       2 = 执行失败（环境/契约/内部错误/超时）或无法证明（no_endpoints /
 //!                           attack_inconclusive / plan_incomplete / scout_routes_unverified /
 //!                           static_routes_unverified / no_list_endpoint / param_binding_unverified /
-//!                           blackbox_login_failed / no_attack_cases：
+//!                           blackbox_login_failed / no_attack_cases / identity_bootstrap_unavailable /
+//!                           identity_bootstrap_failed / identity_seed_failed：
 //!                           没识别到路由、推断的地址实测全部未命中、契约不足无法构造/确认取值来源、
-//!                           黑盒配了账号却一个身份都登不上；身份类失败 login_form_rerendered /
-//!                           login_session_unverified 亦为 2，只是措辞记作 failed）
+//!                           黑盒配了账号却一个身份都登不上、省略口令的身份没能自举出账号或种子数据；
+//!                           身份类失败 login_form_rerendered / login_session_unverified 亦为 2，
+//!                           只是措辞记作 failed。终态类别取自 sidecar 的 error.outcome，不在这里重复定义）
 //!   --report <dir>    报告输出目录（report.emit 的落盘位置）
 //!
 //! 环境变量（自动化兼容）：GUARDBUILD_DATA_DIR / GUARDBUILD_SIDECAR / GUARDBUILD_NODE /
@@ -154,26 +156,38 @@ fn spawn_gate_watcher(host: Arc<Host>) {
                     finish_gate(&host, 1, p);
                 }
                 "error" => {
-                    let code = view
-                        .get("error")
+                    let err = view.get("error");
+                    let code = err
                         .and_then(|e| e.get("code"))
                         .and_then(|c| c.as_str())
                         .unwrap_or("internal");
-                    let (exit_code, verdict) = match code {
-                        "no_candidates" => (0, "no_candidates"),
-                        "attack_not_reproducible" => (0, "not_reproducible"),
-                        "no_patchable_candidates" => (1, "vulnerable_unfixed"),
-                        // 「没测到」不能当作 exit 0：未能证明覆盖就不放行
-                        "no_endpoints"
-                        | "attack_inconclusive"
-                        | "plan_incomplete"
-                        | "scout_routes_unverified"
-                        | "static_routes_unverified"
-                        | "no_list_endpoint"
-                        | "param_binding_unverified"
-                        | "blackbox_login_failed"
-                        | "no_attack_cases" => (2, "inconclusive"),
-                        _ => (2, "failed"),
+                    // 终态语义只有一份事实来源：sidecar 的 coverage.mjs 已把错误码归到 outcome
+                    // （inconclusive / failed / vulnerable_unfixed / …）并随视图带过来。
+                    // 这里曾另存一份码表，新增的 identity_* 因此被降级成 failed（把「测不了」
+                    // 说成「跑挂了」），现在改为优先读 outcome，码表只作缺字段时的兜底。
+                    let outcome = err.and_then(|e| e.get("outcome")).and_then(|o| o.as_str());
+                    let (exit_code, verdict) = match outcome {
+                        Some("vulnerable_unfixed") => (1, "vulnerable_unfixed"),
+                        Some("not_reproducible") => (0, "not_reproducible"),
+                        Some("no_candidates") => (0, "no_candidates"),
+                        Some("inconclusive") => (2, "inconclusive"),
+                        Some("failed") => (2, "failed"),
+                        _ => match code {
+                            "no_candidates" => (0, "no_candidates"),
+                            "attack_not_reproducible" => (0, "not_reproducible"),
+                            "no_patchable_candidates" => (1, "vulnerable_unfixed"),
+                            // 「没测到」不能当作 exit 0：未能证明覆盖就不放行
+                            "no_endpoints"
+                            | "attack_inconclusive"
+                            | "plan_incomplete"
+                            | "scout_routes_unverified"
+                            | "static_routes_unverified"
+                            | "no_list_endpoint"
+                            | "param_binding_unverified"
+                            | "blackbox_login_failed"
+                            | "no_attack_cases" => (2, "inconclusive"),
+                            _ => (2, "failed"),
+                        },
                     };
                     let mut p = base(verdict);
                     p["error"] = view.get("error").cloned().unwrap_or(Value::Null);

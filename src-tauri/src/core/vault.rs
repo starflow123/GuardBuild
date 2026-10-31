@@ -20,6 +20,9 @@ pub struct Credential {
 #[derive(Default)]
 pub struct Vault {
     entries: HashMap<String, Credential>,
+    /// 只用于脱敏的秘密（引擎自生成的测试账号口令等）。不会作为请求头注入任何请求，
+    /// 值也永不出 Host；任何流经 Host 的文本命中它都会被掩码。
+    protected: HashMap<String, String>,
 }
 
 impl Vault {
@@ -50,14 +53,56 @@ impl Vault {
 
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.protected.clear();
+    }
+
+    /// 登记一个只用于脱敏的秘密（不是请求头凭证）。重复登记同一标签会覆盖旧值。
+    pub fn protect(&mut self, label: &str, value: &str) {
+        self.protected.insert(label.to_string(), value.to_string());
     }
 
     /// 返回全部秘密值（用于全局脱敏）。仅当长度 >= 6 时返回，避免误伤短字符串。
     pub fn secret_values(&self) -> Vec<(String, String)> {
-        self.entries
+        let mut out: Vec<(String, String)> = self
+            .entries
             .iter()
             .filter(|(_, c)| c.value.len() >= 6)
             .map(|(k, c)| (k.clone(), c.value.clone()))
-            .collect()
+            .collect();
+        for (k, v) in &self.protected {
+            if v.len() >= 6 {
+                out.push((k.clone(), v.clone()));
+            }
+        }
+        out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Vault;
+
+    #[test]
+    fn protected_secret_is_redacted_but_not_injectable() {
+        let mut vault = Vault::default();
+        vault.protect("password:alice", "Gb-rotating-horse-77");
+        // 参与全局脱敏
+        let secrets = vault.secret_values();
+        assert!(secrets.iter().any(|(k, v)| k == "password:alice" && v == "Gb-rotating-horse-77"));
+        // 但不是可用的请求头凭证，也不会出现在身份列表里
+        assert!(vault.get("alice").is_none());
+        assert!(vault.names().is_empty());
+        // 过短的秘密不参与脱敏（避免误伤常规文本）
+        vault.protect("password:short", "abc");
+        assert!(!vault.secret_values().iter().any(|(k, _)| k == "password:short"));
+    }
+
+    #[test]
+    fn clear_drops_protected_secrets_too() {
+        let mut vault = Vault::default();
+        vault.store("alice", "Authorization", "Bearer t0ken-value", "http://127.0.0.1");
+        vault.protect("password:alice", "Gb-rotating-horse-77");
+        vault.clear();
+        assert!(vault.secret_values().is_empty());
     }
 }

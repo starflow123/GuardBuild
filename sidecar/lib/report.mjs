@@ -883,6 +883,25 @@ function renderMarkdown(r) {
     summaryLines.push(
       `- 身份会话：${on.length}/${(idr.configured ?? []).length} 建立${who ? `（${who}）` : ""}；会话真实性：${verify}`
     );
+    const ib = idr.bootstrap;
+    const firstPhase = ib?.byPhase?.[0];
+    if (ib?.attempted) {
+      const detail = (firstPhase?.accounts ?? [])
+        .map((a) => `${esc(a.name)}：${esc(a.verdict ?? "—")}${a.status ? ` (HTTP ${a.status})` : ""}`)
+        .join("、");
+      const generated = (firstPhase?.accounts ?? []).filter((a) => a.passwordSource === "engine-generated").length;
+      summaryLines.push(
+        `- 身份自举：本轮由目标注册接口 \`${esc(firstPhase?.endpoint ?? "?")}\`（${esc(firstPhase?.endpointSource ?? "—")}）建号 ${ib.registered} 个${
+          generated ? `，其中 ${generated} 个口令由引擎随机生成、只进 Host 保险库（不落配置/报告/证据库）` : ""
+        }；写入测试数据 ${ib.seeded} 条。判定明细：${detail}`
+      );
+    } else if (firstPhase?.unavailableReason === "static-ambiguous") {
+      // 登录本轮靠声明口令成功了，但静态看到了多个建号候选：读者需要知道引擎没有猜、
+      // 因此「换空库重跑」时这条路并不会自动生效。
+      summaryLines.push(
+        `- 身份自举：未参与（静态识别到 ${(firstPhase.candidates ?? []).length} 个建号候选，引擎不猜：${esc((firstPhase.candidates ?? []).join("、"))}）；需要自举时请在 guardbuild.json 声明 register.path`
+      );
+    }
   }
   if (!bb && r.llm?.used) {
     const applied = [
@@ -1217,6 +1236,43 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
                   identities: (ctx._identityReport.sessionVerification.identities ?? []).slice(0, 8),
                 }
               : null,
+            // 身份自举（#179）：账号是声明的还是引擎在沙箱里现注册的、造了几条数据。
+            // 口令本身一律不进报告——只留「引擎生成」这个来源标记。
+            bootstrap: (() => {
+              const byPhase = ctx._identityBootstrap?.byPhase ?? {};
+              const clean = (p) => ({
+                phase: p.phase,
+                endpoint: p.endpoint,
+                endpointSource: p.endpointSource,
+                unavailableReason: p.unavailableReason,
+                candidates: (p.candidates ?? []).slice(0, 8),
+                accounts: (p.accounts ?? []).map((a) => ({
+                  name: a.name,
+                  trigger: a.trigger ?? null,
+                  verdict: a.verdict ?? a.reason ?? null,
+                  status: a.status ?? null,
+                  passwordSource: a.generated ? "engine-generated" : "declared",
+                  unresolvedFields: a.fields ?? null,
+                })),
+                seeds: (p.seeds ?? []).map((s) => ({
+                  identity: s.identity,
+                  endpoint: s.path,
+                  verdict: s.verdict,
+                  status: s.status ?? null,
+                })),
+                secretProtection: p.secretProtection ?? {},
+              });
+              const phases = Object.values(byPhase).map(clean);
+              return {
+                attempted: phases.some((p) => (p.accounts?.length ?? 0) > 0),
+                registered: phases.reduce(
+                  (n, p) => n + (p.accounts ?? []).filter((a) => a.verdict === "created").length,
+                  0
+                ),
+                seeded: phases.reduce((n, p) => n + (p.seeds ?? []).filter((s) => s.verdict === "written").length, 0),
+                byPhase: phases,
+              };
+            })(),
           }
         : null,
     },

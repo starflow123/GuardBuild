@@ -16,6 +16,8 @@
  *                "params": { "orgId": "orgId", "orderId": "id" } }],
  *   "identities": [{ "name": "alice", "email": "alice@example.com", "password": "alice123", "role": "user",
  *                    "loginPath": "/auth/attendee/login" }],
+ *   "register": { "path": "/api/register", "method": "POST", "bodyTemplate": { "email": "{email}", "password": "{password}" },
+ *                 "seed": [{ "method": "POST", "path": "/api/orders", "bodyTemplate": { "item": "gb-seed" } }] },
  *   "supabase": { "envFile": ".env", "url": "https://xyz.supabase.co", "anonKey": "eyJ…", "tables": ["profiles"] },
  *   "llm": { "enabled": true, "model": "deepseek-chat" },
  *   "bootstrap": { "enabled": true, "maxSteps": 6 },
@@ -23,6 +25,12 @@
  * }
  *
  * 身份支持三种形状：username / email / fields（自定义字段映射），至少两项。
+ * password 省略 ＝ 交给引擎随机生成，配合 register 做「身份自举」：沙箱目标库是空的，
+ *   引擎用目标自己的公开注册接口建号（请求由引擎发出、会话由 #175 的登录回读验证真伪），
+ *   register.seed 再给每个新建账号写入几条对象。口令只进 Host 保险库（只用于脱敏，不作为
+ *   请求头凭证、不进 credential.list、不落配置/报告/证据库）。准备不成立就显式 inconclusive，
+ *   绝不静默退回匿名探测再报「未发现漏洞」；未声明 register.path 时只从静态识别的 POST 路由里
+ *   按形状挑，挑不出来就如实报「未能确定注册端点」。黑盒模式不做自举（对第三方站点写库越界）。
  * prepare 步骤在目标进程启动前按序执行（依赖安装、构建等），在 worktree 中同样复跑。
  * bootstrap 是「有界启动代理」（S3-full）：目标起不来时按引擎生成的动作菜单逐步处理（装依赖/构建/换启动候选）。
  *   默认关闭、gate 模式结构性禁用；命令行始终由引擎拼装，模型只报编号；预算耗尽即回退确定性契约，不伪造成功。
@@ -104,7 +112,9 @@ function normalizeIdentities(raw) {
   const out = [];
   for (const it of raw) {
     if (!it || typeof it !== "object") return null;
-    if (typeof it.password !== "string") return null;
+    // password 省略/null ＝ 交给引擎随机生成（配合 register 契约做身份自举）；
+    // 写了但不是非空字符串仍算非法契约，不能悄悄当空密码去登录
+    if (it.password != null && (typeof it.password !== "string" || !it.password)) return null;
     const username = typeof it.username === "string" && it.username ? it.username : null;
     const email = typeof it.email === "string" && it.email ? it.email : null;
     const fields =
@@ -130,12 +140,66 @@ function normalizeIdentities(raw) {
       username,
       email,
       fields: fields && Object.keys(fields).length ? fields : null,
-      password: it.password,
+      password: typeof it.password === "string" && it.password ? it.password : null,
       role: it.role === "admin" ? "admin" : "user",
       loginPath,
     });
   }
   return out;
+}
+
+/**
+ * 注册契约（身份自举）：沙箱里的目标库是空的，跨归属攻击需要「两个各自名下有数据的账号」，
+ * 靠人手写账号既脆弱又常拿不到数据。这里声明「用目标自己的公开注册接口建号」的形态，
+ * 发送与判定仍由引擎完成：注册必须真发出请求、登录必须真建立会话（含 #175 的会话回读），
+ * 任一环节不成立就显式 inconclusive，绝不静默退回匿名探测再报「未发现漏洞」。
+ * 未声明 register.path 时，引擎从静态识别到的 POST 路由里按形状挑（仅一个候选时才敢用），
+ * 挑不出来就如实报「未能确定注册端点」。
+ */
+export function normalizeRegister(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const trimPath = (p) => {
+    const s = String(p ?? "").trim();
+    if (!s) return null;
+    return s.startsWith("/") ? s : `/${s}`;
+  };
+  const templateOf = (t) => {
+    if (!t || typeof t !== "object" || Array.isArray(t)) return null;
+    const entries = Object.entries(t).filter(([k, v]) => typeof k === "string" && k && typeof v === "string");
+    return entries.length ? Object.fromEntries(entries) : null;
+  };
+  const seed = Array.isArray(raw.seed)
+    ? raw.seed
+        .slice(0, 8)
+        .map((s) => {
+          if (!s || typeof s !== "object" || Array.isArray(s)) return null;
+          const path = trimPath(s.path);
+          if (!path) return null;
+          return {
+            method: typeof s.method === "string" && /^[A-Za-z]+$/.test(s.method.trim())
+              ? s.method.trim().toUpperCase()
+              : "POST",
+            path,
+            bodyTemplate: templateOf(s.bodyTemplate),
+          };
+        })
+        .filter(Boolean)
+    : [];
+  return {
+    enabled: raw.enabled !== false,
+    path: trimPath(raw.path),
+    method:
+      typeof raw.method === "string" && /^[A-Za-z]+$/.test(raw.method.trim())
+        ? raw.method.trim().toUpperCase()
+        : "POST",
+    bodyTemplate: templateOf(raw.bodyTemplate),
+    encoding:
+      raw.encoding === "form" || raw.encoding === "urlencoded" || raw.encoding === "x-www-form-urlencoded"
+        ? "form"
+        : "json",
+    headers: templateOf(raw.headers) ?? {},
+    seed,
+  };
 }
 
 /** 登录契约：路径 / 请求体模板 / 凭据在响应中的位置与请求头写法。 */
@@ -566,6 +630,7 @@ function emptyConfig(source, invalid = null) {
     invalid,
     identities: null,
     login: null,
+    register: null,
     prepare: null,
     responses: null,
     listEndpoint: null,
@@ -660,6 +725,7 @@ export async function loadTargetConfig(ctx) {
     ...(await resolveStart(ctx, parsed)),
     identities: normalizeIdentities(parsed.identities),
     login: normalizeLogin(parsed.login),
+    register: normalizeRegister(parsed.register),
     prepare: normalizePrepare(parsed.prepare),
     responses: normalizeResponses(parsed.responses),
     listEndpoint: normalizeListEndpoint(parsed.listEndpoint),

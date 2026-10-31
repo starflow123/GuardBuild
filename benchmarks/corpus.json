@@ -142,6 +142,15 @@
       "expectedVulnerableCases": [],
       "expectedOutcomes": ["not_reproducible"],
       "expectedStatic": []
+    },
+    {
+      "id": "selfboot-shop",
+      "fixture": "fixtures/selfboot-shop",
+      "expectedExit": 1,
+      "expectedVulnerableCases": ["attack-read-foreign"],
+      "expectedStatic": [
+        { "kind": "idor-suspect", "method": "GET", "path": "/api/orders/:id" }
+      ]
     }
   ]
 }

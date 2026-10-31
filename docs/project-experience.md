@@ -1,14 +1,14 @@
 # GuardBuild · 项目经历
 
 > 用途：简历 / 面试用项目经历。分三档：一句话版、简历条目版、面试展开版。
-> 数据基准日：2026-10-24（基准靶场数、召回率、单测/演练计数于 2026-10-31 复测，见文末「可核验出处」）。
+> 数据基准日：2026-10-24（基准靶场数、召回率、单测/演练计数与「身份自举」能力于 2026-10-31 复测/补充，见文末「可核验出处」）。
 > 对外统一口径见 `docs/support-matrix.md`；本文与它冲突时以支持矩阵与仓库代码为准。
 
 ---
 
 ## 一句话版
 
-独立设计并实现 GuardBuild——一个「发现 → 沙箱复现 → 隔离修复 → 双重验收」的本地安全 Agent（Tauri + Rust 权限宿主 + 零依赖 Node 编排器，约 4.7 万行含测试），把大模型参与的自动修复变成有真实攻击证据与回归验证背书的产品能力，而非又一个扫描告警列表。
+独立设计并实现 GuardBuild——一个「发现 → 沙箱复现 → 隔离修复 → 双重验收」的本地安全 Agent（Tauri + Rust 权限宿主 + 零依赖 Node 编排器，约 4.9 万行含测试），把大模型参与的自动修复变成有真实攻击证据与回归验证背书的产品能力，而非又一个扫描告警列表。
 
 ---
 
@@ -18,12 +18,12 @@
 技术栈：Tauri 2 / Rust / React + TypeScript / Node.js 22（`node:sqlite`）/ JSON-RPC 2.0 / GitHub Actions
 
 - 设计「最小权限宿主」架构：Rust Host 是唯一系统能力持有者，7 类作用域令牌（`project.read` / `worktree.write` / `proc.spawn` / `net.probe` / `net.egress` / `workspace.write` / `workspace.rollback`）绑定路径、端口与补丁哈希；不可信的 Node 编排器只能通过「申请令牌 → 由 Host 执行」动作，无法绕过边界。Sidecar **零 npm 依赖**，凭证进 Host 保险库、日志全量脱敏。
-- 提出并实现 **proof, not alerts** 取证工作流：静态分析只产线索，必须用「身份 × 对象」用例矩阵在沙箱内真实打穿才计为漏洞；每条发现附可复现 curl PoC 与 SQLite 证据链（7 张表），授权诊断端点可把攻击归因到服务端决策点。
+- 提出并实现 **proof, not alerts** 取证工作流：静态分析只产线索，必须用「身份 × 对象」用例矩阵在沙箱内真实打穿才计为漏洞；每条发现附可复现 curl PoC 与 SQLite 证据链（7 张表），授权诊断端点可把攻击归因到服务端决策点。身份与测试数据同样由引擎自举——契约不给口令时用目标**自己的**注册接口在沙箱内建账号、按 `register.seed` 写入带 canary 的对象，再用两个身份的真实响应对拉实测主键与归属字段；建不进号或写不进数据判「无法证明」（inconclusive，退出码 2），不会静默退化成匿名探测，纯黑盒外部目标一律不自举建号。
 - 覆盖 **10 类可复现漏洞**（对象级越权（含查询参数形态；JSON 字段比对与服务端渲染页面正文独有片段两种归属取证）/ 无鉴权读取与纵向越权 / 路径穿越 / SQL 注入 / 命令注入 / SSRF / 文件上传 / JWT 伪造令牌 / 业务逻辑跳步与并发双花 / Supabase RLS 与 service_role 暴露）与 **7 套框架适配器**（Express、Next.js、NestJS、tRPC、GraphQL、Supabase/PostgREST、FastAPI/Flask/Django-DRF），并识别 10+ 种取数形态（Prisma、Drizzle、Knex、裸 SQL）。
 - 打通**自动修复闭环**：补丁只在临时 git worktree 生成，双重验收（攻击用例全阻断 + 业务用例零回归）通过才进 `writeback_pending`，用户审阅 Diff 后授权写回，带备份与冲突安全回滚；CI gate 模式结构性禁止写回、单轮不重试，保证输出可复现。
 - 引入 **LLM 三通道且严格限制其裁决权**：接入侦察（未知框架推断启动/登录/路由）、编码代理（5 类候选的补丁意图，可先 `read`/`list` 只读自查，S2-full 允许按依赖闭包跨文件改 4 个已有文件与新建 3 个文件）、有界启动代理（S3-full，本地交互模式按候选启动契约实跑验证，gate/CI 结构性禁用）。模型输出经结构白名单、锚点逐字命中、写集边界、禁用文件与危险调用扫描逐条校验；LLM 不判定漏洞、不生成身份、不参与验收；修复失败按 `fixRounds`（默认 2、上限 5）回灌证据有界重试，仍失败则回落 `vulnerable_unfixed`。
-- 建 **精度基准**（13 个标注靶场语料，2026-10-31 复跑）量化漏报/误报/退出码一致率：当前基线动态召回 24/24、误报 0/24、退出码一致 13/13、静态召回 24/24、零模型调用；含干净对照组靶场验证「动态澄清静态误报」。
-- 工程化交付：纯黑盒外部扫描模式（URL 即可、OpenAPI 发现 + 路由爆破 + 前端 JS 提取、写操作默认关）、受限 `docker run` 容器沙箱、GitHub Action 门禁（三档退出码语义）、无头宿主（Linux 无需 WebKit 依赖）、独立 exe 单文件产物；测试含 36 个 Sidecar 单测文件（482 项）+ 49 个 Rust 测试 + 24 套端到端演练脚本。
+- 建 **精度基准**（14 个标注靶场语料，2026-10-31 复跑）量化漏报/误报/退出码一致率：当前基线动态召回 25/25、误报 0/25、退出码一致 14/14、静态召回 25/25、零模型调用；含干净对照组靶场验证「动态澄清静态误报」，以及一个空库靶场验证「身份与数据自举后再打越权」整条链路。
+- 工程化交付：纯黑盒外部扫描模式（URL 即可、OpenAPI 发现 + 路由爆破 + 前端 JS 提取、写操作默认关）、受限 `docker run` 容器沙箱、GitHub Action 门禁（三档退出码语义）、无头宿主（Linux 无需 WebKit 依赖）、独立 exe 单文件产物；测试含 37 个 Sidecar 单测文件（507 项）+ 50 项 Rust 测试（49 通过、1 项需公网默认跳过）+ 25 套端到端演练脚本。
 - 以真实项目反向驱动迭代：在 OWASP Juice Shop v20.3.0 跑通全链路（静态分析 → email 登录 → 越权复现 → 隔离修复 → 双重验收 verified），据此定位并修复 10 项真实接入失败点（端口争用、就绪行解析、CRLF、挂载级鉴权误判、非 git 仓库预检等）；另在 DVWA / DVNA 等公开靶场与多个用户真实项目上实测。
 
 ---
@@ -46,11 +46,12 @@ GuardBuild 的定位夹在中间：把漏洞从「静态猜测」变成「沙箱
 `verified` 的定义是：攻击用例全部不再复现 **且** 业务用例全部保持通过。前者防「没修好」，后者防「修坏了」。裁决只看实测证据，模型不参与。这条纪律使得即使 LLM 完全胡说，最坏结果也只是产出一个被驳回的意图，而不是一条假的「已修复」。
 
 **3. 精度基准而不是单点 demo**
-13 个标注靶场语料（含一个全站只有 HTML 页面、没有 JSON 列表接口的服务端渲染靶场）+ 逐靶场的期望复现用例集合，指标是动态召回率、误报率、退出码一致率，任一漏报/误报即基准失败。含一个「干净对照」靶场（归属校验封装在辅助函数里，静态看像漏、运行期真实拒绝），专门用来证明「动态能澄清静态误报」而不是只会喊狼来了。
+14 个标注靶场语料（含一个全站只有 HTML 页面、没有 JSON 列表接口的服务端渲染靶场，一个库里没有任何账号、身份与数据都要由引擎自举的靶场）+ 逐靶场的期望复现用例集合，指标是动态召回率、误报率、退出码一致率，任一漏报/误报即基准失败。含一个「干净对照」靶场（归属校验封装在辅助函数里，静态看像漏、运行期真实拒绝），专门用来证明「动态能澄清静态误报」而不是只会喊狼来了。
 
 ### 难点（真正花时间的地方）
 
 - **让任意真实项目跑起来**：这是全链路第一道坎，也是失败率最高的地方。做了启动契约自动探测（Procfile / package.json scripts / Python 入口 / 子目录 monorepo）、`${GB_PORT}` 空闲端口槽位（解决服务硬编码端口导致的双实例冲突）、就绪行端口解析（剥 ANSI、行内 JSON、`host:port`、「端口 NNNN」中文形状）、服务无输出时回环 HTTP 探活兜底，以及 13 类启动失败诊断码给出可操作建议。
+- **「空库项目测不了」不能伪装成绿灯**：越权取证的前提是「两个身份 + 各自名下有对象」，而很多项目既没现成账号也没数据。引擎因此接管身份与数据准备：按目标自己的注册端点自举账号、按 `register.seed` 写入带 canary 的对象，再把「登录到底成没成」做成可证伪判据（响应回落成登录表单、或带会话与匿名的回读响应同形，都终止本轮而不是降级成匿名继续打）。「注册端点不可用 / 建号失败 / 写入被拒」三类统一归 `inconclusive`→退出码 2。同时踩到一个架构教训：终态语义只能有一份事实来源——无头宿主里另存过一张错误码表，新增的身份类码没同步就被降级成 `failed`（把「测不了」说成「跑挂了」），现在改为直接读 Sidecar 裁决出的 `outcome`。引擎生成的口令只进 Host 保险库的脱敏桶，契约/事件流/报告/审计库四条渠道实测零残留。
 - **动态复现的判据设计**：命令注入不能用「输入被反射」当证据（大量误报），改成 shell 展开令牌回显；SQL 注入要列表行数变化或数据库报错特征双证据之一；无法确证记 `inconclusive`，不算漏洞。宁可不报也不假报。
 - **Windows 全链路**：`.cmd` shim 沿 PATH×PATHEXT 解析、CRLF 锚点匹配、进程树清理、junction 与 worktree 删除互相穿透的坑。
 
@@ -69,7 +70,7 @@ GuardBuild 的定位夹在中间：把漏洞从「静态猜测」变成「沙箱
 
 | 说法 | 出处 |
 | --- | --- |
-| 4.7 万行量级 | `sidecar`（含测试）29,474 行、`src-tauri/src` 6,046、`src` 3,144、`scripts` 8,238、`shared/protocol.mjs` 216 |
+| 4.9 万行量级 | 2026-10-31 实测：`sidecar`（含测试）39,168 行、`src-tauri/src` 6,462、`src` 2,167（ts/tsx/css）、`scripts` 11,024、`shared/protocol.mjs` 217 |
 | 7 类作用域令牌 | `README.md` 「安全模型」、`src-tauri/src/core/token.rs` |
 | Host 结构性禁止 gate 写回 | `src-tauri/src/core/host.rs:1815 approve_writeback`（要求 `writeback_pending` + 补丁哈希匹配） |
 | 跨文件补丁边界 | `sidecar/lib/llm-patcher.mjs:491`（候选外最多 4 个已有文件 + 新建 3 个）；`llm-patcher.mjs:494 crossFilePatchEnabled` gate 下禁用 |
@@ -77,8 +78,9 @@ GuardBuild 的定位夹在中间：把漏洞从「静态猜测」变成「沙箱
 | 失败反馈含日志/diff | `sidecar/lib/fixfeedback.mjs:57 buildFixFeedback` |
 | `fixRounds` 默认 2 / 上限 5 | `sidecar/lib/targetconfig.mjs:407` |
 | 7 套适配器 | `sidecar/lib/` 下 `nextjs/nestjs/trpc/graphql/supabase/python/analyzer` |
-| 基准 24/24、0 误报、13/13 | `README.md` 精度基准节 + `benchmarks/corpus.json`（13 条标注）+ `scripts/benchmark.mjs` |
-| 测试规模 | `sidecar/tests/` 36 个文件 / 482 项、`#[test]` 49 处、`scripts/e2e-*.mjs` 24 套演练 |
+| 基准 25/25、0 误报、14/14 | `README.md` 精度基准节 + `benchmarks/corpus.json`（14 条标注）+ `scripts/benchmark.mjs`（2026-10-31 复跑，报告 `.benchmark/benchmark-report.json`） |
+| 测试规模 | 2026-10-31 实测：`sidecar/tests/` 37 个文件 / 507 项、`cargo test` 50 项（49 通过 + 1 需公网 ignore）、`scripts/e2e-*.mjs` 25 套演练 |
+| 身份与测试数据自举 | `sidecar/lib/identityboot.mjs`（口令生成/注册端点解析）、`sidecar/lib/probe.mjs`（`registerPlan` / `registerOne` / `seed`）、演练 `scripts/e2e-selfboot.mjs`（33 项断言，含四条渠道口令零残留）；契约见 `README.md`「身份与测试数据自举（`register`）」 |
 | Juice Shop dogfood | `README.md` 已知边界末条 |
 | Java 边界 | `sidecar/lib/analyzer.mjs:43 SOURCE_EXT`、`src-tauri/src/core/token.rs:317 LAUNCHERS` |
 | 对外统一口径 | `docs/support-matrix.md` |

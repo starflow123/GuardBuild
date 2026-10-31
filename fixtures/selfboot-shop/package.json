@@ -1,0 +1,10 @@
+{
+  "name": "selfboot-shop",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "SelfBootShop - 空库靶场：账号只能由目标自己的 /api/register 产生，验证引擎的身份与测试数据自举（#179）",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

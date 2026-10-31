@@ -154,6 +154,27 @@ const OUTCOME_PRESENTATION = {
     stateLabel: "身份未建立 · 执行失败",
     hint: "登录响应看似成功，但用该会话回读一个静态确认需要登录的只读接口时，响应与匿名请求同形（exit 2）：这个身份在目标上并没有认证。带着它跑越权只会全线被拒，进而被误判成「未复现」。请核对账号密码与目标库实际状态，或用 login.credentialPath 声明可判定的凭据字段。",
   },
+  identity_bootstrap_unavailable: {
+    outcome: "inconclusive",
+    kind: "inconclusive",
+    title: "未能确定注册端点，身份无法自举（无法证明）",
+    stateLabel: "身份未建立 · 无法证明",
+    hint: "某个身份省略了 password（口令交给引擎随机生成），但引擎没能确定目标自己的注册端点（exit 2）：没有可信身份，越权/写入类用例一条都没发出，本轮既不是「测过且干净」也不是跑挂。请在 guardbuild.json 声明 register.path（必要时配 register.bodyTemplate），或显式提供两个已存在账号的口令。",
+  },
+  identity_bootstrap_failed: {
+    outcome: "inconclusive",
+    kind: "inconclusive",
+    title: "身份自举未建立账号（无法证明）",
+    stateLabel: "身份未建立 · 无法证明",
+    hint: "引擎用目标自己的注册接口建号、再登录，任一步没有被目标真实接受（exit 2）：没有归属可信的两个身份，跨归属用例无从构造。报告写明注册端点、状态码与判定依据；请核对 register.bodyTemplate 的字段名、目标是否允许公开注册，或在 prepare 步骤里重置数据库。引擎不会因此改用匿名探测再报「未发现漏洞」。",
+  },
+  identity_seed_failed: {
+    outcome: "inconclusive",
+    kind: "inconclusive",
+    title: "测试数据未能写入（无法证明）",
+    stateLabel: "无归属数据 · 无法证明",
+    hint: "身份已建立，但契约声明的种子写入没有被目标接受（exit 2）：账号名下没有对象，越权用例就没有可比对的归属数据。请核对 register.seed 的端点/字段名与账号权限；本轮按「测不了」处理，不代表「没有漏洞」。",
+  },
   blackbox_login_failed: {
     outcome: "inconclusive",
     kind: "inconclusive",

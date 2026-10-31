@@ -33,7 +33,7 @@ import {
   ownerOf,
   resourceIdOf,
 } from "../lib/probe.mjs";
-import { loadTargetConfig, startUsesPortSlot, renderStart, PORT_SLOT } from "../lib/targetconfig.mjs";
+import { loadTargetConfig, normalizeRegister, startUsesPortSlot, renderStart, PORT_SLOT } from "../lib/targetconfig.mjs";
 import {
   detectStartConfig,
   diagnoseStartFailure,
@@ -2828,4 +2828,62 @@ test("postPhaseCases: 修复前未复现的变体剔除并计数", () => {
   const scoped = postPhaseCases(ordered, { claimed: new Set(["GET /api/orders/:id"]), preVerdicts });
   assert.deepEqual(scoped.cases.map((c) => c.id), ["attack-read-foreign", "attack-read-foreign-enc1"]);
   assert.equal(scoped.variantSkipped, 1);
+});
+
+// —— #179：身份自举契约（register / 省略口令）——
+
+test("loadTargetConfig: identities 省略 password 记为 null（交给引擎生成），空串仍算非法契约", async () => {
+  const omitted = await loadTargetConfig(
+    fakeCtx(
+      JSON.stringify({
+        identities: [
+          { name: "a", username: "a", role: "user" },
+          { name: "b", username: "b", role: "user" },
+        ],
+      })
+    )
+  );
+  assert.deepEqual(omitted.identities.map((i) => i.password), [null, null]);
+  const blank = await loadTargetConfig(
+    fakeCtx(
+      JSON.stringify({
+        identities: [
+          { name: "a", username: "a", password: "" },
+          { name: "b", username: "b" },
+        ],
+      })
+    )
+  );
+  assert.equal(blank.identities, null, "password 写成空串是契约写错，不能当「引擎生成」或空密码登录");
+});
+
+test("normalizeRegister: 路径补斜杠、seed 限 8 步、encoding 归一，非对象回 null", () => {
+  assert.equal(normalizeRegister(null), null);
+  assert.equal(normalizeRegister([]), null);
+  const r = normalizeRegister({
+    path: "api/register",
+    method: "post",
+    encoding: "urlencoded",
+    headers: { "X-Tenant": "t1", Bad: 3 },
+    seed: Array.from({ length: 12 }, (_, i) => ({ path: `/api/orders${i}`, bodyTemplate: { title: "{canary}" } })),
+  });
+  assert.equal(r.path, "/api/register");
+  assert.equal(r.method, "POST");
+  assert.equal(r.encoding, "form");
+  assert.equal(r.enabled, true, "缺省视为启用，显式 enabled:false 才关");
+  assert.deepEqual(r.headers, { "X-Tenant": "t1" }, "非字符串 header 值不收");
+  assert.equal(r.seed.length, 8, "种子步骤有上限，不能拿它跑无界写入");
+  assert.deepEqual(r.seed[0], { method: "POST", path: "/api/orders0", bodyTemplate: { title: "{canary}" } });
+  assert.equal(normalizeRegister({ enabled: false }).enabled, false);
+  assert.equal(normalizeRegister({ seed: [{ path: "" }] }).seed.length, 0, "没有路径的种子步骤整条丢弃");
+});
+
+test("loadTargetConfig: register 契约随白盒配置读出，未声明时为 null（静态单候选仍可自举）", async () => {
+  const withRegister = await loadTargetConfig(
+    fakeCtx(JSON.stringify({ register: { path: "/api/signup", seed: [{ path: "/api/orders", bodyTemplate: { t: "{canary}" } }] } }))
+  );
+  assert.equal(withRegister.register.path, "/api/signup");
+  assert.deepEqual(withRegister.register.seed, [{ method: "POST", path: "/api/orders", bodyTemplate: { t: "{canary}" } }]);
+  const without = await loadTargetConfig(fakeCtx(JSON.stringify({ start: { cmd: "node", args: ["s.js"] } })));
+  assert.equal(without.register, null);
 });

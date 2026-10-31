@@ -95,6 +95,9 @@ jobs:
       - name: SSR 页面越权 E2E（全站只有 HTML：页面链接发现 + 正文归属取证 + 跨文件加固对照）
         run: node scripts/e2e-ssr.mjs
 
+      - name: 身份与数据自举 E2E（空库靶场：引擎注册建号 + seed 造数据 + 口令不落产物 + 四类测不了终态）
+        run: node scripts/e2e-selfboot.mjs
+
       - name: 黑盒外部模式 E2E（真实 HTTP 目标 + Cookie 会话鉴权，本机回环）
         run: node scripts/e2e-blackbox.mjs
 

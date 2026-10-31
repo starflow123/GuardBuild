@@ -69,7 +69,8 @@ GuardBuild 是一个面向 Vibe Coding 开发者的本地安全 Agent：先启�
 
 - Node.js ≥ 22.5（`node:sqlite`）、Rust stable；桌面模式需 Tauri 2 平台依赖。
 - 目标项目能按 `guardbuild.json` 启动（或自行启动后用黑盒 `--url`）。
-- 跨用户越权需要 **≥2 个普通测试身份**，纵向越权需要管理身份；工具**不创建用户**。
+- 跨用户越权需要 **≥2 个普通测试身份**，纵向越权需要管理身份。身份可以有两种来源：契约里直接给出已存在的账号口令；或**省略 `password`**，让引擎用目标自己的注册接口现建号（`register` 契约，口令随机生成、只进 Host 保险库，不落任何产物）。
+- 空库沙箱不再要求人工准备数据：`register.seed` 会在建号后给每个账号写入名下对象（最多 8 步，`{canary}` 是本轮随机种子标识，会出现在越权取证正文里）。注册端点唯一、写入被目标接受，才有跨归属用例可打；任一环节不成立就判 `inconclusive`（exit 2，错误码 `identity_bootstrap_unavailable` / `identity_bootstrap_failed` / `identity_seed_failed`），不会退回匿名探测再报「未发现漏洞」。纯黑盒目标（外部在跑的实例）一律不自举建号——那是对他人的写操作。
 - 运行期形态静态看不见时优先自动发现：响应包装与主键/归属字段、分页参数、多段路径参数取值都用两个测试身份的真实请求实测（结论见报告 `summary.resourceContract`）。自动发现试不出时再用契约显式声明：`responses.list/entity/id/owner`、`listEndpoint` + `query`、`routes` + `params`。声明或实测都缺时不会静默跳过，而是判 `inconclusive`（exit 2）。
 - 建议用 `prepare` 步骤跑幂等种子脚本准备数据。
 - 验证码 / MFA / SSO 需要先绕过或提供测试通道，当前不自动处理。
@@ -95,18 +96,19 @@ GuardBuild 是一个面向 Vibe Coding 开发者的本地安全 Agent：先启�
 | --- | --- | --- |
 | 0 | `no_candidates` / `not_reproducible` | 已扫描但无可探测候选，或攻击在真实实例上打不通——**不是执行失败，也不是「系统安全」的证明** |
 | 1 | `vulnerable_unfixed` / `patchStatus=verified` / `verify_failed` | 漏洞证据成立（附补丁或人工修复指引） |
-| 2 | `inconclusive`（`no_endpoints` / `attack_inconclusive` / `plan_incomplete` / `scout_routes_unverified` / `static_routes_unverified` / `no_list_endpoint` / `param_binding_unverified` / `blackbox_login_failed` / `no_attack_cases`）/ `failed`（含 `login_form_rerendered` / `login_session_unverified`）/ `aborted` / `timeout` | 无法证明覆盖，或契约、环境、内部错误、超时、中断 |
+| 2 | `inconclusive`（`no_endpoints` / `attack_inconclusive` / `plan_incomplete` / `scout_routes_unverified` / `static_routes_unverified` / `no_list_endpoint` / `param_binding_unverified` / `blackbox_login_failed` / `no_attack_cases` / `identity_bootstrap_unavailable` / `identity_bootstrap_failed` / `identity_seed_failed`）/ `failed`（含 `login_form_rerendered` / `login_session_unverified`）/ `aborted` / `timeout` | 无法证明覆盖，或契约、环境、内部错误、超时、中断 |
 
 - `no_candidates`（exit 0）：路由已识别，但没有候选同时命中「静态形状 + 攻击用例」，界面显示「已扫描 · 无安全候选」并列出支持清单。
 - `not_reproducible`（exit 0）：静态有线索、攻击已发出但打不通，显示「已测未复现 · 未证明安全」。
 - `inconclusive`（exit 2）：**没测到 ≠ 安全**。未识别到任何路由（`no_endpoints`）、静态分析给出的路由在真实实例上逐条打完全部不成立（`static_routes_unverified`，多见于挂载前缀/路径拼接类适配问题）、计划用例因身份 / 资源 / 运行期契约不足被跳过（`attack_inconclusive`）、候选端点缺少可寻址参数（`plan_incomplete`）、模型侦察给出的路由在真实运行实例上逐条打完全部不成立（`scout_routes_unverified`）、定位不到按归属过滤的列表接口（`no_list_endpoint`）、多段路径参数取值来源实测不出（`param_binding_unverified`）、纯黑盒模式契约里配了账号但一个身份都登不上（`blackbox_login_failed`，身份族用例整族未执行）、登录与路由都正常却一个攻击用例都构造不出来（`no_attack_cases`，测试账号名下没有可读回的对象数据）都归这一档，门禁不放行，报告给出对应的契约补齐字段。
+- `inconclusive` 中的身份自举三类（exit 2）：身份省略 `password` 由引擎随机生成、但注册端点没能确定（`identity_bootstrap_unavailable`，`static-ambiguous` 与纯黑盒目标也归这里——引擎不会猜端点，更不会对别人在跑的系统建号）、引擎用目标自己的注册接口建号或随后登录任一步未被真实接受（`identity_bootstrap_failed`）、号建了但 `register.seed` 写入被拒（`identity_seed_failed`，没有归属对象就无从构造越权用例）。三类都不会退化成匿名探测后报「未发现漏洞」，也不依赖模型判断——端点解析、模板占位符校验、口令生成与 canary 写入全是确定性代码路径。
 - `failed` 中的登录两类（exit 2）：目标把「密码错误」渲染成 HTTP 200 + 登录表单（`login_form_rerendered`），或状态码可接受、凭据也取到了，但拿静态分析已知的「无参数、只读、需登录」接口做鉴权回读时匿名与带会话的响应同形同码被拒（`login_session_unverified`）。两类都是**会话没建立**，若按状态码判定就会被记成登录成功、随后所有越权用例拿匿名会话打，产出假的「未复现」。分开登录入口的应用要用 `identities[].loginPath` 为每个身份指定端点；找不到可回读的探针接口时引擎不做判定，但会在报告里写明「会话真实性回读未执行」。
 
 ## 精度口径
 
-- 基准语料：**13 个标注靶场**，逐靶场标注期望退出码、期望复现的攻击用例、期望静态候选。
+- 基准语料：**14 个标注靶场**，逐靶场标注期望退出码、期望复现的攻击用例、期望静态候选（含一个「空库」靶场：库内没有账号，身份与数据由引擎自举后再打越权）。
 - 黑盒基准语料：**25 个已运行靶场**，逐靶场标注期望退出码、期望/禁止出现的 vulnerable 用例族（写探测与 CSRF 开关分档，含 SSRF / 上传 / JWT / 业务逻辑的漏洞—默认关闭—加固三档对照，以及 robots/sitemap、Next `_buildManifest.js`、Swagger UI 内嵌地址三路发现各配一个加固对照）。
-- 当前基线：动态召回 **24/24**、误报 **0/24**、退出码一致 **13/13**、静态召回 **24/24**；黑盒用例召回 **46/46**、误报 **0/46**、退出码一致 **25/25**；均零模型调用。
+- 当前基线（2026-10-31 复跑，含自举靶场）：动态召回 **25/25**、误报 **0/25**、退出码一致 **14/14**、静态召回 **25/25**；黑盒用例召回 **46/46**、误报 **0/46**、退出码一致 **25/25**；均零模型调用。
 - 第三方真实靶场层（可选，不进 CI）：`npm run benchmark:realworld` 打的是**上游真代码**（VulnAPI、OWASP Juice Shop），标注来自上游声明的漏洞清单 + 逐行核对源码。本机没这份代码就跳过，`--require=<id>` 才把跳过判失败。当前基线（2026-10-25）：**2/2 实跑、召回 3/3、明令禁止命中 0、未标注 0、退出码一致 2/2**；单轮约 6 分钟（VulnAPI ≈ 340s / Juice Shop ≈ 16s）。这一层的价值在于自建靶场给不出的东西：它实测暴露过一次误报——共享/全局集合（商品目录）两个身份都能看到同一批 id，被早先的版本读成「读到了别人的对象」；现在跨用户读写判定会先用攻击者自己的列表排除这种形状，回落为 `inconclusive`，并把它作为否定断言长期锁住。
 - **这是「标注语料内」的召回率**，衡量已覆盖类别打得准不准，**不等于**被测项目没有漏洞。
 - 静默成功型问题（不回显的盲注、带外 SSRF 等）按设计记 `inconclusive`：宁可不报，也不假报。

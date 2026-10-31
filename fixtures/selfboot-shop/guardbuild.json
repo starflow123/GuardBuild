@@ -1,0 +1,26 @@
+{
+  "_note": "空库自举靶场（#179）：src/app.js 里 USERS 初始为空数组，唯一的建号入口是目标自己的 POST /api/register。identities 故意省略 password —— 口令由引擎随机生成、只进 Host 保险库；register.seed 给每个新建账号写入名下对象，之后才有「两个各自名下有数据的账号」可打跨归属。GB_SELFB_HARDENED=1 时单体端点加归属校验（自举成功 → exit 0 已测未复现）；GB_SELFB_BOOT=0 关注册（省略口令却建不了号 → exit 2 identity_bootstrap_unavailable/failed）；GB_SELFB_SEED_DENIED=1 让写入对已登录身份回 403（→ exit 2 identity_seed_failed）。",
+  "start": {
+    "cmd": "node",
+    "args": ["server.js"],
+    "env": { "PORT": "0" },
+    "readyPattern": "已就绪",
+    "readyTimeoutMs": 20000
+  },
+  "login": {
+    "path": "/api/login",
+    "bodyTemplate": { "email": "{email}", "password": "{password}" },
+    "credentialPath": "token"
+  },
+  "register": {
+    "path": "/api/register",
+    "bodyTemplate": { "email": "{email}", "username": "{username}", "password": "{password}" },
+    "seed": [{ "method": "POST", "path": "/api/orders", "bodyTemplate": { "title": "{canary}" } }]
+  },
+  "identities": [
+    { "name": "alice", "username": "alice", "role": "user" },
+    { "name": "bob", "username": "bob", "role": "user" }
+  ],
+  "llm": { "enabled": false },
+  "scopes": ["project.read", "worktree.write", "proc.spawn", "net.probe"]
+}

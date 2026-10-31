@@ -431,6 +431,7 @@ impl Host {
         cap!("http.request", cap_http_request);
         cap!("credential.list", cap_credential_list);
         cap!("credential.revoke", cap_credential_revoke);
+        cap!("credential.protect", cap_credential_protect);
         cap!("report.emit", cap_report_emit);
     }
 
@@ -1518,6 +1519,27 @@ impl Host {
         let _ = self.session_of_token(&p.token)?;
         let names = self.vault.lock().unwrap().names();
         Ok(json!({ "identities": names }))
+    }
+
+    /// 登记「只用于脱敏」的秘密：引擎自生成的测试账号口令走这里。
+    /// 值留在 Host 的 `protected` 表里（不参与请求头注入、不进 `credential.list`、不落任何产物），
+    /// 任何流经 Host 的文本命中它都会被掩码——包括目标把凭据回显在响应里的情况。
+    /// 这里只回布尔，绝不回显值本身。
+    fn cap_credential_protect(&self, params: Value) -> HostResult<Value> {
+        #[derive(Deserialize)]
+        struct P {
+            token: String,
+            label: String,
+            value: String,
+        }
+        let p: P = jget(&params)?;
+        let _ = self.session_of_token(&p.token)?;
+        if p.label.trim().is_empty() || p.value.is_empty() {
+            return Err(HostError::InvalidParams("label/value 不能为空".into()));
+        }
+        let mut vault = self.vault.lock().unwrap();
+        vault.protect(&p.label, &p.value);
+        Ok(json!({ "ok": true }))
     }
 
     fn cap_credential_revoke(&self, params: Value) -> HostResult<Value> {

@@ -113,6 +113,7 @@ function createCtx(params) {
     tokens: { project: params.token },
     identities: loadIdentities(),
     loginConfig: null,
+    registerConfig: null,
     analysis: null,
     plan: null,
     supabaseLeaks: 0,
@@ -2242,6 +2243,7 @@ async function runFlow(ctx) {
       });
     }
     ctx.loginConfig = targetConfig.login ?? null;
+    ctx.registerConfig = targetConfig.register ?? null;
     ctx.llmConfig = targetConfig.llm ?? null;
     ctx.llmGetToken = (url, reason) => ensureLlmToken(ctx, url, reason);
     if (targetConfig.identities) {

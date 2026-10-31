@@ -229,6 +229,75 @@ test("身份基础：会话建立端点与回读结论写进 report.json 与 mar
   assert.match(markdown, /会话真实性：已回读验证（探针 `\/api\/me`：att1 匿名 401→会话 200、org1 匿名 401→会话 200）/);
 });
 
+test("身份基础：引擎自举建号与造数据写进报告，口令明文一律不落产物", () => {
+  const ctx = ctxFor({ patchStatus: "verified" });
+  ctx._identityReport = {
+    configured: ["alice", "bob"],
+    loggedIn: [
+      { name: "alice", role: "user", endpoint: "/api/login", credentialKind: "token" },
+      { name: "bob", role: "user", endpoint: "/api/login", credentialKind: "token" },
+    ],
+    sessionVerification: { status: "verified", probePath: "/api/profile", identities: [] },
+    bootstrap: { endpoint: "/api/register", endpointSource: "contract", unavailableReason: null, accounts: [], seeds: [] },
+  };
+  ctx._identityBootstrap = {
+    byPhase: {
+      pre: {
+        phase: "pre",
+        endpoint: "/api/register",
+        endpointSource: "contract",
+        unavailableReason: null,
+        candidates: [],
+        accounts: [
+          { name: "alice", trigger: "no-declared-password", verdict: "created", status: 201, generated: true, endpoint: "/api/register" },
+          { name: "bob", trigger: "no-declared-password", verdict: "created", status: 201, generated: true, endpoint: "/api/register" },
+        ],
+        seeds: [
+          { identity: "alice", path: "/api/orders", status: 201, verdict: "written" },
+          { identity: "bob", path: "/api/orders", status: 201, verdict: "written" },
+        ],
+        secretProtection: { alice: "ok", bob: "ok" },
+      },
+    },
+  };
+  const { json, markdown } = buildReport(ctx, { outcome: "vulnerable", exitCode: 1 });
+  const ib = json.summary.identities.bootstrap;
+  assert.equal(ib.attempted, true);
+  assert.equal(ib.registered, 2);
+  assert.equal(ib.seeded, 2);
+  assert.deepEqual(ib.byPhase[0].accounts.map((a) => a.passwordSource), ["engine-generated", "engine-generated"]);
+  assert.match(markdown, /身份自举：本轮由目标注册接口 `\/api\/register`（contract）建号 2 个/);
+  assert.match(markdown, /口令由引擎随机生成、只进 Host 保险库（不落配置\/报告\/证据库）/);
+  assert.match(markdown, /写入测试数据 2 条/);
+  // 报告里不能出现任何形如引擎口令的串
+  assert.doesNotMatch(JSON.stringify(json), /"password"/, "报告 JSON 不该带口令字段");
+});
+
+test("身份基础：静态建号候选有多个时报告写明引擎不猜", () => {
+  const ctx = ctxFor({ patchStatus: "verified" });
+  ctx._identityReport = {
+    configured: ["alice"],
+    loggedIn: [{ name: "alice", role: "user", endpoint: "/api/login", credentialKind: "token" }],
+    sessionVerification: { status: "verified", probePath: "/api/profile", identities: [] },
+  };
+  ctx._identityBootstrap = {
+    byPhase: {
+      pre: {
+        phase: "pre",
+        endpoint: null,
+        endpointSource: null,
+        unavailableReason: "static-ambiguous",
+        candidates: ["/api/register", "/api/users/create"],
+        accounts: [],
+        seeds: [],
+        secretProtection: {},
+      },
+    },
+  };
+  const { markdown } = buildReport(ctx, { outcome: "not_reproducible", exitCode: 0 });
+  assert.match(markdown, /身份自举：未参与（静态识别到 2 个建号候选，引擎不猜：\/api\/register、\/api\/users\/create）/);
+});
+
 test("身份基础：回读未执行时如实标注原因，不写成已验证", () => {
   const ctx = ctxFor({ patchStatus: "verified" });
   ctx._identityReport = {

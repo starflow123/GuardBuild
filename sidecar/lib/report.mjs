@@ -564,6 +564,68 @@ function renderAttackPlanSection(p) {
   return lines.join("\n");
 }
 
+/** 探索区（第 13 项）：呈报「模型自主试打了什么、留下什么草稿」，草稿不是结论 */
+const EXPLORATION_OUTCOME_LABEL = {
+  not_run: "未运行",
+  no_targets: "无可试打端点",
+  stopped: "自行收手",
+  budget_exhausted: "预算用尽即停",
+  llm_unavailable: "模型不可用",
+  agent_error: "代理异常",
+};
+
+function renderExplorationSection(e) {
+  if (!e) return "";
+  const label = EXPLORATION_OUTCOME_LABEL[e.outcome] ?? e.outcome ?? "—";
+  const lines = [
+    "## 探索区（自主试打 → 配方草稿）\n",
+    "| 项目 | 值 |",
+    "| --- | --- |",
+    `| 模型 | ${esc(e.model ?? "—")} |`,
+    `| 结局 | ${esc(label)} |`,
+    `| 轮次 / LLM 调用 | ${e.rounds ?? 0} 轮 / ${e.modelCalls ?? 0} 次 |`,
+    `| 实发请求 | ${e.requestsUsed ?? 0} 次（上限 ${e.budget?.maxRequests ?? "—"}） |`,
+    `| 菜单 | 端点 ${e.menu?.targets ?? 0} / 身份 ${e.menu?.roles ?? 0} / 对象 ${e.menu?.resources ?? 0} |`,
+    `| 被拒选择 | ${(e.rejectedChoices ?? []).length} 条 |`,
+    `| 丢弃的模型自带字段 | ${(e.ignoredFields ?? []).length ? e.ignoredFields.map((f) => `\`${esc(f)}\``).join("、") : "无"} |`,
+    `| 用时 | ${e.durationMs != null ? `${e.durationMs}ms` : "—"} |`,
+    "",
+  ];
+  if (e.budgetStop) lines.push(`- 超限即停：${esc(e.budgetStop)}`, "");
+  if (e.error) lines.push(`- 探索区错误：${esc(e.error)}`, "");
+  if (Array.isArray(e.trace) && e.trace.length) {
+    lines.push(
+      "**真实请求序列**（路径与载荷由引擎的计划候选拼装，模型只能报菜单编号；这些流量不进证据库、不参与判卷）\n",
+      "| 次 | 动作 | 槽位 | 身份 | 请求 | HTTP | 字节 | 结果 |",
+      "| --- | --- | --- | --- | --- | --- | --- | --- |"
+    );
+    for (const t of e.trace) {
+      lines.push(
+        `| ${t.seq ?? "—"} | ${esc(t.action ?? "—")} | ${esc(t.slot ?? "—")} | ${esc(t.role ?? "—")} | \`${esc(truncate(`${t.method ?? "?"} ${t.path ?? "?"}`, 80))}\` | ${
+          t.status ?? "—"
+        } | ${t.bytes ?? 0} | ${t.ok ? "已送达" : esc(t.error ?? "未成功")} |`
+      );
+    }
+    lines.push("");
+  }
+  if (e.draft) {
+    lines.push(
+      `**配方草稿**：族名 \`${esc(e.draft.family ?? "（待定）")}\`，${e.draft.steps ?? 0} 步，动作表校验${
+        e.draft.tableOk ? "通过" : `拒收（${(e.draft.rejections ?? []).length} 处表外）`
+      }，判据 \`${esc(e.draft.verdictRule ?? "—")}\`（${e.draft.verdictByEngine ? "引擎写死，模型自定的 verdict 已丢弃" : "来源未标"}），**未注册、未进判定链**。`
+    );
+    if (e.draft.note) lines.push(`- ${esc(e.draft.note)}`);
+    if (e.artifact) lines.push(`- 草稿文件：\`${esc(e.artifact)}\``);
+    lines.push("");
+  }
+  lines.push(
+    "- 启用条件是双重闸门（契约 `exploration.enabled: true` **且** `GUARDBUILD_LLM_EXPLORATION=1`），gate/CI 与纯黑盒模式代码级不进入这一路。",
+    "- 本段全部是过程事实：漏洞结论仍只由判卷代码按已注册配方落笔（草稿没过判卷器就不算打法）。",
+    ""
+  );
+  return lines.join("\n");
+}
+
 function summarizeBootstrap(b) {
   if (!b) return null;
   return {
@@ -957,11 +1019,19 @@ function renderMarkdown(r) {
       `- 有界启动代理：${esc(BOOTSTRAP_OUTCOME_LABEL[r.bootstrap.outcome] ?? r.bootstrap.outcome ?? "—")}（${r.bootstrap.stepsUsed ?? 0}/${r.bootstrap.maxSteps ?? "—"} 步，菜单 ${r.bootstrap.menuSize ?? 0} 个动作）`
     );
   }
+  if (!bb && r.exploration) {
+    summaryLines.push(
+      `- 探索区自主试打：${esc(EXPLORATION_OUTCOME_LABEL[r.exploration.outcome] ?? r.exploration.outcome ?? "—")}（${r.exploration.requestsUsed ?? 0} 次实发 / ${r.exploration.rounds ?? 0} 轮），草稿${
+        r.exploration.draft ? (r.exploration.draft.tableOk ? "已过动作表校验（未注册、不进判定链）" : "被动作表拒收") : "未产出"
+      }`
+    );
+  }
   if (r.error) summaryLines.push(`- 错误：\`${esc(r.error.code)}\` — ${esc(r.error.message)}`);
   parts.push(summaryLines.join("\n") + "\n");
 
   if (!bb && r.llm?.used) parts.push(renderLlmSection(r.llm));
   if (!bb && r.bootstrap) parts.push(renderBootstrapSection(r.bootstrap), "");
+  if (!bb && r.exploration) parts.push(renderExplorationSection(r.exploration));
 
   if (!bb && r.summary.findings.length) {
     parts.push(`## 静态发现（${r.summary.findings.length}）\n`);
@@ -1393,6 +1463,7 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
         }
       : null,
     bootstrap: summarizeBootstrap(view.bootstrap),
+    exploration: view.exploration ?? null,
     supabase,
     blackbox,
     evidence: {

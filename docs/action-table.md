@@ -124,4 +124,28 @@ Host 侧 `http.request` 的参数结构体没开 `deny_unknown_fields`，sidecar
 
 **还剩什么**：其余十族仍是专用代码（第 199 项，M5）；配方被拒收目前只会让当次扫描抛错，还没接进事件流与失败账本，那是第 9 项能力请求单要做的落点；穿越族的身份位（`victim→attacker`）还写死在代码里——`fs.traverse` 的参数表不含 `identity`，要把它交给配方得先扩表，扩表是注册动作参数，要人批，不在等价重构里顺手做。
 
+## 九、第二个消费方：探索区的编号菜单只放「此刻真能执行」的那几条（M1 第 13 项）
+
+装载器：`sidecar/lib/explorer.mjs` · 单测：`sidecar/tests/explorer.test.mjs`（19 条）· e2e：`npm run e2e:explore`（52 断言 / 7 轮）
+
+第八节的配方是**离线**过表的（人工写好、装载即校验）。探索区是**在线**用表的：模型在沙箱里逐步挑编号，引擎逐步实发，跑完再把真实请求序列落成草稿。表在这里起三个作用：
+
+| 表的作用 | 落在哪一行代码 |
+| --- | --- |
+| 决定菜单上有几条动作 | `PRIMITIVES` 只列 4 条（`request.anonymous` / `request.as` / `payload.inject` / `fs.traverse`），每条带 `allowedTargetIds`——动作 × 槽位的**合法组合**是引擎算出来的，模型看不到也造不出别的 |
+| 决定这一步能不能发 | `validateExploreChoice` 只认编号：菜单外编号、把动作打到不该打的槽位、该填对象主键却本轮没有可用对象（表上 `needsResourceId`，菜单里如实写 `needs_resource`，执行器再拒一次）都在**发请求之前**拒收，一个请求都不多发 |
+| 决定草稿收不收 | 真实序列 → `draftStepOf` → `buildDraft` 立刻走同一个 `validateRecipe`；映射不出表内写法就当场拒收并留拒收原文，表校验不过的草稿不会伪装成「打过」 |
+
+线形态不自成一套：读取类两条把 GraphQL/tRPC 的 `graphql` 标志照判卷用例一样传给 `httpJson`，注入与穿越两条沿用 `injectionReq`/`traversalAttemptPath`——这两条构建器在**判卷路径里本来也只发 REST 形态**（`probe.mjs` 里两处 send 都不带线标志），所以探索区与考卷打的是同一种请求，不是探索区另开一条通道。这两族对 GraphQL/tRPC 的覆盖缺口是原有的，归第 8/16 项补齐，不在这里假装已解决。
+
+三条边界沿用第八节那条分工，且都是这一路新需要的：
+- **判据不进菜单**：`verdict`/`verdictRule` 都是表外字段，出现即丢弃并留名（`ignoredFields`）；草稿的判据由引擎写成 `EXPLORATION_DRAFT_RULE = attack-repro`，`verdictByEngine` 一并进视图与报告，供复核者核对「这一条不是模型给的」。
+- **族名可以给，路径不能给**：模型声明的 `family` 进草稿（仅命名），`path` 只能是 `{slot:X}` 引用，字面路径照旧拒收——否则「草稿写着打了 `/api/orders/999`」而实发的是别的请求，又是一块假绿灯。
+- **锚点回读**：`checkExplorationAnchors()` 逐条回读执行器，菜单上写的每个动作必须在 `probe.mjs` 里真有那一段。执行器哪天被重构掉，菜单当场判红而不是让模型对着不存在的能力出主意。
+
+草稿的去向说清楚：`$GUARDBUILD_DATA_DIR/exploration/<项目指纹>/`，`registered: false`，**不写 `sidecar/recipes/`**——注册仍是人工闸门（红线 2、8）。这一路只把「表能不能装下模型想的打法」这个缺口暴露出来：装不下就拒收留名，而不是临时给模型加一条能力。
+
+**还剩什么**：草稿→注册的通路仍是人工（第 9/10 项把请求单与审查代理接上之后才成流程）；草稿本身尚无独立证据（第 6 项判卷器要拿考卷验它打不打得中）；表里另外 11 条动作没进菜单，放开哪几条是注册动作，要人批。
+
+
 

@@ -25,11 +25,12 @@ import {
 } from "./lib/targetconfig.mjs";
 import { diagnoseStartFailure, redactLogLines } from "./lib/autostart.mjs";
 import { parsePortFromLine, stripAnsi } from "./lib/readyline.mjs";
-import { runPhase, ProbeError } from "./lib/probe.mjs";
+import { runPhase, explorationSendStep, ProbeError } from "./lib/probe.mjs";
 import { runSupabasePhase, isLoopbackHostname } from "./lib/supabase.mjs";
 import { runScout, applyScoutResult, recordScoutVerification, MAX_START_CANDIDATES } from "./lib/scout.mjs";
 import { isEnabled as llmEnabled } from "./lib/llm.mjs";
 import { bootstrapEnabled, runBootstrapAgent } from "./lib/bootstrap.mjs";
+import { explorationEnabled, runExploration } from "./lib/explorer.mjs";
 import { runBlackbox } from "./lib/blackbox.mjs";
 import { coverageSummary, describeOutcome } from "./lib/coverage.mjs";
 import { createPatch, writebackPatch, rollbackWorkspace, PatchError } from "./lib/patcher.mjs";
@@ -1662,8 +1663,74 @@ async function stageReproduce(ctx) {
       details: ctx.view.phases.pre ?? supaRes?.summary ?? null,
     });
   }
+  await stageExploration(ctx);
   setState(ctx, STATE.EVIDENCED);
   return pre ?? supaRes;
+}
+
+/**
+ * 探索区（第 13 项，可选）：模型在沙箱里按编号自主挑「动作/目标/身份/资源」，
+ * 由引擎实发请求，真实请求序列落成配方草稿。判定链一律不受影响——
+ * 草稿只写数据目录、不注册、不过判卷器就不进判定链（红线 2/4）。
+ * 双重闸门：guardbuild.json 的 exploration.enabled 与 GUARDBUILD_LLM_EXPLORATION=1 缺一不跑；
+ * gate/CI 与纯黑盒模式代码级排除（真实项目扫描不经过这一路）。
+ */
+async function stageExploration(ctx) {
+  if (!explorationEnabled(ctx)) return;
+  const stash = ctx._exploration ?? null;
+  const baseUrl = stash?.baseUrl ?? ctx.procs?.original?.url ?? null;
+  if (!stash || !baseUrl) {
+    emit(ctx, {
+      kind: "exploration",
+      severity: SEVERITY.WARN,
+      message: "探索区已启用，但本轮没有可用的沙箱实例或候选池（未启动本地目标）——跳过，不影响判定链",
+      phase: STATE.PROBING,
+      data: { reason: stash ? "no_base_url" : "no_stash" },
+    });
+    return;
+  }
+  const model = ctx.llmConfig?.model ?? null;
+  emit(ctx, {
+    kind: "exploration",
+    severity: SEVERITY.INFO,
+    message: `开始探索区自主试打${model ? `（${model}）` : ""}：模型只报菜单编号，请求由引擎实发；产出只是配方草稿，不参与漏洞判定`,
+    phase: STATE.PROBING,
+    data: { model, baseUrl, budget: ctx.targetConfig?.exploration ?? null },
+  });
+  let result = null;
+  try {
+    result = await runExploration(ctx, {
+      baseUrl,
+      stash,
+      model,
+      getToken: (url, reason) => ensureLlmToken(ctx, url, reason),
+      sendStep: (step) => explorationSendStep(ctx, { baseUrl, step }),
+    });
+  } catch (e) {
+    emit(ctx, {
+      kind: "exploration",
+      severity: SEVERITY.WARN,
+      message: `探索区异常结束（不影响判定链与已判用例）：${e.message}`,
+      phase: STATE.PROBING,
+      data: { code: e.code ?? null },
+    });
+    return;
+  }
+  if (result && result.draft) {
+    emit(ctx, {
+      kind: "exploration",
+      severity: SEVERITY.INFO,
+      message: `探索区收手：${result.requestsUsed} 次实发 / ${result.rounds} 轮，草稿${result.draft.tableOk ? "已过动作表校验" : "被动作表拒收"}；未过判卷器，不进判定链${
+        result.artifact ? `；草稿见 ${result.artifact}` : ""
+      }`,
+      phase: STATE.PROBING,
+      data: {
+        outcome: result.outcome,
+        steps: result.trace.length,
+        draft: result.draft ? { family: result.draft.family, tableOk: result.draft.tableOk, registered: false } : null,
+      },
+    });
+  }
 }
 
 async function stagePatch(ctx) {

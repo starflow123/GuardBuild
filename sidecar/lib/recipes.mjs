@@ -90,8 +90,8 @@ export function resolvePlanField(ref, obj, recipeId, where) {
   return obj?.[field];
 }
 
-/** 计划槽位 → planner 候选种类（写死的对应关系，配方看不到这一层） */
-const SLOT_KIND = {
+/** 计划槽位 → planner 候选种类（写死的对应关系，配方看不到这一层；探索区按它反查槽位） */
+export const SLOT_KIND = {
   readPath: "read",
   cancelPath: "cancel",
   unauthReadPath: "unauthRead",

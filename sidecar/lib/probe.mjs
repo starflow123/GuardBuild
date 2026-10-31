@@ -49,8 +49,10 @@ import {
   resolvePlanField,
   resolveRole,
   resolveRolePreferred,
+  SLOT_KIND,
   variantAxisSteps,
 } from "./recipes.mjs";
+import { redactSecrets } from "./failureledger.mjs";
 import { buildProbePlan, candKey } from "./planner.mjs";
 import {
   MAX_SCOUT_ROUTES,
@@ -4903,6 +4905,34 @@ export async function runPhase(ctx, { phase, baseUrl }) {
       });
     }
   }
+  // 探索区（方案第 13 项）的现场快照：把「已发现的槽位候选 / 已种入的身份 / 已发现的资源」留给
+  // 探索通道，它就不必自己重新登录、重新发现（那样探索流量与判卷流量指向的对象会对不上）。
+  // 只在 pre 阶段留；这份快照不参与任何判定，探索请求也不进证据库。
+  if (phase === "pre") {
+    const seenRes = new Set();
+    const resources = [];
+    const addRes = (name, o) => {
+      const id = resourceIdOf(ctx, o);
+      if (id == null || seenRes.has(String(id))) return;
+      seenRes.add(String(id));
+      resources.push({ id: String(id), owner: name });
+    };
+    for (const [name, items] of Object.entries(byUser ?? {})) for (const o of items ?? []) addRes(name, o);
+    for (const o of anonymousItems ?? []) addRes(null, o);
+    ctx._exploration = {
+      baseUrl,
+      loggedIn,
+      targets,
+      byUser,
+      candidates: {
+        readPath: planCandidates(ctx, SLOT_KIND.readPath),
+        unauthReadPath: planCandidates(ctx, SLOT_KIND.unauthReadPath),
+        sqliPath: planCandidates(ctx, SLOT_KIND.sqliPath),
+        traversalPath: planCandidates(ctx, SLOT_KIND.traversalPath),
+      },
+      resources,
+    };
+  }
   const allCases = buildCases(ctx, targets);
   // 路径穿越会把不存在的路径打到文件读取接口，SSRF 会让目标主动发起外部请求；
   // 个别实现会同步阻塞事件循环。排在最后，避免一条挂起的用例拖掉整轮注入取证。
@@ -5188,4 +5218,91 @@ export async function runPhase(ctx, { phase, baseUrl }) {
   });
 
   return { evidence, summary };
+}
+
+// —— 探索区执行器（方案第 13 项）——
+
+function explorationRespond(res, method, path) {
+  const body = typeof res?.body === "string" ? res.body : "";
+  return {
+    // ok 只表示「请求真的发出去并拿到了响应」，不是判定：探索流量不进证据库、不参与判卷
+    ok: true,
+    method,
+    path,
+    status: Number.isFinite(res?.status) ? res.status : null,
+    bytes: body.length,
+    // 摘录在这里就过一道脱敏：trace 会落盘并进报告，凭据值不许跟着走（红线 6）
+    excerpt: redactSecrets(body).slice(0, 400),
+    error: null,
+  };
+}
+
+/**
+ * 这一步的请求是否要用到一个对象主键：路径参数、`?param=` 形态、GraphQL/tRPC 的 input 都要填 id。
+ * 探索区不许凭空造一个 id（那是「猜」出来的目标，既不可重放也可能打到本轮根本不存在的对象上）。
+ */
+function explorationNeedsResourceId(cand) {
+  const path = candPath(cand);
+  if (!path) return false;
+  if (cand?.queryParam || /:[A-Za-z_]\w*/.test(path)) return true;
+  return isGraphqlCandidate(cand) || isTrpcCandidate(cand);
+}
+
+/**
+ * 把探索器选出的编号组合变成一次真实请求。
+ * 请求构造与判卷用例共用同一批写死程序（candRequest / injectionReq / traversalAttemptPath / httpJson），
+ * 探索器只能选「打哪个槽位、用哪个身份、取哪个对象」，选不出这份菜单之外的能力；
+ * 载荷集与 canary 同样是引擎里那两套，探索器拿不到也改不了内容。
+ */
+export async function explorationSendStep(ctx, { baseUrl, step }) {
+  const fail = (error) => ({ ok: false, method: null, path: null, status: null, bytes: 0, excerpt: null, error });
+  const cand = step?.cand ?? null;
+  if (!cand) return fail("执行器拿不到该槽位的候选（计划里没有它）");
+  const kind = SLOT_KIND[step.slot] ?? null;
+  const seq = Number.isInteger(step.payloadIndex) ? step.payloadIndex : 0;
+  try {
+    switch (step.action) {
+      case "request.anonymous":
+      case "request.as": {
+        const resourceId = step.resourceId ?? null;
+        if (resourceId == null && explorationNeedsResourceId(cand)) {
+          return fail("该端点要一个对象主键，而本轮发现阶段没有给出可用对象——探索区不猜 id");
+        }
+        const req = candRequest(ctx, cand, resourceId);
+        if (!req?.path) return fail("候选路径无法构造");
+        const method = req.method ?? "GET";
+        const res = await httpJson(ctx, {
+          baseUrl,
+          method,
+          path: req.path,
+          identity: step.action === "request.as" ? step.identity : null,
+          body: req.body,
+          graphql: !!req.graphql,
+        });
+        return explorationRespond(res, method, req.path);
+      }
+      case "payload.inject": {
+        const ref = kind ? cand[kind] : null;
+        if (!ref) return fail(`计划里 ${step.slot} 没有声明注入点`);
+        const req = injectionReq(cand, ref, SQLI_PAYLOADS[seq % SQLI_PAYLOADS.length]);
+        if (!req) return fail("注入请求无法构造（缺路由路径）");
+        const res = await httpJson(ctx, { baseUrl, method: req.method, path: req.path, identity: step.identity, body: req.body });
+        return explorationRespond(res, req.method, req.path);
+      }
+      case "fs.traverse": {
+        const ref = kind ? cand[kind] : null;
+        if (!ref) return fail(`计划里 ${step.slot} 没有声明穿越点`);
+        const routePath = candPath(cand);
+        if (!routePath) return fail("穿越路由无法确定");
+        const payload = TRAVERSAL_PAYLOADS[seq % TRAVERSAL_PAYLOADS.length];
+        const path = traversalAttemptPath(routePath, ref, payload, false);
+        const res = await httpJson(ctx, { baseUrl, method: "GET", path });
+        return explorationRespond(res, "GET", path);
+      }
+      default:
+        return fail(`执行器没有「${step.action}」这条动作（菜单与代码不一致）`);
+    }
+  } catch (e) {
+    return fail(String(e?.message ?? e).slice(0, 200));
+  }
 }

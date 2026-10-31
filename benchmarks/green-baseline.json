@@ -1,6 +1,6 @@
 {
   "version": "gb-green-baseline-1",
-  "updatedAt": "2026-10-31T12:31:49.934Z",
+  "updatedAt": "2026-10-31T14:15:36.991Z",
   "suites": {
     "whitebox": {
       "keys": [
@@ -44,8 +44,8 @@
         "whitebox/upload-shop",
         "whitebox/upload-shop#attack-upload"
       ],
-      "lastRunAt": "2026-10-31T12:25:43.934Z",
-      "lastRunHead": "1a6d1e7",
+      "lastRunAt": "2026-10-31T14:05:13.762Z",
+      "lastRunHead": "33b3d1e",
       "corpusVersion": 1,
       "regressions": 0
     },
@@ -123,8 +123,8 @@
         "blackbox/wide-shop-mutate#blackbox-vertical-*",
         "blackbox/wide-shop-mutate#blackbox-xss-*"
       ],
-      "lastRunAt": "2026-10-31T12:28:41.493Z",
-      "lastRunHead": "1a6d1e7",
+      "lastRunAt": "2026-10-31T14:08:23.893Z",
+      "lastRunHead": "33b3d1e",
       "corpusVersion": 1,
       "regressions": 0
     },
@@ -136,8 +136,8 @@
         "realworld/vulnapi#blackbox-sqli-*",
         "realworld/vulnapi#blackbox-ssrf-*"
       ],
-      "lastRunAt": "2026-10-31T11:09:05.598Z",
-      "lastRunHead": "d2853fe",
+      "lastRunAt": "2026-10-31T14:15:36.991Z",
+      "lastRunHead": "33b3d1e",
       "corpusVersion": 1,
       "regressions": 0
     },

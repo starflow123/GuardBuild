@@ -164,6 +164,7 @@ npm run test:rust      # Rust Host
 - `identities`：支持 `username` / `email` / 自定义 `fields` 三种形状；至少 2 个，否则回退到内置演示身份；`role: "admin"` 的身份用于管理端用例；`loginPath` 声明该身份自己的登录端点——分开登录入口的应用（参与者 `/auth/attendee/login`、组织者 `/auth/organiser/login`）必须逐个身份写，否则引擎会拿同一端点登所有身份，把「登不进」变成「身份被静默降级成匿名」；**省略 `password`** 则该账号由引擎经 `register` 现场注册（口令随机生成、只进保险库），见上条
 - `scopes`：仅 CI gate 模式读取，作为「预声明授权」白名单；桌面模式不生效（仍逐次征求用户授权）
 - `llm`：可选 LLM 开关——接入侦察（`enabled` / `model` / `maxFiles`）与编码代理补丁（`patch` / `autoVerify` / `patchMaxFiles` / `patchToolRounds`），默认全关；启用与安全边界见下两节
+- `exploration`：可选探索区（自主试打）开关与预算——`enabled` 与 `maxRequests` / `maxRounds` / `totalBudgetMs` / `maxOutputChars` / `maxTargets` / `maxResources` / `maxDraftSteps`；**双闸**（这里 `enabled: true` 且 `GUARDBUILD_LLM_EXPLORATION=1`）才跑，缺省不写 `enabled` 时只由环境变量决定。预算只能往小调：写大了一律夹到引擎硬上限（30 次 / 12 轮 / 600s / 20 万字符 / 20 步），边界与安全口径见「探索区」一节
 - `docker`：可选容器沙箱（`enabled` / `image` / `containerPort` / `workdir` / `env` / `command` / `readyTimeoutMs`）；启用后目标只经受限 `docker run` 在容器内启动，见下节「Docker 容器沙箱」
 
 **真实项目接入的常见准备**：
@@ -291,6 +292,17 @@ npm run e2e:selfboot-odd       # 本机 mock DeepSeek 八轮演练，无需真�
 - `sidecar/lib/recipes.mjs`：装载器，表在这里才真的生效。配方装载即校验，表外动作/参数、词表外的变体轴、与实际判卷代码不符的判据名、取不到候选种类的槽位、写成字面量的路径与参数名、不存在的载荷集名或 canary、与执行器写死的请求形态冲突的方法，一律在建用例之前整族抛错，绝不「忽略多余键」。
 - `sidecar/recipes/*.json`：已打通的三族四张表——越权读（攻击打法 + 三条同源变体轴 + 归属人复读；本人可见正向断言）、SQL 注入（三种注入通道共用一条打法声明）、路径穿越/敏感文件泄露。配方只填**结构**（哪条打法、哪个角色、哪个槽位、参数名引用计划的哪一个字段、引用哪个载荷集/canary/判据名）；怎么发请求、每轴展开几条、载荷本体、判据本体、`expect` 文案都留在代码里。
 - `benchmarks/*-golden.json` + `scripts/recipe-snapshot.mjs --family <族>`：等价性证据。每族在若干计划形状下（越权读 6 形状 41 条、SQL 注入 7 形状 8 条、路径穿越 6 形状 7 条）把每条用例的全部字段（含 `send`/`verify`/`crossProof` 判据闭包的**源码文本**）在重构**之前**固化，重构之后逐条 deep-equal 全等——「纯等价重构」是可核对的断言，不是口头承诺。
+
+### 探索区：模型在沙箱内自主试打，产出配方草稿（M1 第 13 项，默认关闭）
+
+配方表要有人填。这一路给模型的仍是**编号菜单**：引擎把本轮计划里真实存在的端点槽位、已验证身份、发现阶段选出的对象，连同动作表里**此刻真能执行**的 4 条原语（`request.anonymous` / `request.as` / `payload.inject` / `fs.traverse`）编成号，模型每轮只回一个编号；请求由引擎用冻结的构建器实发，状态码来自真实响应。
+
+- 双闸才跑：`guardbuild.json` 的 `exploration.enabled: true` **与** `GUARDBUILD_LLM_EXPLORATION=1` 缺一不跑；`--gate` 与纯黑盒模式**结构性排除**（CI 不调用模型，真实项目扫描也不经过这一路），代码级短路，不靠配置自觉。
+- 预算是引擎的，不是模型的：契约只能把默认值往小调（如 `maxRequests: 1` 就真只发一次），往大吹一律夹到硬上限（30 次 / 12 轮 / 600s / 20 万字符）；超限即停并在报告写清停在哪一格——**用尽请求预算后不再问模型**，不留「再想一轮」的口子。
+- 表外的一律不执行：菜单外编号、把动作打到不该打的槽位、该填对象主键却本轮没有可用对象（**引擎不猜 id**）都在发请求之前拒收，一个请求都不多发；模型夹带来的 `path`/`payload`/`headers`/`verdict` 等表外字段逐个留名丢弃。
+- 产出只是草稿：真实请求序列落成 `配方草稿` 并立刻过 `validateRecipe`，映射不出表内写法就当场拒收；草稿写进数据目录 `$GUARDBUILD_DATA_DIR/exploration/<项目指纹>/`，**永不写入 `sidecar/recipes/`**（注册仍是人工闸门），判据由引擎写死为 `attack-repro`，模型自定的 verdict 无效。
+- 探索流量与判定链隔离：不入证据库、不进判卷器、不改变 finding 计数与退出码；每步实发与收手都进审计表，视图/事件/报告/草稿四处都不落模型原文与凭据。
+- 回归：`npm run e2e:explore`（52 断言 / 7 轮，靶场 `fixtures/selfboot-shop` + 本机 mock DeepSeek）——默认关闭时 0 次调用、开启后引擎实发两次真实读取并落成草稿、计划未声明注入点时该动作被拒且不多发、小预算被 honored 而吹大的预算被夹紧、反叛模型三轮全拒且零请求、gate 与黑盒结构性不进入、密钥与契约哨兵九条渠道零残留。
 
 ### 黑盒精度基准
 

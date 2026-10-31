@@ -107,6 +107,9 @@ jobs:
       - name: 攻击规划代理 E2E（本机 mock DeepSeek：预算重排 + 只认编号 + gate 结构性禁用）
         run: node scripts/e2e-attackplan.mjs
 
+      - name: 探索区自主试打 E2E（本机 mock：引擎实发 + 预算超限即停 + 草稿不进判定链 + gate/黑盒不进入）
+        run: node scripts/e2e-explore.mjs
+
       - name: LLM 侦察 E2E（本机 mock DeepSeek + 磁盘缓存复用，无需真实密钥）
         run: node scripts/e2e-llm-scout.mjs
 

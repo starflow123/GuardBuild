@@ -311,6 +311,55 @@ export interface BootstrapView {
   actions?: BootstrapAction[];
 }
 
+/** 探索区（方案第 13 项）：模型只报菜单编号，请求由引擎实发；产出是配方草稿，不进判定链 */
+export interface ExplorationTrace {
+  seq?: number;
+  action?: string;
+  slot?: string | null;
+  role?: string | null;
+  method?: string | null;
+  path?: string | null;
+  status?: number | null;
+  bytes?: number | null;
+  ok?: boolean;
+  error?: string | null;
+}
+
+export interface ExplorationView {
+  version?: string | null;
+  outcome?: string | null;
+  model?: string | null;
+  rounds?: number;
+  modelCalls?: number;
+  requestsUsed?: number;
+  durationMs?: number | null;
+  budgetStop?: string | null;
+  error?: string | null;
+  budget?: {
+    maxRequests?: number;
+    maxRounds?: number;
+    totalBudgetMs?: number;
+    maxOutputChars?: number;
+    maxDraftSteps?: number;
+  } | null;
+  menu?: { targets?: number; roles?: number; resources?: number; actions?: string[] } | null;
+  ignoredFields?: string[];
+  rejectedChoices?: { round?: number; kind?: string; why?: string }[];
+  trace?: ExplorationTrace[];
+  draft?: {
+    family?: string | null;
+    familyDeclared?: boolean;
+    steps?: number;
+    tableOk?: boolean;
+    registered?: boolean;
+    verdictRule?: string | null;
+    verdictByEngine?: boolean;
+    note?: string | null;
+    rejections?: { where?: string; rule?: string; why?: string | null }[];
+  } | null;
+  artifact?: string | null;
+}
+
 export interface View {
   sessionId?: string;
   projectRoot?: string;
@@ -344,6 +393,7 @@ export interface View {
   acceptance?: AcceptanceView | null;
   llm?: LlmView | null;
   bootstrap?: BootstrapView | null;
+  exploration?: ExplorationView | null;
   error?: SessionError | null;
   tokens?: TokenItem[];
   pendingConsent?: ConsentRequest | null;

@@ -53,6 +53,7 @@
  */
 import { RPC_TO_HOST } from "../../shared/protocol.mjs";
 import { detectStartConfig, PORT_SLOT } from "./autostart.mjs";
+import { EXPLORATION_DEFAULTS, EXPLORATION_HARD_CAPS } from "./explorer.mjs";
 
 export const CONFIG_FILENAME = "guardbuild.json";
 
@@ -627,6 +628,32 @@ export function normalizeBootstrap(raw) {
   return out;
 }
 
+/**
+ * 探索区（方案第 13 项）：模型在沙箱内自主试打，产出真实请求序列 + 配方草稿。
+ * 双闸才生效：这里显式 enabled:true **且**环境变量 GUARDBUILD_LLM_EXPLORATION=1
+ * （gate/CI 另由 explorer::explorationEnabled 结构性禁用）。真实项目的常规扫描两个条件都不满足，
+ * 因此这一路不会被常规扫描碰到——它是一次「人主动开的试打」，不是一条默认生效的攻击能力。
+ * 预算字段的硬上限取自 explorer（单一出处），契约写更大也只取上限。
+ */
+export function normalizeExploration(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const clamp = (v, lo, hi, dft) => (Number.isFinite(v) ? Math.min(hi, Math.max(lo, Math.floor(v))) : dft);
+  const caps = EXPLORATION_HARD_CAPS;
+  const d = EXPLORATION_DEFAULTS;
+  const out = {
+    maxRequests: clamp(raw.maxRequests, 1, caps.maxRequests, d.maxRequests),
+    maxRounds: clamp(raw.maxRounds, 1, caps.maxRounds, d.maxRounds),
+    totalBudgetMs: clamp(raw.totalBudgetMs, 15_000, caps.totalBudgetMs, d.totalBudgetMs),
+    maxOutputChars: clamp(raw.maxOutputChars, 5_000, caps.maxOutputChars, d.maxOutputChars),
+    maxTargets: clamp(raw.maxTargets, 1, 40, d.maxTargets),
+    maxResources: clamp(raw.maxResources, 1, 40, d.maxResources),
+    maxDraftSteps: clamp(raw.maxDraftSteps, 1, 20, d.maxDraftSteps),
+  };
+  // 缺省不写这个键：契约没表态时留给 GUARDBUILD_LLM_EXPLORATION 决定（显式 false 才是关）
+  if (typeof raw.enabled === "boolean") out.enabled = raw.enabled;
+  return out;
+}
+
 /** Supabase 覆盖项：显式指定环境文件 / 项目 URL / anon key / 表名（缺省由静态检测自动发现） */
 function normalizeSupabase(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
@@ -660,6 +687,7 @@ function emptyConfig(source, invalid = null) {
     openapi: null,
     llm: null,
     bootstrap: null,
+    exploration: null,
     scopes: null,
   };
 }
@@ -756,6 +784,7 @@ export async function loadTargetConfig(ctx) {
     openapi: normalizeOpenapi(parsed.openapi),
     llm: normalizeLlm(parsed.llm),
     bootstrap: normalizeBootstrap(parsed.bootstrap),
+    exploration: normalizeExploration(parsed.exploration),
     scopes: Array.isArray(parsed.scopes)
       ? parsed.scopes.filter((x) => typeof x === "string" && x)
       : null,

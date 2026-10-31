@@ -9,6 +9,7 @@ guardbuild-data/
 
 # 演示与运行时产物（由 scripts/ 生成，不入库）
 .demo/
+.demo-*/
 .demo-gate/
 .demo-supabase/
 .demo-next/

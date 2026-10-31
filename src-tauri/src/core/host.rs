@@ -55,7 +55,7 @@ pub const GATE_DEFAULT_SCOPES: [&str; 4] =
 /// 宿主进程 → Sidecar 的环境变量白名单（sidecar 拿到的是 env_clear 后的干净环境）。
 /// 侧车新读一个 GUARDBUILD_* 开关，就必须在这里登记：漏登记的后果不是报错，而是那条
 /// 命令行/环境变量启用路径永远不生效（黑盒 DELETE 探测开关就漏过一次，由 e2e 第 6/7 轮抓到）。
-pub const SIDECAR_ENV_PASSTHROUGH: [&str; 12] = [
+pub const SIDECAR_ENV_PASSTHROUGH: [&str; 13] = [
     "DEEPSEEK_API_KEY",
     "DEEPSEEK_BASE_URL",
     "DEEPSEEK_MODEL",
@@ -65,6 +65,7 @@ pub const SIDECAR_ENV_PASSTHROUGH: [&str; 12] = [
     "GUARDBUILD_LLM_CROSSFILE",
     "GUARDBUILD_LLM_BOOTSTRAP",
     "GUARDBUILD_LLM_ATTACKPLAN",
+    "GUARDBUILD_LLM_EXPLORATION",
     "GUARDBUILD_BLACKBOX_URL",
     "GUARDBUILD_BLACKBOX_MUTATE",
     "GUARDBUILD_BLACKBOX_DELETE",

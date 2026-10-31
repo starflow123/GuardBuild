@@ -3,7 +3,7 @@
  * 分发布局端到端演练：验证「没有系统 node 也能跑」的安装形态。
  *
  * 构造 .demo-package/app：
- *   guardbuild-headless(.exe) / runtime/node(.exe) / sidecar/{main.mjs,lib} / shared/
+ *   guardbuild-headless(.exe) / runtime/node(.exe) / sidecar/{main.mjs,lib,recipes} / shared/
  * 目标项目复制 fixtures/bizlogic-shop，并把 start.cmd 改成随包 node 的绝对路径；
  * 子进程 PATH 只保留 git 与系统目录（不含 node）：
  *   ① 正常布局 → exit 1（业务逻辑漏洞复现），报告落盘；
@@ -14,7 +14,7 @@
  * 用法: node scripts/e2e-package.mjs   （需先构建 guardbuild-headless）
  */
 import { spawnSync } from "node:child_process";
-import { cpSync, existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { prepareRuntime, isSupportedNode, parseNodeVersion } from "./prepare-runtime.mjs";
@@ -58,6 +58,21 @@ function pathWithoutNode() {
     .join(path.delimiter);
 }
 
+/** Windows 上刚退出的子进程可能还压着 node.exe 的文件句柄，立刻 rename 会 EBUSY；等它松开。 */
+function renameWhenFree(from, to, attempts = 24) {
+  const buf = new Int32Array(new SharedArrayBuffer(4));
+  for (let i = 0; i < attempts; i++) {
+    try {
+      renameSync(from, to);
+      return true;
+    } catch (e) {
+      if (e.code !== "EBUSY" && e.code !== "EPERM") throw e;
+      Atomics.wait(buf, 0, 0, 500);
+    }
+  }
+  return false;
+}
+
 function runGate(project, label, { withRuntime = true } = {}) {
   const dataDir = path.join(demoDir, "data", label);
   const reportDir = path.join(demoDir, "reports", label);
@@ -96,20 +111,31 @@ try {
   // —— 布局：exe 同级 runtime / sidecar / shared ——
   cpSync(exe, packagedExe);
   const runtime = prepareRuntime({ destRoot: appDir });
-  mkdirSync(path.join(appDir, "sidecar"), { recursive: true });
-  cpSync(path.join(repoRoot, "sidecar", "main.mjs"), path.join(appDir, "sidecar", "main.mjs"));
-  cpSync(path.join(repoRoot, "sidecar", "lib"), path.join(appDir, "sidecar", "lib"), { recursive: true });
-  cpSync(path.join(repoRoot, "shared"), path.join(appDir, "shared"), { recursive: true });
+  // 铺什么照 RESOURCE_MAP 抄，不在这里另写一份清单：这一路要验的就是「安装器会带哪些文件」，
+  // 手抄一份会让「真实包缺文件」变成「演练照样通过」。runtime/ 由 prepareRuntime 负责。
+  const packagedResources = Object.entries(RESOURCE_MAP).filter(([src]) => src.startsWith("../"));
+  for (const [src, dest] of packagedResources) {
+    const destPath = path.join(appDir, dest);
+    mkdirSync(path.dirname(destPath), { recursive: true });
+    cpSync(path.resolve(repoRoot, "src-tauri", src), destPath, { recursive: true });
+  }
 
   check("随包 node 存在", existsSync(path.join(appDir, "runtime", nodeName)));
   check("sidecar 入口存在于 exe 同级", existsSync(path.join(appDir, "sidecar", "main.mjs")));
   check("shared 协议存在于 exe 同级", existsSync(path.join(appDir, "shared", "protocol.mjs")));
+  const recipeSrcDir = path.join(repoRoot, "sidecar", "recipes");
+  const packedRecipeDir = path.join(appDir, "sidecar", "recipes");
+  const srcRecipes = readdirSync(recipeSrcDir).sort().join(",");
+  const packedRecipes = existsSync(packedRecipeDir) ? readdirSync(packedRecipeDir).sort().join(",") : "(目录缺失)";
+  // 装载器按 sidecar/lib/../recipes 找表，漏拷的后果不是「少一族攻击」而是整条判定链在建用例之前抛错
+  check("随包配方目录逐文件对齐", srcRecipes === packedRecipes, `随包=${packedRecipes}`);
   check("Node 版本满足 >= 22.5", isSupportedNode(`v${process.versions.node}`), runtime.version);
   check("版本解析拒绝旧版本", parseNodeVersion("v20.11.1")?.[0] === 20 && !isSupportedNode("v20.11.1"));
 
   // —— 资源映射 / 签名接口纯函数 ——
   const overlay = buildDistOverlay({});
   check("分发资源映射含 sidecar/lib", overlay.bundle.resources["../sidecar/lib/"] === "sidecar/lib/");
+  check("分发资源映射含 sidecar/recipes", overlay.bundle.resources["../sidecar/recipes/"] === "sidecar/recipes/");
   check("分发资源映射含 shared", overlay.bundle.resources["../shared/"] === "shared/");
   check("默认不签名", !overlay.bundle.windows.certificateThumbprint && !overlay.bundle.windows.signCommand);
   const signedOverlay = buildDistOverlay({
@@ -151,15 +177,24 @@ try {
   check("负向对照前运行时仍在", existsSync(path.join(appDir, "runtime", nodeName)));
 
   console.log("\n② 移除随包 node（PATH 无 node）");
-  const hidden = `${path.join(appDir, "runtime", nodeName)}.bak`;
-  renameSync(path.join(appDir, "runtime", nodeName), hidden);
+  const runtimeNode = path.join(appDir, "runtime", nodeName);
+  const hidden = `${runtimeNode}.bak`;
+  // 移不走就验不了负向对照；这里如实记一条失败，而不是让整轮以 uncaught EBUSY 收场
+  const moved = renameWhenFree(runtimeNode, hidden);
+  check("随包 node 能从布局移走", moved);
   const bad = runGate(project, "no-runtime");
   check("缺少运行时时 gate 失败（exit 2）", bad.status === 2, `exit=${bad.status}`);
   check("失败信息指向启动 Sidecar", /Sidecar|sidecar|node/i.test(`${bad.stdout}${bad.stderr}`));
-  renameSync(hidden, path.join(appDir, "runtime", nodeName));
+  if (moved) renameWhenFree(hidden, runtimeNode);
 } finally {
   if (process.env.GUARDBUILD_KEEP_DEMO === "1") console.log(`[debug] 保留 ${demoDir}`);
-  else rmSync(demoDir, { recursive: true, force: true });
+  else {
+    try {
+      rmSync(demoDir, { recursive: true, force: true });
+    } catch (e) {
+      console.log(`[warn] 演示目录清理未完成（${e.code}），残留 ${demoDir}`);
+    }
+  }
 }
 
 const failed = checks.filter((c) => !c.pass);

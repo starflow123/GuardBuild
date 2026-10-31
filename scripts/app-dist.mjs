@@ -28,6 +28,9 @@ export const RESOURCE_MAP = {
   "runtime/": "runtime/",
   "../sidecar/main.mjs": "sidecar/main.mjs",
   "../sidecar/lib/": "sidecar/lib/",
+  // 配方表随包：装载器按 sidecar/lib/../recipes 找目录，漏了它不是少一族攻击，是整条
+  // 判定链在建用例之前就抛错（e2e:package 在 CI 上抓到过一次）。
+  "../sidecar/recipes/": "sidecar/recipes/",
   "../shared/": "shared/",
 };
 

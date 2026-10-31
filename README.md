@@ -473,7 +473,7 @@ npm run app:dist          # 构建带资源映射的 NSIS 安装器
 npm run e2e:package       # 分发布局演练：PATH 中没有 node 也能跑通 gate
 ```
 
-- 产物：`src-tauri/target/release/bundle/nsis/GuardBuild_<version>_x64-setup.exe`（currentUser 安装、中英双语）。安装目录含 `guardbuild.exe`、`guardbuild-headless.exe`、`runtime/node.exe`、`sidecar/`、`shared/`；Host 优先使用随包 node，缺失时才回退 PATH。
+- 产物：`src-tauri/target/release/bundle/nsis/GuardBuild_<version>_x64-setup.exe`（currentUser 安装、中英双语）。安装目录含 `guardbuild.exe`、`guardbuild-headless.exe`、`runtime/node.exe`、`sidecar/`（`main.mjs` + `lib/` + `recipes/`）、`shared/`；Host 优先使用随包 node，缺失时才回退 PATH。`sidecar/recipes/` 与 `lib/` 同级被装载器读到，**漏进资源映射不是少一族攻击，而是整条判定链在建用例之前抛错**——`npm run e2e:package` 的分发布局演练按 `RESOURCE_MAP` 铺目录并逐文件比对配方清单，就是钉这一条的。
 - **默认未签名**：会触发 SmartScreen。设置 `GUARDBUILD_SIGN_CERT_THUMBPRINT`（signtool 证书指纹）或 `GUARDBUILD_SIGN_COMMAND`（必须含 `%1`）后重新构建即可接入签名；时间戳默认 `http://timestamp.digicert.com`。
 - 首次构建需要 Tauri 下载 NSIS 工具链（缓存于 `%LOCALAPPDATA%\tauri\NSIS`）；受限网络可预先放置 `Bin/makensis.exe` 与 `Plugins/x86-unicode/additional/nsis_tauri_utils.dll`，之后可离线构建。
 

@@ -479,10 +479,23 @@ test("探索产物目录按项目聚合，旧文件只留有限的几份", () =>
     const base = { version: "gb-explore-1", outcome: "stopped", budget: EXPLORATION_DEFAULTS, trace: [], draft: buildDraft([]) };
     const f1 = writeExplorationArtifact({ projectRoot: "D:/targets/a" }, { ...base, draftKey: "k1" });
     const f2 = writeExplorationArtifact({ projectRoot: "d:/targets/A" }, { ...base, draftKey: "k2" });
-    assert.ok(f1 && f2);
-    assert.equal(dirname(f1), dirname(f2), "同一项目在 Windows 上归一到同一个目录");
-    assert.equal(readdirSafe(dirname(f1)).length, 2);
-    const noDraft = writeExplorationArtifact({ projectRoot: "D:/targets/a" }, { ...base, draft: null, draftKey: "k3" });
+    // 反斜杠与尾斜杠是同一个项目的两种写法：任何平台都必须归一，否则同一项目攒出两份草稿库
+    const fSlashes = writeExplorationArtifact({ projectRoot: "D:\\targets\\a\\" }, { ...base, draftKey: "k3" });
+    assert.ok(f1 && f2 && fSlashes);
+    assert.equal(dirname(fSlashes), dirname(f1), "正反斜杠与尾斜杠要归一到同一目录");
+
+    // 大小写是不是同一项目，由文件系统决定，不由这里假设：
+    // Windows 不敏感 → 必须并到一个目录；POSIX 敏感 → 必须分开，否则 Linux/macOS 上
+    // /srv/Api 和 /srv/api 两个真实项目的草稿会互相冒名复用。
+    if (process.platform === "win32") {
+      assert.equal(dirname(f1), dirname(f2), "同一项目在 Windows 上归一到同一个目录");
+      assert.equal(readdirSafe(dirname(f1)).length, 3);
+    } else {
+      assert.notEqual(dirname(f1), dirname(f2), "大小写敏感的文件系统上这是两个项目，不许并成一个目录");
+      assert.equal(readdirSafe(dirname(f1)).length, 2);
+      assert.equal(readdirSafe(dirname(f2)).length, 1);
+    }
+    const noDraft = writeExplorationArtifact({ projectRoot: "D:/targets/a" }, { ...base, draft: null, draftKey: "k4" });
     assert.equal(noDraft, null, "没有草稿就不落盘");
     assert.equal(writeExplorationArtifact({ projectRoot: null }, base), null);
   } finally {

@@ -1,0 +1,29 @@
+{
+  "version": "gb-exam-1",
+  "examId": "sqli-injection--ledger-shop",
+  "recipe": "sqli-injection",
+  "family": "sqli-injection",
+  "split": "dev",
+  "vulnerable": {
+    "fixture": "fixtures/ledger-shop",
+    "expect": [
+      "attack-sql-injection"
+    ],
+    "note": "SQL 注入·查询参数通道 + 模板插值形态：GET /api/search 把 keyword 原样插进 memo LIKE '%…%' 的 SQL 文本。取数走 db.all(…)（方法形态的 sink），会话走 Bearer 令牌。另有 GET /api/entries 只回本人账目（契约 listEndpoint 指向它），正向断言 business-list-own 靠它核对归属，缺了它这条断言会去拿 /api/whoami 当列表而判成回退"
+  },
+  "hardened": {
+    "derivedFrom": "vulnerable",
+    "patch": {
+      "file": "src/app.js",
+      "search": "  const { keyword } = req.query;",
+      "insertAfter": "\n  if (typeof keyword !== \"string\" || !/^[\\w -]{1,40}$/.test(keyword)) return res.status(400).json({ error: \"检索词只允许字母、数字、下划线、空格与连字符\" });"
+    },
+    "note": "insertAfter 只能在锚点之后插入，改不动下面那行拼接语句本身，所以这道补丁是「入参白名单」而不是参数化查询——它在运行期挡住带引号与 -- 的载荷，拼接代码原样留着。效果是可核对的：静态候选仍在，四条载荷全部 400 拒收，本族零报，而正常检索词照旧 200（业务没回退）。把 SQL 改成参数绑定要重写那一行，不是一处插入能表达的形态，这张考卷不假装它是"
+  },
+  "clean": {
+    "fixture": "fixtures/clean-shop",
+    "note": "什么都没埋的对照：报出任何一条 vulnerable 都是凭空造漏洞"
+  },
+  "repeat": 2,
+  "note": "开发集：这张红了会进失败账本，是第 11 项调优读得到的输入"
+}

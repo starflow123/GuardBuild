@@ -1215,6 +1215,58 @@ test("buildCases: 归属字段兼容 snake_case（user_id）与 data 包裹响�
   assert.equal(ownCase.verify({ status: 200, json: { data: { id: 14, user_id: 7 } } }).verdict, "passed");
 });
 
+test("buildCases: 归属无法比对时判「测不了」，不伪装成业务回退", () => {
+  const ctx = {
+    plan: {
+      readCandidate: { fullPath: "/api/orders/:id", routeKeys: ["orders.get"] },
+      listEndpoint: { path: "/api/orders", routeKey: "orders.list" },
+      resource: "order",
+    },
+    targetConfig: null,
+  };
+  const targets = {
+    attacker: { name: "alice", user: { id: null } },
+    victim: { name: "bob", user: { id: null } },
+    readTarget: { id: 11 },
+    attackCancelTarget: { id: 12 },
+    adminCancelTarget: { id: 13 },
+    ownReadTarget: { id: 14 },
+    ownCancelTarget: null,
+    ownNotCancellable: null,
+  };
+  const cases = buildCases(ctx, targets);
+  const listCase = cases.find((c) => c.id === "business-list-own");
+  const noId = listCase.verify({ status: 200, json: [{ id: 1 }, { id: 2 }] });
+  assert.equal(noId.verdict, "inconclusive", "登录响应没暴露本人 id 时无从比对，不能判成泄露");
+  assert.match(noId.actual, /未暴露本人 id/);
+
+  // 有 id 可比对时，别人的条目仍然判回归——这条闸不许因为新逻辑而变松
+  const withId = { ...ctx, plan: ctx.plan };
+  const cases2 = buildCases(withId, { ...targets, attacker: { name: "alice", user: { id: 7 } } });
+  assert.equal(
+    cases2.find((c) => c.id === "business-list-own").verify({ status: 200, json: [{ id: 1, userId: 8 }] }).verdict,
+    "regressed"
+  );
+
+  // 列表项整体没有归属字段：同样只是比对不到，不是「全是别人的」
+  const noOwnerField = buildCases(withId, { ...targets, attacker: { name: "alice", user: { id: 7 } } })
+    .find((c) => c.id === "business-list-own")
+    .verify({ status: 200, json: [{ id: 1 }, { id: 2 }] });
+  assert.equal(noOwnerField.verdict, "inconclusive");
+  assert.match(noOwnerField.actual, /列表项没有归属字段/);
+
+  // 本人单对象读取：id 取不到时仍校验「读到的是不是自己那条 + 字段契约」，但不以「归属异常」误判回归
+  const ownCase = cases.find((c) => c.id === "business-read-own");
+  const own = ownCase.verify({ status: 200, json: { id: 14, title: "t" } });
+  assert.equal(own.verdict, "passed");
+  assert.match(own.actual, /未暴露·不作比对/);
+  assert.equal(
+    cases.find((c) => c.id === "business-read-own").verify({ status: 200, json: { id: 99, title: "t" } }).verdict,
+    "regressed",
+    "读到别人的对象仍应判回归"
+  );
+});
+
 test("buildLoginBody: 默认 username 形状 / email 形状 / bodyTemplate / fields 优先级", () => {
   const alice = { name: "alice", username: "alice", password: "p1" };
   assert.deepEqual(buildLoginBody(alice, null), { username: "alice", password: "p1" });

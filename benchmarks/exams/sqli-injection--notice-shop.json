@@ -1,0 +1,27 @@
+{
+  "version": "gb-exam-1",
+  "examId": "sqli-injection--notice-shop",
+  "recipe": "sqli-injection",
+  "family": "sqli-injection",
+  "split": "frozen",
+  "vulnerable": {
+    "fixture": "fixtures/notice-shop",
+    "expect": ["attack-sql-injection"],
+    "note": "SQL 注入·请求体通道 + 字符串加号拼接形态：手写 if (method === \"POST\" && pathname === …) 分发，POST /api/reports/query 把 req.body.column 拼进 title LIKE 的 SQL 文本。取数走 dbAll(…) 自由函数，会话走表单编码登录 + Set-Cookie（登录响应体回本人对象，本人可见列表断言才拿得到归属比对基准）"
+  },
+  "hardened": {
+    "derivedFrom": "vulnerable",
+    "patch": {
+      "file": "src/app.js",
+      "search": "    const { column } = req.body;",
+      "insertAfter": "\n    if (typeof column !== \"string\" || !/^[\\w -]{1,40}$/.test(column)) return json(res, 400, { error: \"检索词只允许字母、数字、下划线、空格与连字符\" });"
+    },
+    "note": "同 ledger-shop 那张的口径：一处插入改不了拼接语句，这一处补的是入参白名单。差别在形状——载荷从请求体进来、拼接是加号而不是模板插值、sink 是自由函数，所以「补丁后静态候选仍在、四条载荷被 400 拒掉」这条证据要重新挣一遍，不能靠另一张考卷推定"
+  },
+  "clean": {
+    "fixture": "fixtures/clean-shop",
+    "note": "什么都没埋的对照：报出任何一条 vulnerable 都是凭空造漏洞"
+  },
+  "repeat": 2,
+  "note": "冻结集：失败不进失败账本。这一族的两张考卷一个查询参数通道、一个请求体通道，第 11 项就算照着 dev 那张调判据，也碰不到这一张"
+}

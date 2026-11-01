@@ -4560,11 +4560,12 @@ export function buildCases(ctx, targets) {
           const o = entityOf(res);
           if (!o) return `FAIL:响应缺少${label}对象`;
           if (String(resourceIdOf(ctx, o)) !== String(ownId)) return `FAIL:返回了错误的${label} #${resourceIdOf(ctx, o)}`;
-          if (ownerOf(ctx, o) !== ident.user?.id) return `FAIL:${label}归属异常 ${ownerOf(ctx, o)}`;
+          // 本人 id 取不到时「归属异常」无从定义：判成回归是假红（会把「登录响应没暴露 id」说成「补丁改坏了功能」）
+          if (ident.user?.id && ownerOf(ctx, o) !== ident.user?.id) return `FAIL:${label}归属异常 ${ownerOf(ctx, o)}`;
           const base = ctx._ownerContract?.get(id) ?? [];
           const missing = base.filter((k) => !(k in o));
           if (missing.length) return `FAIL:字段契约缺失 ${missing.join("、")}（不得删减本人可见内容来冒充修复）`;
-          return `返回${label} #${resourceIdOf(ctx, o)}，归属 ${ownerOf(ctx, o)}，字段 ${Object.keys(o).length} 项`;
+          return `返回${label} #${resourceIdOf(ctx, o)}，归属 ${ident.user?.id ? ownerOf(ctx, o) : "未暴露·不作比对"}，字段 ${Object.keys(o).length} 项`;
         });
       },
     };
@@ -4594,14 +4595,24 @@ export function buildCases(ctx, targets) {
       graphql: listReq?.graphql ?? null,
       routeKey: ctx.plan.listEndpoint?.routeKey ?? "orders.list",
       expect: `列表应只包含本人${label}（owner-filter 保持有效）`,
-      verify: (res) =>
-        verifyBusiness(res, 200, () => {
+      verify: (res) => {
+        const list = res.status === 200 ? extractListItems(res.json, listPathFor(ctx, ctx.plan.listEndpoint?.graphql)) : null;
+        // 归属比对要有本人 id 才成立：登录响应未暴露 id、或列表项根本没有归属字段时，
+        // 「全部条数都算他人」是假的回归信号——它会把一个正常靶子判成「补丁改坏了功能」。
+        if (list && (!attacker.user?.id || list.every((o) => ownerOf(ctx, o) == null))) {
+          return {
+            verdict: VERDICT.INCONCLUSIVE,
+            actual: `HTTP 200，列表 ${list.length} 条可读，但归属无法比对（${!attacker.user?.id ? "登录响应未暴露本人 id" : "列表项没有归属字段"}），既不认定泄露也不认定回退`,
+          };
+        }
+        return verifyBusiness(res, 200, () => {
           const arr = extractListItems(res.json, listPathFor(ctx, ctx.plan.listEndpoint?.graphql));
           if (!arr) return `FAIL:响应中未找到${label}列表`;
           const foreign = arr.filter((o) => ownerOf(ctx, o) !== attacker.user?.id);
           if (foreign.length > 0) return `FAIL:列表泄露他人${label} ${foreign.map((o) => o.id).join(",")}`;
           return `共 ${arr.length} 条，全部归属 ${attacker.user?.id}`;
-        }),
+        });
+      },
     });
   }
 

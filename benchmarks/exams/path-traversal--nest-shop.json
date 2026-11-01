@@ -3,6 +3,7 @@
   "examId": "path-traversal--nest-shop",
   "recipe": "path-traversal",
   "family": "path-traversal",
+  "split": "dev",
   "vulnerable": {
     "fixture": "fixtures/nest-shop",
     "expect": ["attack-path-traversal"],

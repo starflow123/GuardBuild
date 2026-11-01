@@ -1,0 +1,10 @@
+{
+  "name": "notice-shop",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "NoticeShop - 内部公告与报表检索靶场（SQL 注入·请求体通道）",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

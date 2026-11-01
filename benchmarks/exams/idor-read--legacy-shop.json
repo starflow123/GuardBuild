@@ -3,6 +3,7 @@
   "examId": "idor-read--legacy-shop",
   "recipe": "idor-read",
   "family": "idor-read",
+  "split": "dev",
   "vulnerable": {
     "fixture": "fixtures/legacy-shop",
     "expect": ["attack-read-foreign"],

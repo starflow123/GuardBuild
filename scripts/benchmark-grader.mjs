@@ -13,6 +13,10 @@
  * 闭环两层照旧进仓库：账本 benchmarks/failure-ledger.jsonl、绿名单 benchmarks/green-baseline.json，
  * 本层的套件名记作 `grader`（绿名单键形如 grader/<考卷 id>#<用例 id>）。
  *
+ * 考卷分两堆（第 8 项）：`split: "dev"` 的失败照常进失败账本——账本是后续调优（第 11 项）唯一读得到的
+ * 输入；`split: "frozen"` 的冻结集只判分、不进账本，调优永远看不到它长什么样。这是「过拟合考卷」
+ * 那条风险唯一的防线，所以 split 是必填字段，没有默认值。
+ *
  * 用法:
  *   node scripts/benchmark-grader.mjs
  *   node scripts/benchmark-grader.mjs --only=idor-read--legacy-shop
@@ -24,7 +28,7 @@ import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } fr
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { variantBaseCaseId } from "../sidecar/lib/attackvariants.mjs";
-import { deriveHardened, EXAM_DIR, loadExams, resolveExamFixture } from "../sidecar/lib/exam.mjs";
+import { deriveHardened, EXAM_DIR, feedsTuning, loadExams, resolveExamFixture } from "../sidecar/lib/exam.mjs";
 import { appendLedger, classifyRun, greenKeysOf, redactSecrets } from "../sidecar/lib/failureledger.mjs";
 import { GATES, gradeExam, notGradedResult } from "../sidecar/lib/grader.mjs";
 import { listRecipeIds, loadRecipe } from "../sidecar/lib/recipes.mjs";
@@ -254,17 +258,18 @@ function buildMarkdown(meta, results, notGraded) {
   lines.push("| --- | --- |");
   lines.push(`| 考卷通过 | ${meta.passed}/${meta.examCount} |`);
   lines.push(`| 四道闸逐条通过率 | ${GATES.map((g) => `${g} ${meta.gateCounts[g]}/${meta.examCount}`).join(" · ")} |`);
+  lines.push(`| 开发集 / 冻结集 | ${meta.devCount} 张（失败进账本，调优读得到） / ${meta.frozenCount} 张（只判分，不进账本） |`);
   lines.push(`| 缺考卷的配方 | ${notGraded.length} |`);
   lines.push("");
   lines.push("## 考卷明细");
   lines.push("");
-  lines.push("| 考卷 | 配方 | G1 打中 | G2 加固零报 | G3 干净对照 | G4 两次一致 | 用时 | 结论 |");
-  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- |");
+  lines.push("| 考卷 | 配方 | 堆 | G1 打中 | G2 加固零报 | G3 干净对照 | G4 两次一致 | 用时 | 结论 |");
+  lines.push("| --- | --- | --- | --- | --- | --- | --- | --- | --- |");
   for (const r of results) {
     const g = r.grade?.gates ?? {};
     const cell = (key) => (g[key]?.status === "passed" ? "✓" : g[key]?.status === "failed" ? "✗" : g[key]?.status ?? "—");
     lines.push(
-      `| ${r.id} | ${r.grade?.recipe ?? "—"} | ${cell("hit")} | ${cell("hardened_zero")} | ${cell("clean_control")} | ${cell("consistent")} | ${(r.durationMs / 1000).toFixed(1)}s | ${r.pass ? "通过" : r.grade?.graded ? "不通过" : "没考"} |`
+      `| ${r.id} | ${r.grade?.recipe ?? "—"} | ${r.split === "frozen" ? "冻结" : "开发"} | ${cell("hit")} | ${cell("hardened_zero")} | ${cell("clean_control")} | ${cell("consistent")} | ${(r.durationMs / 1000).toFixed(1)}s | ${r.pass ? "通过" : r.grade?.graded ? "不通过" : "没考"} |`
     );
   }
   lines.push("");
@@ -293,6 +298,12 @@ function buildMarkdown(meta, results, notGraded) {
       }`
     );
     lines.push("");
+    lines.push("");
+    lines.push(
+      r.split === "frozen"
+        ? "- 这一张在**冻结集**里：红了也不写进失败账本。账本是后续调优唯一读得到的输入，冻结集的失败只对读报告的人可见。"
+        : "- 这一张在**开发集**里：失败按类别写进失败账本，供后续调优读取。"
+    );
     if (r.hardenedDiff) lines.push(`派生的加固版相对漏洞版只改了这些：\n\n\`\`\`\n${r.hardenedDiff}\n\`\`\``);
     if (r.grade?.reasons?.length) {
       lines.push("");
@@ -318,6 +329,7 @@ function buildMarkdown(meta, results, notGraded) {
   lines.push("- G4 逐条比对用例判定与退出码；跑不满次数不是「通过」，是「没考够」。");
   lines.push("- 零报要有生命体征：G2/G3 先数这一份变体实际落地的攻击请求条数，一条都没发出去就判 `not_graded`（没考），靶子被补丁改崩到业务用例回退就判 `failed`。");
   lines.push("- 每一道没过的闸都往账本落一条记录（类别「测不了」，cause 记 `gate_<闸名>_<failed|not_graded>`），红考卷不会在账本上表现成「零条失败」。");
+  lines.push("- 上一条只对**开发集**成立：冻结集的考卷四道闸照判、绿名单照比，但一条账都不记——调优（第 11 项）读得到的只有账本，冻结集不进账本就等于没被读过。");
   lines.push("- 本层零模型调用：运行时清空 LLM 密钥与环境开关，同一张考卷同一份补丁必须能重放。");
   lines.push("");
   return lines.join("\n");
@@ -353,7 +365,7 @@ async function main() {
 
   /** 考卷自己声明连跑次数，--repeat 覆盖；G4 至少要两次才算「结论一致」 */
   const repeatOf = (exam) => Math.max(2, Math.min(4, repeatOverride ?? exam.repeat ?? 2));
-  console.log(`[GRADER] ${exams.length} 张考卷 · ${exams.reduce((n, e) => n + repeatOf(e) * 3, 0)} 次实跑（每张 ${exams.map(repeatOf).join("/")} 次 × 3 变体），宿主 ${exe}`);
+  console.log(`[GRADER] ${exams.length} 张考卷（开发 ${exams.filter((e) => e.split !== "frozen").length} / 冻结 ${exams.filter((e) => e.split === "frozen").length}）· ${exams.reduce((n, e) => n + repeatOf(e) * 3, 0)} 次实跑（每张 ${exams.map(repeatOf).join("/")} 次 × 3 变体），宿主 ${exe}`);
 
   const RUN_TIMEOUT_MS = 240_000;
 
@@ -401,6 +413,7 @@ async function main() {
     const broken = runs.find((r) => r.timedOut || r.error);
     const result = {
       id: exam.examId,
+      split: exam.split,
       pass: grade.pass === true,
       durationMs: Date.now() - startedAt,
       exit: {
@@ -428,8 +441,10 @@ async function main() {
     // 报告与账本共用同一份闸级记录：报告里那条红和账本里那条红必须是同一件事，不能各算各的
     result.gateLedger = examInvalid ? [] : gateLedgerRecords({ exam, grade, result });
 
+    // 冻结集只判分不进账本：账本是调优唯一读得到的输入，拿冻结集的失败去调提示词＝提前读过答案
+    const tuned = feedsTuning(exam);
     if (examInvalid) {
-      ledgerRecords.push({
+      if (tuned) ledgerRecords.push({
         suite: SUITE,
         target: exam.examId,
         caseKey: "-",
@@ -442,7 +457,7 @@ async function main() {
         durationMs: result.durationMs,
         corpus: { expectedExit: 1, expectedCases: exam.vulnerable.expect, forbidden: null },
       });
-    } else {
+    } else if (tuned) {
       ledgerRecords.push(
         ...classifyRun({
           suite: SUITE,
@@ -457,7 +472,7 @@ async function main() {
 
     // 闸名首字母会撞车（hit / hardened_zero 都是 h），报告与控制台一律用 G1..G4 标号
     const marks = GATES.map((g, idx) => `G${idx + 1}${grade.gates[g].ok ? "✓" : "✗"}`).join(" ");
-    console.log(` ${marks} ${grade.pass ? "✓" : "✗"}${examInvalid ? `（考卷无效：${examInvalid}）` : ""}`);
+    console.log(` ${marks} ${grade.pass ? "✓" : "✗"}${examInvalid ? `（考卷无效：${examInvalid}）` : ""}${tuned ? "" : " [冻结集：不记账]"}`);
     if (!grade.pass) for (const why of grade.reasons) console.log(`        ${why}`);
   }
 
@@ -531,6 +546,8 @@ async function main() {
     examCount: results.length,
     recipeTotal: index.size,
     recipeCovered: new Set(exams.map((e) => e.recipe)).size,
+    devCount: exams.filter((e) => e.split !== "frozen").length,
+    frozenCount: exams.filter((e) => e.split === "frozen").length,
     passed,
     pass,
     gateOk,

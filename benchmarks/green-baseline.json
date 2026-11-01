@@ -1,6 +1,6 @@
 {
   "version": "gb-green-baseline-1",
-  "updatedAt": "2026-10-31T15:24:42.035Z",
+  "updatedAt": "2026-11-01T04:26:56.066Z",
   "suites": {
     "whitebox": {
       "keys": [
@@ -15,6 +15,9 @@
         "whitebox/jwt-shop",
         "whitebox/jwt-shop#attack-jwt-forge",
         "whitebox/jwt-shop#attack-jwt-forge-2",
+        "whitebox/ledger-shop",
+        "whitebox/ledger-shop#attack-path-traversal",
+        "whitebox/ledger-shop#attack-sql-injection",
         "whitebox/legacy-shop",
         "whitebox/legacy-shop#attack-cancel-foreign",
         "whitebox/legacy-shop#attack-read-foreign",
@@ -28,6 +31,8 @@
         "whitebox/next-shop",
         "whitebox/next-shop#attack-cancel-foreign",
         "whitebox/next-shop#attack-read-foreign",
+        "whitebox/notice-shop",
+        "whitebox/notice-shop#attack-sql-injection",
         "whitebox/python-shop",
         "whitebox/python-shop#attack-anonymous-read",
         "whitebox/python-shop#attack-cancel-foreign",
@@ -44,8 +49,8 @@
         "whitebox/upload-shop",
         "whitebox/upload-shop#attack-upload"
       ],
-      "lastRunAt": "2026-10-31T15:14:10.873Z",
-      "lastRunHead": "d68180a",
+      "lastRunAt": "2026-11-01T04:18:17.854Z",
+      "lastRunHead": "e2d4eeb",
       "corpusVersion": 1,
       "regressions": 0
     },
@@ -123,8 +128,8 @@
         "blackbox/wide-shop-mutate#blackbox-vertical-*",
         "blackbox/wide-shop-mutate#blackbox-xss-*"
       ],
-      "lastRunAt": "2026-10-31T15:17:09.585Z",
-      "lastRunHead": "d68180a",
+      "lastRunAt": "2026-11-01T04:13:00.293Z",
+      "lastRunHead": "e2d4eeb",
       "corpusVersion": 1,
       "regressions": 0
     },
@@ -136,8 +141,8 @@
         "realworld/vulnapi#blackbox-sqli-*",
         "realworld/vulnapi#blackbox-ssrf-*"
       ],
-      "lastRunAt": "2026-10-31T15:23:22.000Z",
-      "lastRunHead": "d68180a",
+      "lastRunAt": "2026-11-01T04:25:10.314Z",
+      "lastRunHead": "e2d4eeb",
       "corpusVersion": 1,
       "regressions": 0
     },
@@ -146,8 +151,8 @@
         "indie/juice-shop",
         "indie/vuln-express"
       ],
-      "lastRunAt": "2026-10-31T15:24:42.035Z",
-      "lastRunHead": "d68180a",
+      "lastRunAt": "2026-11-01T04:26:56.066Z",
+      "lastRunHead": "e2d4eeb",
       "corpusVersion": 2,
       "regressions": 0
     },
@@ -155,12 +160,20 @@
       "keys": [
         "grader/idor-read--legacy-shop",
         "grader/idor-read--legacy-shop#attack-read-foreign",
+        "grader/idor-read--ssr-shop",
+        "grader/idor-read--ssr-shop#attack-read-foreign",
+        "grader/path-traversal--ledger-shop",
+        "grader/path-traversal--ledger-shop#attack-path-traversal",
         "grader/path-traversal--nest-shop",
-        "grader/path-traversal--nest-shop#attack-path-traversal"
+        "grader/path-traversal--nest-shop#attack-path-traversal",
+        "grader/sqli-injection--ledger-shop",
+        "grader/sqli-injection--ledger-shop#attack-sql-injection",
+        "grader/sqli-injection--notice-shop",
+        "grader/sqli-injection--notice-shop#attack-sql-injection"
       ],
-      "lastRunAt": "2026-10-31T15:11:36.736Z",
-      "lastRunHead": "d68180a",
-      "corpusVersion": "2 张考卷",
+      "lastRunAt": "2026-11-01T04:07:19.100Z",
+      "lastRunHead": "e2d4eeb",
+      "corpusVersion": "6 张考卷",
       "regressions": 0
     }
   }

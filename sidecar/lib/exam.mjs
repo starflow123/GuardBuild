@@ -15,7 +15,12 @@ import { fileURLToPath } from "node:url";
 export const EXAM_VERSION = "gb-exam-1";
 export const EXAM_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "benchmarks", "exams");
 
-const TOP_KEYS = ["version", "examId", "recipe", "family", "vulnerable", "hardened", "clean", "repeat", "note"];
+const TOP_KEYS = ["version", "examId", "recipe", "family", "split", "vulnerable", "hardened", "clean", "repeat", "note"];
+/**
+ * 考卷分两堆（第 8 项）：dev 可以反复看、失败可以进调优；frozen 只判分，永远不进调优的输入。
+ * 必填、没有默认值：一张没标过堆的考卷会被默认算成「能拿来调」，那正是过拟合的入口。
+ */
+export const EXAM_SPLITS = ["dev", "frozen"];
 const VULNERABLE_KEYS = ["fixture", "expect", "note"];
 const HARDENED_KEYS = ["derivedFrom", "patch", "note"];
 const PATCH_KEYS = ["file", "search", "insertAfter"];
@@ -25,6 +30,14 @@ export const MAX_DERIVED_PATCHES = 1;
 /** G4 要连跑两次；上限是防有人拿重复跑当性能调优的口子 */
 export const REPEAT_MIN = 2;
 export const REPEAT_MAX = 4;
+
+/**
+ * 这张考卷的结果能不能进失败账本（= 调优唯一读得到的输入）。
+ * 冻结集只判分不记账：拿冻结集上的失败去调提示词，考完就跟没考一样。
+ */
+export function feedsTuning(exam) {
+  return exam?.split !== "frozen";
+}
 
 export class ExamRejected extends Error {
   constructor(examId, reasons) {
@@ -61,6 +74,9 @@ export function validateExam(raw, { lookupRecipe } = {}) {
   if (raw.version !== EXAM_VERSION) reject(`version 必须是 ${EXAM_VERSION}，实为 ${JSON.stringify(raw.version)}`);
   for (const k of unknownKeys(raw, TOP_KEYS)) reject(`表外键 ${k}：考卷只能声明 ${TOP_KEYS.join(" / ")}，多余的一律拒收而不是忽略`);
   if (typeof raw.examId !== "string" || !raw.examId) reject("examId 缺失：账本与绿名单都要靠它定位这一份考卷");
+  if (!EXAM_SPLITS.includes(raw.split)) {
+    reject(`split 必须是 ${EXAM_SPLITS.join(" / ")} 之一，实为 ${JSON.stringify(raw.split)}：这张考卷要不要拿来调优必须写死，不给默认值`);
+  }
 
   const recipeId = raw.recipe;
   const recipe = typeof recipeId === "string" ? lookupRecipe?.(recipeId) ?? null : null;
@@ -132,6 +148,7 @@ function normalize(raw, repeat) {
     examId: raw.examId,
     recipe: raw.recipe,
     family: raw.family,
+    split: raw.split,
     vulnerable: { fixture: raw.vulnerable.fixture, expect: [...raw.vulnerable.expect], note: raw.vulnerable.note ?? null },
     hardened: { derivedFrom: "vulnerable", patches, note: raw.hardened.note ?? null },
     clean: { fixture: raw.clean.fixture, note: raw.clean.note ?? null },

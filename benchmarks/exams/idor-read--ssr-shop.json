@@ -1,0 +1,27 @@
+{
+  "version": "gb-exam-1",
+  "examId": "idor-read--ssr-shop",
+  "recipe": "idor-read",
+  "family": "idor-read",
+  "split": "frozen",
+  "vulnerable": {
+    "fixture": "fixtures/ssr-shop",
+    "expect": ["attack-read-foreign"],
+    "note": "服务端渲染形态：列表与详情都是 HTML 页，对象 ID 只出现在 <a href> 里，归属信息只在正文里。/notes/:id 只验登录不验归属，且路由块内没有归属比较语句（校验 helper 在 src/access.js）"
+  },
+  "hardened": {
+    "derivedFrom": "vulnerable",
+    "patch": {
+      "file": "src/app.js",
+      "search": "    const note = findNoteById(Number(noteMatch[1]));",
+      "insertAfter": "\n    if (!canReadNote(auth, note)) return render(res, 403, \"禁止访问\", \"<p>无权查看该笔记</p>\");"
+    },
+    "note": "补的正是 src/access.js 里那个 helper 调用：helper 早已写好，路由块只是没调用它。补丁后静态层依旧把 /notes/:id 当越权候选（区块内仍看不到归属比较），本族探针照旧发出、由运行期的 403 拒掉——这一张要的就是「候选仍在、运行期拒」那一形状，用来替掉 legacy-shop 那张的 family_candidate_gone 弱形态"
+  },
+  "clean": {
+    "fixture": "fixtures/clean-shop",
+    "note": "什么都没埋的对照：报出任何一条 vulnerable 都是凭空造漏洞"
+  },
+  "repeat": 2,
+  "note": "冻结集：这一张的失败永远不进失败账本，调优读不到它长什么样"
+}

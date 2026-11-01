@@ -151,6 +151,25 @@
       "expectedStatic": [
         { "kind": "idor-suspect", "method": "GET", "path": "/api/orders/:id" }
       ]
+    },
+    {
+      "id": "ledger-shop",
+      "fixture": "fixtures/ledger-shop",
+      "expectedExit": 1,
+      "expectedVulnerableCases": ["attack-sql-injection", "attack-path-traversal"],
+      "expectedStatic": [
+        { "kind": "sqli-suspect", "method": "GET", "path": "/api/search" },
+        { "kind": "traversal-suspect", "method": "GET", "path": "/api/docs" }
+      ]
+    },
+    {
+      "id": "notice-shop",
+      "fixture": "fixtures/notice-shop",
+      "expectedExit": 1,
+      "expectedVulnerableCases": ["attack-sql-injection"],
+      "expectedStatic": [
+        { "kind": "sqli-suspect", "method": "POST", "path": "/api/reports/query" }
+      ]
     }
   ]
 }

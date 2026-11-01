@@ -1,0 +1,29 @@
+{
+  "version": "gb-exam-1",
+  "examId": "path-traversal--ledger-shop",
+  "recipe": "path-traversal",
+  "family": "path-traversal",
+  "split": "frozen",
+  "vulnerable": {
+    "fixture": "fixtures/ledger-shop",
+    "expect": [
+      "attack-path-traversal"
+    ],
+    "note": "Express 风格路由注册（由 src/express-lite.js 微型垫片承载，CI 不装依赖）+ Bearer 令牌会话：GET /api/docs 把 doc 参数直接 join 进 storage 目录读取，越出目录无人管。另有 GET /api/entries 只回本人账目（契约 listEndpoint 指向它），正向断言 business-list-own 靠它核对归属，缺了它这条断言会去拿 /api/whoami 当列表而判成回退"
+  },
+  "hardened": {
+    "derivedFrom": "vulnerable",
+    "patch": {
+      "file": "src/app.js",
+      "search": "  const target = path.join(STORAGE_DIR, doc);",
+      "insertAfter": "\n  const rootDir = path.resolve(STORAGE_DIR);\n  if (!path.resolve(target).startsWith(rootDir + path.sep)) return res.status(403).json({ error: \"非法文件路径\" });"
+    },
+    "note": "只在拼完路径之后加一道目录归属校验，读取语句原样留着 → 静态候选不被抹掉，../package.json 打在加固版上会被运行期的 403 拒掉。靶子里的 SQL 注入（别一族）没修，退出码仍是 1，G2 只判本族一条都不许报"
+  },
+  "clean": {
+    "fixture": "fixtures/clean-shop",
+    "note": "什么都没埋的对照：报出任何一条 vulnerable 都是凭空造漏洞"
+  },
+  "repeat": 2,
+  "note": "与 nest-shop 那张同族不同形状：那边是 NestJS 装饰器路由 + 拼进 __dirname/public，这边是 Express 风格 router.get 注册（纯 Node 垫片承载）+ 拼进 storage 目录 + Bearer 会话"
+}

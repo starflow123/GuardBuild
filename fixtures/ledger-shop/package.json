@@ -1,0 +1,11 @@
+{
+  "name": "ledger-shop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "LedgerShop - 记账本诊断靶场（GuardBuild 第 8 项补齐：Express 风格路由 + SQL 注入 / 敏感文件泄露两族）",
+  "type": "module",
+  "dependencies": {},
+  "scripts": {
+    "start": "node server.js"
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "_note": "公告/报表靶场（第 8 项的第二张 SQL 注入考卷用）：手写 if 分发 + 表单登录 Cookie 会话 + POST 请求体通道拼接 SQL。llm 关闭，判卷层要求零模型调用可复现。",
+  "start": {
+    "cmd": "node",
+    "args": ["server.js"],
+    "env": { "PORT": "0" },
+    "readyPattern": "已就绪",
+    "readyTimeoutMs": 20000
+  },
+  "login": {
+    "path": "/api/session",
+    "encoding": "form",
+    "cookieAuth": true,
+    "bodyTemplate": { "username": "{username}", "password": "{password}" }
+  },
+  "identities": [
+    { "name": "ning", "username": "ning", "password": "ning123", "role": "user" },
+    { "name": "qi", "username": "qi", "password": "qi123", "role": "user" },
+    { "name": "hr-admin", "username": "hr-admin", "password": "hr123", "role": "admin" }
+  ],
+  "llm": { "enabled": false },
+  "scopes": ["project.read", "worktree.write", "proc.spawn", "net.probe"]
+}

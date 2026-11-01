@@ -4,7 +4,7 @@ import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { ExamRejected, deriveHardened, loadExams, resolveExamFixture, validateExam, EXAM_VERSION } from "../lib/exam.mjs";
+import { ExamRejected, deriveHardened, feedsTuning, loadExams, resolveExamFixture, validateExam, EXAM_VERSION } from "../lib/exam.mjs";
 import { GATES, gradeExam, notGradedResult, summarizeGrades } from "../lib/grader.mjs";
 import { listRecipeIds, loadRecipe } from "../lib/recipes.mjs";
 
@@ -22,6 +22,7 @@ const baseExam = (over = {}) => ({
   examId: "idor-read--legacy-shop",
   recipe: "idor-read",
   family: "idor-read",
+  split: "dev",
   vulnerable: { fixture: "fixtures/legacy-shop", expect: ["attack-read-foreign"] },
   hardened: {
     derivedFrom: "vulnerable",
@@ -308,6 +309,76 @@ test("deriveHardened：命中一处就写入并留下差异记录", () => {
     assert.equal(r.records[0].afterChars, r.records[0].beforeChars + "\nif (!order) return 404;".length);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// —— 第 8 项：开发集 / 冻结集切分 ——
+
+test("split 必填：没标堆的考卷整张拒收，不给默认值", () => {
+  const noSplit = { ...baseExam() };
+  delete noSplit.split;
+  assert.ok(validateExam(noSplit, { lookupRecipe }).rejections.some((r) => r.includes("split 必须是")));
+
+  const bogus = validateExam({ ...baseExam(), split: "training" }, { lookupRecipe });
+  assert.ok(bogus.rejections.some((r) => r.includes("split 必须是")));
+
+  const ok = validateExam({ ...baseExam(), split: "frozen" }, { lookupRecipe });
+  assert.equal(ok.ok, true, JSON.stringify(ok.rejections));
+  assert.equal(ok.normalized.split, "frozen");
+});
+
+test("feedsTuning：开发集进调优输入，冻结集只判分", () => {
+  assert.equal(feedsTuning({ split: "dev" }), true);
+  assert.equal(feedsTuning({ split: "frozen" }), false);
+  // 只有显式 frozen 才抑制记账：字段缺失时宁可照常记账，也不要悄悄把失败藏起来（装载层已会拒收缺 split 的考卷）
+  assert.equal(feedsTuning({}), true);
+  assert.equal(feedsTuning(null), true);
+});
+
+/** 真实考卷目录 + 真实配方索引：验收测试读的是仓库现状，不是造出来的样本 */
+const repoExams = () => {
+  const index = new Map();
+  for (const id of listRecipeIds()) {
+    const r = loadRecipe(id);
+    index.set(id, { recipeId: id, family: r.family, caseIds: (r.steps ?? []).map((s) => s.id) });
+  }
+  return loadExams({ repoRoot, lookupRecipe: (id) => index.get(id) ?? null });
+};
+
+test("验收：真实仓库里冻结集的失败从未被写进失败账本", () => {
+  const exams = repoExams();
+  const frozen = exams.filter((e) => e.split === "frozen").map((e) => e.examId);
+  assert.ok(frozen.length >= 1, "一张冻结考卷都没有，切分就是空话");
+  // 冻结集必须覆盖到每一个族：只冻一族等于另两族随时可被过拟合
+  const families = new Set(exams.map((e) => e.family));
+  const frozenFamilies = new Set(exams.filter((e) => e.split === "frozen").map((e) => e.family));
+  for (const f of families) assert.equal(frozenFamilies.has(f), true, `族 ${f} 没有冻结集考卷`);
+
+  const ledger = readFileSync(path.join(repoRoot, "benchmarks", "failure-ledger.jsonl"), "utf8")
+    .split("\n")
+    .filter((l) => l.trim())
+    .map((l) => JSON.parse(l));
+  for (const rec of ledger) {
+    assert.equal(
+      frozen.includes(rec.target),
+      false,
+      `冻结考卷 ${rec.target} 的失败出现在调优输入（失败账本）里：切分失效`
+    );
+  }
+});
+
+test("每族至少两份形状不同的考卷（第 8 项的「补齐」那一半）", () => {
+  const exams = repoExams();
+  const byFamily = new Map();
+  for (const e of exams) {
+    if (!byFamily.has(e.family)) byFamily.set(e.family, []);
+    byFamily.get(e.family).push(e);
+  }
+  assert.ok(byFamily.size >= 3, `只覆盖 ${byFamily.size} 族`);
+  for (const [family, list] of byFamily) {
+    assert.ok(list.length >= 2, `族 ${family} 只有 ${list.length} 张考卷`);
+    const shapes = new Set(list.map((e) => `${e.vulnerable.fixture}|${e.hardened.patches.map((p) => `${p.file}:${p.search}`).join(",")}`));
+    assert.equal(shapes.size, list.length, `族 ${family} 的考卷有重复形状：靶子与补丁锚点必须两两不同`);
   }
 });
 

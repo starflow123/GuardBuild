@@ -1,0 +1,23 @@
+{
+  "_note": "记账本靶场（Express 风格路由 + 纯 Node 微运行时垫片）。埋两族漏洞：GET /api/search 把检索词拼进 SQL 文本（SQL 注入·查询参数通道），GET /api/docs 把 doc 参数直接 join 进读取路径（敏感文件泄露）。两张考卷各修其中一处。",
+  "start": {
+    "cmd": "node",
+    "args": ["server.js"],
+    "env": { "PORT": "0" },
+    "readyPattern": "已就绪",
+    "readyTimeoutMs": 20000
+  },
+  "login": {
+    "path": "/api/login",
+    "bodyTemplate": { "email": "{email}", "password": "{password}" },
+    "credentialPath": "token"
+  },
+  "listEndpoint": { "method": "GET", "path": "/api/entries" },
+  "identities": [
+    { "name": "alice", "email": "alice@ledger.shop", "password": "alice123", "role": "user" },
+    { "name": "bob", "email": "bob@ledger.shop", "password": "bob123", "role": "user" },
+    { "name": "admin", "email": "admin@ledger.shop", "password": "admin123", "role": "admin" }
+  ],
+  "llm": { "enabled": false },
+  "scopes": ["project.read", "worktree.write", "proc.spawn", "net.probe"]
+}

@@ -325,6 +325,43 @@ export interface ExplorationTrace {
   error?: string | null;
 }
 
+/** 第 14/15 项：双路独立提案与对比分析的视图（结论字段由引擎落笔，这里只呈现） */
+export interface DualProposalView {
+  id?: string;
+  promptVersion?: string | null;
+  basis?: string | null;
+  outcome?: string | null;
+  requestsUsed?: number;
+  modelCalls?: number;
+  menuFingerprint?: string | null;
+  draftKey?: string | null;
+  draft?: { family?: string | null; steps?: number; tableOk?: boolean; verdictRule?: string | null; registered?: boolean } | null;
+  grades?: unknown;
+}
+
+export interface DualView {
+  version?: string | null;
+  outcome?: string | null;
+  model?: string | null;
+  menusIdentical?: boolean | null;
+  draftsDiffer?: boolean | null;
+  isolation?: { ok?: boolean; checked?: number; leaked?: { from?: string; to?: string; kind?: string; token?: string }[] } | null;
+  diff?: { identical?: boolean; shared?: number; onlyA?: { shape: string; times: number }[]; onlyB?: { shape: string; times: number }[]; divergences?: string[] } | null;
+  totals?: { modelCalls?: number; requestsUsed?: number; durationMs?: number | null } | null;
+  proposals?: DualProposalView[];
+  comparison?: {
+    decision?: string | null;
+    decisionLabel?: string | null;
+    decidedBy?: string | null;
+    authority?: string | null;
+    registered?: boolean;
+    canWritePassField?: boolean;
+    reasons?: string[];
+    facts?: { fact: string; ok: boolean }[];
+    model?: { ok?: boolean; recommendation?: string | null; rejected?: string | null; divergences?: string[] } | null;
+  } | null;
+}
+
 export interface ExplorationView {
   version?: string | null;
   outcome?: string | null;
@@ -358,6 +395,8 @@ export interface ExplorationView {
     rejections?: { where?: string; rule?: string; why?: string | null }[];
   } | null;
   artifact?: string | null;
+  proposal?: { id?: string; key?: string | null; label?: string | null; basis?: string | null } | null;
+  dual?: DualView | null;
 }
 
 export interface View {

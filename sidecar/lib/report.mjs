@@ -626,6 +626,99 @@ function renderExplorationSection(e) {
   return lines.join("\n");
 }
 
+/**
+ * 第 14/15 项的呈报：双路独立提案 + 对比分析。
+ * 这一节的存在意义是「把降级过程写清楚」：读者要能看到两路各自看到什么、各自留下什么、
+ * 差异由代码算出来、对比代理说了什么、以及最终为什么是（或不是）「退回」。
+ * 报告里没有「通过」这一格——对比代理没有放行权，结论由引擎按事实落（红线 3/4）。
+ */
+function renderDualSection(d) {
+  if (!d) return "";
+  const cmp = d.comparison ?? null;
+  const yes = (v) => (v === true ? "是" : v === false ? "否" : "—");
+  const lines = [
+    "## 探索区双路（提议者 A/B 独立提案 → 对比分析）\n",
+    "| 项目 | 值 |",
+    "| --- | --- |",
+    `| 模型 | ${esc(d.model ?? "—")} |`,
+    `| 提议者 | ${(d.proposals ?? []).map((p) => `${esc(p.id)}（${p.basis === "target_response" ? "照靶子真实响应形状" : "照通用打法形状"}）`).join(" / ") || "—"} |`,
+    `| 合计 | ${d.totals?.requestsUsed ?? 0} 次实发 / ${d.totals?.modelCalls ?? 0} 次模型调用（每路一份预算：${d.budget?.maxRequests ?? "—"} 次请求、${d.budget?.maxRounds ?? "—"} 轮） |`,
+    `| 两路菜单一致 | ${yes(d.menusIdentical)}（指纹一致才说明草稿差异来自提议者，不是可打面变了） |`,
+    `| 提示词隔离 | ${d.isolation ? (d.isolation.ok ? `通过（比对 ${d.isolation.checked ?? 0} 条独有文本行）` : `**失败**（${(d.isolation.leaked ?? []).length} 处跨路文本）`) : "—"} |`,
+    `| 草稿差异 | ${d.draftsDiffer === true ? "确有差异" : d.draftsDiffer === false ? "无差异（B 是 A 换皮）" : "—"} |`,
+    `| 对比结论 | **${esc(cmp?.decisionLabel ?? "—")}**（由引擎按事实落笔，模型意见只能往退回压） |`,
+    `| 注册状态 | 未注册、不进判定链${cmp?.canWritePassField === false ? "，且对比代理无「通过」字段写权限" : ""} |`,
+    "",
+  ];
+  if ((d.isolation?.leaked ?? []).length) {
+    lines.push("跨路文本（红线事故级明细）：");
+    for (const l of d.isolation.leaked) lines.push(`- \`${esc(l.from)}\` → \`${esc(l.to)}\`：${esc(l.kind ?? "private_text")}，片段 \`${truncate(String(l.token ?? ""), 60)}\``);
+    if (d.isolation.truncated) lines.push("- （泄露清单已截断）");
+    lines.push("");
+  }
+  if (Array.isArray(d.isolation?.checks)) {
+    for (const c of d.isolation.checks) lines.push(`- 隔离结构性检查 \`${esc(c.check)}\`：${c.ok ? "通过" : "**失败**"}`);
+    if (d.isolation.checks.length) lines.push("");
+  }
+  lines.push("**两路草稿并排**\n", "| 提议者 | 结局 | 实发 | 模型调用 | 草稿族名 | 步数 | 动作表 | 判据 | 草稿键 | 考卷成绩 |", "| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |");
+  for (const p of d.proposals ?? []) {
+    const dr = p.draft;
+    lines.push(
+      `| ${esc(p.id)} | ${esc(EXPLORATION_OUTCOME_LABEL[p.outcome] ?? p.outcome ?? "—")} | ${p.requestsUsed ?? 0} | ${p.modelCalls ?? 0} | \`${esc(dr?.family ?? "（无）")}\` | ${
+        dr?.steps ?? 0
+      } | ${dr ? (dr.tableOk ? "通过" : `拒收（${(dr.rejections ?? []).length} 处）`) : "—"} | \`${esc(dr?.verdictRule ?? "—")}\`${dr?.verdictByEngine ? "（引擎写死）" : ""} | \`${truncate(String(p.draftKey ?? "—"), 12)}\` | ${
+        p.grades ? esc(typeof p.grades === "object" ? (p.grades.runLabel ?? "有") : String(p.grades)) : "无（草稿未判卷）"
+      } |`
+    );
+  }
+  lines.push("");
+  if (d.diff) {
+    lines.push("**结构差异（确定性代码算的，模型改不了）**\n");
+    lines.push(`- 共用打法：${d.diff.shared ?? 0} 条；A 独有：${(d.diff.onlyA ?? []).length} 条；B 独有：${(d.diff.onlyB ?? []).length} 条`);
+    for (const t of (d.diff.divergences ?? []).slice(0, 12)) lines.push(`- ${esc(truncate(String(t), 200))}`);
+    lines.push("");
+  }
+  for (const p of d.proposals ?? []) {
+    const reqs = p.evidence?.requests ?? [];
+    if (!reqs.length) continue;
+    lines.push(`**提议者 ${esc(p.id)} 的实发序列**（各自独立的一次探索，互不见文本）\n`, "| 次 | 动作 | 槽位 | 身份 | HTTP | 字节 | 结果 |", "| --- | --- | --- | --- | --- | --- | --- |");
+    for (const r of reqs) {
+      lines.push(
+        `| ${r.seq ?? "—"} | ${esc(r.action ?? "—")} | ${esc(r.slot ?? "—")} | ${esc(r.role ?? "—")} | ${r.status ?? "—"} | ${r.bytes ?? 0} | ${r.ok ? "已送达" : esc(truncate(String(r.error ?? "未成功"), 60))} |`
+      );
+    }
+    lines.push("");
+  }
+  if (cmp) {
+    lines.push("**引擎按事实算的结论**\n", "| 前置事实 | 成立 |", "| --- | --- |");
+    for (const f of cmp.facts ?? []) lines.push(`| ${esc(f.fact)} | ${f.ok ? "✓" : "✗"} |`);
+    lines.push("");
+    if ((cmp.reasons ?? []).length) {
+      lines.push("不成立的事实（即退回原因）：");
+      for (const r of cmp.reasons) lines.push(`- ${esc(r)}`);
+      lines.push("");
+    }
+    lines.push(
+      `对比代理的意见：${cmp.model?.ok ? esc(cmp.model.recommendation === "return" ? "退回" : "建议合并") : `**被拒**（${esc(String(cmp.model?.rejected ?? "无输出"))}）`}${
+        (cmp.model?.divergences ?? []).length ? `，分歧说明 ${cmp.model.divergences.length} 条` : ""
+      }${cmp.model?.ignoredFields?.length ? `，表外字段已丢弃：${cmp.model.ignoredFields.map((k) => `\`${esc(k)}\``).join("、")}` : ""}${
+        cmp.downgraded_model_merge ? "；它说了「合并」但事实不齐，被引擎降回退回" : ""
+      }`
+    );
+    for (const t of (cmp.model?.divergences ?? []).slice(0, 8)) lines.push(`- ${esc(truncate(String(t), 200))}`);
+    lines.push("");
+  }
+  lines.push(
+    "- 双路的启用条件是三重：探索区双闸（契约 `exploration.enabled` **且** `GUARDBUILD_LLM_EXPLORATION=1`）**且**契约 `exploration.proposers` 点名两条互不相同的提议者；gate/CI 与纯黑盒模式代码级不进入这一路。",
+    "- 两路共用同一份菜单、同一批动作、同一个执行器与同一条冻结判据：这一层只加「看问题的方式」和「挑毛病的位置」，不加任何打法。",
+    "- 为什么这一节永远没有「通过」：对比代理只有降级权（红线 3），结论字段由引擎落笔（红线 4）；草稿在过判卷器（第 6 项，要跑漏洞版/加固版/干净对照三份变体）之前不得注册（红线 2）。",
+    "- 所以实跑会话里的对比结论只会是「退回」——那是人工闸门在起作用，不是失败：没判过卷的草稿被自动放行，就是本项目要拒的假绿灯。",
+    "- 这些流量不进证据库、不参与判卷：本段全是过程事实。",
+    ""
+  );
+  return lines.join("\n");
+}
+
 function summarizeBootstrap(b) {
   if (!b) return null;
   return {
@@ -1020,18 +1113,27 @@ function renderMarkdown(r) {
     );
   }
   if (!bb && r.exploration) {
-    summaryLines.push(
-      `- 探索区自主试打：${esc(EXPLORATION_OUTCOME_LABEL[r.exploration.outcome] ?? r.exploration.outcome ?? "—")}（${r.exploration.requestsUsed ?? 0} 次实发 / ${r.exploration.rounds ?? 0} 轮），草稿${
-        r.exploration.draft ? (r.exploration.draft.tableOk ? "已过动作表校验（未注册、不进判定链）" : "被动作表拒收") : "未产出"
-      }`
-    );
+    const dl = r.exploration.dual;
+    if (dl) {
+      summaryLines.push(
+        `- 探索区双路独立提案：${(dl.proposals ?? []).map((p) => p.id).join("/")} 两路共 ${dl.totals?.requestsUsed ?? 0} 次实发 / ${dl.totals?.modelCalls ?? 0} 次模型调用，菜单${
+          dl.menusIdentical ? "一致" : "不一致"
+        }、提示词隔离${dl.isolation?.ok ? "通过" : "失败"}、草稿${dl.draftsDiffer ? "确有差异" : "无差异"}；对比结论=**${esc(dl.comparison?.decisionLabel ?? "—")}**（对比代理只有降级权，草稿未注册、不进判定链）`
+      );
+    } else {
+      summaryLines.push(
+        `- 探索区自主试打：${esc(EXPLORATION_OUTCOME_LABEL[r.exploration.outcome] ?? r.exploration.outcome ?? "—")}（${r.exploration.requestsUsed ?? 0} 次实发 / ${r.exploration.rounds ?? 0} 轮），草稿${
+          r.exploration.draft ? (r.exploration.draft.tableOk ? "已过动作表校验（未注册、不进判定链）" : "被动作表拒收") : "未产出"
+        }`
+      );
+    }
   }
   if (r.error) summaryLines.push(`- 错误：\`${esc(r.error.code)}\` — ${esc(r.error.message)}`);
   parts.push(summaryLines.join("\n") + "\n");
 
   if (!bb && r.llm?.used) parts.push(renderLlmSection(r.llm));
   if (!bb && r.bootstrap) parts.push(renderBootstrapSection(r.bootstrap), "");
-  if (!bb && r.exploration) parts.push(renderExplorationSection(r.exploration));
+  if (!bb && r.exploration) parts.push(r.exploration.dual ? renderDualSection(r.exploration.dual) : renderExplorationSection(r.exploration));
 
   if (!bb && r.summary.findings.length) {
     parts.push(`## 静态发现（${r.summary.findings.length}）\n`);

@@ -1,4 +1,4 @@
-import type { ExplorationView, View } from "../bridge";
+import type { DualView, ExplorationView, View } from "../bridge";
 
 const OUTCOME_LABEL: Record<string, string> = {
   stopped: "已自行收手",
@@ -9,9 +9,53 @@ const OUTCOME_LABEL: Record<string, string> = {
   agent_error: "代理执行出错",
 };
 
+const BASIS_LABEL: Record<string, string> = {
+  generic_shapes: "照通用打法形状（不看靶子正文）",
+  target_response: "照靶子真实响应形状",
+};
+
+/** 第 14/15 项的双路块：两路各自的事实 + 引擎按事实落的结论（没有「通过」这一格） */
+function DualBlock({ d }: { d: DualView }) {
+  const cmp = d.comparison ?? null;
+  return (
+    <div className="scout-warn" style={{ marginBottom: 6 }}>
+      <div>
+        · 两路提议者：
+        {(d.proposals ?? [])
+          .map((p) => `${p.id ?? "?"}（${BASIS_LABEL[p.basis ?? ""] ?? p.basis ?? "—"}，实发 ${p.requestsUsed ?? 0} 次，草稿 ${p.draft?.steps ?? 0} 步${p.draft?.tableOk ? "·过表" : p.draft ? "·被拒" : "·无"}）`)
+          .join(" ｜ ")}
+      </div>
+      <div>
+        · 独立性对账：菜单{d.menusIdentical ? "一致" : "不一致（差异不可归因）"} · 提示词隔离
+        {d.isolation?.ok ? `通过（比对 ${d.isolation.checked ?? 0} 条独有文本行）` : "失败（出现跨路文本）"} · 草稿
+        {d.draftsDiffer ? "确有差异" : "无差异（B 是 A 换皮）"} · 合计 {d.totals?.requestsUsed ?? 0} 次实发 /{" "}
+        {d.totals?.modelCalls ?? 0} 次模型调用
+      </div>
+      {(d.isolation?.leaked ?? []).slice(0, 3).map((l, i) => (
+        <div key={`leak-${i}`}>
+          · 泄露：{l.from} → {l.to}（{l.kind ?? "private_text"}）{l.token ? `：${l.token}` : ""}
+        </div>
+      ))}
+      {(d.diff?.divergences ?? []).slice(0, 3).map((t, i) => (
+        <div key={`div-${i}`}>· 结构差异：{t}</div>
+      ))}
+      <div>
+        · 对比结论：<b>{cmp?.decisionLabel ?? "—"}</b>（结论由引擎按事实落笔，对比代理只有降级权，没有「通过」字段写权限）
+      </div>
+      {(cmp?.reasons ?? []).slice(0, 3).map((r, i) => (
+        <div key={`why-${i}`}>· 原因：{r}</div>
+      ))}
+      {cmp?.model?.ok && (cmp.model.divergences ?? []).length > 0 && <div>· 模型补充的分歧说明：{cmp.model.divergences!.slice(0, 3).join("；")}</div>}
+      {cmp?.model?.ok === false && cmp.model?.rejected && <div>· 模型意见被拒：{cmp.model.rejected}</div>}
+      <div>· 上面列出的是其中一路的实发序列；每一路各自独立跑，各自留一份草稿（成绩各记各的，不许共享）。</div>
+    </div>
+  );
+}
+
 export function ExplorationPanel({ view }: { view: View | null }) {
   const e: ExplorationView | null | undefined = view?.exploration;
   if (!e) return null;
+  const d: DualView | null | undefined = e.dual;
   const trace = e.trace ?? [];
   const budget = e.budget ?? {};
   const draft = e.draft ?? null;
@@ -19,10 +63,11 @@ export function ExplorationPanel({ view }: { view: View | null }) {
   return (
     <div className="panel">
       <div className="panel-title">
-        探索区（自主试打）
+        {d ? "探索区（双路独立提案 → 对比分析）" : "探索区（自主试打）"}
         <span className="count">{OUTCOME_LABEL[e.outcome ?? ""] ?? e.outcome ?? "—"}</span>
       </div>
       <div className="panel-body" style={{ padding: "8px 13px" }}>
+        {d && <DualBlock d={d} />}
         <div className="scout-kv">
           <span className="k">模型</span>
           <span className="v">{e.model ?? "未知"}</span>

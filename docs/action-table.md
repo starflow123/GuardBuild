@@ -149,3 +149,21 @@ Host 侧 `http.request` 的参数结构体没开 `deny_unknown_fields`，sidecar
 
 
 
+
+## 十、表的第三个消费方：两路提议者吃的是同一张表（M2 第 14、15 项）
+
+装载器：`sidecar/lib/dualpropose.mjs` + `sidecar/lib/proposers.mjs` · 单测：`sidecar/tests/dual-proposal.test.mjs`（25 条）· e2e：`npm run e2e:dual`（59 断言 / 6 轮）
+
+第九节那条通道可以复制成两条：契约里再写 `exploration.proposers: ["A","B"]`，同一份菜单、同一批动作、同一个执行器、同一条冻结判据各跑一遍，只有提示词依据不同（A 看通用形状清单，B 看自己那轮的真实响应摘录）。表在这一层的作用是**让差异可以归因**：
+
+| 表的作用 | 落在哪一行代码 |
+| --- | --- |
+| 两路必须看到同一张表 | `menuFingerprint` 进结论前置条件——菜单不一样，草稿差异就只是菜单差异，不是视角差异（`menus_identical` 因此是事实而不是声明） |
+| 两路各填各的表 | 每路一份独立预算（`maxRequests`/`maxRounds` 逐路计时），各自跑同一个 `validateRecipe`，两份草稿带 `A-`/`B-` 前缀互不覆盖 |
+| 对比代理的输出同样过表 | 只许写 `divergences`/`b_is_reskin`/`recommendation`/`why` 四格；`通过`/`批准`/`注册`/`放行` 等词一律按表外字段丢弃，`decision` 由 `decideComparison` 纯函数按事实算 |
+
+成绩这一格是表外的硬约束：`provenance` 必须逐字等于那一路自己的 `draftKey`，两路的 `runLabel` 不许相同——**借别路的成绩等于没考**。任一路没有成绩，对比结论就落「退回」（不是「不合适」，也不是含糊一句）。
+
+**这一层没有加任何打法**：菜单还是那 4 条动作，草稿还是 `registered: false`，`sidecar/recipes/` 逐文件比对未变。它加的是「挑毛病的位置」——第 15 项要的「两份都错至少标出一个分歧或退回」，落点是纯函数 + 只有降级权的模型意见。
+
+**还剩什么**：实跑会话里草稿**没有成绩**（判卷器只认已注册配方），所以真实双路的结论目前必然落「退回」——第 14 项验收的后半句「各自过考卷」要等 overlay 配方目录 + 用例 id 归一化 + 人工考卷背书那条通路（任务 #202）。

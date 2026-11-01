@@ -31,6 +31,7 @@ import { runScout, applyScoutResult, recordScoutVerification, MAX_START_CANDIDAT
 import { isEnabled as llmEnabled } from "./lib/llm.mjs";
 import { bootstrapEnabled, runBootstrapAgent } from "./lib/bootstrap.mjs";
 import { explorationEnabled, runExploration } from "./lib/explorer.mjs";
+import { dualEnabled, proposersRequested, runComparator, runDualProposals, summarizeDual } from "./lib/dualpropose.mjs";
 import { runBlackbox } from "./lib/blackbox.mjs";
 import { coverageSummary, describeOutcome } from "./lib/coverage.mjs";
 import { createPatch, writebackPatch, rollbackWorkspace, PatchError } from "./lib/patcher.mjs";
@@ -1690,6 +1691,9 @@ async function stageExploration(ctx) {
     return;
   }
   const model = ctx.llmConfig?.model ?? null;
+  if (dualEnabled(ctx)) {
+    return stageDualExploration(ctx, { baseUrl, stash, model });
+  }
   emit(ctx, {
     kind: "exploration",
     severity: SEVERITY.INFO,
@@ -1731,6 +1735,76 @@ async function stageExploration(ctx) {
       },
     });
   }
+}
+
+/**
+ * 第 14/15 项的双路分支：同一沙箱、同一份菜单、同一个执行器，两名提议者各拿一份预算独立试打，
+ * 随后由对比分析代理出一份「建议合并 / 退回」的意见。
+ *
+ * 三条要写在这里的事实：
+ *  - 两路之间不传文本（`checkPromptIsolation` 逐次核对出站提示词），草稿差异才能归因到视角差异；
+ *  - 对比代理只有降级权（红线 3）：最终结论由引擎按事实算，它说「合并」也要事实齐备才亮；
+ *  - 实跑会话里草稿**没有成绩**——判卷器（第 6 项）只在考卷层跑，而探索区在 gate/CI 结构性禁用。
+ *    所以这一路的结论必然落在「退回」，原因里写清缺的是哪一条。那不是失败，那是人工闸门：
+ *    没有已知答案考卷背书的草稿如果被自动放行，就是本项目要拒的那块假绿灯。
+ */
+async function stageDualExploration(ctx, { baseUrl, stash, model }) {
+  const ids = proposersRequested(ctx).join("/");
+  emit(ctx, {
+    kind: "exploration",
+    severity: SEVERITY.INFO,
+    message: `开始探索区双路独立提案（${ids}）：同一菜单同一执行器，两路各拿一份预算且互不见文本；产出仍是配方草稿，不参与漏洞判定`,
+    phase: STATE.PROBING,
+    data: { model, baseUrl, proposers: ids, budget: ctx.targetConfig?.exploration ?? null },
+  });
+  let dual = null;
+  try {
+    dual = await runDualProposals(ctx, {
+      baseUrl,
+      stash,
+      model,
+      getToken: (url, reason) => ensureLlmToken(ctx, url, reason),
+      sendStep: (step) => explorationSendStep(ctx, { baseUrl, step }),
+    });
+  } catch (e) {
+    emit(ctx, {
+      kind: "exploration",
+      severity: SEVERITY.WARN,
+      message: `探索区双路异常结束（不影响判定链与已判用例）：${e.message}`,
+      phase: STATE.PROBING,
+      data: { code: e.code ?? null },
+    });
+    return;
+  }
+  const comparison = await runComparator(ctx, {
+    dual,
+    grades: null,
+    model,
+    getToken: (url, reason) => ensureLlmToken(ctx, url, reason),
+  });
+  const merged = summarizeDual(dual, comparison);
+  const primary = dual.proposals?.[0]?.summary ?? null;
+  ctx.view.exploration = { ...(primary ?? { outcome: dual.outcome, requestsUsed: dual.requestsUsed, rounds: 0 }), dual: merged };
+  ctx.pushView?.();
+  emit(ctx, {
+    kind: "exploration",
+    severity: comparison.decision === "return" ? SEVERITY.WARN : SEVERITY.INFO,
+    message: `探索区双路收手：${dual.requestsUsed} 次实发 / ${dual.modelCalls} 次模型调用（${ids} 两路各一份预算）；提示词隔离${
+      dual.isolation?.ok ? "通过" : "失败"
+    }；对比结论=${comparison.decisionLabel}（对比代理只有降级权，草稿一律未注册、不进判定链）${
+      comparison.reasons.length ? `；首要原因：${comparison.reasons[0]}` : ""
+    }`,
+    phase: STATE.PROBING,
+    data: {
+      outcome: dual.outcome,
+      decision: comparison.decision,
+      draftsDiffer: dual.draftsDiffer,
+      menusIdentical: dual.menusIdentical,
+      isolationOk: dual.isolation?.ok === true,
+      registered: false,
+    },
+  });
+  return dual;
 }
 
 async function stagePatch(ctx) {

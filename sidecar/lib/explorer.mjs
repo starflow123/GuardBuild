@@ -25,6 +25,7 @@ import { SEVERITY } from "../../shared/protocol.mjs";
 import { RECIPE_VERSION, VERDICT_RULES, formatRejections, validateRecipe } from "./actiontable.mjs";
 import { redactSecrets } from "./failureledger.mjs";
 import { LlmError, chat, parseJson } from "./llm.mjs";
+import { observationFor, systemPromptOf } from "./proposers.mjs";
 import { SLOT_KIND } from "./recipes.mjs";
 
 export const EXPLORATION_VERSION = "gb-explore-1";
@@ -219,6 +220,19 @@ export function buildMenu(stash, budget = explorationBudget(null)) {
   };
 }
 
+/**
+ * 菜单指纹：只取「可打组合的形状」（槽位/路径/参数/身份/对象），不含模型可见的其它文本。
+ * 双路草稿不一致时，先要能证明两路看到的菜单是一样的——否则差异可能来自可打面变了，不是来自提议者。
+ */
+export function menuFingerprint(menu) {
+  const h = createHash("sha256");
+  for (const t of menu.targets.items) h.update(`\0T${t.id}:${t.slot}:${t.method}:${t.path}:${t.wire}:${t.needsResourceId}:${t.planRef?.param ?? "-"}`);
+  for (const r of menu.roles.items) h.update(`\0R${r.id}:${r.role}:${r.identity ?? "-"}`);
+  for (const r of menu.resources.items) h.update(`\0O${r.id}:${r.resourceId}:${r.owner ?? "-"}`);
+  for (const p of menu.primitives) h.update(`\0A${p.id}:${p.action}:${p.allowedTargetIds.join(",")}`);
+  return h.digest("hex").slice(0, 32);
+}
+
 function renderMenuForPrompt(menu) {
   const authedRoles = (p) =>
     menu.roles.items.filter((r) => (p.roles.length ? menu.roles.authedIds.includes(r.id) : false)).map((r) => `${r.id}:${r.role}`);
@@ -402,7 +416,8 @@ const SYSTEM_PROMPT = `你在一个隔离沙箱里对一个本地靶场做攻击
 4. 预算有限（请求数、轮数、时长都写死），宁少勿多；不要重复已经同样打过的那一步。
 只返回一个 JSON 对象：{"primitive":2,"target":1,"role":2,"resource":1} 或 {"stop":true,"family":"idor-read-x"}。不要输出 JSON 以外的内容。`;
 
-function observationOf(menu, budget, state, history) {
+function observationOf(menu, budget, state, history, proposer = null) {
+  if (proposer) return observationFor(proposer, menu, budget, state, history, renderMenuForPrompt);
   return {
     goal: "试出这一族攻击的打法（动作+槽位+身份+对象的组合），产出一张配方草稿；你不判定漏洞，也不构造请求内容",
     budget: {
@@ -424,16 +439,17 @@ function artifactDir(root) {
   return join(base, "exploration", createHash("sha256").update(p).digest("hex").slice(0, 16));
 }
 
-/** 键只取「本轮可打组合的形状」+ 模型名：菜单变了就重探，不沿用别的目标形状的草稿 */
-export function draftKeyFor(model, menu) {
+/** 键只取「本轮可打组合的形状」+ 模型名 + 提议者：菜单变了就重探，双路也不互相覆盖草稿 */
+export function draftKeyFor(model, menu, proposalId = null) {
   const h = createHash("sha256");
   h.update(EXPLORATION_VERSION);
   h.update("\0");
   h.update(model ?? "");
+  h.update(`\0propose:${proposalId ?? "single"}`);
   for (const t of menu.targets.items) h.update(`\0${t.id}:${t.slot}:${t.path}:${t.planRef?.param ?? "-"}`);
   for (const r of menu.roles.items) h.update(`\0${r.id}:${r.role}:${r.identity ?? "-"}`);
   for (const r of menu.resources.items) h.update(`\0${r.id}:${r.resourceId}:${r.owner ?? "-"}`);
-  return h.digest("hex").slice(0, 32);
+  return `${proposalId ? `${proposalId}-` : ""}${h.digest("hex").slice(0, 32)}`;
 }
 
 function writeArtifactAtomic(file, data) {
@@ -468,6 +484,8 @@ export function writeExplorationArtifact(ctx, result) {
       version: EXPLORATION_VERSION,
       savedAt: Date.now(),
       model: result.model ?? null,
+      proposal: result.proposal ?? null,
+      menuFingerprint: result.menuFingerprint ?? null,
       outcome: result.outcome,
       budget: result.budget,
       budgetStop: result.budgetStop ?? null,
@@ -521,10 +539,12 @@ function emitStep(ctx, data, message, severity = SEVERITY.INFO) {
  * @param {(url:string, reason:string)=>Promise<string>} opts.getToken
  * @param {string} [opts.model]
  * @param {typeof chat} [opts.chatImpl] LLM 调用注入点（单测用）
+ * @param {object} [opts.proposer] 提议者定义（第 14 项的 A/B 两路）；不给就是第 13 项那条单路，提示词逐字不变
+ * @param {(record:{proposal:string,system:string,user:string})=>void} [opts.promptSink] 出站提示词留痕（隔离检查与 e2e 读它）
  */
 export async function runExploration(
   ctx,
-  { baseUrl, sendStep, stash = null, getToken = null, model = null, chatImpl = chat, budget = null, onStep = null } = {}
+  { baseUrl, sendStep, stash = null, getToken = null, model = null, chatImpl = chat, budget = null, onStep = null, proposer = null, promptSink = null } = {}
 ) {
   const b = budget ?? explorationBudget(ctx);
   const s = stash ?? ctx?._exploration ?? null;
@@ -550,6 +570,8 @@ export async function runExploration(
     artifact: null,
     startedAt: Date.now(),
     durationMs: 0,
+    proposal: proposer ? { id: proposer.id, key: proposer.key, label: proposer.label, promptVersion: proposer.promptVersion, basis: proposer.seesExcerpts ? "target_response" : "generic_shapes" } : null,
+    menuFingerprint: null,
   };
   const seenIgnored = new Set();
   const noteIgnored = (names) => {
@@ -566,6 +588,7 @@ export async function runExploration(
     return state;
   }
   const menu = buildMenu(s, b);
+  state.menuFingerprint = menuFingerprint(menu);
   state.menu = {
     targets: menu.targets.items.length,
     roles: menu.roles.items.length,
@@ -603,15 +626,18 @@ export async function runExploration(
     }));
     let res;
     const t0 = Date.now();
+    const sysPrompt = proposer ? systemPromptOf(proposer) : SYSTEM_PROMPT;
+    const userPrompt = clamp(JSON.stringify(observationOf(menu, b, state, history, proposer), null, 1), MAX_OBSERVE_CHARS);
     try {
       state.modelCalls += 1;
+      if (typeof promptSink === "function") promptSink({ proposal: proposer?.id ?? "single", round: state.rounds, system: sysPrompt, user: userPrompt });
       res = await chatImpl(ctx, {
-        systemPrompt: SYSTEM_PROMPT,
-        userPrompt: clamp(JSON.stringify(observationOf(menu, b, state, history), null, 1), MAX_OBSERVE_CHARS),
+        systemPrompt: sysPrompt,
+        userPrompt,
         getToken: getToken ?? ctx?.llmGetToken,
         model,
         maxTokens: 400,
-        purpose: "探索区选下一步",
+        purpose: proposer ? `探索区选下一步（提议者 ${proposer.id}）` : "探索区选下一步",
       });
     } catch (e) {
       state.outcome = e instanceof LlmError ? "llm_unavailable" : "agent_error";
@@ -717,7 +743,7 @@ export async function runExploration(
 
   if (state.trace.length) {
     state.draft = buildDraft(state.trace, { family, maxSteps: b.maxDraftSteps });
-    state.draftKey = draftKeyFor(state.model, menu);
+    state.draftKey = draftKeyFor(state.model, menu, proposer?.id ?? null);
     state.artifact = writeExplorationArtifact(ctx, state);
     emitStep(
       ctx,
@@ -760,6 +786,9 @@ export function summarizeExploration(state) {
     version: state.version ?? EXPLORATION_VERSION,
     outcome: state.outcome ?? null,
     model: state.model ?? null,
+    // 双路（第 14 项）的两条归属事实：这一份是哪一路产的、两路看到的是不是同一份菜单
+    proposal: state.proposal ?? null,
+    menuFingerprint: state.menuFingerprint ?? null,
     rounds: state.rounds ?? 0,
     modelCalls: state.modelCalls ?? 0,
     requestsUsed: state.requestsUsed ?? 0,

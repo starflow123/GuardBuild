@@ -651,6 +651,11 @@ export function normalizeExploration(raw) {
   };
   // 缺省不写这个键：契约没表态时留给 GUARDBUILD_LLM_EXPLORATION 决定（显式 false 才是关）
   if (typeof raw.enabled === "boolean") out.enabled = raw.enabled;
+  // 第 14 项的双路提议者点名：只认 A/B 两个编号，去重后不足两条就当没写（单路行为不变）
+  if (Array.isArray(raw.proposers)) {
+    const ids = [...new Set(raw.proposers.map((x) => String(x ?? "").trim().toUpperCase()).filter((x) => x === "A" || x === "B"))];
+    if (ids.length >= 2) out.proposers = ids;
+  }
   return out;
 }
 

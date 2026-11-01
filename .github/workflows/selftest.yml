@@ -128,13 +128,13 @@ jobs:
       - name: 分发布局 E2E（随包 node 在 PATH 无 node 时跑通 gate）
         run: node scripts/e2e-package.mjs
 
-      - name: 精度基准（14 个标注靶场：漏报 / 误报 / 退出码一致性）
+      - name: 精度基准（标注靶场数量以 benchmarks/corpus.json 为准：漏报 / 误报 / 退出码一致性）
         run: node scripts/benchmark.mjs
 
-      - name: 黑盒精度基准（25 个标注靶场：用例族召回 / 误报 / 写与破坏性探测开关 / 路由发现来源 / 退出码）
+      - name: 黑盒精度基准（标注靶场以 benchmarks/blackbox-corpus.json 为准：用例族召回 / 误报 / 写与破坏性探测开关 / 路由发现来源 / 退出码）
         run: node scripts/benchmark-blackbox.mjs
 
-      - name: 判卷基准（考卷层：漏洞版打中 / 加固版零报 / 干净对照不造假 / 两次一致；加固版由补丁派生）
+      - name: 判卷基准（考卷张数与开发/冻结切分以 benchmarks/exams/ 为准：漏洞版打中 / 加固版零报 / 干净对照不造假 / 两次一致；加固版由补丁派生）
         run: node scripts/benchmark-grader.mjs
 
       - name: Docker 沙箱 E2E（无可用 Docker 时自动跳过）

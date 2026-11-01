@@ -134,6 +134,9 @@ jobs:
       - name: 黑盒精度基准（25 个标注靶场：用例族召回 / 误报 / 写与破坏性探测开关 / 路由发现来源 / 退出码）
         run: node scripts/benchmark-blackbox.mjs
 
+      - name: 判卷基准（考卷层：漏洞版打中 / 加固版零报 / 干净对照不造假 / 两次一致；加固版由补丁派生）
+        run: node scripts/benchmark-grader.mjs
+
       - name: Docker 沙箱 E2E（无可用 Docker 时自动跳过）
         run: node scripts/e2e-docker.mjs
 
@@ -188,3 +191,5 @@ jobs:
             .benchmark/benchmark-report.md
             .benchmark/benchmark-report.json
             .benchmark/reports
+            .grader/grader-report.md
+            .grader/grader-report.json

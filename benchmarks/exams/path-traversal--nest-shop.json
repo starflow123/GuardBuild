@@ -1,0 +1,26 @@
+{
+  "version": "gb-exam-1",
+  "examId": "path-traversal--nest-shop",
+  "recipe": "path-traversal",
+  "family": "path-traversal",
+  "vulnerable": {
+    "fixture": "fixtures/nest-shop",
+    "expect": ["attack-path-traversal"],
+    "note": "装饰器路由形态（NestJS 垫片）：导出接口把 query 参数 file 直接拼进读取路径，没校验是否越出 public"
+  },
+  "hardened": {
+    "derivedFrom": "vulnerable",
+    "patch": {
+      "file": "server.js",
+      "search": "      const target = path.join(__dirname, \"public\", file);",
+      "insertAfter": "\n      const rootDir = path.resolve(__dirname, \"public\");\n      if (!path.resolve(target).startsWith(rootDir + path.sep)) return json(res, 403, { error: \"非法文件路径\" });"
+    },
+    "note": "只在拼接读取路径之后加一道目录归属校验。靶子里的订单越权（idor-read 一族）没修，退出码仍是 1——G2 只判路径穿越一条都不许报"
+  },
+  "clean": {
+    "fixture": "fixtures/clean-shop",
+    "note": "什么都没埋的对照：报出任何一条 vulnerable 都是凭空造漏洞"
+  },
+  "repeat": 2,
+  "note": "第二张考卷用的是另一族 + 另一种框架形态，避免「一份靶子的特征被写死进判卷」"
+}

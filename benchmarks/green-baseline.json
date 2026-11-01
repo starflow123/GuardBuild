@@ -1,6 +1,6 @@
 {
   "version": "gb-green-baseline-1",
-  "updatedAt": "2026-10-31T14:15:36.991Z",
+  "updatedAt": "2026-10-31T15:24:42.035Z",
   "suites": {
     "whitebox": {
       "keys": [
@@ -44,8 +44,8 @@
         "whitebox/upload-shop",
         "whitebox/upload-shop#attack-upload"
       ],
-      "lastRunAt": "2026-10-31T14:05:13.762Z",
-      "lastRunHead": "33b3d1e",
+      "lastRunAt": "2026-10-31T15:14:10.873Z",
+      "lastRunHead": "d68180a",
       "corpusVersion": 1,
       "regressions": 0
     },
@@ -123,8 +123,8 @@
         "blackbox/wide-shop-mutate#blackbox-vertical-*",
         "blackbox/wide-shop-mutate#blackbox-xss-*"
       ],
-      "lastRunAt": "2026-10-31T14:08:23.893Z",
-      "lastRunHead": "33b3d1e",
+      "lastRunAt": "2026-10-31T15:17:09.585Z",
+      "lastRunHead": "d68180a",
       "corpusVersion": 1,
       "regressions": 0
     },
@@ -136,8 +136,8 @@
         "realworld/vulnapi#blackbox-sqli-*",
         "realworld/vulnapi#blackbox-ssrf-*"
       ],
-      "lastRunAt": "2026-10-31T14:15:36.991Z",
-      "lastRunHead": "33b3d1e",
+      "lastRunAt": "2026-10-31T15:23:22.000Z",
+      "lastRunHead": "d68180a",
       "corpusVersion": 1,
       "regressions": 0
     },
@@ -146,9 +146,21 @@
         "indie/juice-shop",
         "indie/vuln-express"
       ],
-      "lastRunAt": "2026-10-31T12:31:49.934Z",
-      "lastRunHead": "1a6d1e7",
+      "lastRunAt": "2026-10-31T15:24:42.035Z",
+      "lastRunHead": "d68180a",
       "corpusVersion": 2,
+      "regressions": 0
+    },
+    "grader": {
+      "keys": [
+        "grader/idor-read--legacy-shop",
+        "grader/idor-read--legacy-shop#attack-read-foreign",
+        "grader/path-traversal--nest-shop",
+        "grader/path-traversal--nest-shop#attack-path-traversal"
+      ],
+      "lastRunAt": "2026-10-31T15:11:36.736Z",
+      "lastRunHead": "d68180a",
+      "corpusVersion": "2 张考卷",
       "regressions": 0
     }
   }

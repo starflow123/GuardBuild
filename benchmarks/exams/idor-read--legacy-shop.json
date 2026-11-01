@@ -1,0 +1,26 @@
+{
+  "version": "gb-exam-1",
+  "examId": "idor-read--legacy-shop",
+  "recipe": "idor-read",
+  "family": "idor-read",
+  "vulnerable": {
+    "fixture": "fixtures/legacy-shop",
+    "expect": ["attack-read-foreign"],
+    "note": "表单登录 + 嵌套响应 + 人类可读就绪行的传统形态；订单详情接口查完直接返回，没校验归属"
+  },
+  "hardened": {
+    "derivedFrom": "vulnerable",
+    "patch": {
+      "file": "src/app.js",
+      "search": "const orderId = Number(orderDetailMatch[1]);\n    const order = findOrderById(orderId);\n    if (!order) return json(res, 404, { error: \"订单不存在\" });",
+      "insertAfter": "\n    if (order.userId !== auth.user.id) return json(res, 403, { error: \"无权访问该订单\" });"
+    },
+    "note": "只在 orders.get 拿到订单后插一道归属校验，位置在写放行决定之前。靶子里的取消接口（attack-cancel-foreign，非本配方）依旧没修，所以加固版的退出码仍是 1——G2 只判这一族一条都不许报"
+  },
+  "clean": {
+    "fixture": "fixtures/clean-shop",
+    "note": "什么都没埋的对照：报出任何一条 vulnerable 都是凭空造漏洞"
+  },
+  "repeat": 2,
+  "note": "第 7 项要求的形态：加固版不是一张独立手写的靶子，而是漏洞版工作区复制来后逐字锚点插一处补丁派生"
+}

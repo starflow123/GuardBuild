@@ -44,6 +44,7 @@
     "e2e:bootstrap": "node scripts/e2e-bootstrap.mjs",
     "benchmark": "node scripts/benchmark.mjs",
     "benchmark:blackbox": "node scripts/benchmark-blackbox.mjs",
+    "benchmark:grader": "node scripts/benchmark-grader.mjs",
     "e2e:blackbox": "node scripts/e2e-blackbox.mjs",
     "e2e:attackplan": "node scripts/e2e-attackplan.mjs",
     "e2e:explore": "node scripts/e2e-explore.mjs",

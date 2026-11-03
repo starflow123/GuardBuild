@@ -25,7 +25,7 @@ import { SEVERITY } from "../../shared/protocol.mjs";
 import { RECIPE_VERSION, VERDICT_RULES, formatRejections, validateRecipe } from "./actiontable.mjs";
 import { redactSecrets } from "./failureledger.mjs";
 import { LlmError, chat, parseJson } from "./llm.mjs";
-import { observationFor, systemPromptOf } from "./proposers.mjs";
+import { observationFor, promptDigestOf, systemPromptOf } from "./proposers.mjs";
 import { SLOT_KIND } from "./recipes.mjs";
 
 export const EXPLORATION_VERSION = "gb-explore-1";
@@ -416,6 +416,9 @@ const SYSTEM_PROMPT = `你在一个隔离沙箱里对一个本地靶场做攻击
 4. 预算有限（请求数、轮数、时长都写死），宁少勿多；不要重复已经同样打过的那一步。
 只返回一个 JSON 对象：{"primitive":2,"target":1,"role":2,"resource":1} 或 {"stop":true,"family":"idor-read-x"}。不要输出 JSON 以外的内容。`;
 
+/** 单路（第 13 项）提示词摘要：与提议者两路同规则——措辞变了草稿键就变，旧草稿不冒充新问法的产出 */
+const SINGLE_PROMPT_DIGEST = createHash("sha256").update(SYSTEM_PROMPT).digest("hex").slice(0, 12);
+
 function observationOf(menu, budget, state, history, proposer = null) {
   if (proposer) return observationFor(proposer, menu, budget, state, history, renderMenuForPrompt);
   return {
@@ -439,10 +442,12 @@ function artifactDir(root) {
   return join(base, "exploration", createHash("sha256").update(p).digest("hex").slice(0, 16));
 }
 
-/** 键只取「本轮可打组合的形状」+ 模型名 + 提议者：菜单变了就重探，双路也不互相覆盖草稿 */
-export function draftKeyFor(model, menu, proposalId = null) {
+/** 键只取「本轮可打组合的形状」+ 模型名 + 提议者 + 提示词摘要：菜单或措辞变了就重探，双路也不互相覆盖草稿 */
+export function draftKeyFor(model, menu, proposalId = null, promptDigest = null) {
   const h = createHash("sha256");
   h.update(EXPLORATION_VERSION);
+  h.update("\0");
+  h.update(promptDigest ?? "pd-none");
   h.update("\0");
   h.update(model ?? "");
   h.update(`\0propose:${proposalId ?? "single"}`);
@@ -743,7 +748,7 @@ export async function runExploration(
 
   if (state.trace.length) {
     state.draft = buildDraft(state.trace, { family, maxSteps: b.maxDraftSteps });
-    state.draftKey = draftKeyFor(state.model, menu, proposer?.id ?? null);
+    state.draftKey = draftKeyFor(state.model, menu, proposer?.id ?? null, proposer ? promptDigestOf(proposer) : SINGLE_PROMPT_DIGEST);
     state.artifact = writeExplorationArtifact(ctx, state);
     emitStep(
       ctx,

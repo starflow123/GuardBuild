@@ -24,7 +24,8 @@ import {
   summarizeDual,
   validateComparatorOpinion,
 } from "../lib/dualpropose.mjs";
-import { PROPOSERS, errorClass, observationFor, privateLinesOf, proposerById, systemPromptOf } from "../lib/proposers.mjs";
+import { PROPOSERS, errorClass, observationFor, privateLinesOf, promptDigestOf, proposerById, systemPromptOf } from "../lib/proposers.mjs";
+import { createHash } from "node:crypto";
 import { normalizeExploration } from "../lib/targetconfig.mjs";
 import { LlmError } from "../lib/llm.mjs";
 import { buildReport } from "../lib/report.mjs";
@@ -326,6 +327,10 @@ test("点名不足两条就不跑；菜单指纹同一算法，换候选就变�
   assert.notEqual(menuFingerprint(menu), menuFingerprint(changed), "可打面变了必须反映到指纹上");
   assert.notEqual(draftKeyFor("m", menu, "A"), draftKeyFor("m", menu, "B"), "同一菜单下两路草稿键互不覆盖");
   assert.ok(!draftKeyFor("m", menu).startsWith("A-"), "单路（第 13 项）的键不带编号，行为逐字不变");
+  assert.notEqual(draftKeyFor("m", menu, "A", "a".repeat(12)), draftKeyFor("m", menu, "A", "b".repeat(12)), "提示词措辞变了草稿键也要变：旧草稿不顶着新措辞的名义");
+  assert.notEqual(promptDigestOf(A), promptDigestOf(B), "两路的提示词文本不同，摘要就不同");
+  const expectedDigest = createHash("sha256").update([systemPromptOf(A), ...A.guide].join("\n")).digest("hex").slice(0, 12);
+  assert.equal(promptDigestOf(A), expectedDigest, "摘要跟着真正写进提示词的文本算（系统提示+该路清单），不是独立维护的版本号");
 });
 
 test("单路不写 proposer 时提示词与第 13 项一致：purpose 不带编号，也没有清单段", async () => {

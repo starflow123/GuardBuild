@@ -212,6 +212,17 @@ const SYSTEM_PROMPT = [
   "- 不确定的字段用 null 或空数组，不要编造。",
 ].join("\n");
 
+/**
+ * 提示词摘要：SYSTEM_PROMPT 或用户模板骨架（buildPrompt 的静态文本）任一改动都会换键，
+ * 旧的磁盘提案自然失效重验——版本号是给人看的，键要跟着**实际发出去的文本**走。
+ */
+export const SCOUT_PROMPT_DIGEST = createHash("sha256")
+  .update(SYSTEM_PROMPT)
+  .update("\0")
+  .update(String(buildPrompt))
+  .digest("hex")
+  .slice(0, 12);
+
 function sanitizeArgs(raw) {
   const list = Array.isArray(raw) ? raw.map(String) : [];
   if (list.length > 16) return null;
@@ -505,9 +516,11 @@ export async function validateScoutResult(raw, { evidence, readFile }, warnings 
   return { start, starts, login, routes, notes, warnings };
 }
 
-function cacheKeyFor(model, evidence) {
+export function cacheKeyFor(model, evidence, promptDigest = SCOUT_PROMPT_DIGEST) {
   const h = createHash("sha256");
   h.update(SCOUT_VERSION);
+  h.update("\0");
+  h.update(promptDigest);
   h.update("\0");
   h.update(model ?? "");
   h.update("\0");

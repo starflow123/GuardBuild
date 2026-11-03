@@ -8,6 +8,7 @@ import { RPC_TO_HOST } from "../../shared/protocol.mjs";
 import { loginAll } from "../lib/probe.mjs";
 import {
   SELFBOOT_AGENT_VERSION,
+  SELFBOOT_PROMPT_DIGEST,
   askRegisterAgent,
   buildRegisterMenu,
   cacheKeyFor,
@@ -376,6 +377,8 @@ test("cacheKeyFor：路由形状变或换模型就换键，源码改行不换键
   assert.notEqual(cacheKeyFor("m1", a), cacheKeyFor("m2", a), "换模型要重问");
   const c = buildRegisterMenu({ endpoints: [...HUIYUAN_ANALYSIS.endpoints, { method: "POST", fullPath: "/api/x/new" }] }, {});
   assert.notEqual(cacheKeyFor("m1", a), cacheKeyFor("m1", c), "候选菜单变了不能照旧提案发请求");
+  assert.equal(cacheKeyFor("m1", a), cacheKeyFor("m1", a, SELFBOOT_PROMPT_DIGEST), "默认键跟着实际提示词文本走");
+  assert.notEqual(cacheKeyFor("m1", a, "a".repeat(12)), cacheKeyFor("m1", a, "b".repeat(12)), "提示词措辞变了旧验证提案必须失效重验——gate 复用缓存的前提是问法没变");
 });
 
 // ---------- askRegisterAgent：观测内容与失败回落 ----------

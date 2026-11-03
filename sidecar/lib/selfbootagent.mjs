@@ -168,6 +168,19 @@ const SYSTEM_PROMPT = `你在帮一次白盒安全扫描定位「目标项目自
 5. 认为菜单里没有公开建号接口，就返回空 picks——不要硬选。
 只返回一个 JSON 对象：{"picks":[3],"templates":{"3":{"mail":"{email}","pwd":"{password}","nickname":"{name}"}},"note":"一句话理由"}。不要输出 JSON 以外的内容。`;
 
+/**
+ * 提示词摘要：系统提示词、菜单渲染骨架、上一轮回灌文案任一改动都换键。
+ * gate 只复用「已实测验证过」的缓存提案——发问的措辞变了，旧验证结论就不该继续代表新问法。
+ */
+export const SELFBOOT_PROMPT_DIGEST = createHash("sha256")
+  .update(SYSTEM_PROMPT)
+  .update("\0")
+  .update(String(renderMenuForPrompt))
+  .update("\0")
+  .update(String(renderPriorAttempts))
+  .digest("hex")
+  .slice(0, 12);
+
 function clamp(text, n) {
   const s = String(text ?? "");
   return s.length > n ? `${s.slice(0, n)}\n/* …(超限，已截去 ${s.length - n} 字符)… */` : s;
@@ -278,10 +291,12 @@ function projectCacheId(root) {
   return createHash("sha256").update(p).digest("hex").slice(0, 16);
 }
 
-/** 键只取「路由形状」：方法+路径+定义位置+静态形状标记。源码换行不改键，换接口才改键 */
-export function cacheKeyFor(model, menu) {
+/** 键只取「路由形状」：方法+路径+定义位置+静态形状标记。源码换行不改键，换接口才改键；提示词文本变则换键 */
+export function cacheKeyFor(model, menu, promptDigest = SELFBOOT_PROMPT_DIGEST) {
   const h = createHash("sha256");
   h.update(SELFBOOT_AGENT_VERSION);
+  h.update("\0");
+  h.update(promptDigest);
   h.update("\0");
   h.update(model ?? "");
   for (const it of menu.items) {

@@ -14,6 +14,7 @@
  *
  * 判据不在任何一路的可选项里（红线 1）：两路都只回答「怎么打」，「什么算打穿」由引擎写死。
  */
+import { createHash } from "node:crypto";
 
 export const PROPOSERS_VERSION = "gb-proposers-1";
 
@@ -78,6 +79,15 @@ export function proposerById(id) {
 /** 这一路会写进提示词的全部文本：系统提示（含规则块）+ 自己的清单行 */
 function textOf(proposer) {
   return [systemPromptFor(proposer), ...(proposer.guide ?? [])].join("\n");
+}
+
+/**
+ * 这一路提示词文本的摘要：草稿键必须带上它——措辞改了就重新探索，
+ * 旧提示词试出来的草稿不能顶着新措辞的名义复用。promptVersion 是给人看的标签，
+ * 真正让缓存失效的是这份跟着文本走的摘要。
+ */
+export function promptDigestOf(proposer) {
+  return createHash("sha256").update(textOf(proposer)).digest("hex").slice(0, 12);
 }
 
 /**

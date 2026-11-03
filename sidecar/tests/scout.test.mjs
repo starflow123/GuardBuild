@@ -11,6 +11,8 @@ import {
   applyScoutResult,
   recordScoutVerification,
   clearScoutCache,
+  cacheKeyFor,
+  SCOUT_PROMPT_DIGEST,
 } from "../lib/scout.mjs";
 import { analyzeProject } from "../lib/analyzer.mjs";
 import { buildProbePlan } from "../lib/planner.mjs";
@@ -509,4 +511,10 @@ test("analyzeProject：LLM 侦察路由并入候选，来源标记 llm-scout", a
   assert.equal(a.candidates.some((c) => c.fullPath === "/api/invoices"), false);
   assert.equal(buildProbePlan(a).listEndpoint?.path, "/api/invoices");
   assert.equal(a.diagnostics.endpointsFromLlm, 2);
+});
+
+test("侦察缓存键带提示词摘要：措辞变了旧提案必须失效重验", () => {
+  const ev = { tree: ["a.js"], files: [{ rel: "a.js", content: "x" }] };
+  assert.equal(cacheKeyFor("m", ev), cacheKeyFor("m", ev, SCOUT_PROMPT_DIGEST), "默认键跟着实际发出去的提示词文本走");
+  assert.notEqual(cacheKeyFor("m", ev, "a".repeat(12)), cacheKeyFor("m", ev, "b".repeat(12)), "摘要不同则键不同——版本号是标签，失效靠文本");
 });

@@ -3686,7 +3686,7 @@ export function buildCases(ctx, targets) {
             proof.field = picked.field;
             proof.original = picked.original;
             proof.canary = canary;
-            attackReq.body = { [picked.field]: canary };
+            attackReq.body = JSON.stringify({ [picked.field]: canary });
           }
           let res;
           try {
@@ -3707,7 +3707,7 @@ export function buildCases(ctx, targets) {
             proof.changed = !!echo || inReread;
             if (proof.changed) {
               try {
-                await httpJson(c, { baseUrl, method, path: attackPath, identity: victim.name, body: { [picked.field]: picked.original } });
+                await httpJson(c, { baseUrl, method, path: attackPath, identity: victim.name, body: JSON.stringify({ [picked.field]: picked.original }) });
                 const check = await reread();
                 proof.restored = !!check && !JSON.stringify(check.json ?? check.body ?? "").includes(canary);
               } catch {

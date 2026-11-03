@@ -26,10 +26,15 @@ function makeCtx(targetConfig) {
         if (method !== RPC_TO_HOST.HTTP_REQUEST) throw new Error(`不应调用 ${method}`);
         const headers = { ...(params.headers ?? {}) };
         if (params.identityRef) headers["x-gb-identity"] = params.identityRef;
+        // Host 的请求体槽位只收字符串（用例自己序列化）——这里照同样口径把关，
+        // 否则单测会把「发不出去的请求体」跑成 200，掩盖成真绿灯。
+        if (params.body != null && typeof params.body !== "string") {
+          throw new Error("请求体必须是已序列化的字符串");
+        }
         const res = await fetch(params.url, {
           method: params.method,
           headers,
-          body: params.body == null ? undefined : typeof params.body === "string" ? params.body : JSON.stringify(params.body),
+          body: params.body ?? undefined,
         });
         const text = await res.text();
         let json = null;

@@ -1,0 +1,10 @@
+{
+  "name": "write-shop",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "WriteShop - 白盒写面越权靶场（裸 PATCH / 裸 DELETE，读取有归属校验）",
+  "scripts": {
+    "start": "node server.js"
+  }
+}

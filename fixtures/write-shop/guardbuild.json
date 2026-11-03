@@ -1,0 +1,19 @@
+{
+  "start": {
+    "cmd": "node",
+    "args": ["server.js"],
+    "env": { "PORT": "0" },
+    "readyPattern": "listening on port",
+    "readyTimeoutMs": 20000
+  },
+  "login": {
+    "path": "/api/login",
+    "bodyTemplate": { "email": "{email}", "password": "{password}" },
+    "credentialPath": "token"
+  },
+  "identities": [
+    { "name": "alice", "email": "alice@write.shop", "password": "alice123", "role": "user" },
+    { "name": "bob", "email": "bob@write.shop", "password": "bob123", "role": "user" }
+  ],
+  "scopes": ["project.read", "worktree.write", "proc.spawn", "net.probe"]
+}

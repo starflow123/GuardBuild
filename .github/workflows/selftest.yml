@@ -77,6 +77,9 @@ jobs:
       - name: 业务逻辑/竞态 E2E（状态跳步回读 + 并发双花，加固后 409/单次成功对照）
         run: node scripts/e2e-bizlogic.mjs
 
+      - name: 白盒写面越权 E2E（开关默认不打 + 改回复读见 canary + 删除复读 404 + 加固对照）
+        run: node scripts/e2e-write.mjs
+
       - name: tRPC 适配器 E2E（过程路径组装 + input 编码协商，本机垫片）
         run: node scripts/e2e-trpc.mjs
 

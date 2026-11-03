@@ -78,6 +78,7 @@ npm run e2e:ssrf       # SSRF 演练（23 断言：本机 canary 回连取证 + 
 npm run e2e:upload     # 文件上传演练（23 断言：主动内容同源回读取证 + 类型白名单对照）
 npm run e2e:jwt        # JWT 演练（24 断言：alg=none / 无效签名伪造放行取证 + 固定算法强密钥对照）
 npm run e2e:bizlogic   # 业务逻辑/竞态演练（29 断言：状态跳步回读 + 并发双花副作用标识，加固后 409/单次成功对照）
+npm run e2e:write      # 白盒写面越权演练（20 断言：开关默认不打且候选点名 → MUTATE 改回复读见 canary 并恢复 → 再加 DELETE 复读 404 → 加固版全 blocked）
 npm run e2e:attackplan # 攻击规划代理演练（40 断言，本机 mock DeepSeek：预算重排 + 只认编号 + gate 结构性禁用）
 npm run e2e:llm        # LLM 接入侦察演练（61 断言，本机 mock DeepSeek：候选逐个启动、全灭回退、无密钥磁盘缓存复用，含模型编造路由被运行期实测拦下）
 npm run e2e:llm-patch  # LLM 编码代理补丁演练（73 断言，本机 mock：守规矩 / 不守规矩 / 无密钥 / 先只读自查四轮）

@@ -45,6 +45,7 @@ export function planView(plan) {
     resource: plan.resource,
     readPath: plan.readCandidate?.fullPath ?? plan.readCandidate?.path ?? null,
     cancelPath: plan.cancelCandidate?.fullPath ?? plan.cancelCandidate?.path ?? null,
+    writePath: plan.writeCandidate?.fullPath ?? plan.writeCandidate?.path ?? null,
     unauthReadPath: plan.unauthReadCandidate?.fullPath ?? plan.unauthReadCandidate?.path ?? null,
     traversalPath: plan.traversalCandidate?.fullPath ?? plan.traversalCandidate?.path ?? null,
     sqliPath: plan.sqliCandidate?.fullPath ?? plan.sqliCandidate?.path ?? null,
@@ -131,6 +132,18 @@ export function buildProbePlan(analysis, { loginPathOverride = null, contract = 
   const cancelCandidate = cancelCandidates[0] ?? null;
   const readCandidate = readCandidates[0] ?? null;
   const unauthReadCandidate = unauthReadCandidates[0] ?? null;
+  // 写面越权候选：PUT/PATCH/DELETE 的「有认证、缺归属校验」端点。以前只有 POST /cancel 进计划，
+  // 裸 DELETE/PATCH 明明在源码里躺着却不进槽位——报告口径就成了「没有攻击面」，这是漏检不是安全。
+  // 打不打由引擎层开关决定（targetConfig.mutation：allowWrite 管改、再加 allowDelete 管删）；
+  // 计划照收，未开开关时在探测披露里点名。
+  const WRITE_IDOR_METHODS = new Set(["PUT", "PATCH", "DELETE"]);
+  const writeCandidates = topK(
+    (c) =>
+      c.kind === "idor-suspect" &&
+      WRITE_IDOR_METHODS.has(String(c.method ?? "").toUpperCase()) &&
+      addressable(c)
+  );
+  const writeCandidate = writeCandidates[0] ?? null;
   // 路径穿越候选：文件读取端点含请求输入（无自动修复策略，仅复现取证）
   const traversalCandidates = topK((c) => c.kind === "traversal-suspect");
   const traversalCandidate = traversalCandidates[0] ?? null;
@@ -151,6 +164,7 @@ export function buildProbePlan(analysis, { loginPathOverride = null, contract = 
   const resource =
     readCandidate?.resource ??
     cancelCandidate?.resource ??
+    writeCandidate?.resource ??
     unauthReadCandidate?.resource ??
     traversalCandidate?.resource ??
     sqliCandidate?.resource ??
@@ -222,6 +236,7 @@ export function buildProbePlan(analysis, { loginPathOverride = null, contract = 
     resource,
     readCandidate,
     cancelCandidate,
+    writeCandidate,
     unauthReadCandidate,
     traversalCandidate,
     sqliCandidate,
@@ -233,6 +248,7 @@ export function buildProbePlan(analysis, { loginPathOverride = null, contract = 
     readCandidates,
     pendingCandidates,
     cancelCandidates,
+    writeCandidates,
     unauthReadCandidates,
     traversalCandidates,
     sqliCandidates,

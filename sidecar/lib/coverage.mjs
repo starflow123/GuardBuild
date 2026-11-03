@@ -52,6 +52,40 @@ export function coverageSummary() {
 }
 
 /**
+ * 白盒探测族 ↔ 攻击用例 id 前缀。报告里的「本轮攻击面 / 本轮未涉及」必须按实际建出的
+ * 用例前缀对账，不能拿上面的能力清单冒充「这一轮都打过了」。
+ */
+export const WHITEBOX_FAMILIES = [
+  { prefix: "attack-read-foreign", name: "跨用户读取（IDOR）" },
+  { prefix: "attack-cancel-foreign", name: "跨用户状态动作（取消别人的对象）" },
+  { prefix: "attack-write-foreign", name: "跨用户改写 / 删除（写面越权）" },
+  { prefix: "attack-vertical-escalation", name: "纵向越权（普通身份打管理端点）" },
+  { prefix: "attack-anonymous-read", name: "无鉴权读取" },
+  { prefix: "attack-path-traversal", name: "路径穿越" },
+  { prefix: "attack-sql-injection", name: "SQL 注入" },
+  { prefix: "attack-command-injection", name: "命令注入" },
+  { prefix: "attack-ssrf", name: "SSRF（本机 canary 回连）" },
+  { prefix: "attack-upload", name: "文件上传（主动内容）" },
+  { prefix: "attack-jwt-forge", name: "JWT 伪造令牌" },
+  { prefix: "attack-state-skip", name: "业务逻辑跳步" },
+  { prefix: "attack-race", name: "并发双花" },
+];
+
+/** 只有黑盒链路才打的族：白盒报告里不能把它们算进「本轮未涉及（无候选）」，要单列 */
+export const BLACKBOX_ONLY_FAMILIES = [
+  "CORS 配置（伪造 Origin + 允许凭证）",
+  "CSRF（Cookie 会话下的跨站表单改写）",
+  "反射型 XSS（HTML 上下文）",
+];
+
+/** 用例 id → 族名；认不出前缀的返回 null（调用方保留原 id，不让陌生用例静默消失） */
+export function whiteboxFamilyName(caseId) {
+  const id = String(caseId ?? "");
+  const hit = WHITEBOX_FAMILIES.find((f) => id === f.prefix || id.startsWith(`${f.prefix}-`));
+  return hit ? hit.name : null;
+}
+
+/**
  * 终态措辞：code（会话错误码）→ 呈现方式。
  * kind 供 GUI 决定用红色错误还是中性提示；exitCode 与原 failSession 映射保持一致。
  */

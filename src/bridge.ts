@@ -413,6 +413,7 @@ export interface View {
     resource: string;
     readPath: string | null;
     cancelPath: string | null;
+    writePath?: string | null;
     unauthReadPath?: string | null;
     traversalPath?: string | null;
     sqliPath?: string | null;

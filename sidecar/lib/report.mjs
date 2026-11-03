@@ -151,6 +151,33 @@ function coverageText(coverage) {
   return coverage.join("、");
 }
 
+/**
+ * 白盒族差集：本轮真打的族 / 没候选所以没打的族 / 只有黑盒链路才打的族 / 被写面开关关掉的候选。
+ * 数据来自 probe 阶段按实际用例前缀的对账（`ctx._attackSurface`），不是能力清单。
+ */
+function attackSurfaceLines(r) {
+  const s = r.summary?.attackSurface;
+  if (!s) return [];
+  const lines = [];
+  lines.push(
+    `- 本轮攻击面：${(s.probed ?? []).length ? s.probed.join("、") : "无（未建出攻击用例）"}${
+      (s.unknown ?? []).length ? `；未归族的用例：${s.unknown.join("、")}` : ""
+    }`
+  );
+  if ((s.noCandidate ?? []).length) {
+    lines.push(`- 本轮无候选、因此一条没打：${s.noCandidate.join("、")}（未打 ≠ 已防住）。`);
+  }
+  if ((s.gateSkippedWrite ?? []).length) {
+    lines.push(
+      `- 有候选但被写面开关关掉：${s.gateSkippedWrite.join("、")}（改要 \`mutation.allowWrite\`，删还要 \`mutation.allowDelete\`）。`
+    );
+  }
+  if ((s.blackboxOnly ?? []).length) {
+    lines.push(`- 白盒模式不探测、只在黑盒链路取证：${s.blackboxOnly.join("、")}。`);
+  }
+  return lines;
+}
+
 function suggestions(r) {
   const { outcome, patchStatus } = r.verdict;
   const supabase = r.supabase ?? null;
@@ -293,6 +320,22 @@ function suggestions(r) {
     lines.push(`- 执行失败（${r.error?.code}）：${r.error?.message ?? ""}${r.error?.hint ? `；建议：${r.error.hint}` : ""}`);
   } else {
     lines.push("- 会话被中止，未完成裁决；可重新运行。");
+  }
+  if (!r.blackbox && outcome !== "failed" && outcome !== "aborted") {
+    const s = r.summary?.attackSurface;
+    if (s?.gateSkippedWrite?.length) {
+      lines.push(
+        `- 写面越权候选本轮未探测（${s.gateSkippedWrite.join("、")}）：这类请求会真改甚至销毁目标数据，默认关闭。如需覆盖，在 guardbuild.json 设 \`mutation.allowWrite: true\`（DELETE 另加 \`mutation.allowDelete: true\`），或临时 GUARDBUILD_MUTATE=1 / GUARDBUILD_DELETE=1 后重跑。`
+      );
+    }
+    if (s?.noCandidate?.length) {
+      lines.push(
+        `- 以下探测族本轮没有静态候选、一条请求都没发出：${s.noCandidate.join("、")}。报告只对打过的请求下结论，这些族的状态未知。`
+      );
+    }
+    if (s?.blackboxOnly?.length) {
+      lines.push(`- ${s.blackboxOnly.join("、")} 属黑盒链路取证族，白盒轮次不探测。`);
+    }
   }
   lines.push(...startDiagnosisLines(r));
   return lines.join("\n");
@@ -959,6 +1002,7 @@ function renderMarkdown(r) {
         `- 证据级别（pre）：决策轨迹 ${preGrades.strong ?? 0} 条 / 内容归属 ${preGrades["cross-proven"] ?? 0} 条 / 仅 HTTP ${preGrades["http-only"] ?? 0} 条`
       );
     }
+    summaryLines.push(...attackSurfaceLines(r));
   }
   if (acc) {
     summaryLines.push(
@@ -1386,6 +1430,16 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
         postWriteback: byPhase("post_writeback").length,
       },
       phases: view.phases ?? {},
+      attackSurface: ctx._attackSurface
+        ? {
+            probed: ctx._attackSurface.probed ?? [],
+            unknown: ctx._attackSurface.unknown ?? [],
+            noCandidate: ctx._attackSurface.noCandidate ?? [],
+            blackboxOnly: ctx._attackSurface.blackboxOnly ?? [],
+            gateSkippedWrite: ctx._attackSurface.gateSkippedWrite ?? [],
+            mutation: ctx._attackSurface.mutation ?? null,
+          }
+        : null,
       acceptance: view.acceptance ?? null,
       supabase,
       blackbox: blackbox

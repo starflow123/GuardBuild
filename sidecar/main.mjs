@@ -1184,6 +1184,7 @@ async function stageAnalyze(ctx) {
   if (
     !ctx.plan.readCandidate &&
     !ctx.plan.cancelCandidate &&
+    !ctx.plan.writeCandidate &&
     !ctx.plan.unauthReadCandidate &&
     !ctx.plan.traversalCandidate &&
     !ctx.plan.sqliCandidate &&
@@ -1489,6 +1490,7 @@ async function stageReproduce(ctx) {
   const hasLocalProbes = !!(
     plan.readCandidate ||
     plan.cancelCandidate ||
+    plan.writeCandidate ||
     plan.unauthReadCandidate ||
     plan.traversalCandidate ||
     plan.sqliCandidate ||
@@ -2385,6 +2387,15 @@ async function runFlow(ctx) {
     }
     ctx.loginConfig = targetConfig.login ?? null;
     ctx.registerConfig = targetConfig.register ?? null;
+    // 白盒写面开关：契约 mutation.allowWrite/allowDelete 为准，无头演练环境变量可从外部补开
+    // （与黑盒的 GUARDBUILD_BLACKBOX_MUTATE/DELETE 同构；删除仍以允许改写为前提）
+    {
+      const m = { allowWrite: false, allowDelete: false, ...(ctx.targetConfig.mutation ?? {}) };
+      if (process.env.GUARDBUILD_MUTATE === "1") m.allowWrite = true;
+      if (process.env.GUARDBUILD_DELETE === "1") m.allowDelete = true;
+      if (!m.allowWrite) m.allowDelete = false;
+      ctx.targetConfig.mutation = m;
+    }
     ctx.llmConfig = targetConfig.llm ?? null;
     ctx.llmGetToken = (url, reason) => ensureLlmToken(ctx, url, reason);
     if (targetConfig.identities) {

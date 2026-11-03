@@ -167,6 +167,7 @@ npm run test:rust      # Rust Host
 - `llm`：可选 LLM 开关——接入侦察（`enabled` / `model` / `maxFiles`）与编码代理补丁（`patch` / `autoVerify` / `patchMaxFiles` / `patchToolRounds`），默认全关；启用与安全边界见下两节
 - `exploration`：可选探索区（自主试打）开关与预算——`enabled` 与 `maxRequests` / `maxRounds` / `totalBudgetMs` / `maxOutputChars` / `maxTargets` / `maxResources` / `maxDraftSteps`；**双闸**（这里 `enabled: true` 且 `GUARDBUILD_LLM_EXPLORATION=1`）才跑，缺省不写 `enabled` 时只由环境变量决定。预算只能往小调：写大了一律夹到引擎硬上限（30 次 / 12 轮 / 600s / 20 万字符 / 20 步），边界与安全口径见「探索区」一节
 - `docker`：可选容器沙箱（`enabled` / `image` / `containerPort` / `workdir` / `env` / `command` / `readyTimeoutMs`）；启用后目标只经受限 `docker run` 在容器内启动，见下节「Docker 容器沙箱」
+- `mutation`：白盒「写面越权」开关（`allowWrite` 打 PUT/PATCH，`allowDelete` 在此基础上再打 DELETE），**默认全关**。静态分析本来就能认出裸改写/裸删除端点的越权嫌疑，开关只决定「这一轮打不打」，判据不变：改值用例要看**归属人复读**见到 canary（`原值_gbw`）才算证据，删除用例要看归属人复读**真的读不到**（404，或 2xx 且实体从响应里消失；405 一律不算「已删除」）；证据取到后尽力把原值改回去，恢复与否如实写进证据行。会真改数据库、删除不可回滚，所以与黑盒写面回合一样默认关闭；临时打开可用环境变量 `GUARDBUILD_MUTATE=1` / `GUARDBUILD_DELETE=1`。开关关闭时不会把这批候选算成「该测没测」（那是用户的明确配置），但报告与事件流会点名列出「本轮未探测的写面候选」，不会静默消失
 
 **真实项目接入的常见准备**：
 

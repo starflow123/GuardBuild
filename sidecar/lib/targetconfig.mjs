@@ -659,6 +659,20 @@ export function normalizeExploration(raw) {
   return out;
 }
 
+/**
+ * 白盒写面探测开关（与黑盒 blackbox.allowMutation/allowDestructive 同构，但独立成段）：
+ * 跨用户修改（PUT/PATCH）要 allowWrite，跨用户删除（DELETE）还要再加 allowDelete；
+ * 两者默认关闭——计划里照收候选（宁缺不假），但不开开关就一发都不打，报告如实披露。
+ * allowDelete 只在 allowWrite 成立时生效，与黑盒的「破坏性以写开关为前提」一致。
+ */
+export function normalizeMutation(raw) {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const out = {};
+  if (typeof raw.allowWrite === "boolean") out.allowWrite = raw.allowWrite;
+  if (typeof raw.allowDelete === "boolean") out.allowDelete = raw.allowDelete;
+  return Object.keys(out).length ? out : null;
+}
+
 /** Supabase 覆盖项：显式指定环境文件 / 项目 URL / anon key / 表名（缺省由静态检测自动发现） */
 function normalizeSupabase(raw) {
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
@@ -784,6 +798,7 @@ export async function loadTargetConfig(ctx) {
     responses: normalizeResponses(parsed.responses),
     listEndpoint: normalizeListEndpoint(parsed.listEndpoint),
     docker: normalizeDocker(parsed.docker),
+    mutation: normalizeMutation(parsed.mutation),
     supabase: normalizeSupabase(parsed.supabase),
     routes: normalizeRoutes(parsed.routes),
     openapi: normalizeOpenapi(parsed.openapi),

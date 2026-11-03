@@ -54,6 +54,7 @@ import {
 } from "./recipes.mjs";
 import { redactSecrets } from "./failureledger.mjs";
 import { buildProbePlan, candKey } from "./planner.mjs";
+import { BLACKBOX_ONLY_FAMILIES, WHITEBOX_FAMILIES, whiteboxFamilyName } from "./coverage.mjs";
 import {
   MAX_SCOUT_ROUTES,
   verifyScoutRoutes,
@@ -2582,6 +2583,7 @@ function pickTargets(ctx, byUser, loggedIn, anonymousItems = [], anonTargets = [
   const attackerPaid = attackerItems.filter((o) => o.status === "paid");
   // attacker 自己列表里已有的资源 id：这些资源不属于"他人"，请求成功不算越权
   const attackerOwnIds = new Set(attackerItems.map((o) => String(resourceIdOf(ctx, o))).filter(Boolean));
+  const attackCancelTarget = victimPaid[0] ?? victimItems[1] ?? victimItems[0] ?? null;
   return {
     attacker,
     victim,
@@ -2592,7 +2594,9 @@ function pickTargets(ctx, byUser, loggedIn, anonymousItems = [], anonTargets = [
     // victim 自己的对象（正向断言：修复后本人仍能看到完整对象）
     victimItems,
     victimOwnTarget: victimItems[0] ?? null,
-    attackCancelTarget: victimPaid[0] ?? victimItems[1] ?? victimItems[0] ?? null,
+    attackCancelTarget,
+    // 写面越权（改/删）用度对象：尽量避开读/取消已用的对象，删除用例不至于把读靶子先打死
+    attackWriteTarget: victimItems.find((o) => o !== attackCancelTarget && o !== victimItems[0]) ?? victimItems[0] ?? null,
     adminCancelTarget: victimPaid[1] ?? victimPaid[0] ?? victimItems[0] ?? null,
     ownReadTarget: attackerItems[0] ?? null,
     ownCancelTarget: attackerPaid[1] ?? attackerPaid[0] ?? null,
@@ -3027,6 +3031,34 @@ function ssrfCanaryOpts(ctx) {
   return ctx?.targetConfig?.docker?.enabled === true ? { advertiseHost: DOCKER_HOST_ADVERTISE } : {};
 }
 
+// —— 白盒写面越权（跨用户改/删）辅助 ——
+// 开关与黑盒同构但分段命名，避免一个键同时管两条链路。默认关：改（allowWrite）先于删（allowDelete）。
+function writeGatesOf(ctx) {
+  const m = ctx?.targetConfig?.mutation ?? {};
+  const allowWrite = m.allowWrite === true;
+  return { allowWrite, allowDelete: allowWrite && m.allowDelete === true };
+}
+
+// 归属人复读的取值路径：有配对的读候选就按读候选构造 GET；否则退回写候选自身路径的 GET 形态。
+function writeRereadPath(ctx, writeCand, readCand, id) {
+  if (readCand && !readCand.graphql && !readCand.trpc) {
+    const p = fillCandPath(ctx, readCand, id);
+    if (p) return p;
+  }
+  if (writeCand.graphql || writeCand.trpc) return null;
+  return fillCandPath(ctx, writeCand, id);
+}
+
+// 改面载荷字段：从归属人可见的对象里挑一个「非身份/非状态/非时间」的字符串字段，写入无害 canary。
+const WRITE_FIELD_DENY = /^(id|uuid|_id|.*id|email|status|state|created.*|updated.*|password|secret|token|role)$/i;
+function pickMutableField(item) {
+  if (!item || typeof item !== "object") return null;
+  for (const [k, v] of Object.entries(item)) {
+    if (typeof v === "string" && v.length && !WRITE_FIELD_DENY.test(k)) return { field: k, original: v };
+  }
+  return null;
+}
+
 function startSsrfCanary({ advertiseHost = "127.0.0.1" } = {}) {
   return new Promise((resolve, reject) => {
     const token = shortId("ssrf");
@@ -3401,6 +3433,7 @@ export function buildCases(ctx, targets) {
   // 每类候选 top-K 逐一构建攻击用例；首个候选保持基名（兼容既有报告/测试/e2e）
   const readCands = planCandidates(ctx, readAttack.kind);
   const cancelCands = planCandidates(ctx, "cancel");
+  const writeCands = planCandidates(ctx, "write");
   const unauthCands = planCandidates(ctx, "unauthRead");
   const readPath = candPath(readCands[0]);
   const cancelPath = candPath(cancelCands[0]);
@@ -3586,6 +3619,137 @@ export function buildCases(ctx, targets) {
         return o && o.status === "cancelled" ? `可越权取消他人${candLabel}（业务破坏）` : null;
       },
     });
+  }
+
+  // —— 写面越权用例（白盒对照黑盒「跨用户改/删」）——
+  // 默认关闭：PUT/PATCH 要 mutation.allowWrite，DELETE 还要 mutation.allowDelete（删不可回滚）。
+  // 开关只决定「打不打」，不决定「怎么判」：判据不轻信响应回显——
+  // 改以「归属人复读见到 canary」为准并尽力恢复原值，删以「归属人复读对象消失」为准；
+  // 请求被接受但复读无变化一律 inconclusive，既记不成漏洞，也记不成「已防住」。
+  if (writeGatesOf(ctx).allowWrite) {
+    const gates = writeGatesOf(ctx);
+    for (const [i, cand] of writeCands.entries()) {
+      const method = String(cand.method ?? "").toUpperCase();
+      if (!["PUT", "PATCH", "DELETE"].includes(method)) continue;
+      if (method === "DELETE" && !gates.allowDelete) continue;
+      const path = candPath(cand);
+      const writeTarget = targets.attackWriteTarget;
+      if (!path || cand.graphql || cand.trpc || !writeTarget || !attacker || !victim) continue;
+      const suffix = i === 0 ? "" : `-${i + 1}`;
+      const multi = writeCands.length > 1 ? `（${path}）` : "";
+      const candLabel = resourceLabelOf(cand.resource ?? ctx.plan?.resource);
+      const isDelete = method === "DELETE";
+      const verb = isDelete ? "删除" : "修改";
+      cases.push({
+        id: `attack-write-foreign${suffix}`,
+        candidateKey: candKey(cand),
+        category: CASE_CATEGORY.ATTACK,
+        name: `${attacker.name} 越权${verb} ${victim.name} 的${candLabel} #${resourceIdOf(ctx, writeTarget)}（${method} ${path}）${multi}`,
+        identity: attacker.name,
+        method,
+        path: fillCandPath(ctx, cand, resourceIdOf(ctx, writeTarget)),
+        body: null,
+        routeKey: cand.routeKeys?.[0] ?? null,
+        expect: `越权${verb}他人${candLabel}应被拒绝（401/403/404）`,
+        send: async (c, baseUrl) => {
+          const id = resourceIdOf(c, writeTarget);
+          const rereadPath = writeRereadPath(c, cand, readCands[0], id);
+          const attackPath = rereadPath ?? fillCandPath(c, cand, id);
+          const proof = { mode: isDelete ? "delete" : "modify", targetId: String(id) };
+          const reread = async () => {
+            if (!rereadPath) return null;
+            try {
+              return await httpJson(c, { baseUrl, method: "GET", path: rereadPath, identity: victim.name });
+            } catch {
+              return null;
+            }
+          };
+          const base = await reread();
+          proof.baseStatus = base?.status ?? null;
+          if (!base || !okStatus(base.status)) {
+            proof.baseMissing = true;
+            const res = base ?? { status: 0, statusText: "", body: "", json: null };
+            res._writeProof = proof;
+            return { res, path: attackPath, method };
+          }
+          const baseEntity = extractEntity(base.json, entityPathFor(c, null)) ?? writeTarget;
+          const picked = pickMutableField(baseEntity);
+          if (!isDelete && !picked) {
+            proof.noField = true;
+            const res = { ...base };
+            res._writeProof = proof;
+            return { res, path: rereadPath, method: "GET" };
+          }
+          const canary = isDelete ? null : `${picked.original}_gbw`;
+          const attackReq = { baseUrl, method, path: attackPath, identity: attacker.name };
+          if (!isDelete) {
+            proof.field = picked.field;
+            proof.original = picked.original;
+            proof.canary = canary;
+            attackReq.body = { [picked.field]: canary };
+          }
+          let res;
+          try {
+            res = await httpJson(c, attackReq);
+          } catch (e) {
+            res = { status: 0, statusText: "", body: "", json: null, error: String(e?.message ?? e).slice(0, 160) };
+          }
+          proof.attackStatus = res.status;
+          const after = await reread();
+          proof.rereadStatus = after?.status ?? null;
+          if (isDelete) {
+            // 只有「404」或「2xx 但对象不在」才算删除生效；复读通道本身不可用（如路由不支持 GET→405）
+            // 不算证据，宁缺不假。
+            proof.gone = !!after && (after.status === 404 || (okStatus(after.status) && !extractEntity(after.json, entityPathFor(c, null))));
+          } else {
+            const echo = res.json && JSON.stringify(res.json).includes(canary);
+            const inReread = !!after && okStatus(after.status) && JSON.stringify(after.json ?? after.body ?? "").includes(canary);
+            proof.changed = !!echo || inReread;
+            if (proof.changed) {
+              try {
+                await httpJson(c, { baseUrl, method, path: attackPath, identity: victim.name, body: { [picked.field]: picked.original } });
+                const check = await reread();
+                proof.restored = !!check && !JSON.stringify(check.json ?? check.body ?? "").includes(canary);
+              } catch {
+                proof.restored = false;
+              }
+            }
+          }
+          res._writeProof = proof;
+          return { res, path: attackPath, method };
+        },
+        verify: (res, phase) => {
+          const p = res._writeProof ?? {};
+          if (p.noField) {
+            return { verdict: VERDICT.INCONCLUSIVE, actual: `对象 #${p.targetId} 上没有可安全改写的字符串字段，写面用例未构造载荷，不判定` };
+          }
+          if (p.baseMissing) {
+            return { verdict: VERDICT.INCONCLUSIVE, actual: `归属人复读未见对象 #${p.targetId}（HTTP ${p.baseStatus}），本轮不打未在场的数据` };
+          }
+          const leaked = p.mode === "delete" ? p.gone === true : p.changed === true;
+          const detail = leaked
+            ? p.mode === "delete"
+              ? `证据：${victim.name} 复读 #${p.targetId} 已不存在（HTTP ${p.rereadStatus}），销毁不可回滚`
+              : `证据：归属人复读见到 ${p.field}=${p.canary}${p.restored ? "，原值已恢复" : "，原值恢复未确认"}`
+            : "";
+          return verifyAttack(res, phase, detail, leaked);
+        },
+        crossProof: (res) => {
+          const p = res._writeProof ?? {};
+          if (p.mode === "delete" && p.gone) return { note: `归属人复读确认对象 #${p.targetId} 消失（HTTP ${p.rereadStatus}）` };
+          if (p.mode === "modify" && p.changed) {
+            return { note: `攻击写入的 ${p.field}=${p.canary} 由归属人复读取得；已尝试恢复原值（${p.restored ? "成功" : "未确认"}）` };
+          }
+          return null;
+        },
+        impact: (res) => {
+          const p = res._writeProof ?? {};
+          if (p.mode === "delete" && p.gone) return `可越权删除他人${candLabel}（数据销毁不可恢复）`;
+          if (p.mode === "modify" && p.changed) return `可越权修改他人${candLabel}字段（${p.field}）`;
+          return null;
+        },
+      });
+    }
   }
 
   if (adminListPath && victim) {
@@ -4870,6 +5034,32 @@ async function assertTargetTouched(ctx, { baseUrl, evidence, phase }) {
   );
 }
 
+/**
+ * 族差集：按本轮真正建出的攻击用例 id 归族。
+ * - `probed`：建出用例并会发请求的族
+ * - `noCandidate`：引擎会打、但这一轮一个用例都没建出来的族（静态无候选）
+ * - `gateSkippedWrite`：有候选却被写面开关关掉的端点（从 noCandidate 里摘出来，别混成「没候选」）
+ * - `blackboxOnly`：白盒链路根本不打、只有黑盒才取证的那些族
+ * - `unknown`：不在族表里的用例 id（族表漂移时原样保留，不静默丢弃）
+ */
+export function attackSurfaceOf(attackCaseIds, { gateSkippedWrite = [], mutation = null } = {}) {
+  const probed = [];
+  const unknown = [];
+  for (const id of attackCaseIds) {
+    const name = whiteboxFamilyName(id);
+    if (!name) {
+      if (!unknown.includes(id)) unknown.push(id);
+    } else if (!probed.includes(name)) {
+      probed.push(name);
+    }
+  }
+  const writeFamily = whiteboxFamilyName("attack-write-foreign");
+  const noCandidate = WHITEBOX_FAMILIES.map((f) => f.name).filter(
+    (n) => !probed.includes(n) && !(n === writeFamily && gateSkippedWrite.length > 0)
+  );
+  return { probed, unknown, noCandidate, blackboxOnly: [...BLACKBOX_ONLY_FAMILIES], gateSkippedWrite, mutation };
+}
+
 export async function runPhase(ctx, { phase, baseUrl }) {
   ctx._lastDecisionSeq = 0;
   ctx._probePhase = phase;
@@ -5012,6 +5202,11 @@ export async function runPhase(ctx, { phase, baseUrl }) {
   const plannedSlots = [
     { slot: "readCandidate", prefix: "attack-read-foreign", count: planCandidates(ctx, "read").length },
     { slot: "cancelCandidate", prefix: "attack-cancel-foreign", count: planCandidates(ctx, "cancel").length },
+    // 写面槽位只在开关开启时进「该建没建」的对账——开关关闭是用户的明确配置，不是漏测；
+    // 漏测披露由下面单独的 gate 文案负责，不混进「身份/资源不足」。
+    ...(writeGatesOf(ctx).allowWrite
+      ? [{ slot: "writeCandidate", prefix: "attack-write-foreign", count: planCandidates(ctx, "write").length }]
+      : []),
     { slot: "unauthReadCandidate", prefix: "attack-anonymous-read", count: planCandidates(ctx, "unauthRead").length },
     { slot: "traversalCandidate", prefix: travBaseline.step.id, count: planCandidates(ctx, travBaseline.kind).length },
     { slot: "sqliCandidate", prefix: sqliBaseline.step.id, count: planCandidates(ctx, sqliBaseline.kind).length },
@@ -5037,6 +5232,37 @@ export async function runPhase(ctx, { phase, baseUrl }) {
     });
   } else if (phase === "pre") {
     ctx._unverifiedSlots = [];
+  }
+
+  // 写面开关关掉的候选：动态结论只对打过的请求负责——这里点名「有候选但本轮没打」，
+  // 让报告披露「写面未验证」，而不是让 DELETE/PATCH 候选静默消失。
+  if (phase === "pre") {
+    const wg = writeGatesOf(ctx);
+    const writeAll = planCandidates(ctx, "write");
+    const unprobed = wg.allowWrite
+      ? writeAll.filter((cd) => String(cd.method ?? "").toUpperCase() === "DELETE" && !wg.allowDelete)
+      : writeAll;
+    ctx._gateSkippedWrite = unprobed.map((cd) => `${cd.method} ${candPath(cd) ?? "?"}`);
+    if (unprobed.length > 0) {
+      ctx.emit({
+        kind: "discovery",
+        severity: SEVERITY.INFO,
+        message: `写面越权候选 ${unprobed.length} 个本轮未探测（${
+          wg.allowWrite ? "DELETE 需另开 mutation.allowDelete，删除不可回滚" : "mutation.allowWrite/allowDelete 默认关闭"
+        }）：${ctx._gateSkippedWrite.join("、")}——未探测不等于无漏洞，报告只对打过的请求下结论`,
+        data: { writeCandidates: ctx._gateSkippedWrite, allowWrite: wg.allowWrite, allowDelete: wg.allowDelete },
+      });
+    }
+  }
+
+  // 族差集披露：「引擎会哪些族」不等于「这一轮打了哪些族」。报告按实际建出的用例前缀
+  // 对账，把没候选的族、只有黑盒才打的族、被写面开关关掉的族分开点名，
+  // 避免读者把「本轮没报 SQL 注入」读成「SQL 注入已测过且防住了」。
+  if (phase === "pre") {
+    ctx._attackSurface = attackSurfaceOf(
+      cases.filter((c) => c.category === CASE_CATEGORY.ATTACK).map((c) => c.id),
+      { gateSkippedWrite: ctx._gateSkippedWrite ?? [], mutation: writeGatesOf(ctx) }
+    );
   }
 
   const attackSlots = cases.filter((c) => c.category === CASE_CATEGORY.ATTACK);

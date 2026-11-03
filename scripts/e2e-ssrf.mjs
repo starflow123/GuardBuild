@@ -9,8 +9,9 @@
  *   ② 已修复（GB_SSRF_HARDENED=1：解析 URL 后校验协议 + 主机白名单） → exit 0（not_reproducible）
  *      静态候选仍在，但 canary 不再收到回连 → 不建立漏洞基线。
  *
- * 说明：canary 只监听 127.0.0.1 的随机端口，只接受一次带随机令牌的路径。
- * Docker/远程目标无法回连宿主回环地址，此类目标会得到 inconclusive（不虚构证据）。
+ * 说明：canary 监听随机端口的一个随机令牌路径；宿主目标只绑 127.0.0.1，
+ * Docker 沙箱目标改经 host.docker.internal 回连（此时才绑全部接口）。
+ * 远程目标或容器网络不可达时会得到 inconclusive（不虚构证据）。
  *
  * 用法: node scripts/e2e-ssrf.mjs
  */

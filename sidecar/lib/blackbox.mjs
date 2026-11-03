@@ -2091,7 +2091,9 @@ const SSRF_PATH_GUESSES = [
 ];
 const SSRF_PARAM_GUESSES = ["url", "uri", "target", "src", "link", "redirect"];
 
-function startSsrfCanary() {
+// 与 probe.mjs 同款：默认仅绑回环；容器目标改经 host.docker.internal 回连宿主时绑 0.0.0.0，
+// 否则容器根本发不起这条连接（远程目标仍只记 inconclusive，不虚构证据）。
+function startSsrfCanary({ advertiseHost = "127.0.0.1" } = {}) {
   return new Promise((resolve, reject) => {
     const token = shortId("ssrf");
     const hits = [];
@@ -2101,11 +2103,12 @@ function startSsrfCanary() {
       res.end(`guardbuild-ssrf-canary:${token}`);
     });
     server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
+    const bind = advertiseHost === "127.0.0.1" ? "127.0.0.1" : "0.0.0.0";
+    server.listen(0, bind, () => {
       resolve({
         token,
         hits,
-        url: `http://127.0.0.1:${server.address().port}${SSRF_CANARY_PATH}${token}`,
+        url: `http://${advertiseHost}:${server.address().port}${SSRF_CANARY_PATH}${token}`,
         close: () => new Promise((r) => server.close(() => r())),
       });
     });
@@ -2125,7 +2128,7 @@ async function waitForCanaryHit(canary, timeoutMs = 700) {
 /**
  * SSRF：只把 canary URL 交给「名字像拉取远端资源」的参数。命中回连即成立；
  * 被服务端拒绝记 blocked；200 但无回连只记 inconclusive（参数可能被忽略）。
- * 目标在容器里时访问不到宿主回环，此时不会命中，属于已知边界。
+ * Docker 沙箱目标改经 host.docker.internal  advertised 回连（容器网络不可达时仍如实记 inconclusive）。
  */
 async function probeSsrf(ctx, baseUrl, routes, identity, limit = MAX_SSRF_ROUTES) {
   const records = [];
@@ -2143,7 +2146,9 @@ async function probeSsrf(ctx, baseUrl, routes, identity, limit = MAX_SSRF_ROUTES
   }
   for (const p of SSRF_PATH_GUESSES) push(p, SSRF_PARAM_GUESSES);
 
-  const canary = await startSsrfCanary();
+  const canary = await startSsrfCanary(
+    ctx.targetConfig?.docker?.enabled === true ? { advertiseHost: "host.docker.internal" } : {}
+  );
   let budget = MAX_SSRF_REQUESTS;
   let hits = 0;
   try {

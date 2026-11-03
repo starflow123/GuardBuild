@@ -3015,12 +3015,19 @@ function traversalAttemptPath(routePath, trav, payload, encoded) {
 }
 
 // —— SSRF 用例辅助：本地回连 canary ——
-// 用例把可被攻击者控制的 URL 指向本进程监听的 127.0.0.1 随机端口；
+// 用例把可被攻击者控制的 URL 指向本进程监听的随机端口；
 // 只有目标服务真的发起连接，canary 才会收到带随机令牌的请求。
+// Docker 沙箱目标经 host.docker.internal 回连宿主（advertiseHost），此时改绑 0.0.0.0
+// ——仅回环监听收不到容器发起的连接；非容器目标仍只绑回环，不多开暴露面。
 const SSRF_CANARY_PATH = "/gb-ssrf/";
 const SSRF_CANARY_WAIT_MS = 800;
+const DOCKER_HOST_ADVERTISE = "host.docker.internal";
 
-function startSsrfCanary() {
+function ssrfCanaryOpts(ctx) {
+  return ctx?.targetConfig?.docker?.enabled === true ? { advertiseHost: DOCKER_HOST_ADVERTISE } : {};
+}
+
+function startSsrfCanary({ advertiseHost = "127.0.0.1" } = {}) {
   return new Promise((resolve, reject) => {
     const token = shortId("ssrf");
     const hits = [];
@@ -3030,12 +3037,13 @@ function startSsrfCanary() {
       res.end(`guardbuild-ssrf-canary:${token}`);
     });
     server.once("error", reject);
-    server.listen(0, "127.0.0.1", () => {
+    const bind = advertiseHost === "127.0.0.1" ? "127.0.0.1" : "0.0.0.0";
+    server.listen(0, bind, () => {
       const port = server.address().port;
       resolve({
         token,
         hits,
-        url: `http://127.0.0.1:${port}${SSRF_CANARY_PATH}${token}`,
+        url: `http://${advertiseHost}:${port}${SSRF_CANARY_PATH}${token}`,
         close: () => new Promise((r) => server.close(() => r())),
       });
     });
@@ -3764,7 +3772,7 @@ export function buildCases(ctx, targets) {
       routeKey: cand.routeKeys?.[0] ?? null,
       expect: "请求中的 URL 不得由服务端直接发起（应校验协议与主机白名单），不得回连内网地址",
       send: async (c, baseUrl) => {
-        const canary = await startSsrfCanary();
+        const canary = await startSsrfCanary(ssrfCanaryOpts(c));
         try {
           const req = injectionReq(cand, ssrf, canary.url);
           let res = null;
@@ -3809,7 +3817,11 @@ export function buildCases(ctx, targets) {
           return {
             verdict: VERDICT.INCONCLUSIVE,
             actual: `HTTP ${res.status}，未观测到 canary 回连${
-              proof.fetchError ? `（目标侧请求失败：${proof.fetchError}）` : "（可能已有主机/协议白名单）"
+              proof.fetchError
+                ? `（目标侧请求失败：${proof.fetchError}）`
+                : String(proof.canaryUrl ?? "").includes("host.docker.internal")
+                ? "（Docker 沙箱经 host.docker.internal 回连宿主；容器网络不可达时同样不会命中，也不排除已有白名单）"
+                : "（可能已有主机/协议白名单）"
             }`,
           };
         }

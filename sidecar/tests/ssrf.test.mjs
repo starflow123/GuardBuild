@@ -163,3 +163,51 @@ test("buildCases + canary: 目标回连 canary 即判 vulnerable，硬化后判 
     await new Promise((r) => vulnerable.server.close(r));
   }
 });
+
+test("SSRF canary: Docker 沙箱目标经 host.docker.internal 回连，不可达时仍只记 inconclusive", async () => {
+  const tried = [];
+  // 模拟容器内的目标：能看到发进来的 canary URL，但本测试机不保证能解析
+  // host.docker.internal——只做「不真回连」的分支，验证形状与诚实判定。
+  const target = await listen(async (req, res) => {
+    const url = new URL(req.url, "http://127.0.0.1");
+    const fetched = url.searchParams.get("url") ?? "";
+    tried.push(fetched);
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ deferred: !fetched.startsWith("http://127.0.0.1:") }));
+  });
+
+  try {
+    const cand = {
+      path: "/api/preview",
+      fullPath: "/api/preview",
+      method: "GET",
+      ssrf: { source: "query", param: "url", sink: "fetch", form: "variable" },
+      routeKeys: ["preview.get"],
+    };
+    const cases = buildCases(
+      { plan: { ssrfCandidates: [cand] }, targetConfig: { docker: { enabled: true } } },
+      { attacker: { name: "alice", user: { id: 1 } }, victim: { name: "bob", user: { id: 2 } } }
+    );
+    const kase = cases[0];
+    const ctx = { ...stubCtx(), targetConfig: { docker: { enabled: true } } };
+    const out = await kase.send(ctx, target.url);
+
+    assert.equal(tried.length, 1);
+    assert.match(tried[0], /^http:\/\/host\.docker\.internal:\d+\/gb-ssrf\/ssrf/, "发给容器目标的 canary 地址须可被容器路由到宿主");
+    assert.match(out.res._ssrfProof.canaryUrl, /^http:\/\/host\.docker\.internal:/);
+    assert.equal(out.res._ssrfProof.hit, false, "本轮没有真回连，证据不得凭 URL 形状成立");
+    const verdict = kase.verify(out.res, "pre");
+    assert.equal(verdict.verdict, "inconclusive");
+    assert.match(verdict.actual, /host\.docker\.internal/, "不可达的解释须写进判定");
+
+    // 非 Docker 目标不受影响：仍只 advertised 回环地址
+    const casesLocal = buildCases(
+      { plan: { ssrfCandidates: [cand] }, targetConfig: { docker: { enabled: false } } },
+      { attacker: { name: "alice", user: { id: 1 } }, victim: { name: "bob", user: { id: 2 } } }
+    );
+    const outLocal = await casesLocal[0].send({ ...stubCtx(), targetConfig: null }, target.url);
+    assert.match(outLocal.res._ssrfProof.canaryUrl, /^http:\/\/127\.0\.0\.1:/);
+  } finally {
+    await new Promise((r) => target.server.close(r));
+  }
+});

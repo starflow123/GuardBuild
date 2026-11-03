@@ -228,6 +228,76 @@ test("analyzeProject: tRPC 越权过程进入候选，公开/管理过程不误�
   assert.equal(a.diagnostics.trpcProcedures, 7);
 });
 
+/** 通用内存项目分析器：fs.list/fs.read 全部走 files 映射，项目形态由测试自定 */
+async function analyzeFiles(root, files) {
+  const contents = new Map(Object.entries(files));
+  const listing = { entries: [...contents.keys()].map((p) => ({ path: p, kind: "file", size: 400 })) };
+  return analyzeProject({
+    projectRoot: root,
+    tokens: { project: "tok" },
+    rpc: {
+      request: async (method, params) => {
+        if (method === "fs.list") return listing;
+        if (method === "fs.read") return { content: contents.get(params.path) ?? "", size: 400, redacted: false, redactions: [] };
+        if (method === "fs.exists") return { exists: false };
+        throw new Error(`不应调用 ${method}`);
+      },
+    },
+  });
+}
+
+/**
+ * 假绿灯防线：tRPC 过程的输入走 `?input=` 包一层 zod 的 JSON，注入/穿越/SSRF/上传/JWT
+ * 这几族的探针只会发 REST 形态（query 参数 / 裸 body / 纯头部请求），打到 tRPC 端点
+ * 必然被 schema 拒成 400——而 400 会被读成「攻击被挡住」。这类候选存在即谎报覆盖，
+ * 所以静态层整族跳过（analyzer 的 wireRestOnly）。GraphQL 早有同形处理，这里补 tRPC。
+ * 断言取「全集」而不是逐族：tRPC 区块文本混进 req 引用时任何 REST 形态族都可能是伪候选。
+ */
+test("analyzeProject: tRPC 区块不产出注入/穿越/SSRF/上传/JWT 伪候选，越权候选保留", async () => {
+  const root = "/synth-trpc";
+  const files = {
+    [`${root}/server/router.ts`]: [
+      'import { initTRPC, TRPCError } from "@trpc/server";',
+      'import { z } from "zod";',
+      'import jwt from "jsonwebtoken";',
+      'import fs from "node:fs";',
+      "const JWT_SECRET = \"synth-hardcoded-signing-secret-2026\";",
+      "const t = initTRPC.create();",
+      "const isAuthed = t.middleware(({ ctx, next }) => {",
+      "  const claims = jwt.verify(ctx.token, JWT_SECRET); // 验签未固定算法 + 硬编码密钥",
+      '  if (!claims?.sub) throw new TRPCError({ code: "UNAUTHORIZED" });',
+      "  return next({ ctx: { user: { id: claims.sub } } });",
+      "});",
+      "const protectedProcedure = t.procedure.use(isAuthed);",
+      "export const appRouter = t.router({",
+      "  me: {",
+      "    profile: protectedProcedure",
+      "      .input(z.object({ id: z.string() }))",
+      "      .query(async ({ input }) => {",
+      "        return { profile: userRepo.findById(input.id) };",
+      "      }),",
+      "  },",
+      "  doc: {",
+      "    read: protectedProcedure",
+      "      .input(z.object({ name: z.string() }))",
+      "      .query(async ({ input }) => {",
+      "        const { name } = input; // 不是 req 污点源；sink 紧邻也不该产出穿越候选",
+      '        return { text: fs.readFileSync("/srv/public/" + name, "utf8") };',
+      "      }),",
+      "  },",
+      "});",
+    ].join("\n"),
+  };
+  const a = await analyzeFiles(root, files);
+  const trpcCands = a.candidates.filter((c) => c.style === "trpc");
+  assert.ok(trpcCands.length > 0, "tRPC 候选仍要存在——排除不是把 tRPC 整体关掉");
+  const restOnlyKinds = new Set(["sqli-suspect", "traversal-suspect", "cmdi-suspect", "ssrf-suspect", "upload-suspect", "jwt-suspect"]);
+  for (const c of trpcCands) {
+    assert.ok(!restOnlyKinds.has(c.kind), `tRPC 区块不应产出 ${c.kind}（${c.fullPath}）：探针只会发 REST 形态，打不中还会被记成挡住`);
+  }
+  assert.equal(a.diagnostics.trpcProcedures, 2);
+});
+
 test("buildProbePlan: tRPC 候选填充读/取消槽位，列表过程作资源发现端点", async () => {
   const a = await analyzeFixture();
   const plan = buildProbePlan(a, { loginPathOverride: "/api/trpc/auth.login" });

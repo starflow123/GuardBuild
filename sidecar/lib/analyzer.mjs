@@ -745,7 +745,12 @@ export async function analyzeProject(ctx) {
     // 可疑「路径穿越」：文件读取 sink 的相邻语句链中出现请求输入（读取族，无修复策略）
     // GraphQL 区块的 text 含 resolver 体，可能恰好引用文件读取；穿越取证走 HTTP 路径参数，
     // 与 GraphQL 单端点模型不符，跳过（避免造出无法寻址的伪穿越用例）
-    const traversal = s.graphql ? null : findTraversalSignal(s.text);
+    // tRPC 同理且更危险：注入点要放进 query/body 参数，而 tRPC 的输入是 `?input=` 包一层
+    // zod 校验的 JSON——REST 形态的探针必被 schema 拒成 400，还会被记成「攻击被挡住」。
+    // 对这两类线形态发注入/穿越/SSRF/上传/JWT 探针属于「报称打过、形状注定打不中」，
+    // 整族跳过；接 tRPC 线形态属能力增长，走能力请求单。
+    const wireRestOnly = s.graphql || s.trpc;
+    const traversal = wireRestOnly ? null : findTraversalSignal(s.text);
     if (traversal) {
       candidates.push({
         ...ep,
@@ -756,7 +761,7 @@ export async function analyzeProject(ctx) {
     }
 
     // 可疑「SQL 注入」：请求输入经模板/拼接进入 SQL 首参（参数化查询不入选）
-    const sqli = s.graphql ? null : findSqlInjectionSignal(s.text);
+    const sqli = wireRestOnly ? null : findSqlInjectionSignal(s.text);
     if (sqli && path) {
       candidates.push({
         ...ep,
@@ -767,7 +772,7 @@ export async function analyzeProject(ctx) {
     }
 
     // 可疑「命令注入」：请求输入进入 shell 执行入口（exec/os.system/subprocess）
-    const cmdi = s.graphql ? null : findCommandInjectionSignal(s.text);
+    const cmdi = wireRestOnly ? null : findCommandInjectionSignal(s.text);
     if (cmdi && path) {
       candidates.push({
         ...ep,
@@ -784,7 +789,7 @@ export async function analyzeProject(ctx) {
     // }
 
     // 可疑「SSRF」：请求输入直接作为 HTTP 客户端的 URL（本地 canary 回连复现）
-    const ssrf = s.graphql ? null : findSsrfSignal(s.text);
+    const ssrf = wireRestOnly ? null : findSsrfSignal(s.text);
     if (ssrf && path) {
       candidates.push({
         ...ep,
@@ -795,7 +800,7 @@ export async function analyzeProject(ctx) {
     }
 
     // 可疑「文件上传」：服务端接收 multipart 文件；是否可上传主动内容由动态用例取证
-    const upload = s.graphql ? null : findUploadSignal(s.text);
+    const upload = wireRestOnly ? null : findUploadSignal(s.text);
     if (upload && path && ep.method && ep.method !== "GET") {
       candidates.push({
         ...ep,
@@ -807,7 +812,7 @@ export async function analyzeProject(ctx) {
 
     // 可疑「JWT 伪造」：受认证端点 + 文件级验签缺口（只解码/允许 none/未固定算法/硬编码密钥）。
     // 认的是「认证端点」而不是「调用点」：校验通常被封装在共享 helper 中。
-    const jwt = s.graphql ? null : jwtByFile.get(normFile) ?? findJwtSignal(s.text);
+    const jwt = wireRestOnly ? null : jwtByFile.get(normFile) ?? findJwtSignal(s.text);
     if (jwt && path && hasAuth) {
       candidates.push({ ...ep, kind: "jwt-suspect", resource: "token", jwt });
     }

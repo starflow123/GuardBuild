@@ -116,6 +116,9 @@ jobs:
       - name: 提议者双路独立提案 E2E（本机 mock：A/B 互不见文本 + 同一菜单两份草稿有差异 + 对比代理只有降级权 + gate/黑盒不进入）
         run: node scripts/e2e-dual.mjs
 
+      - name: 草稿→判卷→注册通路 E2E（真判卷器 + 真宿主：顶替目录跑的是草稿 + 只考开发集 + 注册四道拒收）
+        run: node scripts/e2e-draft-grade.mjs
+
       - name: LLM 侦察 E2E（本机 mock DeepSeek + 磁盘缓存复用，无需真实密钥）
         run: node scripts/e2e-llm-scout.mjs
 

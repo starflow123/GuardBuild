@@ -50,6 +50,7 @@
     "e2e:attackplan": "node scripts/e2e-attackplan.mjs",
     "e2e:explore": "node scripts/e2e-explore.mjs",
     "e2e:dual": "node scripts/e2e-dual.mjs",
+    "e2e:draft-grade": "node scripts/e2e-draft-grade.mjs",
     "e2e:docker": "node scripts/e2e-docker.mjs",
     "benchmark:realworld": "node scripts/benchmark-realworld.mjs",
     "benchmark:indie": "node scripts/benchmark-indie.mjs"

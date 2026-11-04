@@ -13,6 +13,9 @@
  *      两份草稿各带 A-/B- 前缀落进数据目录，sidecar/recipes/ 一个字节都不变。
  *   r4 gate + 三闸全开：结构性禁用，0 次模型调用，报告里没有双路章节。
  *   r5 纯黑盒外部目标 + 三闸全开：这一路根本不进入。
+ *   r6 判卷层落了成绩之后（第 6/14 项那条通路的**读取侧**）：只给 A 放一条形状一致的样例成绩，
+ *      A 的两条成绩事实亮绿、B 仍如实无成绩，结论照样是引擎落的「退回」，且 grades/ 逐字节没被扫描改过。
+ *      真判卷那条通路在 scripts/e2e-draft-grade.mjs 里演练，这一轮不假装考过卷。
  *
  * 安全边界与第 13 项同一口径：模型走私的内容、模型原文（note）、契约哨兵、身份口令
  * 都不许进视图/事件/报告/草稿文件/审计库；A 一路连响应正文的键都收不到。
@@ -23,7 +26,7 @@
  * 用法: node scripts/e2e-dual.mjs
  */
 import { spawn, spawnSync } from "node:child_process";
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { createServer } from "node:http";
 import { cpSync, existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import path from "node:path";
@@ -31,6 +34,8 @@ import readline from "node:readline";
 import { fileURLToPath } from "node:url";
 import { openAuditDb, queryAudit } from "./lib/auditdb.mjs";
 import { PROPOSERS, privateLinesOf, proposerById } from "../sidecar/lib/proposers.mjs";
+import { GRADE_VERSION } from "../sidecar/lib/grader.mjs";
+import { readGradeRecord, recipeSha256, writeGradeRecord } from "../sidecar/lib/draftgrade.mjs";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const demoDir = path.join(repoRoot, ".demo-dual");
@@ -451,6 +456,19 @@ function draftFiles(label) {
   return out;
 }
 
+/** 成绩目录快照：扫描这一侧声称「只读不写成绩」，就用逐文件的字节数+内容哈希比给它看 */
+function gradeSnapshot(dir) {
+  if (!dir || !existsSync(dir)) return "empty";
+  return readdirSync(dir)
+    .filter((n) => n.endsWith(".json"))
+    .sort()
+    .map((n) => {
+      const buf = readFileSync(path.join(dir, n));
+      return `${n}:${buf.length}:${createHash("sha256").update(buf).digest("hex").slice(0, 12)}`;
+    })
+    .join("|");
+}
+
 function recipeSnapshot() {
   const dir = path.join(repoRoot, "sidecar", "recipes");
   return readdirSync(dir)
@@ -468,7 +486,7 @@ function promptsFor(state, who) {
 }
 
 async function main() {
-  console.log("[DUAL] 0/6 准备靶场与工作区…");
+  console.log("[DUAL] 0/7 准备靶场与工作区…");
   rmSync(demoDir, { recursive: true, force: true });
   mkdirSync(dataDir, { recursive: true });
   if (!existsSync(exe)) throw new Error(`未找到无头宿主: ${exe}（先 cargo build --no-default-features --bin guardbuild-headless）`);
@@ -512,7 +530,7 @@ async function main() {
   let target = null;
   try {
     // ============ r1 默认关闭 ============
-    console.log("\n[DUAL] 1/6 契约没点名提议者、环境变量也没开 → 一次都不问…");
+    console.log("\n[DUAL] 1/7 契约没点名提议者、环境变量也没开 → 一次都不问…");
     const s1 = await interactive("r1-off", wsOff, envOn);
     const rep1 = readReport("r1-off");
     check("r1 判定链照常跑完（有漏洞、有证据）", rep1 != null && vulnerableEvidenceCount("r1-off") >= 1, `outcome=${rep1?.verdict?.outcome ?? "无报告"}`);
@@ -521,7 +539,7 @@ async function main() {
     check("r1 没有草稿落盘", draftFiles("r1-off").length === 0);
 
     // ============ r2 只开探索区：双路不是顺手就开 ============
-    console.log("\n[DUAL] 2/6 只开第 13 项那条单路：dual 段必须不存在…");
+    console.log("\n[DUAL] 2/7 只开第 13 项那条单路：dual 段必须不存在…");
     const s2 = await interactive("r2-single", wsSingle, envOn);
     const e2 = s2.view.exploration ?? readReport("r2-single")?.exploration ?? null;
     check("r2 单路真跑：三次询问、两次实发", delta() === 3 && e2?.modelCalls === 3 && e2?.requestsUsed === 2, `calls=${delta()} modelCalls=${e2?.modelCalls} requests=${e2?.requestsUsed}`);
@@ -530,7 +548,7 @@ async function main() {
     check("r2 单路提示词里没有双路的清单段与响应指引", promptsFor(state, "single").every((p) => !p.includes('"shapes"') && !p.includes('"observe"')), "");
 
     // ============ r3 双路真跑 ============
-    console.log("\n[DUAL] 3/6 双路独立提案：同一菜单各打各的 → 草稿有差异 → 对比只出退回…");
+    console.log("\n[DUAL] 3/7 双路独立提案：同一菜单各打各的 → 草稿有差异 → 对比只出退回…");
     const s3 = await interactive("r3-dual", wsDual, envOn);
     const rep3 = readReport("r3-dual");
     const md3 = readMarkdown("r3-dual");
@@ -593,7 +611,7 @@ async function main() {
     check("r3 报告 Markdown 有双路章节与隔离/差异/结论三块", md3.includes("## 探索区双路") && md3.includes("提示词隔离") && md3.includes("结构差异（确定性代码算的") && md3.includes("对比结论"), "");
     check("r3 报告把「为什么这一节永远没有通过」写在纸上", md3.includes("为什么这一节永远没有「通过」") && md3.includes("对比代理只有降级权"), "");
     check("r3 报告如实标出模型说了合并但被引擎降回退回", md3.includes("被引擎降回退回"), "");
-    check("r3 成绩那一栏写的是「无（草稿未判卷）」", md3.includes("无（草稿未判卷）"), "");
+    check("r3 成绩那一栏如实写着无成绩", md3.includes("无（这条草稿还没有考卷成绩）"), `成绩栏=${JSON.stringify((md3.match(/无（[^）]*）/g) ?? []).slice(0, 4))}`);
     check("r3 报告摘要行把双路事实带进结论段", /探索区双路独立提案：A\/B 两路共 2 次实发/.test(md3), "");
     check("r3 探索流量不进证据库：pre 证据条数与单路轮一致", preEvidenceCount("r3-dual") === preEvidenceCount("r2-single"), `pre r2=${preEvidenceCount("r2-single")} r3=${preEvidenceCount("r3-dual")}`);
     check(
@@ -623,7 +641,7 @@ async function main() {
     );
 
     // ============ r4 gate：结构性禁用 ============
-    console.log("\n[DUAL] 4/6 gate + 三闸全开 → 结构性禁用…");
+    console.log("\n[DUAL] 4/7 gate + 三闸全开 → 结构性禁用…");
     before = state.calls;
     state.base = before;
     state.per = {};
@@ -648,7 +666,7 @@ async function main() {
     check("r4 gate 没有草稿落盘", draftFiles("r4-gate").length === 0, `files=${draftFiles("r4-gate").length}`);
 
     // ============ r5 纯黑盒：这一路不进入 ============
-    console.log("\n[DUAL] 5/6 黑盒模式 + 三闸全开 → 双路不进入…");
+    console.log("\n[DUAL] 5/7 黑盒模式 + 三闸全开 → 双路不进入…");
     target = await startTarget();
     before = state.calls;
     state.base = before;
@@ -669,9 +687,70 @@ async function main() {
     check("r5 视图与报告无 exploration/dual 段", rep5 != null && s5.view.exploration == null && rep5.exploration == null, "");
     check("r5 无探索事件", !s5.events.some((ev) => ev.kind === "exploration"), "");
 
-    // ============ 6/6 跨轮安全边界 ============
-    console.log("\n[DUAL] 6/6 安全边界与隔离实况…");
-    check("每次出站都带 Bearer（密钥只从环境经 Host 传递）", state.authHeaders.length === 8 && state.authHeaders.every((h) => h === `Bearer ${MOCK_KEY}`), `headers=${state.authHeaders.length}`);
+    // ============ r6 判卷层落了成绩之后：扫描读得到，但自己写不出成绩 ============
+    // 成绩记录由 `benchmark-grader.mjs --draft` 产出（那条真通路在 e2e:draft-grade 里演练）。
+    // 这一轮只验**读取侧**：所以这里放的是一份「形状与判卷器产出一致」的样例记录，
+    // 并且只给 A 那一路放——B 打的是匿名读（`request.anonymous`），那一族今天根本没有考卷（M5 第 199 项）。
+    // 单边有成绩时必须仍然落「退回」，这正是这条通路最该有的假绿灯闸门。
+    console.log("\n[DUAL] 6/7 判卷层落了成绩之后：扫描只读得到 A 的成绩，B 仍然没考卷 → 依然退回…");
+    // 把 r3 那一批草稿整棵复制到 r6 自己的数据目录（草稿键只由「菜单形状 + 模型 + 提议者 + 提示词摘要」决定，
+    // 同一个靶子再跑一次键不变，所以判卷层落下的成绩仍然挂得住）。r6 的审计库/报告各走自己的标签目录。
+    const srcExplore = path.join(dataDir, "r3-dual", "exploration");
+    const hashDirs = existsSync(srcExplore) ? readdirSync(srcExplore).filter((n) => statSync(path.join(srcExplore, n)).isDirectory()) : [];
+    mkdirSync(path.join(dataDir, "r6-graded"), { recursive: true });
+    if (hashDirs.length) cpSync(srcExplore, path.join(dataDir, "r6-graded", "exploration"), { recursive: true });
+    const gradesDir = hashDirs.length ? path.join(dataDir, "r6-graded", "exploration", hashDirs[0], "grades") : null;
+    const draftsOnDisk = draftFiles("r6-graded")
+      .map((f) => JSON.parse(readFileSync(f, "utf8")))
+      .filter((j) => j?.proposal?.id === "A" || j?.proposal?.id === "B");
+    const artA = draftsOnDisk.find((j) => j?.proposal?.id === "A");
+    const artB = draftsOnDisk.find((j) => j?.proposal?.id === "B");
+    check("r6 前置：r3 那两份草稿还在数据目录里（成绩就落在同一批草稿的隔壁目录）", !!gradesDir && !!artA?.draftKey && !!artB?.draftKey, `grades=${gradesDir ?? "无"}`);
+    const recipeA = artA?.draft?.recipe ?? null;
+    const seeded = writeGradeRecord({
+      gradeDir: gradesDir,
+      record: {
+        gradeVersion: GRADE_VERSION,
+        draftKey: artA.draftKey,
+        recipeSha256: recipeSha256(recipeA),
+        familySlot: "idor-read",
+        draftFamily: recipeA?.family ?? null,
+        action: "request.as",
+        model: artA.model ?? null,
+        proposalId: "A",
+        runLabel: `sample-${String(artA.draftKey).slice(0, 12)}`,
+        overlayDir: ".grader/draft-overlay（样例记录，指向演练外部）",
+        overlayProof: { ok: true, seenIn: "vulnerable#1（样例）", envelope: "idor-read.json" },
+        caseIdMap: { from: "exp-1", to: "attack-read-foreign" },
+        exams: [{ examId: "idor-read--legacy-shop", split: "dev", repeat: 2, pass: true, gates: { hit: "passed", hardened_zero: "passed", clean_control: "passed", consistent: "passed" }, reasons: [] }],
+        pass: true,
+        whyNot: null,
+        gradedAt: Date.now(),
+        durationMs: 0,
+        registered: false,
+        note: "演练样例记录：形状与 scripts/benchmark-grader.mjs --draft 产出的一致，用来验证扫描侧「只读不写成绩」。真判卷见 scripts/e2e-draft-grade.mjs。",
+      },
+    });
+    check("r6 样例成绩落到 grades/ 且四项自校验通过（读得回来才算数）", seeded.ok === true && readGradeRecord({ gradeDir: gradesDir, draftKey: artA.draftKey, recipe: recipeA }).ok === true, `seeded=${JSON.stringify(seeded)}`);
+    const gradesBefore = gradeSnapshot(gradesDir);
+    const s6 = await interactive("r6-graded", wsDual, envOn);
+    const rep6 = readReport("r6-graded");
+    const md6 = readMarkdown("r6-graded");
+    const d6 = (s6.view.exploration ?? rep6?.exploration ?? {})?.dual ?? null;
+    const cmp6 = d6?.comparison ?? null;
+    const factOf = (name) => (cmp6?.facts ?? []).find((f) => f.fact === name)?.ok ?? null;
+    check("r6 又跑了双路 + 对比代理（5 次出站）", delta() === 5 && d6?.outcome === "ran", `calls=${delta()}`);
+    check("r6 A 那一路读到了成绩且是判卷层那条（不是会话自己造的）", factOf("A 有自己的成绩") === true && factOf("A 的成绩显示过卷") === true, `facts=${JSON.stringify((cmp6?.facts ?? []).map((f) => [f.fact, f.ok]))}`);
+    check("r6 读来的成绩带着外部实跑标签（runLabel 不是本轮会话名）", (d6?.proposals ?? []).find((p) => p.id === "A")?.grades?.runLabel === `sample-${String(artA.draftKey).slice(0, 12)}`, JSON.stringify((d6?.proposals ?? []).map((p) => [p.id, p.grades?.present, p.grades?.runLabel])));
+    check("r6 B 那一路仍然没有成绩（匿名读一族今天没有考卷，见 M5 第 199 项）", factOf("B 有自己的成绩") === false && (cmp6?.reasons ?? []).some((r) => /B 没有自己的考卷成绩/.test(String(r))), `reasons=${JSON.stringify(cmp6?.reasons)}`);
+    check("r6 单边过卷造不出绿灯：结论仍是退回，且是引擎自己退的（模型那句合并建议照样被降级）", cmp6?.decision === "return" && cmp6?.decidedBy === "engine" && cmp6?.downgraded_model_merge === true && cmp6?.registered === false, `decision=${cmp6?.decision} decidedBy=${cmp6?.decidedBy} downgraded=${cmp6?.downgraded_model_merge}`);
+    check("r6 报告里 A 那栏写着过卷与外部实跑标签、B 那栏如实写着无成绩", md6.includes("过卷（顶替族 `idor-read`") && md6.includes(`sample-${String(artA.draftKey).slice(0, 12)}`) && md6.includes("无（这条草稿还没有考卷成绩）"), `成绩栏=${JSON.stringify((md6.match(/无（[^）]*）/g) ?? []).slice(0, 4))}`);
+    check("r6 事件留痕写出「只读判卷器落下的记录，本会话不写成绩」", explorationEventMessages("r6-graded").some((m) => m.includes("草稿考卷成绩") && m.includes("A=过卷")), JSON.stringify(explorationEventMessages("r6-graded").slice(0, 4)));
+    check("r6 扫描这一侧没有改成绩：grades/ 逐字节没动", gradeSnapshot(gradesDir) === gradesBefore, `${gradesBefore} → ${gradeSnapshot(gradesDir)}`);
+
+    // ============ 7/7 跨轮安全边界 ============
+    console.log("\n[DUAL] 7/7 安全边界与隔离实况…");
+    check("每次出站都带 Bearer（密钥只从环境经 Host 传递）", state.authHeaders.length === 13 && state.authHeaders.every((h) => h === `Bearer ${MOCK_KEY}`), `headers=${state.authHeaders.length}`);
     check("请求为 JSON 模式（response_format=json_object, stream=false）", state.responseFormat === "json_object" && state.stream === false, `format=${state.responseFormat} stream=${state.stream}`);
     const allPrompts = state.prompts.join("\n");
     const promptA = promptsFor(state, "A").join("\n");

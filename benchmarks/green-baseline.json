@@ -1,6 +1,6 @@
 {
   "version": "gb-green-baseline-1",
-  "updatedAt": "2026-11-01T06:28:19.256Z",
+  "updatedAt": "2026-11-04T11:18:01.662Z",
   "suites": {
     "whitebox": {
       "keys": [
@@ -49,8 +49,8 @@
         "whitebox/upload-shop",
         "whitebox/upload-shop#attack-upload"
       ],
-      "lastRunAt": "2026-11-01T06:14:51.868Z",
-      "lastRunHead": "0e421d3",
+      "lastRunAt": "2026-11-04T11:13:15.215Z",
+      "lastRunHead": "811edc4",
       "corpusVersion": 1,
       "regressions": 0
     },
@@ -128,8 +128,8 @@
         "blackbox/wide-shop-mutate#blackbox-vertical-*",
         "blackbox/wide-shop-mutate#blackbox-xss-*"
       ],
-      "lastRunAt": "2026-11-01T06:16:18.650Z",
-      "lastRunHead": "0e421d3",
+      "lastRunAt": "2026-11-04T11:16:17.475Z",
+      "lastRunHead": "811edc4",
       "corpusVersion": 1,
       "regressions": 0
     },
@@ -171,8 +171,8 @@
         "grader/sqli-injection--notice-shop",
         "grader/sqli-injection--notice-shop#attack-sql-injection"
       ],
-      "lastRunAt": "2026-11-01T06:28:19.256Z",
-      "lastRunHead": "0e421d3",
+      "lastRunAt": "2026-11-04T11:18:01.662Z",
+      "lastRunHead": "811edc4",
       "corpusVersion": "6 张考卷",
       "regressions": 0
     }

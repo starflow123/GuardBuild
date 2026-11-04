@@ -404,7 +404,7 @@ export function buildDraft(trace, { family = null, maxSteps = EXPLORATION_DEFAUL
     rejections: validation.ok ? [] : validation.rejections.map((r) => ({ where: r.where, rule: r.rule, why: r.why ?? null })),
     rejectionText: formatRejections(validation),
     registered: false,
-    note: "草稿未过判卷器（第 6 项）：不得进判定链，不得写入 sidecar/recipes/。过表校验只代表填表合法，不代表打得中。",
+    note: "草稿未过判卷器（第 6 项）：不得进判定链，不得写入 sidecar/recipes/。过表校验只代表填表合法，不代表打得中。要拿成绩请跑 `node scripts/benchmark-grader.mjs --draft=<本产物文件>`（只考开发集，成绩落在同目录 grades/ 下，注册仍是人工动作）。",
   };
 }
 
@@ -440,6 +440,21 @@ function artifactDir(root) {
   let p = String(root).replace(/\\/g, "/").replace(/\/+$/, "");
   if (process.platform === "win32") p = p.toLowerCase();
   return join(base, "exploration", createHash("sha256").update(p).digest("hex").slice(0, 16));
+}
+
+/** 草稿产物目录（判卷器与扫描侧共用的定位方式） */
+export function explorationArtifactDir(root) {
+  return artifactDir(root);
+}
+
+/**
+ * 考卷成绩目录：`<草稿目录>/grades/<草稿键>.json`。
+ * 写的一方是判卷器（`benchmark-grader.mjs --draft`，人工启动）；扫描这一侧只读，
+ * 读不到就按「没有成绩」处理——成绩不是扫描自己能造的东西（红线 4）。
+ */
+export function explorationGradeDir(root) {
+  const dir = artifactDir(root);
+  return dir ? join(dir, "grades") : null;
 }
 
 /** 键只取「本轮可打组合的形状」+ 模型名 + 提议者 + 提示词摘要：菜单或措辞变了就重探，双路也不互相覆盖草稿 */
@@ -488,6 +503,7 @@ export function writeExplorationArtifact(ctx, result) {
     writeArtifactAtomic(file, {
       version: EXPLORATION_VERSION,
       savedAt: Date.now(),
+      draftKey: result.draftKey ?? null,
       model: result.model ?? null,
       proposal: result.proposal ?? null,
       menuFingerprint: result.menuFingerprint ?? null,

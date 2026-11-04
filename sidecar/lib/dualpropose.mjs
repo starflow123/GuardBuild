@@ -331,20 +331,30 @@ export function decideComparison(dual, { opinion = null, grades = null } = {}) {
   push("B 草稿存在且过动作表", draftOkB, `B 的草稿${bb?.summary?.draft ? "被动作表拒收" : "没有产出"}：草稿本身不成立，无从合并`);
   push("两份草稿确有差异", dual?.draftsDiffer === true, dual?.diff?.identical ? "两路草稿的打法集合逐条相同（B 是 A 换皮）——双路没有带来多样性" : "两路都没有可用草稿");
 
-  // 「各自过考卷，不许共享成绩」：成绩必须存在、必须挂在这一路自己的 draftKey 上、两次跑的标签必须不同
+  // 「各自过考卷，不许共享成绩」：成绩必须存在、必须挂在这一路自己的 draftKey 上、必须显示过卷、两次跑的标签必须不同。
+  // 成绩由判卷器的 `--draft` 模式落盘（红线 4：扫描这一侧只读不写），读不到就是「没有成绩」→ 退回。
   const gA = grades?.[a?.id] ?? a?.grades?.[a?.id] ?? null;
   const gB = grades?.[bb?.id] ?? bb?.grades?.[bb?.id] ?? null;
   const ownGrade = (p, g) => {
     if (!p) return [false, "这一路不存在"];
-    if (!g) return [false, `提议者 ${p.id} 没有自己的考卷成绩：草稿未判卷（第 6 项的闸要跑过三份变体），不许借另一路的成绩`];
+    if (!g || g.present === false) {
+      return [false, `提议者 ${p.id} 没有自己的考卷成绩${g?.whyNot ? `（${String(g.whyNot).slice(0, 120)}）` : ""}：草稿未判卷（第 6 项的闸要跑过三份变体），不许借另一路的成绩`];
+    }
     if (g.provenance !== p.summary?.draftKey) return [false, `提议者 ${p.id} 的成绩 provenance 与它自己的草稿键不一致——成绩不是它那次跑产的`];
+    return [true, ""];
+  };
+  const showsPass = (p, g) => {
+    if (!g || g.present === false) return [false, `提议者 ${p.id} 没有成绩，谈不上过卷`];
+    if (g.pass !== true) return [false, `提议者 ${p.id} 的成绩没过卷：${String(g.whyNot ?? "四道闸未全过").slice(0, 160)}`];
     return [true, ""];
   };
   const [okA, whyA] = ownGrade(a, gA);
   const [okB, whyB] = ownGrade(bb, gB);
   push("A 有自己的成绩", okA, whyA);
   push("B 有自己的成绩", okB, whyB);
-  if (gA && gB) push("两份成绩来自两次独立实跑", (gA.runLabel ?? null) !== (gB.runLabel ?? null), "两份成绩的实跑标签相同：那是同一次跑的成绩被共享了");
+  push("A 的成绩显示过卷", okA && showsPass(a, gA)[0], showsPass(a, gA)[1]);
+  push("B 的成绩显示过卷", okB && showsPass(bb, gB)[0], showsPass(bb, gB)[1]);
+  if (okA && okB) push("两份成绩来自两次独立实跑", (gA.runLabel ?? null) !== (gB.runLabel ?? null) && !!gA.runLabel && !!gB.runLabel, "两份成绩的实跑标签相同或缺失：那是同一次跑的成绩被共享了");
 
   // 「建议合并」这个格子只能由对比代理自己填出来：它缺席或写得越界时，引擎不替它做决定。
   push("拿到合法的对比意见", opinion?.ok === true, `没有合法的对比意见（${String(opinion?.rejected ?? "未调用对比代理").slice(0, 80)}）：宁可退回，也不替没说话的一方写「建议合并」`);

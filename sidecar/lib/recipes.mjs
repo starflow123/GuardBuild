@@ -24,6 +24,21 @@ import { VARIANT_AXES } from "./attackvariants.mjs";
 
 const RECIPES_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "recipes");
 
+/**
+ * 判卷模式的「配方顶替目录」（#202）：草稿从没注册过，而执行器只认 `sidecar/recipes/` 里的表，
+ * 于是「拿考卷考一张草稿」此前根本没有通路——双路的结论因此永远停在「没有成绩」。
+ * 这一层只开一个**判卷专用**的入口：目录由 `GUARDBUILD_RECIPES_OVERLAY` 给出，
+ * 里面每份文件必须显式声明 `gradingOnly: true` 与它顶替的族名，装载的仍是同一套校验。
+ *
+ * 三条不许松的地方：
+ *  - 环境变量给了但目录不存在 → 当场抛错，绝不静默退回注册配方（那会把「考的是草稿」写成「考的是注册配方」）；
+ *  - 顶替文件里没有 `gradingOnly` 或族名与文件名不符 → 整份拒收（手写一张表丢进目录就想冒充注册配方，不行）；
+ *  - 本进程用过哪些顶替，`recipeOverlayHits()` 全量留给报告披露——扫描报告不许看不出来自己跑的是草稿。
+ *
+ * 常量值必须与 `overlayDirOrNull()` 里那处字面读取同名（宿主契约测试只认字面形式）。
+ */
+export const RECIPES_OVERLAY_ENV = "GUARDBUILD_RECIPES_OVERLAY";
+
 /** 哪些动作接受 path 参数：接受就得填成计划槽位，填成字面路径一律拒收（见 inspectRecipe） */
 const ACTION_PARAMS = new Map(ACTIONS.map((a) => [a.name, new Set(a.params ?? [])]));
 
@@ -132,6 +147,56 @@ export function listRecipeIds() {
 }
 
 const cache = new Map();
+/** 本进程用过的顶替记录（recipeId -> {file, overlayOf, dir}），报告拿它披露「这一轮跑的不是注册配方」 */
+const overlayHits = new Map();
+
+/** 顶替目录：没设环境变量就是 null（常规扫描不受影响）；设了就必须是一个真实目录 */
+function overlayDirOrNull() {
+  // 这里必须把环境变量名整个写死（宿主那条 Rust 契约测试只认字面形式，改名成变量下标就等于把这条开关
+  // 从契约网里漏出去——漏出去的症状是「草稿顶替静默不生效且不报错」）。
+  const raw = process.env.GUARDBUILD_RECIPES_OVERLAY;
+  if (typeof raw !== "string" || !raw.trim()) return null;
+  const dir = path.resolve(raw.trim());
+  if (!fs.existsSync(dir) || !fs.statSync(dir).isDirectory()) {
+    throw new RecipeRejected("(overlay)", `${RECIPES_OVERLAY_ENV} 指向的目录不存在或不是目录：${dir}——判卷模式不许静默退回注册配方`);
+  }
+  return dir;
+}
+
+/** 这一轮从顶替目录装载过哪些族（报告与 e2e 读它，不信声明只信装载记录） */
+export function recipeOverlayHits() {
+  return [...overlayHits.entries()].map(([recipeId, h]) => ({ recipeId, ...h }));
+}
+
+/** 单测与逐草稿判卷之间要清掉记录，否则第二张草稿的成绩会带着第一张的披露 */
+export function resetRecipeOverlayHits() {
+  overlayHits.clear();
+  for (const k of [...cache.keys()]) if (k.includes("\0")) cache.delete(k);
+}
+
+/**
+ * 顶替文件的格式：外层是判卷信封，内层 `recipe` 才是被考的那张表。
+ * 信封存在的意义是让「这是草稿」这件事写在文件里，而不是靠目录名或调用方口头保证。
+ */
+function readOverlayRecipeFile(file, recipeId, dir) {
+  let wrapped = null;
+  try {
+    wrapped = JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch (e) {
+    throw new RecipeRejected(recipeId, `顶替文件 JSON 解析失败（${file}）：${e.message}`);
+  }
+  if (!wrapped || typeof wrapped !== "object" || wrapped.gradingOnly !== true) {
+    throw new RecipeRejected(recipeId, `顶替文件缺 gradingOnly: true（${file}）：只有判卷器写出的草稿允许顶替注册配方，手写一份丢进目录不等于注册（红线 2/8）`);
+  }
+  if (wrapped.familySlot !== recipeId) {
+    throw new RecipeRejected(recipeId, `顶替文件声明的族槽位是 ${JSON.stringify(wrapped.familySlot)}，文件名却是 ${recipeId}：顶替对象必须自己说得清顶的是哪一族`);
+  }
+  if (!wrapped.recipe || typeof wrapped.recipe !== "object") {
+    throw new RecipeRejected(recipeId, `顶替文件缺 recipe 段（${file}）`);
+  }
+  overlayHits.set(recipeId, { file, overlayOf: String(wrapped.draftKey ?? ""), dir });
+  return wrapped.recipe;
+}
 
 /**
  * 检查一张已经解析好的配方（装载与单测走同一条路，不给测试开后门）：
@@ -209,24 +274,32 @@ export function inspectRecipe(recipe, recipeId) {
 /**
  * 装载一张配方：读文件 → JSON 解析 → inspectRecipe 全套校验。
  * 不过就抛 RecipeRejected，调用方（buildCases）不许回退到写死的结构。
+ * 设了顶替目录且该族有顶替文件时，装载的是顶替文件里的表——校验一步不少（判据名、槽位、载荷集照查）。
  */
 export function loadRecipe(recipeId) {
-  if (cache.has(recipeId)) return cache.get(recipeId);
+  const dir = overlayDirOrNull();
+  const cacheKey = dir ? `${dir}\0${recipeId}` : recipeId;
+  if (cache.has(cacheKey)) return cache.get(cacheKey);
   const file = path.join(RECIPES_DIR, `${recipeId}.json`);
-  let raw = null;
-  try {
-    raw = fs.readFileSync(file, "utf8");
-  } catch {
-    throw new RecipeRejected(recipeId, `找不到配方文件 ${path.relative(path.join(RECIPES_DIR, "..", ".."), file)}`);
-  }
+  const shadow = dir ? path.join(dir, `${recipeId}.json`) : null;
   let recipe = null;
-  try {
-    recipe = JSON.parse(raw);
-  } catch (e) {
-    throw new RecipeRejected(recipeId, `JSON 解析失败：${e.message}`);
+  if (shadow && fs.existsSync(shadow)) {
+    recipe = readOverlayRecipeFile(shadow, recipeId, dir);
+  } else {
+    let raw = null;
+    try {
+      raw = fs.readFileSync(file, "utf8");
+    } catch {
+      throw new RecipeRejected(recipeId, `找不到配方文件 ${path.relative(path.join(RECIPES_DIR, "..", ".."), file)}`);
+    }
+    try {
+      recipe = JSON.parse(raw);
+    } catch (e) {
+      throw new RecipeRejected(recipeId, `JSON 解析失败：${e.message}`);
+    }
   }
   inspectRecipe(recipe, recipeId);
-  cache.set(recipeId, recipe);
+  cache.set(cacheKey, recipe);
   return recipe;
 }
 

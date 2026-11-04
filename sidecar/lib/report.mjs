@@ -24,6 +24,7 @@ function buildPocList(preEvidence, baseUrl) {
 import { PROTOCOL_VERSION, RPC_TO_HOST, SEVERITY, STATE_LABELS } from "../../shared/protocol.mjs";
 import { buildFixBriefs } from "./fixbrief.mjs";
 import { coverageSummary, describeOutcome } from "./coverage.mjs";
+import { recipeOverlayHits } from "./recipes.mjs";
 
 const MD_EVIDENCE_CAP = 20;
 const MD_FIX_BRIEF_CAP = 10;
@@ -607,6 +608,14 @@ function renderAttackPlanSection(p) {
   return lines.join("\n");
 }
 
+/** 成绩那一格只报「判卷器落下的记录里有什么」：present=false 就是没有成绩，绝不显示成「有」 */
+function gradeCell(g) {
+  if (!g) return "无（草稿未判卷）";
+  if (g.present === false) return `无（${esc(truncate(String(g.whyNot ?? ""), 46))}）`;
+  const exams = (g.exams ?? []).map((e) => `${esc(e.examId ?? "?")}${e.pass ? "✓" : "✗"}`).join(" ");
+  return `${g.pass ? "过卷" : "**没过卷**"}（顶替族 \`${esc(g.familySlot ?? "—")}\`，实跑 \`${esc(String(g.runLabel ?? "—"))}\`${exams ? `：${exams}` : ""}）`;
+}
+
 /** 探索区（第 13 项）：呈报「模型自主试打了什么、留下什么草稿」，草稿不是结论 */
 const EXPLORATION_OUTCOME_LABEL = {
   not_run: "未运行",
@@ -710,7 +719,7 @@ function renderDualSection(d) {
       `| ${esc(p.id)} | ${esc(EXPLORATION_OUTCOME_LABEL[p.outcome] ?? p.outcome ?? "—")} | ${p.requestsUsed ?? 0} | ${p.modelCalls ?? 0} | \`${esc(dr?.family ?? "（无）")}\` | ${
         dr?.steps ?? 0
       } | ${dr ? (dr.tableOk ? "通过" : `拒收（${(dr.rejections ?? []).length} 处）`) : "—"} | \`${esc(dr?.verdictRule ?? "—")}\`${dr?.verdictByEngine ? "（引擎写死）" : ""} | \`${truncate(String(p.draftKey ?? "—"), 12)}\` | ${
-        p.grades ? esc(typeof p.grades === "object" ? (p.grades.runLabel ?? "有") : String(p.grades)) : "无（草稿未判卷）"
+        gradeCell(p.grades)
       } |`
     );
   }
@@ -755,7 +764,8 @@ function renderDualSection(d) {
     "- 双路的启用条件是三重：探索区双闸（契约 `exploration.enabled` **且** `GUARDBUILD_LLM_EXPLORATION=1`）**且**契约 `exploration.proposers` 点名两条互不相同的提议者；gate/CI 与纯黑盒模式代码级不进入这一路。",
     "- 两路共用同一份菜单、同一批动作、同一个执行器与同一条冻结判据：这一层只加「看问题的方式」和「挑毛病的位置」，不加任何打法。",
     "- 为什么这一节永远没有「通过」：对比代理只有降级权（红线 3），结论字段由引擎落笔（红线 4）；草稿在过判卷器（第 6 项，要跑漏洞版/加固版/干净对照三份变体）之前不得注册（红线 2）。",
-    "- 所以实跑会话里的对比结论只会是「退回」——那是人工闸门在起作用，不是失败：没判过卷的草稿被自动放行，就是本项目要拒的假绿灯。",
+    "- 所以**没有考卷成绩**的实跑会话里对比结论只会是「退回」——那是人工闸门在起作用，不是失败：没判过卷的草稿被自动放行，就是本项目要拒的假绿灯。",
+    "- 成绩不是这一轮产的：它由人工启动的 `node scripts/benchmark-grader.mjs --draft=<探索产物>` 落在草稿同目录的 `grades/` 下，扫描这一侧只读。两条草稿都读到「过卷」成绩、且两份成绩来自两次独立实跑，事实才可能齐；齐了也只是「建议合并（仍需人工终审）」，注册仍走 `scripts/register-recipe.mjs`（人工确认）。",
     "- 这些流量不进证据库、不参与判卷：本段全是过程事实。",
     ""
   );
@@ -1003,6 +1013,12 @@ function renderMarkdown(r) {
       );
     }
     summaryLines.push(...attackSurfaceLines(r));
+  }
+  // 顶替目录装载记录：这一轮跑的执行表不是仓库里注册的那张，就要在概览里点名——不能只藏在 .grader 的日志里
+  for (const o of r.summary?.recipeOverlay ?? []) {
+    summaryLines.push(
+      `- **配方装载来源：判卷顶替目录**——\`${o.recipeId}\` 这一族本轮执行的是**未注册草稿** \`${o.overlayOf}\`（信封 \`${o.envelope ?? "?"}\`）。判据仍是写死的那段代码，执行表不是：这一轮的成绩只对这张草稿负责。`
+    );
   }
   if (acc) {
     summaryLines.push(
@@ -1401,6 +1417,13 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
   const start = ctx.targetConfig?.start ?? null;
   const supabase = view.supabase ?? null;
   const blackbox = view.blackbox ?? null;
+  // 判卷顶替目录（#202）：这一轮执行表若来自 `GUARDBUILD_RECIPES_OVERLAY`，必须在报告里点名到草稿。
+  // 「考的是草稿」这件事不能只有启动判卷的那个终端知道——否则草稿的成绩看着就像注册配方的成绩。
+  const recipeOverlay = recipeOverlayHits().map((h) => ({
+    recipeId: h.recipeId,
+    overlayOf: String(h.overlayOf ?? ""),
+    envelope: String(h.file ?? "").split(/[\\/]/).pop() ?? null,
+  }));
   const r = {
     schema: "guardbuild.report/1",
     generatedAt: Date.now(),
@@ -1440,6 +1463,7 @@ export function buildReport(ctx, { outcome, exitCode, patchStatus = null, error 
             mutation: ctx._attackSurface.mutation ?? null,
           }
         : null,
+      recipeOverlay: recipeOverlay.length ? recipeOverlay : null,
       acceptance: view.acceptance ?? null,
       supabase,
       blackbox: blackbox

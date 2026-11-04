@@ -30,7 +30,8 @@ import { runSupabasePhase, isLoopbackHostname } from "./lib/supabase.mjs";
 import { runScout, applyScoutResult, recordScoutVerification, MAX_START_CANDIDATES } from "./lib/scout.mjs";
 import { isEnabled as llmEnabled } from "./lib/llm.mjs";
 import { bootstrapEnabled, runBootstrapAgent } from "./lib/bootstrap.mjs";
-import { explorationEnabled, runExploration } from "./lib/explorer.mjs";
+import { explorationEnabled, explorationGradeDir, runExploration } from "./lib/explorer.mjs";
+import { readGradeRecord } from "./lib/draftgrade.mjs";
 import { dualEnabled, proposersRequested, runComparator, runDualProposals, summarizeDual } from "./lib/dualpropose.mjs";
 import { runBlackbox } from "./lib/blackbox.mjs";
 import { coverageSummary, describeOutcome } from "./lib/coverage.mjs";
@@ -1740,14 +1741,54 @@ async function stageExploration(ctx) {
 }
 
 /**
+ * 读两条草稿各自的考卷成绩（#202 的接线）。
+ * 这一侧**只读**：成绩由人工启动的 `node scripts/benchmark-grader.mjs --draft=<产物>` 落在草稿同目录的
+ * `grades/<草稿键>.json` 里，扫描永远不自己写一条「看起来过了卷」（红线 4）。
+ * 读不到、草稿键不符、哈希不符（判卷之后草稿被改过）、判卷器换过版本——一律按「没有成绩」处理，
+ * 对比结论照旧落退回。那不是失败，是人工闸门还在起作用。
+ */
+function draftGradesOf(ctx, dual) {
+  const gradeDir = explorationGradeDir(ctx?.projectRoot);
+  const out = {};
+  for (const p of dual?.proposals ?? []) {
+    const draftKey = p?.summary?.draftKey ?? null;
+    const recipe = p?.summary?.draft?.recipe ?? null;
+    if (!gradeDir || !draftKey || !recipe) {
+      out[p.id] = null;
+      p.grades = { present: false, whyNot: !draftKey ? "这一路没有草稿键（没产出草稿就没有成绩可查）" : "成绩目录不可用（数据目录未设）" };
+      continue;
+    }
+    const rec = readGradeRecord({ gradeDir, draftKey, recipe });
+    if (!rec.ok) {
+      out[p.id] = null;
+      p.grades = { present: false, whyNot: rec.whyNot };
+      continue;
+    }
+    const g = {
+      present: true,
+      provenance: draftKey,
+      pass: rec.record.pass === true,
+      whyNot: rec.record.whyNot ?? null,
+      runLabel: rec.record.runLabel ?? null,
+      familySlot: rec.record.familySlot ?? null,
+      gradeVersion: rec.record.gradeVersion ?? null,
+      exams: (rec.record.exams ?? []).map((e) => ({ examId: e.examId, split: e.split, pass: e.pass === true, gates: e.gates ?? {} })),
+    };
+    out[p.id] = g;
+    p.grades = g;
+  }
+  return out;
+}
+
+/**
  * 第 14/15 项的双路分支：同一沙箱、同一份菜单、同一个执行器，两名提议者各拿一份预算独立试打，
  * 随后由对比分析代理出一份「建议合并 / 退回」的意见。
  *
  * 三条要写在这里的事实：
  *  - 两路之间不传文本（`checkPromptIsolation` 逐次核对出站提示词），草稿差异才能归因到视角差异；
  *  - 对比代理只有降级权（红线 3）：最终结论由引擎按事实算，它说「合并」也要事实齐备才亮；
- *  - 实跑会话里草稿**没有成绩**——判卷器（第 6 项）只在考卷层跑，而探索区在 gate/CI 结构性禁用。
- *    所以这一路的结论必然落在「退回」，原因里写清缺的是哪一条。那不是失败，那是人工闸门：
+ *  - 草稿的成绩来自判卷器的 `--draft` 模式（#202），扫描这一侧只读不写。两条草稿都拿到「过卷」成绩
+ *    才可能亮「建议合并（仍需人工终审）」；读不到成绩就落「退回」，原因里写清缺的是哪一条。
  *    没有已知答案考卷背书的草稿如果被自动放行，就是本项目要拒的那块假绿灯。
  */
 async function stageDualExploration(ctx, { baseUrl, stash, model }) {
@@ -1778,9 +1819,23 @@ async function stageDualExploration(ctx, { baseUrl, stash, model }) {
     });
     return;
   }
+  const grades = draftGradesOf(ctx, dual);
+  const describe = (id) => {
+    const g = grades?.[id] ?? dual.proposals?.find((p) => p.id === id)?.grades ?? null;
+    if (!g) return `${id}=无成绩`;
+    if (g.present === false) return `${id}=无成绩（${g.whyNot}）`;
+    return `${id}=${g.pass ? "过卷" : "没过卷"}（${g.familySlot ?? "?"}/${(g.exams ?? []).length} 张卷）`;
+  };
+  emit(ctx, {
+    kind: "exploration",
+    severity: SEVERITY.INFO,
+    message: `草稿考卷成绩（只读判卷器落下的记录，本会话不写成绩）：${describe("A")}、${describe("B")}`,
+    phase: STATE.PROBING,
+    data: { gradesFound: Object.values(grades).filter((g) => g?.present === true).length, gradeDir: explorationGradeDir(ctx?.projectRoot) ? "grades/" : null },
+  });
   const comparison = await runComparator(ctx, {
     dual,
-    grades: null,
+    grades,
     model,
     getToken: (url, reason) => ensureLlmToken(ctx, url, reason),
   });

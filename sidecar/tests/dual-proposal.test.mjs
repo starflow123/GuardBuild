@@ -125,7 +125,8 @@ function dualFixture({ tableOk = true, draftsDiffer = true, menusIdentical = tru
   };
 }
 
-const ownGrades = () => ({ A: { provenance: "A-k1", runLabel: "dual--A--1" }, B: { provenance: "B-k1", runLabel: "dual--B--1" } });
+// 判卷器 --draft 模式落下的成绩，扫描这一侧只读。pass:true 才是「过卷」。
+const ownGrades = () => ({ A: { provenance: "A-k1", runLabel: "dual--A--1", pass: true }, B: { provenance: "B-k1", runLabel: "dual--B--1", pass: true } });
 
 // ---------- 启用条件：三闸而不是一闸 ----------
 
@@ -438,6 +439,33 @@ test("成绩必须挂在这一路自己的草稿键上：没判卷、借成绩�
   assert.equal(partial.decision, "return", "只有一路有成绩也不算各自过了考卷");
 });
 
+test("成绩存在但红着：照样退回，理由是「没过卷」而不是「没判卷」", () => {
+  const dual = dualFixture();
+  const red = { A: { provenance: "A-k1", runLabel: "draft-a--1", pass: false, whyNot: "hardened_zero 闸在 attempt 2 没守住" }, B: { provenance: "B-k1", runLabel: "draft-b--1", pass: true } };
+  const c = decideComparison(dual, { opinion: validateComparatorOpinion({ recommendation: "merge" }), grades: red });
+  assert.equal(c.decision, "return", "过了考卷是前置事实，红一份就不许落建议合并");
+  assert.ok(c.reasons.some((r) => /A 的成绩没过卷：hardened_zero/.test(r)), JSON.stringify(c.reasons));
+  assert.ok(c.facts.some((f) => f.fact === "A 有自己的成绩" && f.ok === true), "成绩是可采信的，只是没过——两回事要分开标");
+  assert.equal(c.facts.find((f) => f.fact === "B 的成绩显示过卷").ok, true, "另一路过卷这条要为真，报告才说得出差在哪一路");
+
+  const missing = decideComparison(dual, {
+    opinion: validateComparatorOpinion({ recommendation: "merge" }),
+    grades: { A: { present: false, provenance: null, runLabel: null, pass: false, whyNot: "该草稿没有成绩文件" }, B: { provenance: "B-k1", runLabel: "draft-b--1", pass: true } },
+  });
+  assert.equal(missing.decision, "return");
+  assert.ok(missing.reasons.some((r) => /没有自己的考卷成绩/.test(r)), "读不到成绩就是没成绩，不许被 present:false 的空壳冒充成有");
+});
+
+test("成绩可以随提议者带进来（main.mjs 只读判卷记录那条路）：过卷才成立", () => {
+  const dual = dualFixture();
+  const withGrades = { ...dual, proposals: dual.proposals.map((p) => ({ ...p, grades: { [p.id]: { present: true, provenance: p.summary.draftKey, runLabel: `draft-${p.id}--1`, pass: true } } })) };
+  assert.equal(decideComparison(withGrades, { opinion: validateComparatorOpinion({ recommendation: "merge" }) }).decision, "merge_suggestion");
+  const redAttached = { ...dual, proposals: dual.proposals.map((p) => ({ ...p, grades: { [p.id]: { present: true, provenance: p.summary.draftKey, runLabel: `draft-${p.id}--1`, pass: false, whyNot: "开发集没过" } } })) };
+  const c = decideComparison(redAttached, { opinion: validateComparatorOpinion({ recommendation: "merge" }) });
+  assert.equal(c.decision, "return");
+  assert.ok(c.reasons.some((r) => /成绩没过卷：开发集没过/.test(r)));
+});
+
 test("事实全部成立 + 模型建议合并：只落「建议合并（仍需人工终审）」，且没有通过字段", () => {
   const dual = dualFixture();
   const opinion = validateComparatorOpinion({ recommendation: "merge", why: "两份互补", divergences: ["A 匿名读 / B 注入"] });
@@ -497,10 +525,12 @@ test("对比代理不可用：只少一份分歧说明，结论照样由引擎�
       throw new LlmError("上游返回 Set-Cookie: sid=super-secret-token-999 后断开", { code: "http_503" });
     },
   });
-  assert.equal(c.decision, "return", "草稿没判过卷，模型缺席也只是换个理由退回");
+  assert.equal(c.decision, "return", "两份成绩都过卷也照样退回：没人替模型说「建议合并」");
   assert.equal(c.decidedBy, "engine");
   assert.equal(c.model.ok, false);
   assert.match(c.model.rejected, /对比代理不可用/);
+  assert.ok(c.reasons.some((r) => /没有合法的对比意见/.test(r)), JSON.stringify(c.reasons));
+  assert.ok(!c.reasons.some((r) => /没有自己的考卷成绩|成绩没过卷/.test(r)), "成绩这次不是退回的理由，别把原因写错");
   assert.ok(!JSON.stringify(c).includes("super-secret-token-999"), "凭据值不许进结论");
   assert.ok(events.some((e) => e.data?.action === "compare" && e.data?.ok === false), "异常要落一条事件，不能静默");
 });
